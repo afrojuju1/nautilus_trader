@@ -5212,6 +5212,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "034a0ad7deebf0c2abcf2435950a6666c3c15ea9d8fad0c0f48efa8a7f843fed"
 
 [[package]]
+name = "nautilus-alpaca"
+version = "0.57.0"
+
+[[package]]
 name = "nautilus-analysis"
 version = "0.57.0"
 dependencies = [

@@ -1,0 +1,132 @@
+# Alpaca Adapter Runtime Plan
+
+This document captures the proposed path for building an Alpaca Markets adapter in
+NautilusTrader and migrating a strategy equivalent to `index_put_credit_entry`.
+
+## Goal
+
+Build a Nautilus-native Alpaca adapter that can run US equity and US equity option workflows in
+paper trading first, with enough live-data and execution parity to support short-dated put credit
+spread automation.
+
+The first target strategy mirrors the current spreads workflow:
+
+- Underlyings: SPY, QQQ, IWM, DIA, GLD.
+- Cadence: five minutes during the 09:45-14:30 ET entry window.
+- Structure: put credit spreads with 5-10 DTE.
+- Selection: short delta around 0.18-0.28, widths 2/3/5, min open interest, quote age, spread,
+  POP/EV/slippage/IV scoring, and minimum return-on-risk gates.
+- Execution: paper account, multi-leg net-credit limit orders, position-aware risk gates, and
+  target/stop exit management.
+
+## Adapter Shape
+
+Follow Nautilus' existing live adapter pattern:
+
+- Rust crate: `crates/adapters/alpaca`.
+- Python package: `nautilus_trader/adapters/alpaca`.
+- Config and factories exposed in Python.
+- Rust owns HTTP/WebSocket clients, wire models, parsing, retries, rate limits, and execution
+  reconciliation.
+- Python remains the user-facing configuration and strategy assembly surface.
+
+The scaffold added with this plan registers `nautilus-alpaca`, exposes venue/config constants, and
+adds factory placeholders that fail fast until real clients exist.
+
+## Alpaca API Mapping
+
+Market data:
+
+- Contracts: load option contracts from Alpaca's option contracts endpoint by underlying,
+  expiration, type, status, and style.
+- Snapshots: use option snapshots for quotes, greeks, IV, latest trade, and underlying snapshots.
+- Historical bars/trades/quotes: support backfill and replay inputs.
+- WebSocket: subscribe to explicit option symbols only; maintain a dynamic subscription set for
+  the candidate chain because wildcard option quote subscriptions are not available.
+- Feeds: support `indicative` first and `opra` as a paid-feed switch.
+
+Execution:
+
+- Account and positions: poll account, positions, orders, and activities for startup
+  reconciliation and periodic repair.
+- Trade updates: consume the account trade update stream for order state changes.
+- Multi-leg orders: submit spread orders using Alpaca `order_class="mleg"` payloads with signed
+  net limit prices.
+- Reconciliation: activity polling must cover fills, corrections, assignments, exercises, and
+  expirations that may not be fully represented by order events.
+
+## Instrument Model
+
+The adapter should model:
+
+- Equity underlyings as Nautilus equity instruments on venue `ALPACA`.
+- Listed option contracts as Nautilus options with canonical Alpaca option symbols.
+- Put credit spreads as strategy-generated multi-leg order instructions, not separate synthetic
+  instruments for the first implementation.
+
+Keep symbology conversion isolated so the strategy can reason in Nautilus `InstrumentId`s while
+the adapter submits Alpaca symbols.
+
+## Runtime Architecture
+
+Phase 1:
+
+- Implement authenticated REST client.
+- Implement contract provider for equity option instruments.
+- Implement latest option snapshot/quote request path.
+- Implement account/position/order polling.
+- Implement paper multi-leg order submission.
+- Add a dry-run strategy harness that emits candidate decisions without orders.
+
+Phase 2:
+
+- Add option WebSocket data client with explicit subscriptions.
+- Add trade update stream execution reconciliation.
+- Add order modify/cancel support.
+- Add snapshot Greek/IV refresh loop for scoring inputs.
+
+Phase 3:
+
+- Port the `index_put_credit_entry` selection logic into a Nautilus `Strategy`.
+- Add target/stop exit policy.
+- Add historical decision replay using Alpaca bars/snapshots where available.
+- Run paper soak with order submission disabled, then paper execution enabled.
+
+## Strategy Migration
+
+The Nautilus strategy should not copy the current app's job scheduler or alerting layer. It should
+only port the trading decision:
+
+1. On timer, load the eligible underlyings and expiration window.
+2. Request chain contracts and latest option snapshots.
+3. Build candidate put credit spreads from the chain.
+4. Score candidates using the existing POP/EV/slippage/IV/ROR rules.
+5. Check account and portfolio risk.
+6. Submit one multi-leg net-credit limit order when all gates pass.
+7. Manage exits from Nautilus position/order events and periodic account reconciliation.
+
+The existing `spreads` system can remain the operator UI, alerting, and policy research layer until
+Nautilus has equivalent operational visibility.
+
+## Key Risks
+
+- Alpaca option WebSocket subscriptions require explicit symbols, so chain filtering must happen
+  before live quote subscription.
+- OPRA access changes data quality materially; `indicative` is acceptable for development but not
+  a final live-trading assumption.
+- Options assignment, exercise, expiry, and corporate action handling need activity reconciliation,
+  not just order event handling.
+- Nautilus has strong primitives, but portfolio/risk behavior for broker multi-leg option spreads
+  needs targeted paper tests before live trading.
+- The current strategy depends on snapshot Greeks and IV; if these are missing or stale, the
+  Nautilus strategy must gate entries rather than substitute weak estimates.
+
+## Validation Gates
+
+- `cargo check -p nautilus-alpaca --no-default-features`.
+- Python import smoke for `nautilus_trader.adapters.alpaca`.
+- REST client unit tests against captured Alpaca fixtures.
+- Paper-only contract load for SPY and QQQ options.
+- Paper-only multi-leg order dry run that validates payload shape but does not submit.
+- Submit one tiny paper spread in market hours, verify order lifecycle through REST plus trade
+  update stream, then cancel/close and reconcile positions.

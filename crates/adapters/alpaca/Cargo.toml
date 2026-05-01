@@ -1,0 +1,33 @@
+[package]
+name = "nautilus-alpaca"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Alpaca Markets integration adapter for the Nautilus trading engine"
+categories.workspace = true
+keywords.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "nautilus_alpaca"
+crate-type = ["rlib"]
+
+[features]
+default = ["high-precision"]
+extension-module = ["python"]
+high-precision = []
+python = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
