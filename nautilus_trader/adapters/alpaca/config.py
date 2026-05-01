@@ -33,10 +33,12 @@ class AlpacaDataClientConfig(LiveDataClientConfig, frozen=True):
     ----------
     api_key : str, optional
         The Alpaca API key.
-        If ``None`` then will source the `ALPACA_API_KEY` environment variable.
+        If ``None`` then will source the `APCA_API_KEY_ID` or `ALPACA_API_KEY`
+        environment variable.
     api_secret : str, optional
         The Alpaca API secret.
-        If ``None`` then will source the `ALPACA_API_SECRET` environment variable.
+        If ``None`` then will source the `APCA_API_SECRET_KEY` or `ALPACA_SECRET_KEY`
+        environment variable.
     environment : {"paper", "live"}, default "paper"
         The Alpaca trading environment used when data requests need account context.
     data_base_url : str, optional
@@ -76,10 +78,12 @@ class AlpacaExecClientConfig(LiveExecClientConfig, frozen=True):
     ----------
     api_key : str, optional
         The Alpaca API key.
-        If ``None`` then will source the `ALPACA_API_KEY` environment variable.
+        If ``None`` then will source the `APCA_API_KEY_ID` or `ALPACA_API_KEY`
+        environment variable.
     api_secret : str, optional
         The Alpaca API secret.
-        If ``None`` then will source the `ALPACA_API_SECRET` environment variable.
+        If ``None`` then will source the `APCA_API_SECRET_KEY` or `ALPACA_SECRET_KEY`
+        environment variable.
     environment : {"paper", "live"}, default "paper"
         The Alpaca trading environment.
     trading_base_url : str, optional

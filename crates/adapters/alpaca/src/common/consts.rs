@@ -21,10 +21,19 @@ pub const ALPACA_VENUE: &str = "ALPACA";
 /// Default Nautilus client identifier for Alpaca data and execution clients.
 pub const ALPACA_CLIENT_ID: &str = "ALPACA";
 
-/// Environment variable used to load the Alpaca API key.
+/// Primary environment variable used to load the Alpaca API key.
+pub const ENV_APCA_API_KEY_ID: &str = "APCA_API_KEY_ID";
+
+/// Fallback environment variable used by some existing Nautilus deployments.
 pub const ENV_ALPACA_API_KEY: &str = "ALPACA_API_KEY";
 
-/// Environment variable used to load the Alpaca API secret.
+/// Primary environment variable used to load the Alpaca API secret.
+pub const ENV_APCA_API_SECRET_KEY: &str = "APCA_API_SECRET_KEY";
+
+/// Fallback environment variable used by some existing Nautilus deployments.
+pub const ENV_ALPACA_SECRET_KEY: &str = "ALPACA_SECRET_KEY";
+
+/// Legacy fallback environment variable for the Alpaca API secret.
 pub const ENV_ALPACA_API_SECRET: &str = "ALPACA_API_SECRET";
 
 /// Alpaca option symbol pattern used by the options contracts and market data APIs.

@@ -16,7 +16,7 @@
 //! Configuration structures for the Alpaca adapter scaffold.
 
 use crate::common::{
-    consts::{ENV_ALPACA_API_KEY, ENV_ALPACA_API_SECRET},
+    credentials::AlpacaCredential,
     urls::{
         DATA_BASE_URL, LIVE_TRADE_UPDATES_WS_URL, LIVE_TRADING_BASE_URL,
         PAPER_TRADE_UPDATES_WS_URL, PAPER_TRADING_BASE_URL,
@@ -164,9 +164,7 @@ impl AlpacaDataClientConfig {
     /// Returns `true` if credentials are configured directly or through environment variables.
     #[must_use]
     pub fn has_api_credentials(&self) -> bool {
-        let has_key = self.api_key.is_some() || std::env::var(ENV_ALPACA_API_KEY).is_ok();
-        let has_secret = self.api_secret.is_some() || std::env::var(ENV_ALPACA_API_SECRET).is_ok();
-        has_key && has_secret
+        AlpacaCredential::resolve(self.api_key.clone(), self.api_secret.clone()).is_some()
     }
 }
 
@@ -235,8 +233,6 @@ impl AlpacaExecClientConfig {
     /// Returns `true` if credentials are configured directly or through environment variables.
     #[must_use]
     pub fn has_api_credentials(&self) -> bool {
-        let has_key = self.api_key.is_some() || std::env::var(ENV_ALPACA_API_KEY).is_ok();
-        let has_secret = self.api_secret.is_some() || std::env::var(ENV_ALPACA_API_SECRET).is_ok();
-        has_key && has_secret
+        AlpacaCredential::resolve(self.api_key.clone(), self.api_secret.clone()).is_some()
     }
 }

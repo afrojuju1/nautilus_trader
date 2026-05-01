@@ -13,8 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Shared Alpaca adapter constants and URL helpers.
+//! Alpaca REST client, request models, and response models.
 
-pub mod consts;
-pub mod credentials;
-pub mod urls;
+pub mod client;
+pub mod error;
+pub mod models;

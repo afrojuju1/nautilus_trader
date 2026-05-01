@@ -23,7 +23,10 @@ ALPACA: Final[str] = "ALPACA"
 ALPACA_VENUE: Final[Venue] = Venue(ALPACA)
 ALPACA_CLIENT_ID: Final[ClientId] = ClientId(ALPACA)
 
+APCA_API_KEY_ID_ENV: Final[str] = "APCA_API_KEY_ID"
+APCA_API_SECRET_KEY_ENV: Final[str] = "APCA_API_SECRET_KEY"  # noqa: S105
 ALPACA_API_KEY_ENV: Final[str] = "ALPACA_API_KEY"
+ALPACA_SECRET_KEY_ENV: Final[str] = "ALPACA_SECRET_KEY"  # noqa: S105
 ALPACA_API_SECRET_ENV: Final[str] = "ALPACA_API_SECRET"  # noqa: S105
 
 ALPACA_PAPER_TRADING_BASE_URL: Final[str] = "https://paper-api.alpaca.markets"

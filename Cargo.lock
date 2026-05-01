@@ -5214,6 +5214,15 @@ checksum = "034a0ad7deebf0c2abcf2435950a6666c3c15ea9d8fad0c0f48efa8a7f843fed"
 [[package]]
 name = "nautilus-alpaca"
 version = "0.57.0"
+dependencies = [
+ "reqwest 0.13.3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "url",
+]
 
 [[package]]
 name = "nautilus-analysis"
