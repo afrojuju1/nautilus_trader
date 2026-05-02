@@ -42,4 +42,6 @@ pub mod http;
 pub mod orders;
 pub mod parse;
 pub mod providers;
+#[cfg(feature = "python")]
+pub mod python;
 pub mod strategy;

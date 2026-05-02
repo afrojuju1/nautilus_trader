@@ -15,14 +15,13 @@
 """
 Timer scaffold for Alpaca put credit spread selection.
 
-This strategy deliberately calls the current Rust dry-run scanner binary until the Alpaca Rust
-client is exposed to Python through the adapter. It gives Nautilus a real timer-driven strategy
-surface now, while keeping order submission in the Rust paper execution harness.
+This strategy calls the Alpaca Rust scanner through the Nautilus PyO3 extension. It emits candidate
+decisions only; order submission stays in the execution client/harness until the full live adapter
+is wired.
 """
 
 from __future__ import annotations
 
-import subprocess
 from datetime import datetime
 from datetime import time
 from datetime import timedelta
@@ -53,8 +52,14 @@ class AlpacaPutCreditStrategyConfig(StrategyConfig, frozen=True):
     entry_start_time: str = "09:45"
     entry_end_time: str = "14:30"
     entry_timezone: str = "America/New_York"
-    scanner_command: str = "alpaca-dry-run-put-credit"
-    scanner_timeout_secs: PositiveInt = 120
+    min_dte: PositiveInt = 5
+    max_dte: PositiveInt = 10
+    short_delta_min: float = 0.18
+    short_delta_max: float = 0.28
+    widths: list[float] = msgspec.field(default_factory=lambda: [2.0, 3.0, 5.0])
+    min_open_interest: PositiveInt = 200
+    max_leg_spread_pct: float = 0.15
+    min_return_on_risk: float = 0.13
 
 
 class AlpacaPutCreditStrategy(Strategy):
@@ -97,21 +102,38 @@ class AlpacaPutCreditStrategy(Strategy):
             self.log.debug(f"Skipping Alpaca put credit scan outside entry window: {trigger=}")
             return
 
-        command = [self.config.scanner_command, *self.config.underlyings]
         try:
-            completed = subprocess.run(  # noqa: S603
-                command,
-                capture_output=True,
-                check=True,
-                text=True,
-                timeout=self.config.scanner_timeout_secs,
+            from nautilus_trader.core.nautilus_pyo3.alpaca import AlpacaPutCreditScannerConfig
+            from nautilus_trader.core.nautilus_pyo3.alpaca import scan_put_credit_once
+
+            scanner_config = AlpacaPutCreditScannerConfig(
+                min_dte=self.config.min_dte,
+                max_dte=self.config.max_dte,
+                short_delta_min=self.config.short_delta_min,
+                short_delta_max=self.config.short_delta_max,
+                widths=self.config.widths,
+                min_open_interest=self.config.min_open_interest,
+                max_leg_spread_pct=self.config.max_leg_spread_pct,
+                min_return_on_risk=self.config.min_return_on_risk,
             )
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            results = scan_put_credit_once(self.config.underlyings, scanner_config)
+        except RuntimeError as exc:
             self.log.error(f"Alpaca put credit scanner failed: {exc}")
             return
 
-        for line in completed.stdout.splitlines():
-            self.log.info(line)
+        for result in results:
+            if result.candidates:
+                best = result.candidates[0]
+                self.log.info(
+                    f"{result.underlying}: entry_ready short={best.short_symbol} "
+                    f"long={best.long_symbol} credit={best.credit:.2f} "
+                    f"ror={best.return_on_risk * 100.0:.1f}% score={best.score:.1f}",
+                )
+            else:
+                self.log.info(
+                    f"{result.underlying}: no_candidate contracts={result.contract_count} "
+                    f"snapshots={result.snapshot_count} scoreable={result.scoreable_count}",
+                )
 
     def _inside_entry_window(self) -> bool:
         now = datetime.now(tz=self._entry_tz).time()

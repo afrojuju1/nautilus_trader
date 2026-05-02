@@ -22,18 +22,21 @@ crate-type = ["rlib"]
 
 [features]
 default = ["high-precision"]
-extension-module = ["python"]
+extension-module = ["python", "pyo3/extension-module"]
 high-precision = ["nautilus-model/high-precision"]
 live = ["tokio"]
-python = []
+python = ["live", "pyo3", "pyo3-stub-gen"]
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
+nautilus-core = { workspace = true }
 nautilus-model = { workspace = true }
 
+pyo3 = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

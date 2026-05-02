@@ -40,6 +40,7 @@ extension-module = [
   "nautilus-cryptography/extension-module",
   "nautilus-data/extension-module",
   "nautilus-databento/extension-module",
+  "nautilus-alpaca/extension-module",
   "nautilus-deribit/extension-module",
   "nautilus-dydx/extension-module",
   "nautilus-execution/extension-module",
@@ -70,6 +71,7 @@ ffi = [
 high-precision = [
   "nautilus-model/high-precision",
   "nautilus-serialization/high-precision",
+  "nautilus-alpaca/high-precision",
   "nautilus-binance/high-precision",
   "nautilus-bitmex/high-precision",
   "nautilus-coinbase/high-precision",
@@ -114,6 +116,7 @@ nautilus-trading = { workspace = true, features = ["python"] }
 
 # Adapters
 nautilus-architect-ax = { workspace = true, features = ["python"] }
+nautilus-alpaca = { workspace = true, features = ["python"] }
 nautilus-binance = { workspace = true, features = ["python"] }
 nautilus-bitmex = { workspace = true, features = ["python"] }
 nautilus-blockchain = { workspace = true, features = [
