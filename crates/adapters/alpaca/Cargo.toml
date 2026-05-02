@@ -130,6 +130,13 @@ doc = false
 test = false
 
 [[bin]]
+name = "alpaca-submit-order-list-harness"
+path = "bin/submit_order_list_harness.rs"
+required-features = ["live"]
+doc = false
+test = false
+
+[[bin]]
 name = "alpaca-watch-trade-updates"
 path = "bin/watch_trade_updates.rs"
 required-features = ["live"]
