@@ -1,0 +1,293 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! Put credit spread scanner logic shared by smoke binaries and strategy scaffolds.
+
+use std::collections::{BTreeMap, HashMap};
+
+use time::{Duration, OffsetDateTime};
+
+use crate::{
+    config::AlpacaDataClientConfig,
+    http::{
+        client::AlpacaHttpClient,
+        error::Result,
+        models::{
+            AlpacaOptionContract, AlpacaOptionSnapshot, AlpacaOptionType, OptionSnapshotsRequest,
+        },
+    },
+    providers::AlpacaOptionContractProvider,
+};
+
+/// Configuration for the put credit spread scanner.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PutCreditScannerConfig {
+    /// Minimum days to expiration.
+    pub min_dte: i64,
+    /// Maximum days to expiration.
+    pub max_dte: i64,
+    /// Minimum absolute short-leg delta.
+    pub short_delta_min: f64,
+    /// Maximum absolute short-leg delta.
+    pub short_delta_max: f64,
+    /// Allowed spread widths.
+    pub widths: Vec<f64>,
+    /// Minimum open interest per contract.
+    pub min_open_interest: u64,
+    /// Maximum bid/ask spread as a fraction of midpoint per leg.
+    pub max_leg_spread_pct: f64,
+    /// Minimum credit / max loss.
+    pub min_return_on_risk: f64,
+}
+
+impl Default for PutCreditScannerConfig {
+    fn default() -> Self {
+        Self {
+            min_dte: 5,
+            max_dte: 10,
+            short_delta_min: 0.18,
+            short_delta_max: 0.28,
+            widths: vec![2.0, 3.0, 5.0],
+            min_open_interest: 200,
+            max_leg_spread_pct: 0.15,
+            min_return_on_risk: 0.13,
+        }
+    }
+}
+
+/// One scored option contract eligible for strategy candidate building.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoredContract {
+    /// Alpaca option symbol.
+    pub symbol: String,
+    /// Contract expiration date.
+    pub expiration_date: String,
+    /// Strike price.
+    pub strike: f64,
+    /// Bid price.
+    pub bid: f64,
+    /// Ask price.
+    pub ask: f64,
+    /// Absolute delta.
+    pub delta_abs: f64,
+    /// Bid/ask spread as a fraction of midpoint.
+    pub spread_pct: f64,
+    /// Implied volatility, if present.
+    pub implied_volatility: Option<f64>,
+}
+
+/// One put credit spread candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpreadCandidate {
+    /// Short put leg.
+    pub short: ScoredContract,
+    /// Long put hedge leg.
+    pub long: ScoredContract,
+    /// Strike width.
+    pub width: f64,
+    /// Net credit.
+    pub credit: f64,
+    /// Maximum loss.
+    pub max_loss: f64,
+    /// Credit / max loss.
+    pub return_on_risk: f64,
+    /// Scanner score.
+    pub score: f64,
+}
+
+/// Scan result for one underlying.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PutCreditScanResult {
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Number of contracts loaded.
+    pub contract_count: usize,
+    /// Number of snapshots loaded.
+    pub snapshot_count: usize,
+    /// Number of scoreable contracts.
+    pub scoreable_count: usize,
+    /// Ranked candidates.
+    pub candidates: Vec<SpreadCandidate>,
+}
+
+/// Loads chain data and ranks put credit spread candidates for one underlying.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_put_credit_underlying(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &PutCreditScannerConfig,
+    underlying: impl Into<String>,
+) -> Result<PutCreditScanResult> {
+    let underlying = underlying.into();
+    let today = OffsetDateTime::now_utc().date();
+    let min_expiration = (today + Duration::days(config.min_dte)).to_string();
+    let max_expiration = (today + Duration::days(config.max_dte)).to_string();
+    let provider = AlpacaOptionContractProvider::new(client.clone());
+
+    let contracts = provider
+        .load_active_contracts(
+            underlying.clone(),
+            min_expiration,
+            max_expiration,
+            Some(AlpacaOptionType::Put),
+        )
+        .await?;
+    let symbols = contracts
+        .iter()
+        .map(|contract| contract.symbol.clone())
+        .collect::<Vec<_>>();
+    let mut snapshots_request = OptionSnapshotsRequest::for_symbols(symbols);
+    snapshots_request.feed = Some(data_config.option_feed.as_str().to_string());
+    let snapshots = client.option_snapshots(&snapshots_request).await?.snapshots;
+
+    let scored = score_contracts(&contracts, &snapshots, config);
+    let candidates = build_candidates(&scored, config);
+    Ok(PutCreditScanResult {
+        underlying,
+        contract_count: contracts.len(),
+        snapshot_count: snapshots.len(),
+        scoreable_count: scored.len(),
+        candidates,
+    })
+}
+
+/// Scores contracts that have enough quote, Greek, and liquidity data.
+#[must_use]
+pub fn score_contracts(
+    contracts: &[AlpacaOptionContract],
+    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    config: &PutCreditScannerConfig,
+) -> Vec<ScoredContract> {
+    contracts
+        .iter()
+        .filter_map(|contract| {
+            let open_interest = contract
+                .open_interest
+                .as_deref()
+                .and_then(|value| value.parse::<u64>().ok())?;
+            if open_interest < config.min_open_interest {
+                return None;
+            }
+
+            let snapshot = snapshots.get(&contract.symbol)?;
+            let quote = snapshot.latest_quote.as_ref()?;
+            let bid = quote.bid_price?;
+            let ask = quote.ask_price?;
+            let midpoint = quote.midpoint()?;
+            let spread_pct = (ask - bid) / midpoint;
+            if spread_pct > config.max_leg_spread_pct {
+                return None;
+            }
+
+            let delta_abs = snapshot.greeks.as_ref()?.delta?.abs();
+            if delta_abs < config.short_delta_min || delta_abs > config.short_delta_max {
+                return None;
+            }
+
+            Some(ScoredContract {
+                symbol: contract.symbol.clone(),
+                expiration_date: contract.expiration_date.clone(),
+                strike: contract.strike_price.parse::<f64>().ok()?,
+                bid,
+                ask,
+                delta_abs,
+                spread_pct,
+                implied_volatility: snapshot.implied_volatility,
+            })
+        })
+        .collect()
+}
+
+/// Builds and ranks put credit spread candidates from scored put contracts.
+#[must_use]
+pub fn build_candidates(
+    contracts: &[ScoredContract],
+    config: &PutCreditScannerConfig,
+) -> Vec<SpreadCandidate> {
+    let by_expiration_strike = contracts
+        .iter()
+        .map(|contract| {
+            (
+                (
+                    contract.expiration_date.clone(),
+                    strike_key(contract.strike),
+                ),
+                contract,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut candidates = Vec::new();
+    for short in contracts {
+        for width in &config.widths {
+            let long_strike = short.strike - width;
+            let Some(long) = by_expiration_strike
+                .get(&(short.expiration_date.clone(), strike_key(long_strike)))
+                .copied()
+            else {
+                continue;
+            };
+
+            let credit = short.bid - long.ask;
+            if credit <= 0.0 {
+                continue;
+            }
+            let max_loss = width - credit;
+            if max_loss <= 0.0 {
+                continue;
+            }
+            let return_on_risk = credit / max_loss;
+            if return_on_risk < config.min_return_on_risk {
+                continue;
+            }
+
+            let delta_midpoint = (config.short_delta_min + config.short_delta_max) / 2.0;
+            let delta_half_range = (config.short_delta_max - config.short_delta_min) / 2.0;
+            let delta_score =
+                (1.0 - ((short.delta_abs - delta_midpoint).abs() / delta_half_range)).max(0.0);
+            let ror_score = (return_on_risk / config.min_return_on_risk).min(2.0) / 2.0;
+            let credit_score = (credit / width).min(0.5) / 0.5;
+            let spread_penalty =
+                ((short.spread_pct + long.spread_pct) / (2.0 * config.max_leg_spread_pct)).min(1.0);
+            let score =
+                delta_score * 35.0 + ror_score * 30.0 + credit_score * 25.0 - spread_penalty * 10.0;
+
+            candidates.push(SpreadCandidate {
+                short: short.clone(),
+                long: long.clone(),
+                width: *width,
+                credit,
+                max_loss,
+                return_on_risk,
+                score,
+            });
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates
+}
+
+fn strike_key(strike: f64) -> i64 {
+    (strike * 1_000.0).round() as i64
+}

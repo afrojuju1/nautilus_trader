@@ -1,0 +1,102 @@
+[package]
+name = "nautilus-alpaca"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Alpaca Markets integration adapter for the Nautilus trading engine"
+categories.workspace = true
+keywords.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "nautilus_alpaca"
+crate-type = ["rlib"]
+
+[features]
+default = ["high-precision"]
+extension-module = ["python", "pyo3/extension-module"]
+high-precision = ["nautilus-model/high-precision"]
+live = ["tokio"]
+python = ["live", "pyo3", "pyo3-stub-gen"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+nautilus-core = { workspace = true }
+nautilus-model = { workspace = true }
+
+pyo3 = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, optional = true }
+url = { workspace = true }
+
+[[bin]]
+name = "alpaca-load-option-contracts"
+path = "bin/load_option_contracts.rs"
+required-features = ["live"]
+doc = false
+test = false
+
+[[bin]]
+name = "alpaca-load-option-snapshots"
+path = "bin/load_option_snapshots.rs"
+required-features = ["live"]
+doc = false
+test = false
+
+[[bin]]
+name = "alpaca-dry-run-put-credit"
+path = "bin/dry_run_put_credit.rs"
+required-features = ["live"]
+doc = false
+test = false
+
+[[bin]]
+name = "alpaca-check-account-orders"
+path = "bin/check_account_orders.rs"
+required-features = ["live"]
+doc = false
+test = false
+
+[[bin]]
+name = "alpaca-validate-mleg-order"
+path = "bin/validate_mleg_order.rs"
+required-features = ["live"]
+doc = false
+test = false
+
+[[bin]]
+name = "alpaca-submit-mleg-order"
+path = "bin/submit_mleg_order.rs"
+required-features = ["live"]
+doc = false
+test = false
+
+[[bin]]
+name = "alpaca-paper-execution-harness"
+path = "bin/paper_execution_harness.rs"
+required-features = ["live"]
+doc = false
+test = false
+
+[[bin]]
+name = "alpaca-put-credit-strategy-loop"
+path = "bin/put_credit_strategy_loop.rs"
+required-features = ["live"]
+doc = false
+test = false
