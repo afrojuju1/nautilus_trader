@@ -108,6 +108,9 @@ impl MlegOrderLeg {
 pub struct MlegOrderPayload {
     /// Alpaca advanced order class.
     pub order_class: String,
+    /// Optional parent client order ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,
     /// Number of strategy units to trade.
     pub qty: String,
     /// Alpaca order type.
@@ -135,6 +138,7 @@ impl MlegOrderPayload {
     ) -> Result<Self> {
         let payload = Self {
             order_class: "mleg".to_string(),
+            client_order_id: None,
             qty: quantity.to_string(),
             order_type: "limit".to_string(),
             limit_price: format!("{signed_limit_price:.2}"),
@@ -143,6 +147,24 @@ impl MlegOrderPayload {
         };
         payload.validate()?;
         Ok(payload)
+    }
+
+    /// Returns a copy of the payload with the parent client order ID set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the client order ID is empty or non-ASCII.
+    pub fn with_client_order_id(mut self, client_order_id: impl Into<String>) -> Result<Self> {
+        let client_order_id = client_order_id.into();
+        if client_order_id.trim().is_empty() {
+            return Err(validation("client_order_id must not be empty"));
+        }
+        if !client_order_id.is_ascii() {
+            return Err(validation("client_order_id must be ASCII"));
+        }
+        self.client_order_id = Some(client_order_id);
+        self.validate()?;
+        Ok(self)
     }
 
     /// Validates this payload without submitting it.
@@ -154,6 +176,14 @@ impl MlegOrderPayload {
     pub fn validate(&self) -> Result<()> {
         if self.order_class != "mleg" {
             return Err(validation("order_class must be mleg"));
+        }
+        if let Some(client_order_id) = &self.client_order_id {
+            if client_order_id.trim().is_empty() {
+                return Err(validation("client_order_id must not be empty"));
+            }
+            if !client_order_id.is_ascii() {
+                return Err(validation("client_order_id must be ASCII"));
+            }
         }
         if self.order_type != "limit" {
             return Err(validation(

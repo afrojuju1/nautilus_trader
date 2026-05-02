@@ -16,7 +16,11 @@
 //! Execution admission and report mapping helpers for Alpaca option-spread strategies.
 
 #[cfg(feature = "live")]
-use std::{collections::BTreeMap, future::Future, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    sync::{Arc, Mutex},
+};
 use std::{collections::BTreeSet, str::FromStr};
 
 #[cfg(feature = "live")]
@@ -31,6 +35,7 @@ use nautilus_model::{
     accounts::AccountAny,
     enums::{LiquiditySide, OmsType},
     identifiers::{ClientId, TradeId, Venue},
+    orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money},
 };
@@ -49,6 +54,7 @@ use {
         messages::execution::{
             CancelOrder, GenerateFillReports, GenerateOrderStatusReport,
             GenerateOrderStatusReports, GeneratePositionStatusReports, QueryAccount, QueryOrder,
+            SubmitOrder, SubmitOrderList,
         },
     },
     nautilus_live::{ExecutionClientCore, ExecutionEventEmitter},
@@ -68,6 +74,8 @@ use crate::{
 #[cfg(feature = "live")]
 use crate::{
     config::AlpacaExecClientConfig,
+    orders::{AlpacaPositionIntent, MlegOrderLeg, MlegOrderPayload},
+    orders::{NetPremiumKind, TradeIntent, signed_net_limit_price},
     websocket::{
         client::AlpacaTradeUpdatesWebSocketClient,
         messages::{AlpacaTradeUpdate, AlpacaTradeUpdateLeg, AlpacaWsMessage},
@@ -698,6 +706,18 @@ fn normalize(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
+/// Local context for a submitted Alpaca multi-leg order.
+#[cfg(feature = "live")]
+#[derive(Clone, Debug, Default)]
+struct MlegOrderContext {
+    leg_client_ids_by_order_id: BTreeMap<String, ClientOrderId>,
+    leg_client_ids_by_symbol: BTreeMap<String, ClientOrderId>,
+    leg_sides_by_symbol: BTreeMap<String, String>,
+}
+
+#[cfg(feature = "live")]
+type MlegOrderContextMap = BTreeMap<String, MlegOrderContext>;
+
 /// Live execution client for Alpaca Trading.
 #[cfg(feature = "live")]
 #[derive(Debug)]
@@ -710,6 +730,7 @@ pub struct AlpacaExecutionClient {
     ws_user: Option<AlpacaTradeUpdatesWebSocketClient>,
     ws_stream_handle: Option<JoinHandle<()>>,
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
+    mleg_contexts: Arc<Mutex<MlegOrderContextMap>>,
 }
 
 #[cfg(feature = "live")]
@@ -755,6 +776,7 @@ impl AlpacaExecutionClient {
             ws_user,
             ws_stream_handle: None,
             pending_tasks: Mutex::new(Vec::new()),
+            mleg_contexts: Arc::new(Mutex::new(MlegOrderContextMap::new())),
         })
     }
 
@@ -787,6 +809,32 @@ impl AlpacaExecutionClient {
             .await
             .map_err(|e| anyhow::anyhow!("failed to request Alpaca account: {e}"))?;
         account_balances_from_alpaca(&account)
+    }
+
+    fn order_from_cache_or_init(
+        &self,
+        client_order_id: ClientOrderId,
+        order_init: nautilus_model::events::OrderInitialized,
+    ) -> anyhow::Result<OrderAny> {
+        self.core
+            .cache()
+            .order(&client_order_id)
+            .cloned()
+            .map_or_else(|| Ok(OrderAny::try_from(order_init)?), Ok)
+    }
+
+    fn orders_from_submit_order_list(
+        &self,
+        cmd: &SubmitOrderList,
+    ) -> anyhow::Result<Vec<OrderAny>> {
+        cmd.order_list
+            .client_order_ids
+            .iter()
+            .zip(cmd.order_inits.iter())
+            .map(|(client_order_id, order_init)| {
+                self.order_from_cache_or_init(*client_order_id, order_init.clone())
+            })
+            .collect()
     }
 }
 
@@ -869,6 +917,7 @@ impl ExecutionClient for AlpacaExecutionClient {
                 let clock = self.clock;
                 let client_order_id_prefix = self.config.client_order_id_prefix.clone();
                 let external_order_filtering = self.config.external_order_filtering;
+                let mleg_contexts = Arc::clone(&self.mleg_contexts);
 
                 let handle = get_runtime().spawn(async move {
                     while let Some(message) = rx.recv().await {
@@ -886,12 +935,17 @@ impl ExecutionClient for AlpacaExecutionClient {
                                 );
                             }
                             AlpacaWsMessage::TradeUpdate(update) => {
+                                let mut update = *update;
+                                apply_mleg_context_to_trade_update(&mut update, &mleg_contexts);
                                 if external_order_filtering
-                                    && !trade_update_matches_prefix(&update, &client_order_id_prefix)
+                                    && !trade_update_matches_prefix(
+                                        &update,
+                                        &client_order_id_prefix,
+                                    )
                                 {
                                     continue;
                                 }
-                                emit_trade_update_reports(*update, account_id, &emitter, clock);
+                                emit_trade_update_reports(update, account_id, &emitter, clock);
                             }
                             AlpacaWsMessage::Reconnected => {
                                 log::info!("Alpaca trade updates WebSocket reconnected");
@@ -1007,6 +1061,98 @@ impl ExecutionClient for AlpacaExecutionClient {
             }
             Ok(())
         });
+        Ok(())
+    }
+
+    fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        let order = self.order_from_cache_or_init(cmd.client_order_id, cmd.order_init)?;
+        if order.is_closed() {
+            log::warn!("Cannot submit closed order {}", order.client_order_id());
+            return Ok(());
+        }
+
+        self.emitter.emit_order_denied(
+            &order,
+            "Alpaca execution client submits option spreads through SubmitOrderList; single-order submit is not supported",
+        );
+        Ok(())
+    }
+
+    fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
+        let orders = self.orders_from_submit_order_list(&cmd)?;
+        for order in &orders {
+            if order.is_closed() {
+                log::warn!("Cannot submit closed order {}", order.client_order_id());
+                return Ok(());
+            }
+        }
+
+        let payload = build_mleg_payload_from_order_list(&cmd, &orders)?;
+
+        for order in &orders {
+            self.emitter.emit_order_submitted(order);
+        }
+
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let mleg_contexts = Arc::clone(&self.mleg_contexts);
+        let clock = self.clock;
+        let order_list_id = cmd.order_list.id.to_string();
+        register_pending_mleg_order_context(&mleg_contexts, &order_list_id, &orders);
+
+        self.spawn_task("submit_mleg_order", async move {
+            match http_client.submit_mleg_order(&payload).await {
+                Ok(submitted) => {
+                    let nested = match submitted.id.as_deref() {
+                        Some(order_id)
+                            if submitted
+                                .legs
+                                .as_ref()
+                                .is_none_or(|legs| legs.is_empty()) =>
+                        {
+                            http_client
+                                .order_by_id(order_id, true)
+                                .await
+                                .unwrap_or_else(|e| {
+                                    log::warn!(
+                                        "Submitted Alpaca MLeg order {order_id}, but nested lookup failed: {e}"
+                                    );
+                                    submitted.clone()
+                                })
+                        }
+                        _ => submitted.clone(),
+                    };
+                    register_mleg_order_context(&mleg_contexts, &order_list_id, &orders, &nested);
+
+                    let ts_event = clock.get_time_ns();
+                    for order in &orders {
+                        match venue_order_id_for_submitted_leg(order, &nested) {
+                            Some(venue_order_id) => {
+                                emitter.emit_order_accepted(order, venue_order_id, ts_event);
+                            }
+                            None => {
+                                emitter.emit_order_rejected(
+                                    order,
+                                    "submit-order-error: Alpaca accepted MLeg order but returned no venue order id for this leg",
+                                    ts_event,
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let ts_event = clock.get_time_ns();
+                    let reason = format!("submit-order-rejected: {e}");
+                    for order in &orders {
+                        emitter.emit_order_rejected(order, &reason, ts_event, false);
+                    }
+                }
+            }
+
+            Ok(())
+        });
+
         Ok(())
     }
 
@@ -1203,6 +1349,393 @@ fn emit_trade_update_reports(
 }
 
 #[cfg(feature = "live")]
+fn build_mleg_payload_from_order_list(
+    cmd: &SubmitOrderList,
+    orders: &[OrderAny],
+) -> anyhow::Result<MlegOrderPayload> {
+    if orders.len() < 2 {
+        anyhow::bail!("Alpaca MLeg submit requires at least two leg orders");
+    }
+    if orders.len() > 4 {
+        anyhow::bail!("Alpaca MLeg submit supports at most four leg orders");
+    }
+
+    let quantities = orders
+        .iter()
+        .map(|order| positive_integer_quantity(order.quantity(), order.client_order_id()))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let strategy_qty = quantities
+        .iter()
+        .copied()
+        .reduce(gcd_u64)
+        .ok_or_else(|| anyhow::anyhow!("Alpaca MLeg submit requires leg quantities"))?;
+    if strategy_qty == 0 {
+        anyhow::bail!("Alpaca MLeg strategy quantity must be positive");
+    }
+
+    let trade_intent = mleg_trade_intent(orders)?;
+    let mut net_credit = 0.0_f64;
+    let mut legs = Vec::with_capacity(orders.len());
+
+    for (order, leg_qty) in orders.iter().zip(quantities) {
+        validate_mleg_leg_order(order)?;
+        let ratio_qty = leg_qty / strategy_qty;
+        let price = order
+            .price()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Alpaca MLeg leg {} missing limit price",
+                    order.client_order_id()
+                )
+            })?
+            .as_f64();
+        if price <= 0.0 {
+            anyhow::bail!(
+                "Alpaca MLeg leg {} price must be positive, was {price}",
+                order.client_order_id()
+            );
+        }
+
+        let side_multiplier = match order.order_side() {
+            OrderSide::Sell => 1.0,
+            OrderSide::Buy => -1.0,
+            OrderSide::NoOrderSide => {
+                anyhow::bail!(
+                    "Alpaca MLeg leg {} missing order side",
+                    order.client_order_id()
+                )
+            }
+        };
+        net_credit += side_multiplier * price * ratio_qty as f64;
+
+        let position_intent = alpaca_position_intent(order.order_side(), order.is_reduce_only())?;
+        legs.push(MlegOrderLeg::new(
+            order.instrument_id().symbol.as_str(),
+            position_intent.side(),
+            position_intent,
+            ratio_qty.to_string(),
+        ));
+    }
+
+    if net_credit == 0.0 {
+        anyhow::bail!("Alpaca MLeg signed net limit price must be non-zero");
+    }
+    let premium_kind = if net_credit > 0.0 {
+        NetPremiumKind::Credit
+    } else {
+        NetPremiumKind::Debit
+    };
+    let signed_limit_price = signed_net_limit_price(net_credit.abs(), premium_kind, trade_intent);
+
+    MlegOrderPayload::new_limit(strategy_qty, signed_limit_price, legs)
+        .and_then(|payload| payload.with_client_order_id(cmd.order_list.id.to_string()))
+        .map_err(|e| anyhow::anyhow!("invalid Alpaca MLeg payload: {e}"))
+}
+
+#[cfg(feature = "live")]
+fn validate_mleg_leg_order(order: &OrderAny) -> anyhow::Result<()> {
+    if order.instrument_id().venue != Venue::new(ALPACA_VENUE) {
+        anyhow::bail!(
+            "Alpaca MLeg leg {} has non-Alpaca instrument {}",
+            order.client_order_id(),
+            order.instrument_id()
+        );
+    }
+    if order.order_type() != OrderType::Limit {
+        anyhow::bail!(
+            "Alpaca MLeg leg {} must be a limit order, was {:?}",
+            order.client_order_id(),
+            order.order_type()
+        );
+    }
+    if order.time_in_force() != TimeInForce::Day {
+        anyhow::bail!(
+            "Alpaca MLeg leg {} must use DAY time in force, was {:?}",
+            order.client_order_id(),
+            order.time_in_force()
+        );
+    }
+    if order.is_quote_quantity() {
+        anyhow::bail!(
+            "Alpaca MLeg leg {} cannot use quote quantity",
+            order.client_order_id()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live")]
+fn mleg_trade_intent(orders: &[OrderAny]) -> anyhow::Result<TradeIntent> {
+    let all_reduce_only = orders.iter().all(|order| order.is_reduce_only());
+    let any_reduce_only = orders.iter().any(|order| order.is_reduce_only());
+    match (all_reduce_only, any_reduce_only) {
+        (true, true) => Ok(TradeIntent::Close),
+        (false, false) => Ok(TradeIntent::Open),
+        (false, true) => {
+            anyhow::bail!("Alpaca MLeg orders must be all opening or all closing legs")
+        }
+        (true, false) => unreachable!("all_reduce_only implies any_reduce_only"),
+    }
+}
+
+#[cfg(feature = "live")]
+fn positive_integer_quantity(
+    quantity: Quantity,
+    client_order_id: ClientOrderId,
+) -> anyhow::Result<u64> {
+    let normalized = quantity.as_decimal().normalize();
+    if normalized.scale() != 0 {
+        anyhow::bail!(
+            "Alpaca MLeg leg {client_order_id} quantity must be an integer contract count, was {quantity}"
+        );
+    }
+    let parsed = normalized
+        .to_string()
+        .parse::<u64>()
+        .map_err(|e| anyhow::anyhow!("invalid Alpaca MLeg quantity {quantity}: {e}"))?;
+    if parsed == 0 {
+        anyhow::bail!("Alpaca MLeg leg {client_order_id} quantity must be positive");
+    }
+    Ok(parsed)
+}
+
+#[cfg(feature = "live")]
+fn alpaca_position_intent(
+    side: OrderSide,
+    reduce_only: bool,
+) -> anyhow::Result<AlpacaPositionIntent> {
+    match (side, reduce_only) {
+        (OrderSide::Buy, false) => Ok(AlpacaPositionIntent::BuyToOpen),
+        (OrderSide::Sell, false) => Ok(AlpacaPositionIntent::SellToOpen),
+        (OrderSide::Buy, true) => Ok(AlpacaPositionIntent::BuyToClose),
+        (OrderSide::Sell, true) => Ok(AlpacaPositionIntent::SellToClose),
+        (OrderSide::NoOrderSide, _) => anyhow::bail!("Alpaca MLeg leg missing order side"),
+    }
+}
+
+#[cfg(feature = "live")]
+const fn alpaca_side_str(side: OrderSide) -> &'static str {
+    match side {
+        OrderSide::Buy => "buy",
+        OrderSide::Sell => "sell",
+        OrderSide::NoOrderSide => "",
+    }
+}
+
+#[cfg(feature = "live")]
+const fn gcd_u64(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+#[cfg(feature = "live")]
+fn register_mleg_order_context(
+    contexts: &Arc<Mutex<MlegOrderContextMap>>,
+    order_list_id: &str,
+    orders: &[OrderAny],
+    submitted: &AlpacaOrder,
+) {
+    let mut context = mleg_order_context_from_orders(orders);
+    if let Some(legs) = submitted.legs.as_deref() {
+        for leg in legs {
+            let Some(symbol) = leg.symbol.as_deref() else {
+                continue;
+            };
+            let Some(client_order_id) = context.leg_client_ids_by_symbol.get(symbol).copied()
+            else {
+                continue;
+            };
+            if let Some(order_id) = leg.id.as_deref().filter(|value| !value.trim().is_empty()) {
+                context
+                    .leg_client_ids_by_order_id
+                    .insert(order_id.to_string(), client_order_id);
+            }
+        }
+    }
+
+    let mut map = contexts.lock().expect(MUTEX_POISONED);
+    map.insert(order_list_id.to_string(), context.clone());
+    if let Some(parent_id) = submitted
+        .id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        map.insert(parent_id.to_string(), context.clone());
+    }
+    if let Some(parent_client_id) = submitted
+        .client_order_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        map.insert(parent_client_id.to_string(), context);
+    }
+}
+
+#[cfg(feature = "live")]
+fn register_pending_mleg_order_context(
+    contexts: &Arc<Mutex<MlegOrderContextMap>>,
+    order_list_id: &str,
+    orders: &[OrderAny],
+) {
+    let context = mleg_order_context_from_orders(orders);
+    contexts
+        .lock()
+        .expect(MUTEX_POISONED)
+        .insert(order_list_id.to_string(), context);
+}
+
+#[cfg(feature = "live")]
+fn mleg_order_context_from_orders(orders: &[OrderAny]) -> MlegOrderContext {
+    let mut context = MlegOrderContext::default();
+    for order in orders {
+        let symbol = order.instrument_id().symbol.as_str().to_string();
+        context
+            .leg_client_ids_by_symbol
+            .insert(symbol.clone(), order.client_order_id());
+        context
+            .leg_sides_by_symbol
+            .insert(symbol, alpaca_side_str(order.order_side()).to_string());
+    }
+    context
+}
+
+#[cfg(feature = "live")]
+fn apply_mleg_context_to_trade_update(
+    update: &mut AlpacaTradeUpdate,
+    contexts: &Arc<Mutex<MlegOrderContextMap>>,
+) {
+    let Some(context) = mleg_context_for_trade_update(update, contexts) else {
+        return;
+    };
+
+    if let Some(legs) = update.order.legs.as_mut() {
+        for leg in legs {
+            if leg.client_order_id.is_none() {
+                leg.client_order_id = client_order_id_for_leg_context(
+                    &context,
+                    leg.id.as_deref(),
+                    leg.symbol.as_deref(),
+                )
+                .map(|client_order_id| client_order_id.to_string());
+            }
+        }
+    }
+
+    if update
+        .order
+        .legs
+        .as_ref()
+        .is_none_or(|legs| legs.is_empty())
+        && let Some(update_legs) = update.legs.as_deref()
+    {
+        update.order.legs = Some(
+            update_legs
+                .iter()
+                .map(|leg| AlpacaOrder {
+                    id: leg.order_id.clone().or_else(|| update.order.id.clone()),
+                    client_order_id: client_order_id_for_leg_context(
+                        &context,
+                        leg.order_id.as_deref(),
+                        leg.symbol.as_deref(),
+                    )
+                    .map(|client_order_id| client_order_id.to_string())
+                    .or_else(|| update.order.client_order_id.clone()),
+                    created_at: update.order.created_at.clone(),
+                    updated_at: leg
+                        .timestamp
+                        .clone()
+                        .or_else(|| update.timestamp.clone())
+                        .or_else(|| update.order.updated_at.clone()),
+                    submitted_at: update.order.submitted_at.clone(),
+                    filled_at: leg.timestamp.clone().or_else(|| update.timestamp.clone()),
+                    expired_at: update.order.expired_at.clone(),
+                    canceled_at: update.order.canceled_at.clone(),
+                    failed_at: update.order.failed_at.clone(),
+                    asset_id: update.order.asset_id.clone(),
+                    symbol: leg.symbol.clone().or_else(|| update.order.symbol.clone()),
+                    asset_class: update.order.asset_class.clone(),
+                    qty: leg.qty.clone().or_else(|| update.order.qty.clone()),
+                    filled_qty: leg.qty.clone().or_else(|| update.order.filled_qty.clone()),
+                    filled_avg_price: leg
+                        .price
+                        .clone()
+                        .or_else(|| update.order.filled_avg_price.clone()),
+                    order_type: update.order.order_type.clone(),
+                    side: leg.side.clone().or_else(|| {
+                        leg.symbol
+                            .as_deref()
+                            .and_then(|symbol| context.leg_sides_by_symbol.get(symbol).cloned())
+                    }),
+                    time_in_force: update.order.time_in_force.clone(),
+                    limit_price: leg
+                        .price
+                        .clone()
+                        .or_else(|| update.order.limit_price.clone()),
+                    status: update.order.status.clone().or_else(|| {
+                        Some(status_from_trade_update_event(&update.event).to_string())
+                    }),
+                    order_class: update.order.order_class.clone(),
+                    legs: None,
+                })
+                .collect(),
+        );
+    }
+}
+
+#[cfg(feature = "live")]
+fn mleg_context_for_trade_update(
+    update: &AlpacaTradeUpdate,
+    contexts: &Arc<Mutex<MlegOrderContextMap>>,
+) -> Option<MlegOrderContext> {
+    let map = contexts.lock().expect(MUTEX_POISONED);
+    update
+        .order
+        .id
+        .as_deref()
+        .and_then(|key| map.get(key).cloned())
+        .or_else(|| {
+            update
+                .order
+                .client_order_id
+                .as_deref()
+                .and_then(|key| map.get(key).cloned())
+        })
+}
+
+#[cfg(feature = "live")]
+fn client_order_id_for_leg_context(
+    context: &MlegOrderContext,
+    venue_order_id: Option<&str>,
+    symbol: Option<&str>,
+) -> Option<ClientOrderId> {
+    venue_order_id
+        .and_then(|order_id| context.leg_client_ids_by_order_id.get(order_id).copied())
+        .or_else(|| symbol.and_then(|symbol| context.leg_client_ids_by_symbol.get(symbol).copied()))
+}
+
+#[cfg(feature = "live")]
+fn venue_order_id_for_submitted_leg(
+    order: &OrderAny,
+    submitted: &AlpacaOrder,
+) -> Option<VenueOrderId> {
+    submitted
+        .legs
+        .as_deref()
+        .and_then(|legs| {
+            legs.iter()
+                .find(|leg| leg.symbol.as_deref() == Some(order.instrument_id().symbol.as_str()))
+        })
+        .and_then(|leg| leg.id.as_deref())
+        .or(submitted.id.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .map(VenueOrderId::from)
+}
+
+#[cfg(feature = "live")]
 fn trade_update_matches_prefix(update: &AlpacaTradeUpdate, prefix: &str) -> bool {
     if prefix.is_empty() {
         return true;
@@ -1269,6 +1802,12 @@ fn unix_nanos_to_rfc3339(ts: UnixNanos) -> String {
 #[cfg(test)]
 mod tests {
     use nautilus_model::enums::OrderStatus;
+    #[cfg(feature = "live")]
+    use nautilus_model::{
+        events::OrderInitialized,
+        identifiers::{OrderListId, StrategyId, TraderId},
+        orders::OrderList,
+    };
 
     use super::*;
 
@@ -1438,6 +1977,127 @@ mod tests {
         assert_eq!(reports[1].order_side, OrderSide::Buy);
     }
 
+    #[cfg(feature = "live")]
+    #[test]
+    fn build_mleg_payload_from_order_list_uses_signed_credit_open_price() {
+        let orders = vec![
+            mleg_limit_order("O-1", "SPY260508P00500000", OrderSide::Sell, 0.75, false),
+            mleg_limit_order("O-2", "SPY260508P00495000", OrderSide::Buy, 0.25, false),
+        ];
+        let cmd = submit_order_list_for_orders("OL-1", &orders);
+
+        let payload = build_mleg_payload_from_order_list(&cmd, &orders).unwrap();
+
+        assert_eq!(payload.client_order_id.as_deref(), Some("OL-1"));
+        assert_eq!(payload.qty, "1");
+        assert_eq!(payload.limit_price, "-0.50");
+        assert_eq!(payload.legs.len(), 2);
+        assert_eq!(
+            payload.legs[0].position_intent,
+            AlpacaPositionIntent::SellToOpen
+        );
+        assert_eq!(
+            payload.legs[1].position_intent,
+            AlpacaPositionIntent::BuyToOpen
+        );
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn mleg_context_restores_leg_client_ids_on_trade_update() {
+        let orders = vec![
+            mleg_limit_order("O-1", "SPY260508P00500000", OrderSide::Sell, 0.75, false),
+            mleg_limit_order("O-2", "SPY260508P00495000", OrderSide::Buy, 0.25, false),
+        ];
+        let mut submitted = empty_order();
+        submitted.id = Some("parent-order".to_string());
+        submitted.client_order_id = Some("OL-1".to_string());
+        submitted.created_at = Some("2026-05-01T13:30:00Z".to_string());
+        submitted.updated_at = Some("2026-05-01T13:30:01Z".to_string());
+        submitted.order_type = Some("limit".to_string());
+        submitted.time_in_force = Some("day".to_string());
+        submitted.status = Some("new".to_string());
+        submitted.limit_price = Some("-0.50".to_string());
+        submitted.legs = Some(vec![
+            leg_order(
+                "leg-short",
+                "SPY260508P00500000",
+                "sell",
+                "new",
+                "1",
+                "0",
+                "2026-05-01T13:30:00Z",
+                "2026-05-01T13:30:01Z",
+            ),
+            leg_order(
+                "leg-long",
+                "SPY260508P00495000",
+                "buy",
+                "new",
+                "1",
+                "0",
+                "2026-05-01T13:30:00Z",
+                "2026-05-01T13:30:01Z",
+            ),
+        ]);
+
+        let contexts = Arc::new(Mutex::new(MlegOrderContextMap::new()));
+        register_mleg_order_context(&contexts, "OL-1", &orders, &submitted);
+
+        let mut update = AlpacaTradeUpdate {
+            event: "fill".to_string(),
+            order: {
+                let mut order = empty_order();
+                order.id = Some("parent-order".to_string());
+                order.client_order_id = Some("OL-1".to_string());
+                order.created_at = Some("2026-05-01T13:30:00Z".to_string());
+                order.updated_at = Some("2026-05-01T13:31:00Z".to_string());
+                order.order_type = Some("limit".to_string());
+                order.time_in_force = Some("day".to_string());
+                order.status = Some("filled".to_string());
+                order.limit_price = Some("-0.50".to_string());
+                order
+            },
+            execution_id: None,
+            price: None,
+            qty: None,
+            position_qty: None,
+            timestamp: Some("2026-05-01T13:31:00Z".to_string()),
+            legs: Some(vec![
+                AlpacaTradeUpdateLeg {
+                    execution_id: Some("short-exec".to_string()),
+                    price: Some("0.75".to_string()),
+                    qty: Some("1".to_string()),
+                    position_qty: None,
+                    order_id: Some("leg-short".to_string()),
+                    symbol: Some("SPY260508P00500000".to_string()),
+                    timestamp: Some("2026-05-01T13:31:00Z".to_string()),
+                    side: None,
+                },
+                AlpacaTradeUpdateLeg {
+                    execution_id: Some("long-exec".to_string()),
+                    price: Some("0.25".to_string()),
+                    qty: Some("1".to_string()),
+                    position_qty: None,
+                    order_id: Some("leg-long".to_string()),
+                    symbol: Some("SPY260508P00495000".to_string()),
+                    timestamp: Some("2026-05-01T13:31:00Z".to_string()),
+                    side: None,
+                },
+            ]),
+        };
+
+        apply_mleg_context_to_trade_update(&mut update, &contexts);
+        let reports =
+            order_status_reports_from_trade_update(&update, "ALPACA-001", UnixNanos::from(1))
+                .unwrap();
+
+        assert_eq!(reports[0].client_order_id, Some(ClientOrderId::from("O-1")));
+        assert_eq!(reports[0].order_side, OrderSide::Sell);
+        assert_eq!(reports[1].client_order_id, Some(ClientOrderId::from("O-2")));
+        assert_eq!(reports[1].order_side, OrderSide::Buy);
+    }
+
     fn leg_order(
         id: &str,
         symbol: &str,
@@ -1488,5 +2148,80 @@ mod tests {
             order_class: None,
             legs: None,
         }
+    }
+
+    #[cfg(feature = "live")]
+    fn mleg_limit_order(
+        client_order_id: &str,
+        symbol: &str,
+        side: OrderSide,
+        price: f64,
+        reduce_only: bool,
+    ) -> OrderAny {
+        let init = OrderInitialized::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("S-001"),
+            InstrumentId::from_str(&format!("{symbol}.ALPACA")).unwrap(),
+            ClientOrderId::from(client_order_id),
+            side,
+            OrderType::Limit,
+            Quantity::new(1.0, 0),
+            TimeInForce::Day,
+            false,
+            reduce_only,
+            false,
+            false,
+            UUID4::new(),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            Some(Price::new(price, 2)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        OrderAny::try_from(init).unwrap()
+    }
+
+    #[cfg(feature = "live")]
+    fn submit_order_list_for_orders(order_list_id: &str, orders: &[OrderAny]) -> SubmitOrderList {
+        let trader_id = TraderId::from("TRADER-001");
+        let strategy_id = StrategyId::from("S-001");
+        let order_list_id = OrderListId::from(order_list_id);
+        let order_list = OrderList::new(
+            order_list_id,
+            orders[0].instrument_id(),
+            strategy_id,
+            orders.iter().map(Order::client_order_id).collect(),
+            UnixNanos::from(1),
+        );
+        SubmitOrderList::new(
+            trader_id,
+            None,
+            strategy_id,
+            order_list,
+            orders
+                .iter()
+                .map(|order| order.init_event().clone())
+                .collect(),
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+        )
     }
 }
