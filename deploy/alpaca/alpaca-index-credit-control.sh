@@ -3,7 +3,7 @@ set -euo pipefail
 
 SERVICE="${NAUTILUS_ALPACA_SERVICE:-alpaca-index-credit.service}"
 ENV_FILE="${NAUTILUS_ALPACA_ENV_FILE:-$HOME/.config/nautilus-trader/alpaca/index-credit.env}"
-PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+OPERATOR_BIN="${NAUTILUS_ALPACA_OPERATOR_BIN:-$HOME/.local/bin/alpaca-operator-status}"
 
 usage() {
   cat <<EOF
@@ -22,11 +22,13 @@ require_env_file() {
 
 run_operator_status() {
   require_env_file
+  if [[ ! -x "$OPERATOR_BIN" ]]; then
+    echo "missing executable operator binary: $OPERATOR_BIN" >&2
+    exit 127
+  fi
   # shellcheck disable=SC1090
   set -a; . "$ENV_FILE"; set +a
-  repo="${NAUTILUS_ALPACA_REPO:-$HOME/Projects/nautilus_trader}"
-  cd "$repo"
-  cargo run -p nautilus-alpaca --features live --bin alpaca-operator-status -- "$@"
+  "$OPERATOR_BIN" "$@"
 }
 
 case "${1:-}" in
@@ -52,9 +54,7 @@ case "${1:-}" in
       echo "health=degraded reason=missing_lock service=$SERVICE lock_file=$lock_file"
       exit 1
     fi
-    repo="${NAUTILUS_ALPACA_REPO:-$HOME/Projects/nautilus_trader}"
-    cd "$repo"
-    cargo run -p nautilus-alpaca --features live --bin alpaca-operator-status -- --json >/dev/null
+    run_operator_status --json >/dev/null
     echo "health=up service=$SERVICE lock_file=$lock_file log_file=$log_file"
     ;;
   start)

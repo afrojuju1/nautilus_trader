@@ -7,6 +7,7 @@ one runner can own the Alpaca account workflow.
 ## Files
 
 - `deploy/alpaca/alpaca-index-credit.env.example`: non-secret config template.
+- `deploy/alpaca/alpaca-index-credit-install.sh`: builds release binaries and installs user files.
 - `deploy/alpaca/alpaca-index-credit-runner.sh`: `flock`-guarded runner wrapper.
 - `deploy/alpaca/alpaca-index-credit.service`: user systemd service.
 - `deploy/alpaca/alpaca-index-credit-control.sh`: operator status, health, start, stop, restart,
@@ -18,14 +19,7 @@ one runner can own the Alpaca account workflow.
 From the repo root:
 
 ```bash
-mkdir -p ~/.config/nautilus-trader/alpaca
-cp deploy/alpaca/alpaca-index-credit.env.example ~/.config/nautilus-trader/alpaca/index-credit.env
-chmod 600 ~/.config/nautilus-trader/alpaca/index-credit.env
-install -Dm755 deploy/alpaca/alpaca-index-credit-runner.sh ~/.local/bin/alpaca-index-credit-runner
-install -Dm755 deploy/alpaca/alpaca-index-credit-control.sh ~/.local/bin/alpaca-index-credit-control
-mkdir -p ~/.config/systemd/user
-cp deploy/alpaca/alpaca-index-credit.service ~/.config/systemd/user/
-systemctl --user daemon-reload
+deploy/alpaca/alpaca-index-credit-install.sh
 ```
 
 Edit `~/.config/nautilus-trader/alpaca/index-credit.env` and add Alpaca paper credentials. Leave
@@ -65,6 +59,13 @@ Default state files from the env template:
 
 The runner wrapper takes an exclusive non-blocking lock. If another process already owns the lock,
 the service exits without starting another Alpaca account owner.
+
+The service runs installed release binaries by default:
+
+- Runner: `~/.local/bin/alpaca-index-put-credit-entry`
+- Operator status: `~/.local/bin/alpaca-operator-status`
+
+Override with `NAUTILUS_ALPACA_RUNNER_BIN` or `NAUTILUS_ALPACA_OPERATOR_BIN` only for diagnostics.
 
 ## Safety Gates
 

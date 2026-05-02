@@ -32,16 +32,21 @@ Completed foundation:
 - Paper smoke tests have submitted an MLeg spread through Nautilus, observed accepted leg events,
   canceled the parent, and verified zero positions/open orders afterward.
 - The fork has a documented upstream sync workflow in `AGENTS.md`.
+- Native `index_put_credit_entry` and `index_call_credit_entry` scanner/entry paths run from the
+  Rust Alpaca runner and submit through Nautilus `SubmitOrderList` when explicitly enabled.
+- Initial credit-spread management can cancel stale entries, evaluate close triggers, build
+  reduce-only close MLegs, and mark filled closes in strategy state.
+- The NUC has a supervised user service, external env file, lock, logs, health command, operator
+  status command, and kill-switch/submission gates.
 
 Known gaps:
 
-- No production Nautilus live strategy node is deployed on the NUC.
-- The current put-credit loop scans and prints readiness; it does not run as a Nautilus strategy or
-  submit entries.
-- `generate_fill_reports` and `generate_position_status_reports` are not production-complete.
-- Native close/management logic for vertical spreads is not implemented.
-- The operational deployment story still needs a non-`spreads` env, service, logs, health, and kill
-  switch.
+- The `alpaca-index-put-credit-entry` runner is intentionally transitional and now mixes runtime
+  config, strategy loop, management, and submission in one large binary. Continue moving reusable
+  runtime and management code into `src/` modules before live canary.
+- Multi-day paper proof with real management closes is still outstanding.
+- Websocket disconnect alerts are wired through structured events, but the live engine still needs
+  to emit those disconnect events from the account websocket owner.
 
 ## Phase 1: Foundation Lock
 
@@ -71,7 +76,7 @@ Exit criteria:
 - The adapter checks above pass on the NUC.
 - `origin/develop` contains upstream plus the fork-only Alpaca commits.
 
-Status: complete once this document and `AGENTS.md` are committed and pushed.
+Status: complete.
 
 ## Phase 2: Production-Capable Alpaca Adapter
 
@@ -94,6 +99,9 @@ Exit criteria:
 - A restarted Nautilus process can reconstruct account, orders, fills, and positions without
   `spreads`.
 - Paper tests cover accepted, rejected, canceled, filled, and startup-reconciled MLeg orders.
+
+Status: initial production-capable slice complete; continue validating edge broker lifecycle events
+as paper/live proof expands.
 
 ## Phase 3: Native `index_put_credit_entry`
 
@@ -120,6 +128,9 @@ Work:
 Exit criteria:
 
 - One paper run scans, selects, submits, observes order events, and leaves a coherent Nautilus state.
+
+Status: initial native runner complete. Paper submit proof exists for Nautilus MLeg submission; keep
+strategy submission disabled by default outside intentional paper tests.
 
 Runner commands:
 
@@ -179,6 +190,10 @@ Exit criteria:
 - Nautilus can open, manage, close, and reconcile a vertical spread without manual database or
   broker-console intervention.
 
+Status: initial management implementation complete. Full exit criteria still requires a paper run
+that opens a spread, lets management close it, reconciles the close, and verifies zero residual
+orders/positions.
+
 Management controls:
 
 ```bash
@@ -231,6 +246,8 @@ Exit criteria:
 
 - The NUC can start, stop, restart, and report status for the Nautilus engine cleanly.
 
+Status: complete for supervised NUC proof. Production hardening remains in Phase 6.5.
+
 ## Phase 6: Operator Visibility And Alerts
 
 Goal: operate the engine without reading raw logs as the primary interface.
@@ -258,6 +275,52 @@ Exit criteria:
 - An operator can determine whether the engine is safe, idle, trading, blocked, or broken from one
   command.
 
+Status: initial operator command complete. Remaining work is to feed more broker/runtime events into
+the structured event stream and move the command to an installed release binary.
+
+## Phase 6.5: Runtime Packaging And Architecture Hardening
+
+Goal: turn the proven runner/deployment slice into a maintainable single account engine package.
+
+Work:
+
+- Build and install release binaries for `alpaca-index-put-credit-entry` and
+  `alpaca-operator-status`; stop using `cargo run` from systemd and control scripts. (Complete:
+  installer builds release binaries and service/control scripts execute installed binaries.)
+- Move strategy state structs, atomic state persistence, operator-event emission, and credit-spread
+  management helpers from the runner binary into reusable `src/` modules. (State schema,
+  persistence, and operator events moved to `runtime`; management helpers still need extraction.)
+- Make the bin targets thin entrypoints over library code so tests can cover runtime decisions
+  without shelling out to binaries. (Partial: runtime state has direct tests; runner remains a
+  transitional binary.)
+- Replace direct JSON state writes with atomic temp-file write plus rename.
+- Share the strategy state schema between the runner and operator status command.
+- Emit structured websocket disconnect/reconnect and broker reconciliation events from the Alpaca
+  account websocket owner.
+- Refresh deployment docs so installed binaries, not Cargo commands, are the default operational
+  path.
+
+Exit criteria:
+
+- The NUC service and control script use installed release binaries.
+- The account engine can restart without requiring a source checkout build path.
+- Strategy state persistence is atomic and read by both runtime and operator status through one
+  shared schema.
+- Runtime, management, and operator-status logic has direct Rust test coverage outside binary
+  entrypoints.
+
+Current status:
+
+- Release binaries were built and installed on `ade-nucbox-k8-plus` on 2026-05-02.
+- `alpaca-index-credit.service` was verified running `~/.local/bin/alpaca-index-put-credit-entry`
+  instead of `cargo run`.
+- `alpaca-index-credit-control.sh operator|health` was verified running
+  `~/.local/bin/alpaca-operator-status`.
+- Strategy state persistence is atomic and shared between runner and operator status through the
+  `runtime` module.
+- Remaining Phase 6.5 work: extract management/runtime decision helpers from the runner binary and
+  emit websocket disconnect/reconnect structured events from the live account owner.
+
 ## Phase 7: Strategy Migration
 
 Migration order:
@@ -284,8 +347,19 @@ Rollout order:
 5. Tiny live canary.
 6. Controlled expansion only after clean reconciliation and close behavior.
 
+Pre-rollout gates:
+
+- Phase 6.5 is complete.
+- Paper account starts clean: active account, zero unmanaged positions, zero open orders unless the
+  test intentionally creates them.
+- Operator status reports `idle`, `blocked`, or `trading` accurately during the whole paper run and
+  never hides a critical alert.
+- Every submitted paper order is either reconciled into strategy state or canceled/closed and
+  verified flat.
+- Live canary remains disabled until the user explicitly enables live URLs and submission gates.
+
 ## Immediate Next Milestone
 
-The next milestone after Phase 1 is Phase 2 plus the first Phase 3 slice: implement the
-Nautilus-native `index_put_credit_entry` runner while closing the adapter reconciliation gaps needed
-to survive restart and broker event loss.
+Finish the remaining Phase 6.5 runtime extraction and websocket event hooks. After that, run the
+paper workflow during market hours: dry-run scan, submit-with-cancel smoke, paper open with real
+management close, and multi-day paper soak.

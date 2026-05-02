@@ -19,14 +19,7 @@
 //! put-credit candidate, and either records a dry-run decision or submits a real Nautilus
 //! `SubmitOrderList` through the Alpaca execution client. Submission is disabled by default.
 
-use std::{
-    cell::RefCell,
-    env, fs,
-    path::{Path, PathBuf},
-    rc::Rc,
-    str::FromStr,
-    time::Duration,
-};
+use std::{cell::RefCell, env, path::PathBuf, rc::Rc, str::FromStr, time::Duration};
 
 use chrono::{DateTime, NaiveTime, Utc};
 use chrono_tz::Tz;
@@ -39,6 +32,10 @@ use nautilus_alpaca::{
         client::AlpacaHttpClient,
         error::Error,
         models::{AlpacaOrder, ListOrdersRequest, OptionSnapshotsRequest},
+    },
+    runtime::{
+        StrategyState, StrategyStateEntry, credit_spread_strategy_name, emit_operator_event,
+        load_strategy_state, save_strategy_state_atomic,
     },
     strategy::{
         CreditSpreadKind, PutCreditScannerConfig, SpreadCandidate, scan_call_credit_underlying,
@@ -62,8 +59,7 @@ use nautilus_model::{
     },
     types::{Price, Quantity},
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::json;
 use tokio::{
     sync::mpsc,
     time::{Instant, sleep, timeout},
@@ -112,97 +108,10 @@ struct SubmitOutcome {
     parent_order_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct StrategyState {
-    entries: Vec<StrategyStateEntry>,
-}
-
-impl StrategyState {
-    fn has_submitted_underlying(&self, trade_date: &str, underlying: &str) -> bool {
-        self.entries.iter().any(|entry| {
-            entry.submitted
-                && !entry.closed
-                && !entry.canceled
-                && entry.trade_date == trade_date
-                && entry.underlying == underlying
-        })
-    }
-
-    fn record_submission(
-        &mut self,
-        trade_date: String,
-        underlying: String,
-        kind: CreditSpreadKind,
-        quantity: u64,
-        order_list_id: String,
-        candidate: &SpreadCandidate,
-        parent_order_id: Option<String>,
-    ) {
-        self.entries.push(StrategyStateEntry {
-            trade_date,
-            underlying,
-            strategy: strategy_name(kind).to_string(),
-            order_list_id,
-            short_symbol: candidate.short.symbol.clone(),
-            long_symbol: candidate.long.symbol.clone(),
-            quantity,
-            credit: candidate.credit,
-            score: candidate.score,
-            parent_order_id,
-            close_order_list_id: None,
-            close_parent_order_id: None,
-            close_reason: None,
-            submitted: true,
-            canceled: false,
-            closed: false,
-            recorded_at_utc: Utc::now().to_rfc3339(),
-            closed_at_utc: None,
-        });
-    }
-}
-
-impl Default for StrategyState {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct StrategyStateEntry {
-    trade_date: String,
-    underlying: String,
-    #[serde(default = "default_strategy_name")]
-    strategy: String,
-    order_list_id: String,
-    short_symbol: String,
-    long_symbol: String,
-    #[serde(default = "default_quantity")]
-    quantity: u64,
-    credit: f64,
-    score: f64,
-    parent_order_id: Option<String>,
-    #[serde(default)]
-    close_order_list_id: Option<String>,
-    #[serde(default)]
-    close_parent_order_id: Option<String>,
-    #[serde(default)]
-    close_reason: Option<String>,
-    submitted: bool,
-    #[serde(default)]
-    canceled: bool,
-    #[serde(default)]
-    closed: bool,
-    recorded_at_utc: String,
-    #[serde(default)]
-    closed_at_utc: Option<String>,
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = RunnerConfig::from_env()?;
-    let mut state = load_state(&config.state_path)?;
+    let mut state = load_strategy_state(&config.state_path)?;
 
     println!(
         "index_credit_entry: underlyings={} strategies={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} state_path={}",
@@ -252,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
         );
 
         if manage_existing_entries(&http_client, &data_config, &config, &mut state).await? {
-            save_state(&config.state_path, &state)?;
+            save_strategy_state_atomic(&config.state_path, &state)?;
         }
 
         if config.kill_switch {
@@ -324,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
                             &entry.candidate,
                             outcome.parent_order_id.clone(),
                         );
-                        save_state(&config.state_path, &state)?;
+                        save_strategy_state_atomic(&config.state_path, &state)?;
                     }
                     println!(
                         "submit_result: accepted={} rejected={}",
@@ -961,18 +870,7 @@ fn close_order_list_id(entry: &StrategyStateEntry) -> String {
 }
 
 fn strategy_name(kind: CreditSpreadKind) -> &'static str {
-    match kind {
-        CreditSpreadKind::Put => "index_put_credit_entry",
-        CreditSpreadKind::Call => "index_call_credit_entry",
-    }
-}
-
-fn default_strategy_name() -> String {
-    strategy_name(CreditSpreadKind::Put).to_string()
-}
-
-fn default_quantity() -> u64 {
-    1
+    credit_spread_strategy_name(kind)
 }
 
 fn order_age_secs(order: &AlpacaOrder) -> Option<u64> {
@@ -1030,36 +928,6 @@ fn market_trade_date(config: &RunnerConfig) -> String {
         .with_timezone(&config.entry_timezone)
         .date_naive()
         .to_string()
-}
-
-fn load_state(path: &Path) -> anyhow::Result<StrategyState> {
-    if !path.exists() {
-        return Ok(StrategyState::default());
-    }
-    let text = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&text)?)
-}
-
-fn save_state(path: &Path, state: &StrategyState) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_string_pretty(state)?)?;
-    Ok(())
-}
-
-fn emit_operator_event(event_type: &str, payload: Value) {
-    let mut event = Map::new();
-    event.insert("ts_utc".to_string(), Value::String(Utc::now().to_rfc3339()));
-    event.insert("type".to_string(), Value::String(event_type.to_string()));
-    if let Value::Object(fields) = payload {
-        event.extend(fields);
-    }
-    if let Ok(line) = serde_json::to_string(&Value::Object(event)) {
-        println!("operator_event={line}");
-    }
 }
 
 impl RunnerConfig {

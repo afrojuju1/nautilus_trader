@@ -15,12 +15,7 @@
 
 //! Operator status command for the supervised Alpaca account engine.
 
-use std::{
-    collections::BTreeSet,
-    env, fs,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{collections::BTreeSet, env, path::PathBuf, process::Command};
 
 use chrono::{DateTime, Duration, Utc};
 use nautilus_alpaca::{
@@ -29,8 +24,9 @@ use nautilus_alpaca::{
         client::AlpacaHttpClient,
         models::{AlpacaAccount, AlpacaActivity, AlpacaOrder, AlpacaPosition, ListOrdersRequest},
     },
+    runtime::{StrategyState, load_strategy_state, read_operator_events},
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 #[derive(Debug)]
@@ -141,28 +137,6 @@ enum AlertSeverity {
     Info,
     Warning,
     Critical,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct StrategyState {
-    #[serde(default)]
-    entries: Vec<StrategyStateEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StrategyStateEntry {
-    #[serde(default)]
-    short_symbol: String,
-    #[serde(default)]
-    long_symbol: String,
-    #[serde(default)]
-    submitted: bool,
-    #[serde(default)]
-    canceled: bool,
-    #[serde(default)]
-    closed: bool,
-    #[serde(default)]
-    recorded_at_utc: String,
 }
 
 #[tokio::main]
@@ -641,25 +615,6 @@ async fn latest_activities(client: &AlpacaHttpClient) -> anyhow::Result<Vec<Alpa
     Ok(client.account_activities(&request).await?)
 }
 
-fn load_strategy_state(path: &Path) -> anyhow::Result<StrategyState> {
-    if !path.exists() {
-        return Ok(StrategyState::default());
-    }
-    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
-}
-
-fn read_operator_events(path: &Path) -> Vec<Value> {
-    fs::read_to_string(path)
-        .map(|contents| {
-            contents
-                .lines()
-                .filter_map(|line| line.strip_prefix("operator_event="))
-                .filter_map(|value| serde_json::from_str(value).ok())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn latest_event(events: &[Value], event_type: &str) -> Option<Value> {
     events
         .iter()
@@ -718,12 +673,6 @@ fn active_strategy_symbols(state: &StrategyState) -> BTreeSet<String> {
         }
     }
     symbols
-}
-
-impl StrategyStateEntry {
-    fn is_active(&self) -> bool {
-        self.submitted && !self.canceled && !self.closed
-    }
 }
 
 fn order_is_stale(order: &AlpacaOrder, now: DateTime<Utc>, stale_order_secs: i64) -> bool {
