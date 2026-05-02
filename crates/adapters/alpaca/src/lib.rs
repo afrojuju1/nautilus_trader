@@ -48,6 +48,8 @@ pub mod providers;
 pub mod python;
 pub mod strategy;
 #[cfg(feature = "live")]
+pub mod submit;
+#[cfg(feature = "live")]
 pub mod websocket;
 
 #[cfg(feature = "live")]

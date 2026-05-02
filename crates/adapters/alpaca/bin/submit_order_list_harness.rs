@@ -23,6 +23,7 @@ use nautilus_alpaca::{
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
     http::{client::AlpacaHttpClient, error::Error, models::ReplaceOrderRequest},
     strategy::{PutCreditScannerConfig, scan_put_credit_underlying},
+    submit::{MlegSubmitLeg, MlegSubmitOrderListRequest, build_mleg_submit_order_list},
 };
 use nautilus_common::{
     cache::Cache,
@@ -30,15 +31,13 @@ use nautilus_common::{
     live::runner::replace_exec_event_sender,
     messages::{ExecutionEvent, execution::SubmitOrderList},
 };
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{UUID4, time::get_atomic_clock_realtime};
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
-    enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce},
-    events::OrderInitialized,
+    enums::{AccountType, OmsType, OrderSide},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TraderId, Venue,
     },
-    orders::OrderList,
     types::{Price, Quantity},
 };
 use tokio::{
@@ -229,105 +228,32 @@ fn build_submit_order_list(
     let order_list_id = OrderListId::from(order_list_id);
     let short_client_id = ClientOrderId::from(format!("{order_list_id}-short").as_str());
     let long_client_id = ClientOrderId::from(format!("{order_list_id}-long").as_str());
-    let short_instrument_id = alpaca_instrument_id(&spec.short_symbol)?;
-    let long_instrument_id = alpaca_instrument_id(&spec.long_symbol)?;
-    let ts = UnixNanos::from(1);
     let quantity = Quantity::new(spec.quantity as f64, 0);
-
-    let short_init = order_init(
-        trader_id,
-        strategy_id,
-        short_instrument_id,
-        short_client_id,
-        OrderSide::Sell,
-        quantity,
-        spec.short_limit_price,
-        order_list_id,
-        vec![long_client_id],
-        ts,
-    );
-    let long_init = order_init(
-        trader_id,
-        strategy_id,
-        long_instrument_id,
-        long_client_id,
-        OrderSide::Buy,
-        quantity,
-        spec.long_limit_price,
-        order_list_id,
-        vec![short_client_id],
-        ts,
-    );
-    let order_list = OrderList::new(
-        order_list_id,
-        short_instrument_id,
-        strategy_id,
-        vec![short_client_id, long_client_id],
-        ts,
-    );
-
-    Ok(SubmitOrderList::new(
+    build_mleg_submit_order_list(MlegSubmitOrderListRequest {
         trader_id,
         client_id,
         strategy_id,
-        order_list,
-        vec![short_init, long_init],
-        None,
-        None,
-        None,
-        UUID4::new(),
-        ts,
-    ))
-}
-
-#[expect(clippy::too_many_arguments)]
-fn order_init(
-    trader_id: TraderId,
-    strategy_id: StrategyId,
-    instrument_id: InstrumentId,
-    client_order_id: ClientOrderId,
-    order_side: OrderSide,
-    quantity: Quantity,
-    limit_price: f64,
-    order_list_id: OrderListId,
-    linked_order_ids: Vec<ClientOrderId>,
-    ts: UnixNanos,
-) -> OrderInitialized {
-    OrderInitialized::new(
-        trader_id,
-        strategy_id,
-        instrument_id,
-        client_order_id,
-        order_side,
-        OrderType::Limit,
-        quantity,
-        TimeInForce::Day,
-        false,
-        false,
-        false,
-        false,
-        UUID4::new(),
-        ts,
-        ts,
-        Some(Price::new(limit_price, 2)),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(order_list_id),
-        Some(linked_order_ids),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
+        order_list_id,
+        legs: vec![
+            MlegSubmitLeg {
+                client_order_id: short_client_id,
+                instrument_id: alpaca_instrument_id(&spec.short_symbol)?,
+                order_side: OrderSide::Sell,
+                quantity,
+                limit_price: Price::new(spec.short_limit_price, 2),
+                reduce_only: false,
+            },
+            MlegSubmitLeg {
+                client_order_id: long_client_id,
+                instrument_id: alpaca_instrument_id(&spec.long_symbol)?,
+                order_side: OrderSide::Buy,
+                quantity,
+                limit_price: Price::new(spec.long_limit_price, 2),
+                reduce_only: false,
+            },
+        ],
+        ts_init: get_atomic_clock_realtime().get_time_ns(),
+    })
 }
 
 fn alpaca_instrument_id(symbol: &str) -> anyhow::Result<InstrumentId> {

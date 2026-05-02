@@ -26,6 +26,7 @@ use nautilus_alpaca::{
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
     config::AlpacaExecClientConfig,
     http::{client::AlpacaHttpClient, error::Error, models::AlpacaOrder},
+    submit::{MlegSubmitLeg, MlegSubmitOrderListRequest, build_mleg_submit_order_list},
 };
 use nautilus_common::{
     cache::Cache,
@@ -33,15 +34,14 @@ use nautilus_common::{
     live::runner::replace_exec_event_sender,
     messages::{ExecutionEvent, execution::SubmitOrderList},
 };
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
-    enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce},
-    events::{OrderEventAny, OrderInitialized},
+    enums::{AccountType, OmsType, OrderSide},
+    events::OrderEventAny,
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TraderId, Venue,
     },
-    orders::OrderList,
     types::{Price, Quantity},
 };
 use serde::{Deserialize, Serialize};
@@ -199,15 +199,7 @@ fn build_submit_order_list(
         anyhow::bail!("Nautilus bridge supports at most four legs");
     }
 
-    let order_list_id = OrderListId::from(handoff.order_list_id.as_str());
-    let ts = UnixNanos::from(1);
-    let mut client_order_ids = Vec::with_capacity(handoff.legs.len());
-    for leg in &handoff.legs {
-        client_order_ids.push(ClientOrderId::from(leg.client_order_id.as_str()));
-    }
-
-    let first_instrument_id = instrument_id(&handoff.legs[0])?;
-    let mut order_inits = Vec::with_capacity(handoff.legs.len());
+    let mut legs = Vec::with_capacity(handoff.legs.len());
     for leg in &handoff.legs {
         if leg.quantity == 0 {
             anyhow::bail!("leg {} quantity must be positive", leg.client_order_id);
@@ -215,98 +207,24 @@ fn build_submit_order_list(
         if leg.limit_price <= 0.0 {
             anyhow::bail!("leg {} limit price must be positive", leg.client_order_id);
         }
-        let client_order_id = ClientOrderId::from(leg.client_order_id.as_str());
-        let linked_order_ids = client_order_ids
-            .iter()
-            .copied()
-            .filter(|candidate| *candidate != client_order_id)
-            .collect::<Vec<_>>();
-        order_inits.push(order_init(
-            trader_id,
-            strategy_id,
-            instrument_id(leg)?,
-            client_order_id,
-            order_side(leg)?,
-            Quantity::new(leg.quantity as f64, 0),
-            leg.limit_price,
-            is_reduce_only(leg),
-            order_list_id,
-            linked_order_ids,
-            ts,
-        ));
+        legs.push(MlegSubmitLeg {
+            client_order_id: ClientOrderId::from(leg.client_order_id.as_str()),
+            instrument_id: instrument_id(leg)?,
+            order_side: order_side(leg)?,
+            quantity: Quantity::new(leg.quantity as f64, 0),
+            limit_price: Price::new(leg.limit_price, 2),
+            reduce_only: is_reduce_only(leg),
+        });
     }
 
-    let order_list = OrderList::new(
-        order_list_id,
-        first_instrument_id,
-        strategy_id,
-        client_order_ids,
-        ts,
-    );
-
-    Ok(SubmitOrderList::new(
+    build_mleg_submit_order_list(MlegSubmitOrderListRequest {
         trader_id,
         client_id,
         strategy_id,
-        order_list,
-        order_inits,
-        None,
-        None,
-        None,
-        UUID4::new(),
-        ts,
-    ))
-}
-
-#[expect(clippy::too_many_arguments)]
-fn order_init(
-    trader_id: TraderId,
-    strategy_id: StrategyId,
-    instrument_id: InstrumentId,
-    client_order_id: ClientOrderId,
-    order_side: OrderSide,
-    quantity: Quantity,
-    limit_price: f64,
-    reduce_only: bool,
-    order_list_id: OrderListId,
-    linked_order_ids: Vec<ClientOrderId>,
-    ts: UnixNanos,
-) -> OrderInitialized {
-    OrderInitialized::new(
-        trader_id,
-        strategy_id,
-        instrument_id,
-        client_order_id,
-        order_side,
-        OrderType::Limit,
-        quantity,
-        TimeInForce::Day,
-        false,
-        reduce_only,
-        false,
-        false,
-        UUID4::new(),
-        ts,
-        ts,
-        Some(Price::new(limit_price, 2)),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(order_list_id),
-        Some(linked_order_ids),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
+        order_list_id: OrderListId::from(handoff.order_list_id.as_str()),
+        legs,
+        ts_init: get_atomic_clock_realtime().get_time_ns(),
+    })
 }
 
 fn instrument_id(leg: &BridgeLeg) -> anyhow::Result<InstrumentId> {

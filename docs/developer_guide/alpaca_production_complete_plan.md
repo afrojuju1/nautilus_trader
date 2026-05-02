@@ -137,6 +137,11 @@ Implementation note:
   MLeg entries require distinct option leg instruments. Until that core model constraint is changed
   or a Python-safe multi-leg abstraction is added, the native Phase 3 submit path lives in the Rust
   runner where the Alpaca execution client already accepts multi-leg `SubmitOrderList` commands.
+- Recommended submit path for Phase 3 and Phase 4: keep selection, admission, and MLeg submission
+  in the Rust Alpaca runner, then expose a narrow Python control/status surface around it. Do not
+  relax Python `OrderList` globally just for Alpaca; if Python-native submission becomes necessary,
+  add an explicit multi-instrument order-list abstraction or an Alpaca-specific PyO3 submit helper
+  after risk, cache, and execution semantics are designed for broker-native option spreads.
 
 ## Phase 4: Position Management And Close Path
 
