@@ -131,6 +131,15 @@ ALPACA_INDEX_PUT_CREDIT_CANCEL_AFTER_ACCEPT=true \
   cargo run -p nautilus-alpaca --features live --bin alpaca-index-put-credit-entry -- SPY,QQQ,IWM
 ```
 
+Phase 7A call-credit mode:
+
+```bash
+# Scan both index put-credit and index call-credit candidates; submission still disabled.
+ALPACA_INDEX_PUT_CREDIT_IGNORE_WINDOW=true \
+ALPACA_INDEX_CREDIT_STRATEGIES=both \
+  cargo run -p nautilus-alpaca --features live --bin alpaca-index-put-credit-entry -- SPY,QQQ,IWM
+```
+
 Implementation note:
 
 - The existing Python `OrderList` constructor enforces one `InstrumentId` per list, while Alpaca
@@ -150,16 +159,46 @@ Goal: make openings safe by owning the complete lifecycle.
 Work:
 
 - Add profit target, stop loss, max adverse move, stale order timeout, time-based exit, and
-  expiration-risk exit.
-- Implement close MLeg order-list construction for verticals.
-- Add cancel stale entry and close orders.
-- Add manual flatten and global kill switch.
-- Reconcile close fills and mark positions flat.
+  expiration-risk exit. (Initial profit-target, stop-loss-debit, max-hold, stale-entry, and
+  expiration-risk evaluation complete.)
+- Implement close MLeg order-list construction for verticals. (Initial reduce-only close
+  `SubmitOrderList` construction complete for credit verticals.)
+- Add cancel stale entry and close orders. (Runner can cancel stale entry orders and submit close
+  orders only when `ALPACA_INDEX_CREDIT_MANAGE=true`; close submission also requires
+  `ALPACA_INDEX_CREDIT_CLOSE=true`.)
+- Add manual flatten and global kill switch. (Initial `ALPACA_INDEX_CREDIT_FORCE_FLATTEN` and
+  `ALPACA_INDEX_CREDIT_KILL_SWITCH` controls complete.)
+- Reconcile close fills and mark positions flat. (Runner marks persisted entries closed after a
+  filled close parent order is observed.)
 
 Exit criteria:
 
 - Nautilus can open, manage, close, and reconcile a vertical spread without manual database or
   broker-console intervention.
+
+Management controls:
+
+```bash
+# Evaluate management without broker actions.
+ALPACA_INDEX_CREDIT_MANAGE=false \
+  cargo run -p nautilus-alpaca --features live --bin alpaca-index-put-credit-entry
+
+# Allow stale-order cancel and close submission when triggers fire.
+ALPACA_INDEX_CREDIT_MANAGE=true \
+ALPACA_INDEX_CREDIT_CLOSE=true \
+  cargo run -p nautilus-alpaca --features live --bin alpaca-index-put-credit-entry
+```
+
+Key controls:
+
+- `ALPACA_INDEX_CREDIT_KILL_SWITCH=true` blocks new entries.
+- `ALPACA_INDEX_CREDIT_FORCE_FLATTEN=true` treats every tracked open spread as a close candidate.
+- `ALPACA_INDEX_CREDIT_STALE_ENTRY_SECS=900` cancels stale working entries when management is
+  enabled.
+- `ALPACA_INDEX_CREDIT_PROFIT_TARGET_CLOSE_FRACTION=0.50` closes when debit falls to 50% of entry
+  credit.
+- `ALPACA_INDEX_CREDIT_STOP_LOSS_CLOSE_MULTIPLE=2.0` closes when debit reaches 2x entry credit.
+- `ALPACA_INDEX_CREDIT_EXPIRATION_EXIT_DAYS=1` closes near expiration risk.
 
 ## Phase 5: NUC Production Deployment
 
@@ -199,8 +238,9 @@ Exit criteria:
 
 Migration order:
 
-1. `index_put_credit_entry`
-2. `index_call_credit_entry`
+1. `index_put_credit_entry` (initial native runner complete)
+2. `index_call_credit_entry` (Phase 7A scanner path complete through
+   `ALPACA_INDEX_CREDIT_STRATEGIES=call|both`)
 3. `earnings_call_debit_entry`
 4. `earnings_put_debit_entry`
 5. Iron condors after 4-leg open/close is proven

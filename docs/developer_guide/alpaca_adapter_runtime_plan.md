@@ -127,6 +127,13 @@ Initial Phase 3 runner:
   admission checks, enforces daily duplicate-entry state, selects one candidate, and can submit a
   Nautilus `SubmitOrderList` through the Alpaca execution client when
   `ALPACA_INDEX_PUT_CREDIT_SUBMIT=true`.
+- The same runner can scan Phase 7A `index_call_credit_entry` candidates by setting
+  `ALPACA_INDEX_CREDIT_STRATEGIES=call` or scan both vertical-credit directions with `both`.
+- The runner evaluates stale entry cancellation and close triggers from persisted state. Broker
+  management actions are disabled unless `ALPACA_INDEX_CREDIT_MANAGE=true`; close order submission
+  also requires `ALPACA_INDEX_CREDIT_CLOSE=true`.
+- Management triggers include profit target, stop-loss debit, max hold, expiration-risk exit,
+  force-flatten, stale entry cancellation, and a kill switch for blocking new entries.
 - Submission is disabled by default so paper soak can run safely before enabling execution.
 - Python strategy submission remains blocked by the current Python `OrderList` invariant that all
   orders share one `InstrumentId`; Alpaca MLeg entries require distinct option leg instruments, so

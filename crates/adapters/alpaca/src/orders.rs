@@ -270,6 +270,104 @@ pub fn build_put_credit_spread_open_order(
     )
 }
 
+/// Builds a paper-safe put credit spread closing payload without submitting it.
+///
+/// # Errors
+///
+/// Returns an error when quantity or debit limit are invalid, or the generated payload fails local
+/// validation.
+pub fn build_put_credit_spread_close_order(
+    short_put_symbol: impl Into<String>,
+    long_put_symbol: impl Into<String>,
+    debit_limit: f64,
+    quantity: u64,
+) -> Result<MlegOrderPayload> {
+    build_credit_spread_order(
+        short_put_symbol,
+        long_put_symbol,
+        debit_limit,
+        quantity,
+        TradeIntent::Close,
+    )
+}
+
+/// Builds a paper-safe call credit spread opening payload without submitting it.
+///
+/// # Errors
+///
+/// Returns an error when quantity or credit limit are invalid, or the generated payload fails local
+/// validation.
+pub fn build_call_credit_spread_open_order(
+    short_call_symbol: impl Into<String>,
+    long_call_symbol: impl Into<String>,
+    credit_limit: f64,
+    quantity: u64,
+) -> Result<MlegOrderPayload> {
+    build_credit_spread_order(
+        short_call_symbol,
+        long_call_symbol,
+        credit_limit,
+        quantity,
+        TradeIntent::Open,
+    )
+}
+
+/// Builds a paper-safe call credit spread closing payload without submitting it.
+///
+/// # Errors
+///
+/// Returns an error when quantity or debit limit are invalid, or the generated payload fails local
+/// validation.
+pub fn build_call_credit_spread_close_order(
+    short_call_symbol: impl Into<String>,
+    long_call_symbol: impl Into<String>,
+    debit_limit: f64,
+    quantity: u64,
+) -> Result<MlegOrderPayload> {
+    build_credit_spread_order(
+        short_call_symbol,
+        long_call_symbol,
+        debit_limit,
+        quantity,
+        TradeIntent::Close,
+    )
+}
+
+fn build_credit_spread_order(
+    short_symbol: impl Into<String>,
+    long_symbol: impl Into<String>,
+    limit: f64,
+    quantity: u64,
+    trade_intent: TradeIntent,
+) -> Result<MlegOrderPayload> {
+    if quantity == 0 {
+        return Err(validation("quantity must be positive"));
+    }
+    if limit <= 0.0 {
+        return Err(validation("limit must be positive"));
+    }
+
+    let (short_intent, long_intent) = match trade_intent {
+        TradeIntent::Open => (
+            AlpacaPositionIntent::SellToOpen,
+            AlpacaPositionIntent::BuyToOpen,
+        ),
+        TradeIntent::Close => (
+            AlpacaPositionIntent::BuyToClose,
+            AlpacaPositionIntent::SellToClose,
+        ),
+    };
+
+    MlegOrderPayload::new_limit(
+        quantity,
+        signed_net_limit_price(limit, NetPremiumKind::Credit, trade_intent),
+        vec![
+            MlegOrderLeg::new(short_symbol, short_intent.side(), short_intent, "1"),
+            MlegOrderLeg::new(long_symbol, long_intent.side(), long_intent, "1"),
+        ],
+    )
+}
+
 /// Returns Alpaca's signed net limit price for a strategy order.
 #[must_use]
 pub fn signed_net_limit_price(
@@ -307,4 +405,53 @@ fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
 
 fn validation(message: impl Into<String>) -> Error {
     Error::Validation(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credit_spread_close_payload_uses_buy_to_close_and_positive_debit() {
+        let payload = build_put_credit_spread_close_order(
+            "SPY260512P00708000",
+            "SPY260512P00705000",
+            0.25,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(payload.limit_price, "0.25");
+        assert_eq!(payload.legs[0].side, AlpacaOrderSide::Buy);
+        assert_eq!(
+            payload.legs[0].position_intent,
+            AlpacaPositionIntent::BuyToClose
+        );
+        assert_eq!(payload.legs[1].side, AlpacaOrderSide::Sell);
+        assert_eq!(
+            payload.legs[1].position_intent,
+            AlpacaPositionIntent::SellToClose
+        );
+    }
+
+    #[test]
+    fn call_credit_open_payload_uses_credit_signing() {
+        let payload = build_call_credit_spread_open_order(
+            "SPY260512C00710000",
+            "SPY260512C00713000",
+            0.45,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(payload.limit_price, "-0.45");
+        assert_eq!(
+            payload.legs[0].position_intent,
+            AlpacaPositionIntent::SellToOpen
+        );
+        assert_eq!(
+            payload.legs[1].position_intent,
+            AlpacaPositionIntent::BuyToOpen
+        );
+    }
 }

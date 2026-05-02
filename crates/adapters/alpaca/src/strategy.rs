@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Put credit spread scanner logic shared by smoke binaries and strategy scaffolds.
+//! Credit spread scanner logic shared by smoke binaries and strategy scaffolds.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -31,7 +31,32 @@ use crate::{
     providers::AlpacaOptionContractProvider,
 };
 
-/// Configuration for the put credit spread scanner.
+/// Vertical credit spread family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreditSpreadKind {
+    /// Put credit spread.
+    Put,
+    /// Call credit spread.
+    Call,
+}
+
+impl CreditSpreadKind {
+    fn option_type(self) -> AlpacaOptionType {
+        match self {
+            Self::Put => AlpacaOptionType::Put,
+            Self::Call => AlpacaOptionType::Call,
+        }
+    }
+
+    fn long_strike(self, short_strike: f64, width: f64) -> f64 {
+        match self {
+            Self::Put => short_strike - width,
+            Self::Call => short_strike + width,
+        }
+    }
+}
+
+/// Configuration for the credit spread scanner.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PutCreditScannerConfig {
     /// Minimum days to expiration.
@@ -88,7 +113,7 @@ pub struct ScoredContract {
     pub implied_volatility: Option<f64>,
 }
 
-/// One put credit spread candidate.
+/// One vertical credit spread candidate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpreadCandidate {
     /// Short put leg.
@@ -133,6 +158,49 @@ pub async fn scan_put_credit_underlying(
     config: &PutCreditScannerConfig,
     underlying: impl Into<String>,
 ) -> Result<PutCreditScanResult> {
+    scan_credit_spread_underlying(
+        client,
+        data_config,
+        config,
+        underlying,
+        CreditSpreadKind::Put,
+    )
+    .await
+}
+
+/// Loads chain data and ranks call credit spread candidates for one underlying.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_call_credit_underlying(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &PutCreditScannerConfig,
+    underlying: impl Into<String>,
+) -> Result<PutCreditScanResult> {
+    scan_credit_spread_underlying(
+        client,
+        data_config,
+        config,
+        underlying,
+        CreditSpreadKind::Call,
+    )
+    .await
+}
+
+/// Loads chain data and ranks vertical credit spread candidates for one underlying.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_credit_spread_underlying(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &PutCreditScannerConfig,
+    underlying: impl Into<String>,
+    kind: CreditSpreadKind,
+) -> Result<PutCreditScanResult> {
     let underlying = underlying.into();
     let today = OffsetDateTime::now_utc().date();
     let min_expiration = (today + Duration::days(config.min_dte)).to_string();
@@ -144,7 +212,7 @@ pub async fn scan_put_credit_underlying(
             underlying.clone(),
             min_expiration,
             max_expiration,
-            Some(AlpacaOptionType::Put),
+            Some(kind.option_type()),
         )
         .await?;
     let symbols = contracts
@@ -156,7 +224,7 @@ pub async fn scan_put_credit_underlying(
     let snapshots = client.option_snapshots(&snapshots_request).await?.snapshots;
 
     let scored = score_contracts(&contracts, &snapshots, config);
-    let candidates = build_candidates(&scored, config);
+    let candidates = build_candidates_for_kind(&scored, config, kind);
     Ok(PutCreditScanResult {
         underlying,
         contract_count: contracts.len(),
@@ -219,6 +287,16 @@ pub fn build_candidates(
     contracts: &[ScoredContract],
     config: &PutCreditScannerConfig,
 ) -> Vec<SpreadCandidate> {
+    build_candidates_for_kind(contracts, config, CreditSpreadKind::Put)
+}
+
+/// Builds and ranks vertical credit spread candidates from scored contracts.
+#[must_use]
+pub fn build_candidates_for_kind(
+    contracts: &[ScoredContract],
+    config: &PutCreditScannerConfig,
+    kind: CreditSpreadKind,
+) -> Vec<SpreadCandidate> {
     let by_expiration_strike = contracts
         .iter()
         .map(|contract| {
@@ -235,7 +313,7 @@ pub fn build_candidates(
     let mut candidates = Vec::new();
     for short in contracts {
         for width in &config.widths {
-            let long_strike = short.strike - width;
+            let long_strike = kind.long_strike(short.strike, *width);
             let Some(long) = by_expiration_strike
                 .get(&(short.expiration_date.clone(), strike_key(long_strike)))
                 .copied()
@@ -290,4 +368,60 @@ pub fn build_candidates(
 
 fn strike_key(strike: f64) -> i64 {
     (strike * 1_000.0).round() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_credit_candidates_use_higher_long_strike() {
+        let config = PutCreditScannerConfig {
+            widths: vec![3.0],
+            min_return_on_risk: 0.01,
+            ..Default::default()
+        };
+        let contracts = vec![
+            scored("SPY-C-710", 710.0, 2.50, 2.60),
+            scored("SPY-C-713", 713.0, 2.00, 2.05),
+        ];
+
+        let candidates = build_candidates_for_kind(&contracts, &config, CreditSpreadKind::Call);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].short.symbol, "SPY-C-710");
+        assert_eq!(candidates[0].long.symbol, "SPY-C-713");
+    }
+
+    #[test]
+    fn put_credit_candidates_use_lower_long_strike() {
+        let config = PutCreditScannerConfig {
+            widths: vec![3.0],
+            min_return_on_risk: 0.01,
+            ..Default::default()
+        };
+        let contracts = vec![
+            scored("SPY-P-705", 705.0, 2.00, 2.05),
+            scored("SPY-P-708", 708.0, 2.50, 2.60),
+        ];
+
+        let candidates = build_candidates_for_kind(&contracts, &config, CreditSpreadKind::Put);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].short.symbol, "SPY-P-708");
+        assert_eq!(candidates[0].long.symbol, "SPY-P-705");
+    }
+
+    fn scored(symbol: &str, strike: f64, bid: f64, ask: f64) -> ScoredContract {
+        ScoredContract {
+            symbol: symbol.to_string(),
+            expiration_date: "2026-05-15".to_string(),
+            strike,
+            bid,
+            ask,
+            delta_abs: 0.22,
+            spread_pct: 0.02,
+            implied_volatility: Some(0.20),
+        }
+    }
 }
