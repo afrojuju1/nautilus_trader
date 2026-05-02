@@ -30,9 +30,9 @@ use crate::{
     http::{
         error::{Error, Result},
         models::{
-            AlpacaAccount, AlpacaOrder, AlpacaPosition, ListOptionContractsRequest,
-            ListOrdersRequest, OptionContractsResponse, OptionSnapshotsRequest,
-            OptionSnapshotsResponse,
+            AlpacaAccount, AlpacaActivity, AlpacaOrder, AlpacaPosition, ListActivitiesRequest,
+            ListOptionContractsRequest, ListOrdersRequest, OptionContractsResponse,
+            OptionSnapshotsRequest, OptionSnapshotsResponse,
         },
     },
     orders::MlegOrderPayload,
@@ -228,6 +228,38 @@ impl AlpacaHttpClient {
     /// Returns an error if the request fails or the response cannot be decoded.
     pub async fn orders(&self, request: &ListOrdersRequest) -> Result<Vec<AlpacaOrder>> {
         self.get_trading_json("/v2/orders", &request.query_pairs())
+            .await
+    }
+
+    /// Retrieves one order by broker order ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the order ID is empty, the request fails, or the response cannot be
+    /// decoded.
+    pub async fn order_by_id(&self, order_id: &str, nested: bool) -> Result<AlpacaOrder> {
+        if order_id.trim().is_empty() {
+            return Err(Error::Validation("order_id must not be empty".to_string()));
+        }
+        let path = format!("/v2/orders/{}", order_id.trim());
+        let query_pairs = if nested {
+            vec![("nested", "true".to_string())]
+        } else {
+            Vec::new()
+        };
+        self.get_trading_json(&path, &query_pairs).await
+    }
+
+    /// Lists account activities for reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be decoded.
+    pub async fn account_activities(
+        &self,
+        request: &ListActivitiesRequest,
+    ) -> Result<Vec<AlpacaActivity>> {
+        self.get_trading_json("/v2/account/activities", &request.query_pairs())
             .await
     }
 

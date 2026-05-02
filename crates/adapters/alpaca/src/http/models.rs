@@ -273,6 +273,86 @@ impl ListOrdersRequest {
     }
 }
 
+/// Request parameters for listing Alpaca account activities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListActivitiesRequest {
+    /// Activity type filters, such as `FILL`, `OPASN`, `OPEXP`, or `OPEXC`.
+    pub activity_types: Vec<String>,
+    /// Activity category filter: `trade_activity` or `non_trade_activity`.
+    pub category: Option<String>,
+    /// Activity creation date filter.
+    pub date: Option<String>,
+    /// Include activities before this timestamp.
+    pub until: Option<String>,
+    /// Include activities after this timestamp.
+    pub after: Option<String>,
+    /// Sort direction: `asc` or `desc`.
+    pub direction: Option<String>,
+    /// Page size.
+    pub page_size: usize,
+    /// Optional page token.
+    pub page_token: Option<String>,
+}
+
+impl Default for ListActivitiesRequest {
+    fn default() -> Self {
+        Self {
+            activity_types: Vec::new(),
+            category: None,
+            date: None,
+            until: None,
+            after: None,
+            direction: Some("desc".to_string()),
+            page_size: 100,
+            page_token: None,
+        }
+    }
+}
+
+impl ListActivitiesRequest {
+    /// Creates a request for recent option reconciliation activities.
+    #[must_use]
+    pub fn option_reconciliation() -> Self {
+        Self {
+            activity_types: vec![
+                "FILL".to_string(),
+                "OPASN".to_string(),
+                "OPEXP".to_string(),
+                "OPEXC".to_string(),
+                "OPTRD".to_string(),
+            ],
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn query_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = Vec::new();
+        if !self.activity_types.is_empty() {
+            pairs.push(("activity_types", self.activity_types.join(",")));
+        }
+        if let Some(value) = &self.category {
+            pairs.push(("category", value.clone()));
+        }
+        if let Some(value) = &self.date {
+            pairs.push(("date", value.clone()));
+        }
+        if let Some(value) = &self.until {
+            pairs.push(("until", value.clone()));
+        }
+        if let Some(value) = &self.after {
+            pairs.push(("after", value.clone()));
+        }
+        if let Some(value) = &self.direction {
+            pairs.push(("direction", value.clone()));
+        }
+        pairs.push(("page_size", self.page_size.to_string()));
+        if let Some(value) = &self.page_token {
+            pairs.push(("page_token", value.clone()));
+        }
+        pairs
+    }
+}
+
 /// Alpaca account model.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AlpacaAccount {
@@ -388,6 +468,84 @@ pub struct AlpacaOrder {
     /// Nested child orders or multi-leg order legs.
     #[serde(default)]
     pub legs: Option<Vec<AlpacaOrder>>,
+}
+
+impl AlpacaOrder {
+    /// Returns `true` if Alpaca has no further expected lifecycle updates for this order.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_deref(),
+            Some("filled" | "canceled" | "expired" | "rejected")
+        )
+    }
+
+    /// Returns `true` if this order can still block duplicate strategy admission.
+    #[must_use]
+    pub fn is_working(&self) -> bool {
+        !self.is_terminal()
+    }
+
+    /// Returns all symbols on this order, including nested multi-leg symbols.
+    #[must_use]
+    pub fn symbols(&self) -> Vec<String> {
+        let mut symbols = Vec::new();
+        self.push_symbols(&mut symbols);
+        symbols.sort();
+        symbols.dedup();
+        symbols
+    }
+
+    fn push_symbols(&self, symbols: &mut Vec<String>) {
+        if let Some(symbol) = self
+            .symbol
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            symbols.push(symbol.clone());
+        }
+        if let Some(legs) = &self.legs {
+            for leg in legs {
+                leg.push_symbols(symbols);
+            }
+        }
+    }
+}
+
+/// Alpaca account activity model.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AlpacaActivity {
+    /// Activity type.
+    pub activity_type: Option<String>,
+    /// Activity ID.
+    pub id: Option<String>,
+    /// Cumulative filled quantity.
+    pub cum_qty: Option<String>,
+    /// Remaining quantity.
+    pub leaves_qty: Option<String>,
+    /// Execution price.
+    pub price: Option<String>,
+    /// Activity quantity.
+    pub qty: Option<String>,
+    /// Activity side.
+    pub side: Option<String>,
+    /// Activity symbol.
+    pub symbol: Option<String>,
+    /// Trade transaction timestamp.
+    pub transaction_time: Option<String>,
+    /// Related broker order ID.
+    pub order_id: Option<String>,
+    /// Trade activity subtype.
+    #[serde(rename = "type")]
+    pub activity_subtype: Option<String>,
+    /// Non-trade activity date.
+    pub date: Option<String>,
+    /// Net cash amount.
+    pub net_amount: Option<String>,
+    /// Security CUSIP.
+    pub cusip: Option<String>,
+    /// Per-share amount.
+    pub per_share_amount: Option<String>,
 }
 
 /// Response from Alpaca's option snapshots endpoint.

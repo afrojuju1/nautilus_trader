@@ -37,7 +37,9 @@
 
 pub mod common;
 pub mod config;
+pub mod execution;
 pub mod http;
 pub mod orders;
 pub mod parse;
 pub mod providers;
+pub mod strategy;

@@ -30,6 +30,8 @@ from nautilus_trader.adapters.alpaca.constants import APCA_API_KEY_ID_ENV
 from nautilus_trader.adapters.alpaca.constants import APCA_API_SECRET_KEY_ENV
 from nautilus_trader.adapters.alpaca.factories import AlpacaLiveDataClientFactory
 from nautilus_trader.adapters.alpaca.factories import AlpacaLiveExecClientFactory
+from nautilus_trader.adapters.alpaca.strategies import AlpacaPutCreditStrategy
+from nautilus_trader.adapters.alpaca.strategies import AlpacaPutCreditStrategyConfig
 
 
 __all__ = [
@@ -44,4 +46,6 @@ __all__ = [
     "AlpacaExecClientConfig",
     "AlpacaLiveDataClientFactory",
     "AlpacaLiveExecClientFactory",
+    "AlpacaPutCreditStrategy",
+    "AlpacaPutCreditStrategyConfig",
 ]
