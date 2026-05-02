@@ -81,6 +81,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     update.order.client_order_id.as_deref().unwrap_or("unknown"),
                 );
             }
+            Ok(Some(AlpacaWsMessage::Disconnected { reason })) => {
+                println!("disconnected: reason={reason}");
+            }
             Ok(Some(AlpacaWsMessage::Reconnected)) => {
                 println!("reconnected");
             }

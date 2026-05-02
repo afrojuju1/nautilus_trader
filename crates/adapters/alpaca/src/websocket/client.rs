@@ -284,7 +284,11 @@ impl TradeUpdatesHandler {
                                 log::warn!("Failed to send Alpaca WebSocket pong: {e}");
                             }
                         }
-                        Message::Close(_) => return None,
+                        Message::Close(_) => {
+                            return Some(AlpacaWsMessage::Disconnected {
+                                reason: "close_frame".to_string(),
+                            });
+                        }
                         other => match parse_alpaca_ws_message(&other) {
                             Ok(Some(AlpacaWsMessage::Reconnected)) => {
                                 self.authenticate_and_listen().await;
@@ -300,7 +304,11 @@ impl TradeUpdatesHandler {
                         },
                     }
                 }
-                else => return None,
+                else => {
+                    return Some(AlpacaWsMessage::Disconnected {
+                        reason: "message_channel_closed".to_string(),
+                    });
+                },
             }
         }
     }

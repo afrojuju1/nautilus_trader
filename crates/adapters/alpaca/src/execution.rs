@@ -59,6 +59,7 @@ use {
     },
     nautilus_live::{ExecutionClientCore, ExecutionEventEmitter},
     rust_decimal::Decimal,
+    serde_json::json,
     tokio::task::JoinHandle,
 };
 
@@ -77,6 +78,7 @@ use crate::{
     http::models::{AlpacaActivity, ListActivitiesRequest, ReplaceOrderRequest},
     orders::{AlpacaPositionIntent, MlegOrderLeg, MlegOrderPayload},
     orders::{NetPremiumKind, TradeIntent, signed_net_limit_price},
+    runtime::emit_operator_event,
     websocket::{
         client::AlpacaTradeUpdatesWebSocketClient,
         messages::{AlpacaTradeUpdate, AlpacaTradeUpdateLeg, AlpacaWsMessage},
@@ -1168,9 +1170,25 @@ impl ExecutionClient for AlpacaExecutionClient {
                                 }
                                 emit_trade_update_reports(update, account_id, &emitter, clock);
                             }
+                            AlpacaWsMessage::Disconnected { reason } => {
+                                log::warn!("Alpaca trade updates WebSocket disconnected: {reason}");
+                                emit_operator_event(
+                                    "websocket_disconnect",
+                                    json!({
+                                        "stream": "trade_updates",
+                                        "reason": reason,
+                                    }),
+                                );
+                            }
                             AlpacaWsMessage::Reconnected => {
                                 log::info!("Alpaca trade updates WebSocket reconnected");
-                                if let Err(e) = emit_reconciliation_snapshot(
+                                emit_operator_event(
+                                    "websocket_reconnect",
+                                    json!({
+                                        "stream": "trade_updates",
+                                    }),
+                                );
+                                match emit_reconciliation_snapshot(
                                     &http_client,
                                     account_id,
                                     &emitter,
@@ -1180,9 +1198,25 @@ impl ExecutionClient for AlpacaExecutionClient {
                                 )
                                 .await
                                 {
-                                    log::warn!(
-                                        "Failed to repair Alpaca state after reconnect: {e}"
-                                    );
+                                    Ok(()) => emit_operator_event(
+                                        "reconciliation_snapshot",
+                                        json!({
+                                            "source": "websocket_reconnect",
+                                            "lookback_mins": 60,
+                                        }),
+                                    ),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Failed to repair Alpaca state after reconnect: {e}"
+                                        );
+                                        emit_operator_event(
+                                            "reconciliation_error",
+                                            json!({
+                                                "source": "websocket_reconnect",
+                                                "error": e.to_string(),
+                                            }),
+                                        );
+                                    }
                                 }
                             }
                             AlpacaWsMessage::Error(err) => {

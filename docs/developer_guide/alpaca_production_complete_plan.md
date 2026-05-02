@@ -45,8 +45,8 @@ Known gaps:
   config, strategy loop, management, and submission in one large binary. Continue moving reusable
   runtime and management code into `src/` modules before live canary.
 - Multi-day paper proof with real management closes is still outstanding.
-- Websocket disconnect alerts are wired through structured events, but the live engine still needs
-  to emit those disconnect events from the account websocket owner.
+- Websocket disconnect/reconnect and reconciliation events are wired, but they still need paper
+  observation during an actual reconnect or broker event-loss scenario.
 
 ## Phase 1: Foundation Lock
 
@@ -296,7 +296,8 @@ Work:
 - Replace direct JSON state writes with atomic temp-file write plus rename.
 - Share the strategy state schema between the runner and operator status command.
 - Emit structured websocket disconnect/reconnect and broker reconciliation events from the Alpaca
-  account websocket owner.
+  account websocket owner. (Initial disconnect, reconnect, reconciliation success, and
+  reconciliation error events complete.)
 - Refresh deployment docs so installed binaries, not Cargo commands, are the default operational
   path.
 
@@ -319,7 +320,7 @@ Current status:
 - Strategy state persistence is atomic and shared between runner and operator status through the
   `runtime` module.
 - Remaining Phase 6.5 work: extract management/runtime decision helpers from the runner binary and
-  emit websocket disconnect/reconnect structured events from the live account owner.
+  paper-observe websocket reconnect/reconciliation events.
 
 ## Phase 7: Strategy Migration
 

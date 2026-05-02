@@ -152,6 +152,8 @@ pub enum AlpacaWsMessage {
     Listening(AlpacaListening),
     /// Trade update event.
     TradeUpdate(Box<AlpacaTradeUpdate>),
+    /// The network client disconnected.
+    Disconnected { reason: String },
     /// The network client reconnected.
     Reconnected,
     /// Alpaca or adapter error.

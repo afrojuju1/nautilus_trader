@@ -481,6 +481,13 @@ fn build_alerts(
             "a trade-update websocket disconnect event was emitted in the last hour".to_string(),
         ));
     }
+    if recent_event_count(events, "reconciliation_error", 3600) > 0 {
+        alerts.push(alert(
+            AlertSeverity::Critical,
+            "reconciliation_error",
+            "a broker reconciliation repair error was emitted in the last hour".to_string(),
+        ));
+    }
 
     alerts
 }
