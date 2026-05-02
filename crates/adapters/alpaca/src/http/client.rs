@@ -29,7 +29,10 @@ use crate::{
     config::AlpacaDataClientConfig,
     http::{
         error::{Error, Result},
-        models::{ListOptionContractsRequest, OptionContractsResponse},
+        models::{
+            ListOptionContractsRequest, OptionContractsResponse, OptionSnapshotsRequest,
+            OptionSnapshotsResponse,
+        },
     },
 };
 
@@ -151,6 +154,53 @@ impl AlpacaHttpClient {
         })
     }
 
+    /// Lists one page of option snapshots from Alpaca's Market Data API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be decoded.
+    pub async fn option_snapshots_page(
+        &self,
+        request: &OptionSnapshotsRequest,
+    ) -> Result<OptionSnapshotsResponse> {
+        self.get_data_json("/v1beta1/options/snapshots", &request.query_pairs())
+            .await
+    }
+
+    /// Lists option snapshots for all symbols in the request, batching at Alpaca's 100-symbol cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any request fails or cannot be decoded.
+    pub async fn option_snapshots(
+        &self,
+        request: &OptionSnapshotsRequest,
+    ) -> Result<OptionSnapshotsResponse> {
+        let mut snapshots = std::collections::BTreeMap::new();
+
+        for symbol_batch in request.symbols.chunks(100) {
+            let mut page_token = request.page_token.clone();
+
+            loop {
+                let page_request =
+                    request.with_symbols_and_page(symbol_batch.iter().cloned(), page_token.clone());
+                let mut page = self.option_snapshots_page(&page_request).await?;
+                page_token = page.next_token();
+                snapshots.append(&mut page.snapshots);
+
+                if page_token.is_none() {
+                    break;
+                }
+            }
+        }
+
+        Ok(OptionSnapshotsResponse {
+            snapshots,
+            next_page_token: None,
+            page_token: None,
+        })
+    }
+
     async fn get_trading_json<T>(
         &self,
         path: &str,
@@ -163,7 +213,6 @@ impl AlpacaHttpClient {
             .await
     }
 
-    #[allow(dead_code)]
     async fn get_data_json<T>(
         &self,
         path: &str,

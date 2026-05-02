@@ -46,3 +46,10 @@ path = "bin/load_option_contracts.rs"
 required-features = ["live"]
 doc = false
 test = false
+
+[[bin]]
+name = "alpaca-load-option-snapshots"
+path = "bin/load_option_snapshots.rs"
+required-features = ["live"]
+doc = false
+test = false

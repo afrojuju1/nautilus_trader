@@ -33,9 +33,10 @@ Follow Nautilus' existing live adapter pattern:
 The scaffold added with this plan registers `nautilus-alpaca`, exposes venue/config constants, and
 adds factory placeholders that fail fast until real clients exist.
 
-The first implementation slice adds authenticated REST access and an option-contract provider for
-`/v2/options/contracts`. Credentials are resolved from explicit config values first, then from
-`APCA_API_KEY_ID`/`APCA_API_SECRET_KEY`, then from the existing deployment aliases
+The first implementation slices add authenticated REST access, an option-contract provider for
+`/v2/options/contracts`, and batched option snapshot loading through
+`/v1beta1/options/snapshots`. Credentials are resolved from explicit config values first, then
+from `APCA_API_KEY_ID`/`APCA_API_SECRET_KEY`, then from the existing deployment aliases
 `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`.
 
 ## Alpaca API Mapping
@@ -79,7 +80,7 @@ Phase 1:
 - Implement authenticated REST client. (Initial option-contract path complete.)
 - Implement contract provider for equity option instruments. (Initial Alpaca contract model
   complete; Nautilus `OptionContract` conversion remains.)
-- Implement latest option snapshot/quote request path.
+- Implement latest option snapshot/quote request path. (Initial batched snapshot path complete.)
 - Implement account/position/order polling.
 - Implement paper multi-leg order submission.
 - Add a dry-run strategy harness that emits candidate decisions without orders.
