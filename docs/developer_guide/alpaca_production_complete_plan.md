@@ -330,13 +330,22 @@ Migration order:
 1. `index_put_credit_entry` (initial native runner complete)
 2. `index_call_credit_entry` (Phase 7A scanner path complete through
    `ALPACA_INDEX_CREDIT_STRATEGIES=call|both`)
-3. `earnings_call_debit_entry`
-4. `earnings_put_debit_entry`
+3. `earnings_call_debit_entry` (debit-spread Alpaca MLeg order payload builders complete; scanner
+   and earnings-event input policy still required)
+4. `earnings_put_debit_entry` (debit-spread Alpaca MLeg order payload builders complete; scanner
+   and earnings-event input policy still required)
 5. Iron condors after 4-leg open/close is proven
 6. Straddles/strangles after long-premium management rules are proven
 
 Each strategy must have native open, management, close, reconciliation, paper validation, and
 operator visibility before live enablement.
+
+Phase 7 blockers:
+
+- Earnings debit strategies need an approved earnings-calendar/input source and entry policy before
+  scanner implementation. Do not infer earnings dates from broker option chains.
+- Iron condors should wait until 4-leg open/close is paper-proven with the account engine.
+- Straddles/strangles should wait until long-premium management and max-loss behavior are specified.
 
 ## Phase 8: Rollout
 

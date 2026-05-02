@@ -333,6 +333,90 @@ pub fn build_call_credit_spread_close_order(
     )
 }
 
+/// Builds a paper-safe call debit spread opening payload without submitting it.
+///
+/// # Errors
+///
+/// Returns an error when quantity or debit limit are invalid, or the generated payload fails local
+/// validation.
+pub fn build_call_debit_spread_open_order(
+    long_call_symbol: impl Into<String>,
+    short_call_symbol: impl Into<String>,
+    debit_limit: f64,
+    quantity: u64,
+) -> Result<MlegOrderPayload> {
+    build_debit_spread_order(
+        long_call_symbol,
+        short_call_symbol,
+        debit_limit,
+        quantity,
+        TradeIntent::Open,
+    )
+}
+
+/// Builds a paper-safe call debit spread closing payload without submitting it.
+///
+/// # Errors
+///
+/// Returns an error when quantity or credit limit are invalid, or the generated payload fails local
+/// validation.
+pub fn build_call_debit_spread_close_order(
+    long_call_symbol: impl Into<String>,
+    short_call_symbol: impl Into<String>,
+    credit_limit: f64,
+    quantity: u64,
+) -> Result<MlegOrderPayload> {
+    build_debit_spread_order(
+        long_call_symbol,
+        short_call_symbol,
+        credit_limit,
+        quantity,
+        TradeIntent::Close,
+    )
+}
+
+/// Builds a paper-safe put debit spread opening payload without submitting it.
+///
+/// # Errors
+///
+/// Returns an error when quantity or debit limit are invalid, or the generated payload fails local
+/// validation.
+pub fn build_put_debit_spread_open_order(
+    long_put_symbol: impl Into<String>,
+    short_put_symbol: impl Into<String>,
+    debit_limit: f64,
+    quantity: u64,
+) -> Result<MlegOrderPayload> {
+    build_debit_spread_order(
+        long_put_symbol,
+        short_put_symbol,
+        debit_limit,
+        quantity,
+        TradeIntent::Open,
+    )
+}
+
+/// Builds a paper-safe put debit spread closing payload without submitting it.
+///
+/// # Errors
+///
+/// Returns an error when quantity or credit limit are invalid, or the generated payload fails local
+/// validation.
+pub fn build_put_debit_spread_close_order(
+    long_put_symbol: impl Into<String>,
+    short_put_symbol: impl Into<String>,
+    credit_limit: f64,
+    quantity: u64,
+) -> Result<MlegOrderPayload> {
+    build_debit_spread_order(
+        long_put_symbol,
+        short_put_symbol,
+        credit_limit,
+        quantity,
+        TradeIntent::Close,
+    )
+}
+
 fn build_credit_spread_order(
     short_symbol: impl Into<String>,
     long_symbol: impl Into<String>,
@@ -364,6 +448,41 @@ fn build_credit_spread_order(
         vec![
             MlegOrderLeg::new(short_symbol, short_intent.side(), short_intent, "1"),
             MlegOrderLeg::new(long_symbol, long_intent.side(), long_intent, "1"),
+        ],
+    )
+}
+
+fn build_debit_spread_order(
+    long_symbol: impl Into<String>,
+    short_symbol: impl Into<String>,
+    limit: f64,
+    quantity: u64,
+    trade_intent: TradeIntent,
+) -> Result<MlegOrderPayload> {
+    if quantity == 0 {
+        return Err(validation("quantity must be positive"));
+    }
+    if limit <= 0.0 {
+        return Err(validation("limit must be positive"));
+    }
+
+    let (long_intent, short_intent) = match trade_intent {
+        TradeIntent::Open => (
+            AlpacaPositionIntent::BuyToOpen,
+            AlpacaPositionIntent::SellToOpen,
+        ),
+        TradeIntent::Close => (
+            AlpacaPositionIntent::SellToClose,
+            AlpacaPositionIntent::BuyToClose,
+        ),
+    };
+
+    MlegOrderPayload::new_limit(
+        quantity,
+        signed_net_limit_price(limit, NetPremiumKind::Debit, trade_intent),
+        vec![
+            MlegOrderLeg::new(long_symbol, long_intent.side(), long_intent, "1"),
+            MlegOrderLeg::new(short_symbol, short_intent.side(), short_intent, "1"),
         ],
     )
 }
@@ -452,6 +571,44 @@ mod tests {
         assert_eq!(
             payload.legs[1].position_intent,
             AlpacaPositionIntent::BuyToOpen
+        );
+    }
+
+    #[test]
+    fn call_debit_open_payload_uses_debit_signing() {
+        let payload =
+            build_call_debit_spread_open_order("SPY260512C00710000", "SPY260512C00713000", 1.25, 1)
+                .unwrap();
+
+        assert_eq!(payload.limit_price, "1.25");
+        assert_eq!(payload.legs[0].side, AlpacaOrderSide::Buy);
+        assert_eq!(
+            payload.legs[0].position_intent,
+            AlpacaPositionIntent::BuyToOpen
+        );
+        assert_eq!(payload.legs[1].side, AlpacaOrderSide::Sell);
+        assert_eq!(
+            payload.legs[1].position_intent,
+            AlpacaPositionIntent::SellToOpen
+        );
+    }
+
+    #[test]
+    fn put_debit_close_payload_uses_credit_signing() {
+        let payload =
+            build_put_debit_spread_close_order("SPY260512P00710000", "SPY260512P00705000", 1.55, 1)
+                .unwrap();
+
+        assert_eq!(payload.limit_price, "-1.55");
+        assert_eq!(payload.legs[0].side, AlpacaOrderSide::Sell);
+        assert_eq!(
+            payload.legs[0].position_intent,
+            AlpacaPositionIntent::SellToClose
+        );
+        assert_eq!(payload.legs[1].side, AlpacaOrderSide::Buy);
+        assert_eq!(
+            payload.legs[1].position_intent,
+            AlpacaPositionIntent::BuyToClose
         );
     }
 }
