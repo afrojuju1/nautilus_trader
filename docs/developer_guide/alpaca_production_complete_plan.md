@@ -369,6 +369,14 @@ Pre-rollout gates:
   verified flat.
 - Live canary remains disabled until the user explicitly enables live URLs and submission gates.
 
+Current status:
+
+- Blocked outside market hours for real paper execution proof.
+- Latest safe broker check on 2026-05-02 showed active paper account, zero positions, and zero open
+  orders after service verification.
+- Tiny live canary remains blocked until explicit user approval, live endpoints, and live submission
+  gates are enabled.
+
 ## Immediate Next Milestone
 
 Finish the remaining Phase 6.5 broker-orchestration extraction and paper-observe websocket
