@@ -202,7 +202,6 @@ struct StrategyStateEntry {
 async fn main() -> anyhow::Result<()> {
     let config = RunnerConfig::from_env()?;
     let mut state = load_state(&config.state_path)?;
-    let trade_date = market_trade_date(&config);
 
     println!(
         "index_credit_entry: underlyings={} strategies={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} state_path={}",
@@ -226,7 +225,9 @@ async fn main() -> anyhow::Result<()> {
     data_config.data_base_url = env::var("ALPACA_DATA_BASE_URL").ok();
     let http_client = AlpacaHttpClient::from_data_config(&data_config)?;
 
-    for iteration in 1..=config.max_iterations {
+    let mut iteration = 1_u64;
+    loop {
+        let trade_date = market_trade_date(&config);
         println!("strategy_iteration={iteration} trade_date={trade_date}");
 
         if manage_existing_entries(&http_client, &data_config, &config, &mut state).await? {
@@ -290,9 +291,12 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        if iteration < config.max_iterations {
-            sleep(Duration::from_secs(config.interval_secs)).await;
+        if config.max_iterations != 0 && iteration >= config.max_iterations {
+            break;
         }
+
+        iteration = iteration.saturating_add(1);
+        sleep(Duration::from_secs(config.interval_secs)).await;
     }
 
     Ok(())

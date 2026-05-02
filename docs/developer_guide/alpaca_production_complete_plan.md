@@ -10,6 +10,9 @@ Alpaca option-spread workflow. The target state is Nautilus-native execution and
   reconciliation, position lifecycle, and operator controls.
 - The NUC (`ade-nucbox-k8-plus`) runs one supervised Nautilus paper/live process for the active
   Alpaca account.
+- That process is the single Alpaca account engine: it owns broker connectivity and account-level
+  risk, while hosting multiple enabled strategies from config. Add separate supervised services only
+  for separate ownership domains such as paper vs live accounts or non-trading diagnostics.
 - Strategies are implemented as Nautilus-native strategies or Rust/Python components in this repo.
 - Alpaca option spreads are submitted through Nautilus `SubmitOrderList` and reconciled through
   trade updates plus REST repair paths.
@@ -207,11 +210,22 @@ Goal: run Nautilus as the only live trading engine on the box.
 Work:
 
 - Create a NUC service definition for the Nautilus strategy runner.
-- Store env/secrets outside the repo.
-- Add paper/live mode, account ID, strategy config, and symbol universe config.
+- Store env/secrets outside the repo. (Initial `deploy/alpaca/alpaca-index-credit.env.example`
+  documents the external env file shape without secrets.)
+- Add paper/live mode, account ID, strategy config, and symbol universe config. (Initial env
+  template covers paper URLs, strategy universe, scan cadence, and safety gates.)
 - Add log files, rotation, restart policy, health command, status command, and stop command.
-- Ensure only one Alpaca account trade-update websocket owner is active.
+  (Initial user systemd unit, control script, runner wrapper, and logrotate example complete.)
+- Ensure only one Alpaca account trade-update websocket owner is active. (Runner wrapper uses a
+  non-blocking `flock` lock under `NAUTILUS_ALPACA_LOCK_DIR`.)
 - Remove any `spreads` runtime dependency from the service.
+
+Current status:
+
+- Deployment files are documented in [Alpaca NUC Deployment](alpaca_nuc_deployment.md).
+- On 2026-05-02, `alpaca-index-credit.service` was installed, started, health-checked, and stopped
+  on `ade-nucbox-k8-plus` with kill-switch enabled and submission disabled.
+- The runner supports `ALPACA_INDEX_PUT_CREDIT_MAX_ITERATIONS=0` for continuous service mode.
 
 Exit criteria:
 

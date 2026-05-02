@@ -23,6 +23,7 @@ This approach combines Python's simplicity and ecosystem with Rust's performance
 - [Release Notes](releases.md)
 - [Adapters](adapters.md)
 - [Alpaca Production Complete Plan](alpaca_production_complete_plan.md)
+- [Alpaca NUC Deployment](alpaca_nuc_deployment.md)
 - [Data Testing Spec](spec_data_testing.md)
 - [Execution Testing Spec](spec_exec_testing.md)
 - [Benchmarking](benchmarking.md)
