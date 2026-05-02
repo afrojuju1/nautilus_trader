@@ -452,6 +452,8 @@ pub struct AlpacaOrder {
     pub qty: Option<String>,
     /// Filled quantity.
     pub filled_qty: Option<String>,
+    /// Average filled price.
+    pub filled_avg_price: Option<String>,
     /// Order type.
     #[serde(rename = "type")]
     pub order_type: Option<String>,

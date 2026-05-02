@@ -5215,16 +5215,24 @@ checksum = "034a0ad7deebf0c2abcf2435950a6666c3c15ea9d8fad0c0f48efa8a7f843fed"
 name = "nautilus-alpaca"
 version = "0.57.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "log",
+ "nautilus-common",
  "nautilus-core",
+ "nautilus-live",
  "nautilus-model",
+ "nautilus-network",
  "pyo3",
  "pyo3-stub-gen",
  "reqwest 0.13.3",
+ "rust_decimal",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tokio-tungstenite",
  "url",
 ]
 

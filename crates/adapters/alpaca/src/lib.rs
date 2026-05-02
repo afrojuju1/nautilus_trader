@@ -38,6 +38,8 @@
 pub mod common;
 pub mod config;
 pub mod execution;
+#[cfg(feature = "live")]
+pub mod factories;
 pub mod http;
 pub mod orders;
 pub mod parse;
@@ -45,3 +47,10 @@ pub mod providers;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod strategy;
+#[cfg(feature = "live")]
+pub mod websocket;
+
+#[cfg(feature = "live")]
+pub use execution::AlpacaExecutionClient;
+#[cfg(feature = "live")]
+pub use factories::AlpacaExecutionClientFactory;

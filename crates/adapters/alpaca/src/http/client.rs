@@ -26,7 +26,7 @@ use url::form_urlencoded;
 
 use crate::{
     common::{credentials::AlpacaCredential, urls::DATA_BASE_URL},
-    config::AlpacaDataClientConfig,
+    config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
     http::{
         error::{Error, Result},
         models::{
@@ -66,6 +66,24 @@ impl AlpacaHttpClient {
             credential,
             config.resolved_trading_base_url(),
             config.resolved_data_base_url(),
+            config.request_timeout_secs,
+        )
+    }
+
+    /// Creates a client from an Alpaca execution client config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when credentials cannot be resolved or the HTTP client cannot be built.
+    pub fn from_exec_config(config: &AlpacaExecClientConfig) -> Result<Self> {
+        let credential =
+            AlpacaCredential::resolve(config.api_key.clone(), config.api_secret.clone())
+                .ok_or(Error::MissingCredentials)?;
+
+        Self::new(
+            credential,
+            config.resolved_trading_base_url(),
+            DATA_BASE_URL,
             config.request_timeout_secs,
         )
     }
@@ -248,6 +266,30 @@ impl AlpacaHttpClient {
             Vec::new()
         };
         self.get_trading_json(&path, &query_pairs).await
+    }
+
+    /// Retrieves one order by client order ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client order ID is empty, the request fails, or the response cannot
+    /// be decoded.
+    pub async fn order_by_client_order_id(
+        &self,
+        client_order_id: &str,
+        nested: bool,
+    ) -> Result<AlpacaOrder> {
+        if client_order_id.trim().is_empty() {
+            return Err(Error::Validation(
+                "client_order_id must not be empty".to_string(),
+            ));
+        }
+        let mut query_pairs = vec![("client_order_id", client_order_id.trim().to_string())];
+        if nested {
+            query_pairs.push(("nested", "true".to_string()));
+        }
+        self.get_trading_json("/v2/orders:by_client_order_id", &query_pairs)
+            .await
     }
 
     /// Lists account activities for reconciliation.
