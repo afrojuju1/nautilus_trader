@@ -41,6 +41,8 @@ pub mod execution;
 #[cfg(feature = "live")]
 pub mod factories;
 pub mod http;
+#[cfg(feature = "live")]
+pub mod management;
 pub mod orders;
 pub mod parse;
 pub mod providers;

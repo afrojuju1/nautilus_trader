@@ -33,6 +33,7 @@ use nautilus_alpaca::{
         error::Error,
         models::{AlpacaOrder, ListOrdersRequest, OptionSnapshotsRequest},
     },
+    management::{CreditSpreadManagementConfig, credit_spread_close_reason},
     runtime::{
         StrategyState, StrategyStateEntry, credit_spread_strategy_name, emit_operator_event,
         load_strategy_state, save_strategy_state_atomic,
@@ -536,27 +537,8 @@ fn close_reason(
     entry: &StrategyStateEntry,
     close_debit: f64,
 ) -> Option<String> {
-    if config.force_flatten {
-        return Some("manual_flatten".to_string());
-    }
-    if close_debit <= entry.credit * config.profit_target_close_fraction {
-        return Some("profit_target".to_string());
-    }
-    if close_debit >= entry.credit * config.stop_loss_close_multiple {
-        return Some("stop_loss".to_string());
-    }
-    if config.max_hold_secs > 0
-        && recorded_age_secs(entry).is_some_and(|age| age >= config.max_hold_secs)
-    {
-        return Some("max_hold".to_string());
-    }
-    if config.expiration_exit_days >= 0
-        && days_to_expiration(&entry.short_symbol)
-            .is_some_and(|days| days <= config.expiration_exit_days)
-    {
-        return Some("expiration_risk".to_string());
-    }
-    None
+    credit_spread_close_reason(&config.management_config(), entry, close_debit)
+        .map(ToString::to_string)
 }
 
 async fn submit_entry(
@@ -881,31 +863,6 @@ fn order_age_secs(order: &AlpacaOrder) -> Option<u64> {
         .and_then(age_secs_from_rfc3339)
 }
 
-fn recorded_age_secs(entry: &StrategyStateEntry) -> Option<u64> {
-    age_secs_from_rfc3339(&entry.recorded_at_utc)
-}
-
-fn days_to_expiration(symbol: &str) -> Option<i64> {
-    let chars = symbol.as_bytes();
-    for index in 0..chars.len().saturating_sub(6) {
-        let date_slice = &chars[index..index + 6];
-        let put_call = chars.get(index + 6).copied();
-        if date_slice.iter().all(u8::is_ascii_digit) && matches!(put_call, Some(b'P' | b'C')) {
-            let value = std::str::from_utf8(date_slice).ok()?;
-            let year = 2000 + value[0..2].parse::<i32>().ok()?;
-            let month = value[2..4].parse::<u32>().ok()?;
-            let day = value[4..6].parse::<u32>().ok()?;
-            let expiration = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
-            return Some(
-                expiration
-                    .signed_duration_since(Utc::now().date_naive())
-                    .num_days(),
-            );
-        }
-    }
-    None
-}
-
 fn age_secs_from_rfc3339(value: &str) -> Option<u64> {
     DateTime::parse_from_rfc3339(value)
         .ok()
@@ -931,6 +888,16 @@ fn market_trade_date(config: &RunnerConfig) -> String {
 }
 
 impl RunnerConfig {
+    fn management_config(&self) -> CreditSpreadManagementConfig {
+        CreditSpreadManagementConfig {
+            force_flatten: self.force_flatten,
+            profit_target_close_fraction: self.profit_target_close_fraction,
+            stop_loss_close_multiple: self.stop_loss_close_multiple,
+            max_hold_secs: self.max_hold_secs,
+            expiration_exit_days: self.expiration_exit_days,
+        }
+    }
+
     fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
             underlyings: underlyings_from_env(),

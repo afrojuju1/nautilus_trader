@@ -42,8 +42,8 @@ Completed foundation:
 Known gaps:
 
 - The `alpaca-index-put-credit-entry` runner is intentionally transitional and now mixes runtime
-  config, strategy loop, management, and submission in one large binary. Continue moving reusable
-  runtime and management code into `src/` modules before live canary.
+  config, strategy loop, broker I/O, and submission in one large binary. Continue moving reusable
+  broker orchestration code into `src/` modules before live canary.
 - Multi-day paper proof with real management closes is still outstanding.
 - Websocket disconnect/reconnect and reconciliation events are wired, but they still need paper
   observation during an actual reconnect or broker event-loss scenario.
@@ -289,10 +289,11 @@ Work:
   installer builds release binaries and service/control scripts execute installed binaries.)
 - Move strategy state structs, atomic state persistence, operator-event emission, and credit-spread
   management helpers from the runner binary into reusable `src/` modules. (State schema,
-  persistence, and operator events moved to `runtime`; management helpers still need extraction.)
+  persistence, and operator events moved to `runtime`; close-decision helpers moved to
+  `management`.)
 - Make the bin targets thin entrypoints over library code so tests can cover runtime decisions
-  without shelling out to binaries. (Partial: runtime state has direct tests; runner remains a
-  transitional binary.)
+  without shelling out to binaries. (Partial: runtime state and management decisions have direct
+  tests; runner remains a transitional binary.)
 - Replace direct JSON state writes with atomic temp-file write plus rename.
 - Share the strategy state schema between the runner and operator status command.
 - Emit structured websocket disconnect/reconnect and broker reconciliation events from the Alpaca
@@ -307,8 +308,7 @@ Exit criteria:
 - The account engine can restart without requiring a source checkout build path.
 - Strategy state persistence is atomic and read by both runtime and operator status through one
   shared schema.
-- Runtime, management, and operator-status logic has direct Rust test coverage outside binary
-  entrypoints.
+- Runtime state and management decisions have direct Rust test coverage outside binary entrypoints.
 
 Current status:
 
@@ -319,7 +319,8 @@ Current status:
   `~/.local/bin/alpaca-operator-status`.
 - Strategy state persistence is atomic and shared between runner and operator status through the
   `runtime` module.
-- Remaining Phase 6.5 work: extract management/runtime decision helpers from the runner binary and
+- Credit-spread close decisions are shared through the `management` module with direct unit tests.
+- Remaining Phase 6.5 work: extract broker orchestration helpers from the runner binary and
   paper-observe websocket reconnect/reconciliation events.
 
 ## Phase 7: Strategy Migration
@@ -361,6 +362,6 @@ Pre-rollout gates:
 
 ## Immediate Next Milestone
 
-Finish the remaining Phase 6.5 runtime extraction and websocket event hooks. After that, run the
-paper workflow during market hours: dry-run scan, submit-with-cancel smoke, paper open with real
-management close, and multi-day paper soak.
+Finish the remaining Phase 6.5 broker-orchestration extraction and paper-observe websocket
+reconnect/reconciliation events. After that, run the paper workflow during market hours: dry-run
+scan, submit-with-cancel smoke, paper open with real management close, and multi-day paper soak.
