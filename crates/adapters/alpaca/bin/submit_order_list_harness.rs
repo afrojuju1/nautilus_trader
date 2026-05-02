@@ -21,7 +21,7 @@ use nautilus_alpaca::{
     AlpacaExecutionClient,
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
-    http::{client::AlpacaHttpClient, error::Error},
+    http::{client::AlpacaHttpClient, error::Error, models::ReplaceOrderRequest},
     strategy::{PutCreditScannerConfig, scan_put_credit_underlying},
 };
 use nautilus_common::{
@@ -113,6 +113,16 @@ async fn main() -> anyhow::Result<()> {
     client.submit_order_list(cmd)?;
 
     let terminal_events = collect_execution_events(&mut rx).await;
+    if let Err(error) = replace_parent_if_requested(
+        &exec_config,
+        &order_list_id,
+        &spec,
+        terminal_events.accepted > 0,
+    )
+    .await
+    {
+        println!("replace: failed error={error}");
+    }
     cleanup_if_accepted(&exec_config, &order_list_id, terminal_events.accepted > 0).await?;
 
     client.disconnect().await?;
@@ -418,6 +428,63 @@ async fn cleanup_if_accepted(
         }
         Err(Error::HttpStatus { status, body, .. }) => {
             println!("cleanup: parent_lookup_failed status={status} body={body}");
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    Ok(())
+}
+
+async fn replace_parent_if_requested(
+    config: &AlpacaExecClientConfig,
+    order_list_id: &str,
+    spec: &HarnessOrderSpec,
+    accepted: bool,
+) -> anyhow::Result<()> {
+    if !accepted || !env_bool("ALPACA_ORDER_LIST_HARNESS_REPLACE_OPEN", false) {
+        return Ok(());
+    }
+
+    let client = AlpacaHttpClient::from_exec_config(config)?;
+    match client.order_by_client_order_id(order_list_id, true).await {
+        Ok(order) if order.is_terminal() => {
+            println!(
+                "replace: skipped parent_order_id={} status={} terminal=true",
+                order.id.as_deref().unwrap_or("unknown"),
+                order.status.as_deref().unwrap_or("unknown"),
+            );
+        }
+        Ok(order) => {
+            let Some(order_id) = order.id.as_deref() else {
+                println!("replace: accepted parent order had no id");
+                return Ok(());
+            };
+            let current_credit = spec.short_limit_price - spec.long_limit_price;
+            let replacement_credit = env::var("ALPACA_ORDER_LIST_HARNESS_REPLACE_CREDIT")
+                .ok()
+                .map(|value| value.parse::<f64>())
+                .transpose()?
+                .unwrap_or_else(|| (current_credit - 0.01).max(0.01));
+            let requested_limit_price = format!("-{replacement_credit:.2}");
+            let replaced = client
+                .replace_order(
+                    order_id,
+                    &ReplaceOrderRequest {
+                        limit_price: Some(requested_limit_price.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            println!(
+                "replace: parent_order_id={} requested_limit_price={} status={} limit_price={}",
+                replaced.id.as_deref().unwrap_or(order_id),
+                requested_limit_price,
+                replaced.status.as_deref().unwrap_or("unknown"),
+                replaced.limit_price.as_deref().unwrap_or("unknown"),
+            );
+        }
+        Err(Error::HttpStatus { status, body, .. }) => {
+            println!("replace: parent_lookup_failed status={status} body={body}");
         }
         Err(error) => return Err(error.into()),
     }

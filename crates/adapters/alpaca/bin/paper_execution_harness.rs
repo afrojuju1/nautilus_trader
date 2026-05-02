@@ -113,7 +113,7 @@ async fn print_matching_activities(
     order_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let activities = client
-        .account_activities(&ListActivitiesRequest::option_reconciliation())
+        .account_activities_all(&ListActivitiesRequest::option_reconciliation())
         .await?;
     let matching = activities
         .iter()

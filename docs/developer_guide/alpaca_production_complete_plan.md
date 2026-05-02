@@ -98,18 +98,45 @@ Goal: run the first strategy fully inside Nautilus.
 
 Work:
 
-- Build a Nautilus-native put-credit strategy or strategy runner.
+- Build a Nautilus-native put-credit strategy or strategy runner. (Initial
+  `alpaca-index-put-credit-entry` Rust runner complete; it scans, applies broker/state admission,
+  selects one entry, and can submit through the Alpaca `SubmitOrderList` execution path when
+  explicitly enabled.)
 - Port scanner parameters for underlyings, DTE, width, delta, open interest, leg spread, and minimum
-  return-on-risk.
-- Add account/position/open-order admission checks.
-- Add deterministic sizing and daily duplicate-entry controls.
-- Build and submit Nautilus `SubmitOrderList` entries directly.
-- Persist enough local strategy state to avoid duplicate submits after restart.
+  return-on-risk. (Runner exposes these through `ALPACA_PUT_CREDIT_*` environment variables.)
+- Add account/position/open-order admission checks. (Runner uses the Alpaca adapter admission gate.)
+- Add deterministic sizing and daily duplicate-entry controls. (Runner uses
+  `ALPACA_INDEX_PUT_CREDIT_QTY` and persists submitted entries by trade date and underlying.)
+- Build and submit Nautilus `SubmitOrderList` entries directly. (Submission is disabled by default;
+  set `ALPACA_INDEX_PUT_CREDIT_SUBMIT=true` for paper execution.)
+- Persist enough local strategy state to avoid duplicate submits after restart. (Default state path
+  is `$XDG_STATE_HOME/nautilus_trader/alpaca_index_put_credit_entry_state.json` or
+  `$HOME/.local/state/nautilus_trader/alpaca_index_put_credit_entry_state.json`.)
 - Remove any dependency on `spreads` execution intents, workers, or Docker runtime.
 
 Exit criteria:
 
 - One paper run scans, selects, submits, observes order events, and leaves a coherent Nautilus state.
+
+Runner commands:
+
+```bash
+# Dry-run scan, no order submission.
+ALPACA_INDEX_PUT_CREDIT_IGNORE_WINDOW=true \
+  cargo run -p nautilus-alpaca --features live --bin alpaca-index-put-credit-entry -- SPY,QQQ,IWM
+
+# Paper submission path; use cancel-after-accept only for smoke testing.
+ALPACA_INDEX_PUT_CREDIT_SUBMIT=true \
+ALPACA_INDEX_PUT_CREDIT_CANCEL_AFTER_ACCEPT=true \
+  cargo run -p nautilus-alpaca --features live --bin alpaca-index-put-credit-entry -- SPY,QQQ,IWM
+```
+
+Implementation note:
+
+- The existing Python `OrderList` constructor enforces one `InstrumentId` per list, while Alpaca
+  MLeg entries require distinct option leg instruments. Until that core model constraint is changed
+  or a Python-safe multi-leg abstraction is added, the native Phase 3 submit path lives in the Rust
+  runner where the Alpaca execution client already accepts multi-leg `SubmitOrderList` commands.
 
 ## Phase 4: Position Management And Close Path
 

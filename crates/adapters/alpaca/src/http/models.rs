@@ -319,7 +319,6 @@ impl ListActivitiesRequest {
                 "OPASN".to_string(),
                 "OPEXP".to_string(),
                 "OPEXC".to_string(),
-                "OPXRC".to_string(),
                 "OPTRD".to_string(),
             ],
             ..Self::default()
@@ -873,7 +872,6 @@ mod tests {
         assert!(paged.activity_types.contains(&"OPASN".to_string()));
         assert!(paged.activity_types.contains(&"OPEXP".to_string()));
         assert!(paged.activity_types.contains(&"OPEXC".to_string()));
-        assert!(paged.activity_types.contains(&"OPXRC".to_string()));
         assert!(paged.activity_types.contains(&"OPTRD".to_string()));
     }
 

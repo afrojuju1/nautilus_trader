@@ -53,8 +53,8 @@ use {
         live::{get_runtime, runner::get_exec_event_sender},
         messages::execution::{
             CancelOrder, GenerateFillReports, GenerateOrderStatusReport,
-            GenerateOrderStatusReports, GeneratePositionStatusReports, QueryAccount, QueryOrder,
-            SubmitOrder, SubmitOrderList,
+            GenerateOrderStatusReports, GeneratePositionStatusReports, ModifyOrder, QueryAccount,
+            QueryOrder, SubmitOrder, SubmitOrderList,
         },
     },
     nautilus_live::{ExecutionClientCore, ExecutionEventEmitter},
@@ -74,7 +74,7 @@ use crate::{
 #[cfg(feature = "live")]
 use crate::{
     config::AlpacaExecClientConfig,
-    http::models::{AlpacaActivity, ListActivitiesRequest},
+    http::models::{AlpacaActivity, ListActivitiesRequest, ReplaceOrderRequest},
     orders::{AlpacaPositionIntent, MlegOrderLeg, MlegOrderPayload},
     orders::{NetPremiumKind, TradeIntent, signed_net_limit_price},
     websocket::{
@@ -1434,6 +1434,75 @@ impl ExecutionClient for AlpacaExecutionClient {
         Ok(())
     }
 
+    fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+        let ts_event = self.clock.get_time_ns();
+        let Some(venue_order_id) = cmd.venue_order_id else {
+            self.emitter.emit_order_modify_rejected_event(
+                cmd.strategy_id,
+                cmd.instrument_id,
+                cmd.client_order_id,
+                None,
+                "modify-order requires venue_order_id",
+                ts_event,
+            );
+            return Ok(());
+        };
+
+        let replace_request = match replace_order_request_from_modify_order(&cmd) {
+            Ok(request) => request,
+            Err(e) => {
+                self.emitter.emit_order_modify_rejected_event(
+                    cmd.strategy_id,
+                    cmd.instrument_id,
+                    cmd.client_order_id,
+                    Some(venue_order_id),
+                    &format!("modify-order rejected: {e}"),
+                    ts_event,
+                );
+                return Ok(());
+            }
+        };
+
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let account_id = self.core.account_id;
+        let strategy_id = cmd.strategy_id;
+        let instrument_id = cmd.instrument_id;
+        let client_order_id = cmd.client_order_id;
+        let clock = self.clock;
+
+        self.spawn_task("replace_order", async move {
+            match http_client
+                .replace_order(venue_order_id.as_str(), &replace_request)
+                .await
+            {
+                Ok(replaced) => {
+                    let ts_init = clock.get_time_ns();
+                    let reports =
+                        order_status_reports_from_alpaca(&replaced, account_id.as_str(), ts_init)?;
+                    for report in reports {
+                        emitter.send_order_status_report(report);
+                    }
+                }
+                Err(e) => {
+                    let ts_event = clock.get_time_ns();
+                    emitter.emit_order_modify_rejected_event(
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        Some(venue_order_id),
+                        &format!("modify-order rejected: {e}"),
+                        ts_event,
+                    );
+                }
+            }
+
+            Ok(())
+        });
+
+        Ok(())
+    }
+
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
@@ -1789,6 +1858,44 @@ fn build_mleg_payload_from_order_list(
     MlegOrderPayload::new_limit(strategy_qty, signed_limit_price, legs)
         .and_then(|payload| payload.with_client_order_id(cmd.order_list.id.to_string()))
         .map_err(|e| anyhow::anyhow!("invalid Alpaca MLeg payload: {e}"))
+}
+
+#[cfg(feature = "live")]
+fn replace_order_request_from_modify_order(
+    cmd: &ModifyOrder,
+) -> anyhow::Result<ReplaceOrderRequest> {
+    if cmd.trigger_price.is_some() {
+        anyhow::bail!("Alpaca MLeg replace does not support trigger_price");
+    }
+
+    let limit_price = cmd
+        .params
+        .as_ref()
+        .and_then(|params| params.get_str("alpaca_limit_price"))
+        .map(ToString::to_string)
+        .or_else(|| {
+            cmd.price
+                .map(|price| price.as_decimal().normalize().to_string())
+        });
+    let qty = cmd
+        .params
+        .as_ref()
+        .and_then(|params| params.get_str("alpaca_qty"))
+        .map(ToString::to_string)
+        .or_else(|| {
+            cmd.quantity
+                .map(|qty| qty.as_decimal().normalize().to_string())
+        });
+
+    if limit_price.is_none() && qty.is_none() {
+        anyhow::bail!("Alpaca replace requires price, quantity, alpaca_limit_price, or alpaca_qty",);
+    }
+
+    Ok(ReplaceOrderRequest {
+        qty,
+        limit_price,
+        ..Default::default()
+    })
 }
 
 #[cfg(feature = "live")]
@@ -2205,6 +2312,8 @@ fn unix_nanos_to_rfc3339(ts: UnixNanos) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "live")]
+    use nautilus_core::Params;
     use nautilus_model::enums::OrderStatus;
     #[cfg(feature = "live")]
     use nautilus_model::{
@@ -2212,6 +2321,8 @@ mod tests {
         identifiers::{OrderListId, StrategyId, TraderId},
         orders::OrderList,
     };
+    #[cfg(feature = "live")]
+    use serde_json::json;
 
     use super::*;
 
@@ -2503,6 +2614,55 @@ mod tests {
             payload.legs[1].position_intent,
             AlpacaPositionIntent::BuyToOpen
         );
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn replace_order_request_from_modify_order_prefers_alpaca_net_limit_param() {
+        let mut params = Params::new();
+        params.insert("alpaca_limit_price".to_string(), json!("-0.45"));
+
+        let cmd = ModifyOrder::new(
+            TraderId::from("TRADER-001"),
+            None,
+            StrategyId::from("S-001"),
+            InstrumentId::from_str("SPY260508P00500000.ALPACA").unwrap(),
+            ClientOrderId::from("O-1"),
+            Some(VenueOrderId::from("parent-order")),
+            Some(Quantity::new(2.0, 0)),
+            Some(Price::new(0.70, 2)),
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+            Some(params),
+        );
+
+        let request = replace_order_request_from_modify_order(&cmd).unwrap();
+
+        assert_eq!(request.limit_price.as_deref(), Some("-0.45"));
+        assert_eq!(request.qty.as_deref(), Some("2"));
+        assert!(request.stop_price.is_none());
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn replace_order_request_from_modify_order_rejects_trigger_price() {
+        let cmd = ModifyOrder::new(
+            TraderId::from("TRADER-001"),
+            None,
+            StrategyId::from("S-001"),
+            InstrumentId::from_str("SPY260508P00500000.ALPACA").unwrap(),
+            ClientOrderId::from("O-1"),
+            Some(VenueOrderId::from("parent-order")),
+            None,
+            Some(Price::new(0.70, 2)),
+            Some(Price::new(0.50, 2)),
+            UUID4::new(),
+            UnixNanos::from(1),
+            None,
+        );
+
+        assert!(replace_order_request_from_modify_order(&cmd).is_err());
     }
 
     #[cfg(feature = "live")]

@@ -5217,6 +5217,8 @@ version = "0.57.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
+ "chrono-tz",
  "log",
  "nautilus-common",
  "nautilus-core",

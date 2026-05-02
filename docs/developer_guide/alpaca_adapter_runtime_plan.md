@@ -121,6 +121,17 @@ Phase 3:
 - Add historical decision replay using Alpaca bars/snapshots where available.
 - Run paper soak with order submission disabled, then paper execution enabled.
 
+Initial Phase 3 runner:
+
+- `alpaca-index-put-credit-entry` scans configured underlyings, applies account/position/open-order
+  admission checks, enforces daily duplicate-entry state, selects one candidate, and can submit a
+  Nautilus `SubmitOrderList` through the Alpaca execution client when
+  `ALPACA_INDEX_PUT_CREDIT_SUBMIT=true`.
+- Submission is disabled by default so paper soak can run safely before enabling execution.
+- Python strategy submission remains blocked by the current Python `OrderList` invariant that all
+  orders share one `InstrumentId`; Alpaca MLeg entries require distinct option leg instruments, so
+  the first native submit runner is Rust-side.
+
 ## Strategy Migration
 
 The Nautilus strategy should not copy the current app's job scheduler or alerting layer. It should
