@@ -137,6 +137,13 @@ doc = false
 test = false
 
 [[bin]]
+name = "alpaca-submit-order-list-bridge"
+path = "bin/submit_order_list_bridge.rs"
+required-features = ["live"]
+doc = false
+test = false
+
+[[bin]]
 name = "alpaca-watch-trade-updates"
 path = "bin/watch_trade_updates.rs"
 required-features = ["live"]
