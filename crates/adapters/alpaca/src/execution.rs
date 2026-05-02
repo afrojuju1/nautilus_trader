@@ -33,8 +33,8 @@ use nautilus_core::{UUID4, UnixNanos};
 #[cfg(feature = "live")]
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{LiquiditySide, OmsType},
-    identifiers::{ClientId, TradeId, Venue},
+    enums::{LiquiditySide, OmsType, PositionSideSpecified},
+    identifiers::{ClientId, PositionId, TradeId, Venue},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money},
@@ -74,6 +74,7 @@ use crate::{
 #[cfg(feature = "live")]
 use crate::{
     config::AlpacaExecClientConfig,
+    http::models::{AlpacaActivity, ListActivitiesRequest},
     orders::{AlpacaPositionIntent, MlegOrderLeg, MlegOrderPayload},
     orders::{NetPremiumKind, TradeIntent, signed_net_limit_price},
     websocket::{
@@ -298,6 +299,41 @@ pub fn fill_reports_from_trade_update(
         .map(|report| vec![report])
 }
 
+/// Converts Alpaca account activities into Nautilus fill reports.
+///
+/// Non-trade lifecycle activities such as assignment, exercise, and expiry are intentionally
+/// skipped here; they are handled through position reconciliation until Nautilus has a dedicated
+/// broker activity report for them.
+#[cfg(feature = "live")]
+pub fn fill_reports_from_alpaca_activities(
+    activities: &[AlpacaActivity],
+    account_id: impl AsRef<str>,
+    ts_init: UnixNanos,
+) -> Result<Vec<FillReport>> {
+    activities
+        .iter()
+        .filter(|activity| activity_is_fill_reportable(activity))
+        .map(|activity| fill_report_from_alpaca_activity(activity, account_id.as_ref(), ts_init))
+        .collect()
+}
+
+/// Converts Alpaca positions into Nautilus position status reports.
+///
+/// Alpaca only returns open positions from the positions endpoint, so this mapper reports the
+/// broker's current open inventory. Flat positions are reconstructed by the live reconciliation
+/// manager when cached positions have no matching broker report.
+#[cfg(feature = "live")]
+pub fn position_status_reports_from_alpaca_positions(
+    positions: &[AlpacaPosition],
+    account_id: impl AsRef<str>,
+    ts_init: UnixNanos,
+) -> Result<Vec<PositionStatusReport>> {
+    positions
+        .iter()
+        .map(|position| position_status_report_from_alpaca(position, account_id.as_ref(), ts_init))
+        .collect()
+}
+
 #[cfg(feature = "live")]
 fn order_with_trade_update_legs(update: &AlpacaTradeUpdate) -> AlpacaOrder {
     let mut order = update.order.clone();
@@ -459,6 +495,134 @@ fn fill_report_from_trade_update_leg(
         ts_init,
         Some(UUID4::new()),
     ))
+}
+
+#[cfg(feature = "live")]
+fn activity_is_fill_reportable(activity: &AlpacaActivity) -> bool {
+    matches!(
+        activity.activity_type.as_deref().map(normalize).as_deref(),
+        Some("fill" | "optrd")
+    )
+}
+
+#[cfg(feature = "live")]
+fn fill_report_from_alpaca_activity(
+    activity: &AlpacaActivity,
+    account_id: &str,
+    ts_init: UnixNanos,
+) -> Result<FillReport> {
+    let trade_id = activity
+        .id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::Parse("Alpaca fill activity missing id".to_string()))?;
+    let venue_order_id = activity
+        .order_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::Parse("Alpaca fill activity missing order_id".to_string()))?;
+    let symbol = activity
+        .symbol
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::Parse("Alpaca fill activity missing symbol".to_string()))?;
+    let ts_event = activity
+        .transaction_time
+        .as_deref()
+        .or(activity.date.as_deref())
+        .map(unix_nanos_from_activity_timestamp)
+        .transpose()?
+        .ok_or_else(|| Error::Parse("Alpaca fill activity missing timestamp".to_string()))?;
+
+    Ok(FillReport::new(
+        AccountId::from(account_id),
+        instrument_id_from_alpaca_symbol(symbol)?,
+        VenueOrderId::from(venue_order_id),
+        trade_id_from_alpaca_activity_id(trade_id)?,
+        order_side_from_alpaca(activity.side.as_deref())?,
+        quantity_from_optional_str(activity.qty.as_deref(), "activity qty")?,
+        price_from_required_str(activity.price.as_deref(), "activity price")?,
+        Money::zero(Currency::USD()),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        ts_event,
+        ts_init,
+        Some(UUID4::new()),
+    ))
+}
+
+#[cfg(feature = "live")]
+fn trade_id_from_alpaca_activity_id(value: &str) -> Result<TradeId> {
+    let value = value.trim();
+    if value.len() <= 36 {
+        return TradeId::new_checked(value)
+            .map_err(|e| Error::Parse(format!("invalid Alpaca trade id {value}: {e}")));
+    }
+
+    if let Some((_, suffix)) = value.rsplit_once("::")
+        && suffix.len() <= 36
+    {
+        return TradeId::new_checked(suffix)
+            .map_err(|e| Error::Parse(format!("invalid Alpaca trade id {value}: {e}")));
+    }
+
+    Err(Error::Parse(format!(
+        "Alpaca activity id is too long for Nautilus TradeId: {value}",
+    )))
+}
+
+#[cfg(feature = "live")]
+fn position_status_report_from_alpaca(
+    position: &AlpacaPosition,
+    account_id: &str,
+    ts_init: UnixNanos,
+) -> Result<PositionStatusReport> {
+    let symbol = position
+        .symbol
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::Parse("Alpaca position missing symbol".to_string()))?;
+    let qty = decimal_from_required_str(position.qty.as_deref(), "position qty")?;
+    let position_side = position_side_from_alpaca(position.side.as_deref(), qty)?;
+    let quantity = quantity_from_decimal_abs(qty, position.qty.as_deref().unwrap_or("0"))?;
+    let avg_px_open = position
+        .avg_entry_price
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| Decimal::from_str(value))
+        .transpose()
+        .map_err(|e| Error::Parse(format!("invalid Alpaca avg_entry_price: {e}")))?;
+
+    Ok(PositionStatusReport::new(
+        AccountId::from(account_id),
+        instrument_id_from_alpaca_symbol(symbol)?,
+        position_side,
+        quantity,
+        ts_init,
+        ts_init,
+        Some(UUID4::new()),
+        position
+            .asset_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(PositionId::from),
+        avg_px_open,
+    ))
+}
+
+#[cfg(feature = "live")]
+fn position_side_from_alpaca(side: Option<&str>, qty: Decimal) -> Result<PositionSideSpecified> {
+    match side.map(normalize).as_deref() {
+        Some("long") => Ok(PositionSideSpecified::Long),
+        Some("short") => Ok(PositionSideSpecified::Short),
+        Some(value) => Err(Error::Parse(format!(
+            "unsupported Alpaca position side: {value}",
+        ))),
+        None if qty > Decimal::ZERO => Ok(PositionSideSpecified::Long),
+        None if qty < Decimal::ZERO => Ok(PositionSideSpecified::Short),
+        None => Ok(PositionSideSpecified::Flat),
+    }
 }
 
 #[cfg(feature = "live")]
@@ -636,6 +800,16 @@ fn quantity_from_str(value: &str) -> Result<Quantity> {
         .map_err(|e| Error::Parse(format!("invalid Alpaca quantity {value}: {e}")))
 }
 
+#[cfg(feature = "live")]
+fn quantity_from_decimal_abs(value: Decimal, raw_value: &str) -> Result<Quantity> {
+    value
+        .abs()
+        .to_string()
+        .parse::<f64>()
+        .map(|parsed| Quantity::new(parsed, decimal_precision(raw_value)))
+        .map_err(|e| Error::Parse(format!("invalid Alpaca quantity {raw_value}: {e}")))
+}
+
 fn price_from_str(value: &str) -> Result<Price> {
     value
         .parse::<f64>()
@@ -695,8 +869,42 @@ fn unix_nanos_from_rfc3339(value: &str) -> Result<UnixNanos> {
     Ok(UnixNanos::from(nanos as u64))
 }
 
+#[cfg(feature = "live")]
+fn unix_nanos_from_activity_timestamp(value: &str) -> Result<UnixNanos> {
+    if value.contains('T') {
+        return unix_nanos_from_rfc3339(value);
+    }
+
+    let format = time::format_description::parse("[year]-[month]-[day]")
+        .map_err(|e| Error::Parse(format!("invalid Alpaca date format: {e}")))?;
+    let date = time::Date::parse(value, &format)
+        .map_err(|e| Error::Parse(format!("invalid Alpaca date {value}: {e}")))?;
+    let timestamp = date
+        .with_time(time::Time::MIDNIGHT)
+        .assume_utc()
+        .unix_timestamp_nanos();
+    if timestamp < 0 {
+        return Err(Error::Parse(format!(
+            "Alpaca date predates Unix epoch: {value}",
+        )));
+    }
+    Ok(UnixNanos::from(timestamp as u64))
+}
+
+#[cfg(feature = "live")]
+fn decimal_from_required_str(value: Option<&str>, field: &str) -> Result<Decimal> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::Parse(format!("Alpaca {field} missing")))
+        .and_then(|value| {
+            Decimal::from_str(value)
+                .map_err(|e| Error::Parse(format!("invalid Alpaca {field} {value}: {e}")))
+        })
+}
+
 fn decimal_precision(value: &str) -> u8 {
     value
+        .trim_start_matches('-')
         .split_once('.')
         .map(|(_, decimals)| decimals.trim_end_matches('0').len().min(9) as u8)
         .unwrap_or(0)
@@ -731,6 +939,8 @@ pub struct AlpacaExecutionClient {
     ws_stream_handle: Option<JoinHandle<()>>,
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
     mleg_contexts: Arc<Mutex<MlegOrderContextMap>>,
+    seen_trade_update_keys: Arc<Mutex<BTreeSet<String>>>,
+    seen_activity_trade_ids: Arc<Mutex<BTreeSet<String>>>,
 }
 
 #[cfg(feature = "live")]
@@ -777,6 +987,8 @@ impl AlpacaExecutionClient {
             ws_stream_handle: None,
             pending_tasks: Mutex::new(Vec::new()),
             mleg_contexts: Arc::new(Mutex::new(MlegOrderContextMap::new())),
+            seen_trade_update_keys: Arc::new(Mutex::new(BTreeSet::new())),
+            seen_activity_trade_ids: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
@@ -918,6 +1130,8 @@ impl ExecutionClient for AlpacaExecutionClient {
                 let client_order_id_prefix = self.config.client_order_id_prefix.clone();
                 let external_order_filtering = self.config.external_order_filtering;
                 let mleg_contexts = Arc::clone(&self.mleg_contexts);
+                let seen_trade_update_keys = Arc::clone(&self.seen_trade_update_keys);
+                let seen_activity_trade_ids = Arc::clone(&self.seen_activity_trade_ids);
 
                 let handle = get_runtime().spawn(async move {
                     while let Some(message) = rx.recv().await {
@@ -945,32 +1159,30 @@ impl ExecutionClient for AlpacaExecutionClient {
                                 {
                                     continue;
                                 }
+                                if !mark_trade_update_seen(&update, &seen_trade_update_keys) {
+                                    log::debug!(
+                                        "Skipping duplicate Alpaca trade update: {}",
+                                        trade_update_dedupe_key(&update),
+                                    );
+                                    continue;
+                                }
                                 emit_trade_update_reports(update, account_id, &emitter, clock);
                             }
                             AlpacaWsMessage::Reconnected => {
                                 log::info!("Alpaca trade updates WebSocket reconnected");
-                                match http_client.account().await {
-                                    Ok(account) => match account_balances_from_alpaca(&account) {
-                                        Ok(balances) => {
-                                            let ts = clock.get_time_ns();
-                                            emitter.emit_account_state(
-                                                balances,
-                                                Vec::new(),
-                                                true,
-                                                ts,
-                                            );
-                                        }
-                                        Err(e) => {
-                                            log::warn!(
-                                                "Failed to parse Alpaca account after reconnect: {e}"
-                                            );
-                                        }
-                                    },
-                                    Err(e) => {
-                                        log::warn!(
-                                            "Failed to refresh Alpaca account after reconnect: {e}"
-                                        );
-                                    }
+                                if let Err(e) = emit_reconciliation_snapshot(
+                                    &http_client,
+                                    account_id,
+                                    &emitter,
+                                    clock,
+                                    Some(60),
+                                    Some(&seen_activity_trade_ids),
+                                )
+                                .await
+                                {
+                                    log::warn!(
+                                        "Failed to repair Alpaca state after reconnect: {e}"
+                                    );
                                 }
                             }
                             AlpacaWsMessage::Error(err) => {
@@ -987,6 +1199,36 @@ impl ExecutionClient for AlpacaExecutionClient {
         let ts = self.clock.get_time_ns();
         self.emitter
             .emit_account_state(balances, Vec::new(), true, ts);
+
+        if let Some(poll_secs) = self
+            .config
+            .reconciliation_poll_secs
+            .filter(|secs| *secs > 0)
+        {
+            let http_client = self.http_client.clone();
+            let account_id = self.core.account_id;
+            let emitter = self.emitter.clone();
+            let clock = self.clock;
+            let seen_activity_trade_ids = Arc::clone(&self.seen_activity_trade_ids);
+            self.spawn_task("alpaca_reconciliation_poll", async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(poll_secs)).await;
+                    if let Err(e) = emit_reconciliation_snapshot(
+                        &http_client,
+                        account_id,
+                        &emitter,
+                        clock,
+                        Some(poll_secs / 60 + 2),
+                        Some(&seen_activity_trade_ids),
+                    )
+                    .await
+                    {
+                        log::warn!("Alpaca periodic reconciliation repair failed: {e}");
+                    }
+                }
+            });
+        }
+
         self.core.set_connected();
         log::info!("Connected: client_id={}", self.core.client_id);
         Ok(())
@@ -1250,16 +1492,62 @@ impl ExecutionClient for AlpacaExecutionClient {
 
     async fn generate_fill_reports(
         &self,
-        _cmd: GenerateFillReports,
+        cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        Ok(Vec::new())
+        let mut request = ListActivitiesRequest::option_reconciliation();
+        request.direction = Some("asc".to_string());
+        if let Some(start) = cmd.start {
+            request.after = Some(unix_nanos_to_rfc3339(start));
+        }
+        if let Some(end) = cmd.end {
+            request.until = Some(unix_nanos_to_rfc3339(end));
+        }
+
+        let activities = self.http_client.account_activities_all(&request).await?;
+        let mut reports = fill_reports_from_alpaca_activities(
+            &activities,
+            self.core.account_id.as_str(),
+            cmd.ts_init,
+        )?;
+
+        if let Some(instrument_id) = cmd.instrument_id {
+            reports.retain(|report| report.instrument_id == instrument_id);
+        }
+        if let Some(venue_order_id) = cmd.venue_order_id {
+            reports.retain(|report| report.venue_order_id == venue_order_id);
+        }
+        if let Some(start) = cmd.start {
+            reports.retain(|report| report.ts_event >= start);
+        }
+        if let Some(end) = cmd.end {
+            reports.retain(|report| report.ts_event <= end);
+        }
+
+        Ok(reports)
     }
 
     async fn generate_position_status_reports(
         &self,
-        _cmd: &GeneratePositionStatusReports,
+        cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        Ok(Vec::new())
+        let positions = self.http_client.positions().await?;
+        let mut reports = position_status_reports_from_alpaca_positions(
+            &positions,
+            self.core.account_id.as_str(),
+            cmd.ts_init,
+        )?;
+
+        if let Some(instrument_id) = cmd.instrument_id {
+            reports.retain(|report| report.instrument_id == instrument_id);
+        }
+        if let Some(start) = cmd.start {
+            reports.retain(|report| report.ts_last >= start);
+        }
+        if let Some(end) = cmd.end {
+            reports.retain(|report| report.ts_last <= end);
+        }
+
+        Ok(reports)
     }
 
     async fn generate_mass_status(
@@ -1280,7 +1568,16 @@ impl ExecutionClient for AlpacaExecutionClient {
             None,
             None,
         );
-        let order_reports = self.generate_order_status_reports(&order_cmd).await?;
+        let fill_cmd =
+            GenerateFillReports::new(UUID4::new(), ts_now, None, None, start, None, None, None);
+        let position_cmd =
+            GeneratePositionStatusReports::new(UUID4::new(), ts_now, None, start, None, None, None);
+
+        let (order_reports, fill_reports, position_reports) = tokio::try_join!(
+            self.generate_order_status_reports(&order_cmd),
+            self.generate_fill_reports(fill_cmd),
+            self.generate_position_status_reports(&position_cmd),
+        )?;
 
         let mut mass_status = ExecutionMassStatus::new(
             self.core.client_id,
@@ -1290,8 +1587,70 @@ impl ExecutionClient for AlpacaExecutionClient {
             None,
         );
         mass_status.add_order_reports(order_reports);
+        mass_status.add_fill_reports(fill_reports);
+        mass_status.add_position_reports(position_reports);
         Ok(Some(mass_status))
     }
+}
+
+#[cfg(feature = "live")]
+async fn emit_reconciliation_snapshot(
+    http_client: &AlpacaHttpClient,
+    account_id: AccountId,
+    emitter: &ExecutionEventEmitter,
+    clock: &'static AtomicTime,
+    lookback_mins: Option<u64>,
+    seen_activity_trade_ids: Option<&Arc<Mutex<BTreeSet<String>>>>,
+) -> anyhow::Result<()> {
+    let ts_now = clock.get_time_ns();
+    let start = lookback_mins
+        .map(|mins| ts_now.as_u64().saturating_sub(mins * 60 * 1_000_000_000))
+        .map(UnixNanos::from);
+
+    let account = http_client.account().await?;
+    emitter.emit_account_state(
+        account_balances_from_alpaca(&account)?,
+        Vec::new(),
+        true,
+        ts_now,
+    );
+
+    let order_request = crate::http::models::ListOrdersRequest {
+        status: "all".to_string(),
+        nested: true,
+        limit: 500,
+        after: start.map(unix_nanos_to_rfc3339),
+        ..Default::default()
+    };
+    for order in http_client.orders(&order_request).await? {
+        for report in order_status_reports_from_alpaca(&order, account_id.as_str(), ts_now)? {
+            emitter.send_order_status_report(report);
+        }
+    }
+
+    let mut activity_request = ListActivitiesRequest::option_reconciliation();
+    activity_request.direction = Some("asc".to_string());
+    activity_request.after = start.map(unix_nanos_to_rfc3339);
+    let activities = http_client
+        .account_activities_all(&activity_request)
+        .await?;
+    for report in fill_reports_from_alpaca_activities(&activities, account_id.as_str(), ts_now)? {
+        if let Some(seen_activity_trade_ids) = seen_activity_trade_ids
+            && !mark_fill_report_seen(&report, seen_activity_trade_ids)
+        {
+            continue;
+        }
+        emitter.send_fill_report(report);
+    }
+
+    let positions = http_client.positions().await?;
+    for report in
+        position_status_reports_from_alpaca_positions(&positions, account_id.as_str(), ts_now)?
+    {
+        emitter.send_position_report(report);
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "live")]
@@ -1756,6 +2115,51 @@ fn trade_update_matches_prefix(update: &AlpacaTradeUpdate, prefix: &str) -> bool
 }
 
 #[cfg(feature = "live")]
+fn mark_trade_update_seen(
+    update: &AlpacaTradeUpdate,
+    seen_keys: &Arc<Mutex<BTreeSet<String>>>,
+) -> bool {
+    let key = trade_update_dedupe_key(update);
+    let mut seen = seen_keys.lock().expect(MUTEX_POISONED);
+    seen.insert(key)
+}
+
+#[cfg(feature = "live")]
+fn mark_fill_report_seen(
+    report: &FillReport,
+    seen_trade_ids: &Arc<Mutex<BTreeSet<String>>>,
+) -> bool {
+    let mut seen = seen_trade_ids.lock().expect(MUTEX_POISONED);
+    seen.insert(report.trade_id.as_str().to_string())
+}
+
+#[cfg(feature = "live")]
+fn trade_update_dedupe_key(update: &AlpacaTradeUpdate) -> String {
+    let mut parts = vec![
+        update.event.clone(),
+        update.order.id.clone().unwrap_or_default(),
+        update.order.client_order_id.clone().unwrap_or_default(),
+        update.timestamp.clone().unwrap_or_default(),
+        update.execution_id.clone().unwrap_or_default(),
+        update.price.clone().unwrap_or_default(),
+        update.qty.clone().unwrap_or_default(),
+    ];
+
+    if let Some(legs) = update.legs.as_deref() {
+        for leg in legs {
+            parts.push(leg.order_id.clone().unwrap_or_default());
+            parts.push(leg.execution_id.clone().unwrap_or_default());
+            parts.push(leg.symbol.clone().unwrap_or_default());
+            parts.push(leg.timestamp.clone().unwrap_or_default());
+            parts.push(leg.price.clone().unwrap_or_default());
+            parts.push(leg.qty.clone().unwrap_or_default());
+        }
+    }
+
+    parts.join("|")
+}
+
+#[cfg(feature = "live")]
 fn account_balances_from_alpaca(account: &AlpacaAccount) -> anyhow::Result<Vec<AccountBalance>> {
     let currency = account
         .currency
@@ -1979,6 +2383,105 @@ mod tests {
 
     #[cfg(feature = "live")]
     #[test]
+    fn fill_reports_from_alpaca_activities_maps_trade_activities() {
+        let activities = vec![
+            AlpacaActivity {
+                activity_type: Some("FILL".to_string()),
+                id: Some("20260501133100000::8efc7b9a-8b2b-4000-9955-d36e7db0df74".to_string()),
+                cum_qty: Some("1".to_string()),
+                leaves_qty: Some("0".to_string()),
+                price: Some("0.72".to_string()),
+                qty: Some("1".to_string()),
+                side: Some("sell".to_string()),
+                symbol: Some("SPY260508P00500000".to_string()),
+                transaction_time: Some("2026-05-01T13:31:00Z".to_string()),
+                order_id: Some("leg-short".to_string()),
+                activity_subtype: None,
+                date: None,
+                net_amount: None,
+                cusip: None,
+                per_share_amount: None,
+            },
+            AlpacaActivity {
+                activity_type: Some("OPASN".to_string()),
+                id: Some("assignment-1".to_string()),
+                cum_qty: None,
+                leaves_qty: None,
+                price: None,
+                qty: Some("1".to_string()),
+                side: None,
+                symbol: Some("SPY260508P00500000".to_string()),
+                transaction_time: None,
+                order_id: None,
+                activity_subtype: None,
+                date: Some("2026-05-02".to_string()),
+                net_amount: None,
+                cusip: None,
+                per_share_amount: None,
+            },
+        ];
+
+        let reports =
+            fill_reports_from_alpaca_activities(&activities, "ALPACA-001", UnixNanos::from(1))
+                .unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].venue_order_id, VenueOrderId::from("leg-short"));
+        assert_eq!(
+            reports[0].trade_id,
+            TradeId::new("8efc7b9a-8b2b-4000-9955-d36e7db0df74")
+        );
+        assert_eq!(reports[0].order_side, OrderSide::Sell);
+        assert_eq!(
+            reports[0].instrument_id,
+            InstrumentId::from_str("SPY260508P00500000.ALPACA").unwrap(),
+        );
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn position_status_reports_from_alpaca_positions_maps_short_option_position() {
+        let positions = vec![AlpacaPosition {
+            asset_id: Some("asset-1".to_string()),
+            symbol: Some("SPY260508P00500000".to_string()),
+            exchange: Some("OPRA".to_string()),
+            asset_class: Some("us_option".to_string()),
+            qty: Some("2".to_string()),
+            side: Some("short".to_string()),
+            market_value: None,
+            cost_basis: None,
+            current_price: None,
+            unrealized_pl: None,
+            unrealized_plpc: None,
+            avg_entry_price: Some("0.72".to_string()),
+        }];
+
+        let reports = position_status_reports_from_alpaca_positions(
+            &positions,
+            "ALPACA-001",
+            UnixNanos::from(10),
+        )
+        .unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].position_side, PositionSideSpecified::Short);
+        assert_eq!(
+            reports[0].instrument_id,
+            InstrumentId::from_str("SPY260508P00500000.ALPACA").unwrap(),
+        );
+        assert_eq!(
+            reports[0].venue_position_id,
+            Some(PositionId::from("asset-1"))
+        );
+        assert_eq!(reports[0].signed_decimal_qty, Decimal::from(-2));
+        assert_eq!(
+            reports[0].avg_px_open,
+            Some(Decimal::from_str("0.72").unwrap())
+        );
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
     fn build_mleg_payload_from_order_list_uses_signed_credit_open_price() {
         let orders = vec![
             mleg_limit_order("O-1", "SPY260508P00500000", OrderSide::Sell, 0.75, false),
@@ -2096,6 +2599,30 @@ mod tests {
         assert_eq!(reports[0].order_side, OrderSide::Sell);
         assert_eq!(reports[1].client_order_id, Some(ClientOrderId::from("O-2")));
         assert_eq!(reports[1].order_side, OrderSide::Buy);
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn mark_trade_update_seen_filters_duplicate_updates() {
+        let update = AlpacaTradeUpdate {
+            event: "fill".to_string(),
+            order: {
+                let mut order = empty_order();
+                order.id = Some("parent-order".to_string());
+                order.client_order_id = Some("OL-1".to_string());
+                order
+            },
+            execution_id: Some("exec-1".to_string()),
+            price: Some("0.50".to_string()),
+            qty: Some("1".to_string()),
+            position_qty: None,
+            timestamp: Some("2026-05-01T13:31:00Z".to_string()),
+            legs: None,
+        };
+        let seen = Arc::new(Mutex::new(BTreeSet::new()));
+
+        assert!(mark_trade_update_seen(&update, &seen));
+        assert!(!mark_trade_update_seen(&update, &seen));
     }
 
     fn leg_order(

@@ -189,6 +189,8 @@ pub struct AlpacaExecClientConfig {
     pub client_order_id_prefix: String,
     /// Whether to ignore execution reports for client order IDs outside the configured prefix.
     pub external_order_filtering: bool,
+    /// Optional interval for REST reconciliation repair polling.
+    pub reconciliation_poll_secs: Option<u64>,
 }
 
 impl Default for AlpacaExecClientConfig {
@@ -203,6 +205,7 @@ impl Default for AlpacaExecClientConfig {
             use_trade_updates_stream: true,
             client_order_id_prefix: "nautilus".to_string(),
             external_order_filtering: false,
+            reconciliation_poll_secs: Some(60),
         }
     }
 }

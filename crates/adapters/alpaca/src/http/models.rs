@@ -319,9 +319,19 @@ impl ListActivitiesRequest {
                 "OPASN".to_string(),
                 "OPEXP".to_string(),
                 "OPEXC".to_string(),
+                "OPXRC".to_string(),
                 "OPTRD".to_string(),
             ],
             ..Self::default()
+        }
+    }
+
+    /// Returns a copy of this request with the page token replaced.
+    #[must_use]
+    pub fn with_page_token(&self, page_token: Option<String>) -> Self {
+        Self {
+            page_token,
+            ..self.clone()
         }
     }
 
@@ -351,6 +361,29 @@ impl ListActivitiesRequest {
         }
         pairs
     }
+}
+
+/// Request body for replacing an existing Alpaca order.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ReplaceOrderRequest {
+    /// New order quantity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qty: Option<String>,
+    /// New time-in-force.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_in_force: Option<String>,
+    /// New limit price. For MLeg orders, positive is debit and negative is credit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_price: Option<String>,
+    /// New stop price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_price: Option<String>,
+    /// New trailing stop value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trail: Option<String>,
+    /// Client order ID for the replacement order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,
 }
 
 /// Alpaca account model.
@@ -822,4 +855,44 @@ where
         Value::String(value) => value.trim().parse::<u64>().ok(),
         _ => None,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn list_activities_request_replaces_page_token() {
+        let request = ListActivitiesRequest::option_reconciliation();
+        let paged = request.with_page_token(Some("page-1".to_string()));
+
+        assert_eq!(paged.page_token.as_deref(), Some("page-1"));
+        assert!(paged.activity_types.contains(&"FILL".to_string()));
+        assert!(paged.activity_types.contains(&"OPASN".to_string()));
+        assert!(paged.activity_types.contains(&"OPEXP".to_string()));
+        assert!(paged.activity_types.contains(&"OPEXC".to_string()));
+        assert!(paged.activity_types.contains(&"OPXRC".to_string()));
+        assert!(paged.activity_types.contains(&"OPTRD".to_string()));
+    }
+
+    #[test]
+    fn replace_order_request_skips_empty_fields() {
+        let request = ReplaceOrderRequest {
+            limit_price: Some("-0.50".to_string()),
+            client_order_id: Some("replace-1".to_string()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "limit_price": "-0.50",
+                "client_order_id": "replace-1",
+            }),
+        );
+    }
 }

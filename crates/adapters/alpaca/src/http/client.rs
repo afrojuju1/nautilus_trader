@@ -32,7 +32,7 @@ use crate::{
         models::{
             AlpacaAccount, AlpacaActivity, AlpacaOrder, AlpacaPosition, ListActivitiesRequest,
             ListOptionContractsRequest, ListOrdersRequest, OptionContractsResponse,
-            OptionSnapshotsRequest, OptionSnapshotsResponse,
+            OptionSnapshotsRequest, OptionSnapshotsResponse, ReplaceOrderRequest,
         },
     },
     orders::MlegOrderPayload,
@@ -305,6 +305,50 @@ impl AlpacaHttpClient {
             .await
     }
 
+    /// Lists all account activities for a request by following `page_token` pagination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any page request fails or a response cannot be decoded.
+    pub async fn account_activities_all(
+        &self,
+        request: &ListActivitiesRequest,
+    ) -> Result<Vec<AlpacaActivity>> {
+        let mut page_request = request.clone();
+        let mut activities = Vec::new();
+
+        loop {
+            let page = self.account_activities(&page_request).await?;
+            if page.is_empty() {
+                break;
+            }
+
+            let next_token = page.last().and_then(|activity| {
+                activity
+                    .id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToString::to_string)
+            });
+            let page_len = page.len();
+            activities.extend(page);
+
+            if page_len < page_request.page_size {
+                break;
+            }
+
+            let Some(next_token) = next_token else {
+                break;
+            };
+            if page_request.page_token.as_deref() == Some(next_token.as_str()) {
+                break;
+            }
+            page_request = page_request.with_page_token(Some(next_token));
+        }
+
+        Ok(activities)
+    }
+
     /// Submits a validated Alpaca multi-leg order payload.
     ///
     /// # Errors
@@ -331,6 +375,36 @@ impl AlpacaHttpClient {
         self.delete_trading(&path).await
     }
 
+    /// Replaces an existing Alpaca order by broker order ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the order ID is empty, the request has no replacement fields, the
+    /// request fails, or Alpaca rejects the replacement.
+    pub async fn replace_order(
+        &self,
+        order_id: &str,
+        request: &ReplaceOrderRequest,
+    ) -> Result<AlpacaOrder> {
+        if order_id.trim().is_empty() {
+            return Err(Error::Validation("order_id must not be empty".to_string()));
+        }
+        if request.qty.is_none()
+            && request.time_in_force.is_none()
+            && request.limit_price.is_none()
+            && request.stop_price.is_none()
+            && request.trail.is_none()
+            && request.client_order_id.is_none()
+        {
+            return Err(Error::Validation(
+                "replace_order requires at least one replacement field".to_string(),
+            ));
+        }
+
+        let path = format!("/v2/orders/{order_id}");
+        self.patch_trading_json(&path, &[], request).await
+    }
+
     async fn get_trading_json<T>(
         &self,
         path: &str,
@@ -354,6 +428,20 @@ impl AlpacaHttpClient {
         B: Serialize + ?Sized,
     {
         self.post_json(&self.trading_base_url, path, query_pairs, body)
+            .await
+    }
+
+    async fn patch_trading_json<T, B>(
+        &self,
+        path: &str,
+        query_pairs: &[(&'static str, String)],
+        body: &B,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        self.patch_json(&self.trading_base_url, path, query_pairs, body)
             .await
     }
 
@@ -406,6 +494,22 @@ impl AlpacaHttpClient {
     {
         let url = build_url(base_url, path, query_pairs)?;
         let response = self.client.post(url.clone()).json(body).send().await?;
+        decode_response(response.status(), url, response.text().await?).await
+    }
+
+    async fn patch_json<T, B>(
+        &self,
+        base_url: &str,
+        path: &str,
+        query_pairs: &[(&'static str, String)],
+        body: &B,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let url = build_url(base_url, path, query_pairs)?;
+        let response = self.client.patch(url.clone()).json(body).send().await?;
         decode_response(response.status(), url, response.text().await?).await
     }
 }

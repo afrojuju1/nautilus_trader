@@ -98,6 +98,8 @@ class AlpacaExecClientConfig(LiveExecClientConfig, frozen=True):
         Prefix for generated client order IDs.
     external_order_filtering : bool, default False
         If execution reports for client order IDs outside the prefix should be ignored.
+    reconciliation_poll_secs : PositiveInt, optional
+        Optional interval for REST reconciliation repair polling.
 
     """
 
@@ -110,3 +112,4 @@ class AlpacaExecClientConfig(LiveExecClientConfig, frozen=True):
     use_trade_updates_stream: bool = True
     client_order_id_prefix: str = "nautilus"
     external_order_filtering: bool = False
+    reconciliation_poll_secs: PositiveInt | None = 60
