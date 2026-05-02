@@ -181,6 +181,215 @@ impl OptionSnapshotsRequest {
     }
 }
 
+/// Request parameters for listing Alpaca orders.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListOrdersRequest {
+    /// Order status filter: `open`, `closed`, or `all`.
+    pub status: String,
+    /// Maximum number of orders to return.
+    pub limit: usize,
+    /// Include orders submitted after this timestamp.
+    pub after: Option<String>,
+    /// Include orders submitted until this timestamp.
+    pub until: Option<String>,
+    /// Sort direction: `asc` or `desc`.
+    pub direction: Option<String>,
+    /// Roll up multi-leg orders under the parent order's `legs` field.
+    pub nested: bool,
+    /// Optional symbol filter.
+    pub symbols: Vec<String>,
+    /// Optional side filter.
+    pub side: Option<String>,
+    /// Optional asset class filter.
+    pub asset_class: Vec<String>,
+    /// Return orders submitted before this order ID.
+    pub before_order_id: Option<String>,
+    /// Return orders submitted after this order ID.
+    pub after_order_id: Option<String>,
+}
+
+impl Default for ListOrdersRequest {
+    fn default() -> Self {
+        Self {
+            status: "open".to_string(),
+            limit: 50,
+            after: None,
+            until: None,
+            direction: None,
+            nested: false,
+            symbols: Vec::new(),
+            side: None,
+            asset_class: Vec::new(),
+            before_order_id: None,
+            after_order_id: None,
+        }
+    }
+}
+
+impl ListOrdersRequest {
+    /// Creates a request for open orders with multi-leg orders nested.
+    #[must_use]
+    pub fn open_nested() -> Self {
+        Self {
+            nested: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn query_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = Vec::new();
+        if !self.status.is_empty() {
+            pairs.push(("status", self.status.clone()));
+        }
+        pairs.push(("limit", self.limit.to_string()));
+        if let Some(value) = &self.after {
+            pairs.push(("after", value.clone()));
+        }
+        if let Some(value) = &self.until {
+            pairs.push(("until", value.clone()));
+        }
+        if let Some(value) = &self.direction {
+            pairs.push(("direction", value.clone()));
+        }
+        if self.nested {
+            pairs.push(("nested", "true".to_string()));
+        }
+        if !self.symbols.is_empty() {
+            pairs.push(("symbols", self.symbols.join(",")));
+        }
+        if let Some(value) = &self.side {
+            pairs.push(("side", value.clone()));
+        }
+        if !self.asset_class.is_empty() {
+            pairs.push(("asset_class", self.asset_class.join(",")));
+        }
+        if let Some(value) = &self.before_order_id {
+            pairs.push(("before_order_id", value.clone()));
+        }
+        if let Some(value) = &self.after_order_id {
+            pairs.push(("after_order_id", value.clone()));
+        }
+        pairs
+    }
+}
+
+/// Alpaca account model.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AlpacaAccount {
+    /// Alpaca account ID.
+    pub id: Option<String>,
+    /// Alpaca account number.
+    pub account_number: Option<String>,
+    /// Account status.
+    pub status: Option<String>,
+    /// Account currency.
+    pub currency: Option<String>,
+    /// Cash balance.
+    pub cash: Option<String>,
+    /// Portfolio value.
+    pub portfolio_value: Option<String>,
+    /// Equity value.
+    pub equity: Option<String>,
+    /// Buying power.
+    pub buying_power: Option<String>,
+    /// Regulation T buying power.
+    pub regt_buying_power: Option<String>,
+    /// Day-trading buying power.
+    pub daytrading_buying_power: Option<String>,
+    /// Options buying power.
+    pub options_buying_power: Option<String>,
+    /// Pattern day trader flag.
+    pub pattern_day_trader: Option<bool>,
+    /// Trading blocked flag.
+    pub trading_blocked: Option<bool>,
+    /// Transfer blocked flag.
+    pub transfers_blocked: Option<bool>,
+    /// Account blocked flag.
+    pub account_blocked: Option<bool>,
+    /// User-suspended trading flag.
+    pub trade_suspended_by_user: Option<bool>,
+    /// Account multiplier.
+    pub multiplier: Option<String>,
+}
+
+/// Alpaca open position model.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AlpacaPosition {
+    /// Alpaca asset ID.
+    pub asset_id: Option<String>,
+    /// Asset symbol.
+    pub symbol: Option<String>,
+    /// Exchange.
+    pub exchange: Option<String>,
+    /// Asset class.
+    pub asset_class: Option<String>,
+    /// Position quantity.
+    pub qty: Option<String>,
+    /// Position side.
+    pub side: Option<String>,
+    /// Market value.
+    pub market_value: Option<String>,
+    /// Cost basis.
+    pub cost_basis: Option<String>,
+    /// Current price.
+    pub current_price: Option<String>,
+    /// Unrealized profit/loss.
+    pub unrealized_pl: Option<String>,
+    /// Unrealized profit/loss percentage.
+    pub unrealized_plpc: Option<String>,
+    /// Average entry price.
+    pub avg_entry_price: Option<String>,
+}
+
+/// Alpaca order model.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AlpacaOrder {
+    /// Alpaca order ID.
+    pub id: Option<String>,
+    /// Client order ID.
+    pub client_order_id: Option<String>,
+    /// Created timestamp.
+    pub created_at: Option<String>,
+    /// Updated timestamp.
+    pub updated_at: Option<String>,
+    /// Submitted timestamp.
+    pub submitted_at: Option<String>,
+    /// Filled timestamp.
+    pub filled_at: Option<String>,
+    /// Expired timestamp.
+    pub expired_at: Option<String>,
+    /// Canceled timestamp.
+    pub canceled_at: Option<String>,
+    /// Failed timestamp.
+    pub failed_at: Option<String>,
+    /// Asset ID.
+    pub asset_id: Option<String>,
+    /// Asset symbol.
+    pub symbol: Option<String>,
+    /// Asset class.
+    pub asset_class: Option<String>,
+    /// Ordered quantity.
+    pub qty: Option<String>,
+    /// Filled quantity.
+    pub filled_qty: Option<String>,
+    /// Order type.
+    #[serde(rename = "type")]
+    pub order_type: Option<String>,
+    /// Order side.
+    pub side: Option<String>,
+    /// Time in force.
+    pub time_in_force: Option<String>,
+    /// Limit price.
+    pub limit_price: Option<String>,
+    /// Order status.
+    pub status: Option<String>,
+    /// Advanced order class.
+    pub order_class: Option<String>,
+    /// Nested child orders or multi-leg order legs.
+    #[serde(default)]
+    pub legs: Option<Vec<AlpacaOrder>>,
+}
+
 /// Response from Alpaca's option snapshots endpoint.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OptionSnapshotsResponse {

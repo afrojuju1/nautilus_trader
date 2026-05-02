@@ -42,6 +42,9 @@ The contract provider can also convert Alpaca option contract payloads into Naut
 `OptionContract` instruments on venue `ALPACA`.
 An initial dry-run scanner (`alpaca-dry-run-put-credit`) screens active 5-10 DTE put credit spreads
 without submitting orders.
+The next runtime slice adds account, position, and open-order polling through Alpaca Trading REST
+plus a non-submitting multi-leg order payload builder/validator for paper put credit spread
+payloads.
 
 ## Alpaca API Mapping
 
@@ -57,11 +60,11 @@ Market data:
 
 Execution:
 
-- Account and positions: poll account, positions, orders, and activities for startup
-  reconciliation and periodic repair.
+- Account and positions: poll account, positions, and orders for startup reconciliation and
+  periodic repair. (Initial account/position/order polling complete; activities remain.)
 - Trade updates: consume the account trade update stream for order state changes.
-- Multi-leg orders: submit spread orders using Alpaca `order_class="mleg"` payloads with signed
-  net limit prices.
+- Multi-leg orders: build and validate Alpaca `order_class="mleg"` payloads with signed net limit
+  prices. (Initial non-submitting payload builder complete; submission remains disabled.)
 - Reconciliation: activity polling must cover fills, corrections, assignments, exercises, and
   expirations that may not be fully represented by order events.
 
@@ -85,8 +88,10 @@ Phase 1:
 - Implement contract provider for equity option instruments. (Initial Alpaca contract model and
   Nautilus `OptionContract` conversion complete.)
 - Implement latest option snapshot/quote request path. (Initial batched snapshot path complete.)
-- Implement account/position/order polling.
+- Implement account/position/order polling. (Initial REST polling complete.)
 - Implement paper multi-leg order submission.
+- Implement paper-only multi-leg payload validation. (Initial put credit spread payload builder
+  complete; no submit path is exposed.)
 - Add a dry-run strategy harness that emits candidate decisions without orders. (Initial standalone
   scanner complete; Nautilus `Strategy` wiring remains.)
 

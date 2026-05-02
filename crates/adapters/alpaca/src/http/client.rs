@@ -30,7 +30,8 @@ use crate::{
     http::{
         error::{Error, Result},
         models::{
-            ListOptionContractsRequest, OptionContractsResponse, OptionSnapshotsRequest,
+            AlpacaAccount, AlpacaOrder, AlpacaPosition, ListOptionContractsRequest,
+            ListOrdersRequest, OptionContractsResponse, OptionSnapshotsRequest,
             OptionSnapshotsResponse,
         },
     },
@@ -199,6 +200,34 @@ impl AlpacaHttpClient {
             next_page_token: None,
             page_token: None,
         })
+    }
+
+    /// Returns the current Alpaca trading account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be decoded.
+    pub async fn account(&self) -> Result<AlpacaAccount> {
+        self.get_trading_json("/v2/account", &[]).await
+    }
+
+    /// Lists open positions for the current Alpaca trading account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be decoded.
+    pub async fn positions(&self) -> Result<Vec<AlpacaPosition>> {
+        self.get_trading_json("/v2/positions", &[]).await
+    }
+
+    /// Lists orders for the current Alpaca trading account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be decoded.
+    pub async fn orders(&self, request: &ListOrdersRequest) -> Result<Vec<AlpacaOrder>> {
+        self.get_trading_json("/v2/orders", &request.query_pairs())
+            .await
     }
 
     async fn get_trading_json<T>(
