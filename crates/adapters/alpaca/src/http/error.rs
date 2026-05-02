@@ -45,6 +45,9 @@ pub enum Error {
     /// A response body could not be decoded.
     #[error("failed to decode Alpaca response: {0}")]
     Decode(#[from] serde_json::Error),
+    /// A venue payload could not be converted into a Nautilus model.
+    #[error("failed to parse Alpaca payload: {0}")]
+    Parse(String),
     /// A URL could not be constructed.
     #[error("invalid Alpaca URL: {0}")]
     Url(#[from] url::ParseError),

@@ -38,6 +38,8 @@ The first implementation slices add authenticated REST access, an option-contrac
 `/v1beta1/options/snapshots`. Credentials are resolved from explicit config values first, then
 from `APCA_API_KEY_ID`/`APCA_API_SECRET_KEY`, then from the existing deployment aliases
 `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`.
+The contract provider can also convert Alpaca option contract payloads into Nautilus
+`OptionContract` instruments on venue `ALPACA`.
 
 ## Alpaca API Mapping
 
@@ -78,8 +80,8 @@ the adapter submits Alpaca symbols.
 Phase 1:
 
 - Implement authenticated REST client. (Initial option-contract path complete.)
-- Implement contract provider for equity option instruments. (Initial Alpaca contract model
-  complete; Nautilus `OptionContract` conversion remains.)
+- Implement contract provider for equity option instruments. (Initial Alpaca contract model and
+  Nautilus `OptionContract` conversion complete.)
 - Implement latest option snapshot/quote request path. (Initial batched snapshot path complete.)
 - Implement account/position/order polling.
 - Implement paper multi-leg order submission.

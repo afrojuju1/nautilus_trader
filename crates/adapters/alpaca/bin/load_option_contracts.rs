@@ -47,17 +47,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider = AlpacaOptionContractProvider::new(client);
 
     for underlying in underlyings {
-        let puts = provider
-            .load_active_contracts(
+        let instruments = provider
+            .load_active_instruments(
                 underlying.clone(),
                 min_expiration.clone(),
                 max_expiration.clone(),
                 Some(AlpacaOptionType::Put),
             )
             .await?;
+        let first = instruments
+            .first()
+            .map(|instrument| instrument.id.to_string())
+            .unwrap_or_else(|| "none".to_string());
         println!(
-            "{underlying}: {} active put contracts expiring {min_expiration}..{max_expiration}",
-            puts.len()
+            "{underlying}: {} active put instruments expiring {min_expiration}..{max_expiration}; first={first}",
+            instruments.len()
         );
     }
 

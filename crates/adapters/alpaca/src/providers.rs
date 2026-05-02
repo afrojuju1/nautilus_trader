@@ -15,10 +15,15 @@
 
 //! Alpaca instrument provider primitives.
 
-use crate::http::{
-    client::AlpacaHttpClient,
-    error::Result,
-    models::{AlpacaOptionContract, AlpacaOptionType, ListOptionContractsRequest},
+use nautilus_model::instruments::OptionContract;
+
+use crate::{
+    http::{
+        client::AlpacaHttpClient,
+        error::Result,
+        models::{AlpacaOptionContract, AlpacaOptionType, ListOptionContractsRequest},
+    },
+    parse::parse_option_contract,
 };
 
 /// Loads Alpaca option contracts from the Trading API.
@@ -56,5 +61,30 @@ impl AlpacaOptionContractProvider {
             .list_option_contracts(&request)
             .await?
             .option_contracts)
+    }
+
+    /// Loads active option contracts and converts them to Nautilus instruments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Alpaca rejects the request, the response cannot be decoded, or a
+    /// contract cannot be converted into a Nautilus [`OptionContract`].
+    pub async fn load_active_instruments(
+        &self,
+        underlying_symbol: impl Into<String>,
+        min_expiration: impl Into<String>,
+        max_expiration: impl Into<String>,
+        option_type: Option<AlpacaOptionType>,
+    ) -> Result<Vec<OptionContract>> {
+        self.load_active_contracts(
+            underlying_symbol,
+            min_expiration,
+            max_expiration,
+            option_type,
+        )
+        .await?
+        .iter()
+        .map(parse_option_contract)
+        .collect()
     }
 }
