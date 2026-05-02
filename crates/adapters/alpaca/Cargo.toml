@@ -55,3 +55,10 @@ path = "bin/load_option_snapshots.rs"
 required-features = ["live"]
 doc = false
 test = false
+
+[[bin]]
+name = "alpaca-dry-run-put-credit"
+path = "bin/dry_run_put_credit.rs"
+required-features = ["live"]
+doc = false
+test = false

@@ -40,6 +40,8 @@ from `APCA_API_KEY_ID`/`APCA_API_SECRET_KEY`, then from the existing deployment 
 `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`.
 The contract provider can also convert Alpaca option contract payloads into Nautilus
 `OptionContract` instruments on venue `ALPACA`.
+An initial dry-run scanner (`alpaca-dry-run-put-credit`) screens active 5-10 DTE put credit spreads
+without submitting orders.
 
 ## Alpaca API Mapping
 
@@ -85,7 +87,8 @@ Phase 1:
 - Implement latest option snapshot/quote request path. (Initial batched snapshot path complete.)
 - Implement account/position/order polling.
 - Implement paper multi-leg order submission.
-- Add a dry-run strategy harness that emits candidate decisions without orders.
+- Add a dry-run strategy harness that emits candidate decisions without orders. (Initial standalone
+  scanner complete; Nautilus `Strategy` wiring remains.)
 
 Phase 2:
 
