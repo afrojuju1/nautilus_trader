@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use reqwest::{
     StatusCode, Url,
-    header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT},
+    header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT},
 };
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use url::form_urlencoded;
 
 use crate::{
@@ -35,6 +35,7 @@ use crate::{
             OptionSnapshotsResponse,
         },
     },
+    orders::MlegOrderPayload,
 };
 
 const APCA_API_KEY_HEADER: &str = "APCA-API-KEY-ID";
@@ -230,6 +231,32 @@ impl AlpacaHttpClient {
             .await
     }
 
+    /// Submits a validated Alpaca multi-leg order payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload fails local validation, the request fails, or the response
+    /// cannot be decoded.
+    pub async fn submit_mleg_order(&self, payload: &MlegOrderPayload) -> Result<AlpacaOrder> {
+        payload.validate()?;
+        self.post_trading_json("/v2/orders", &[], payload).await
+    }
+
+    /// Attempts to cancel an open Alpaca order by broker order ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the order ID is empty, the cancel request fails, or Alpaca rejects the
+    /// cancel request.
+    pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        if order_id.trim().is_empty() {
+            return Err(Error::Validation("order_id must not be empty".to_string()));
+        }
+
+        let path = format!("/v2/orders/{order_id}");
+        self.delete_trading(&path).await
+    }
+
     async fn get_trading_json<T>(
         &self,
         path: &str,
@@ -240,6 +267,26 @@ impl AlpacaHttpClient {
     {
         self.get_json(&self.trading_base_url, path, query_pairs)
             .await
+    }
+
+    async fn post_trading_json<T, B>(
+        &self,
+        path: &str,
+        query_pairs: &[(&'static str, String)],
+        body: &B,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        self.post_json(&self.trading_base_url, path, query_pairs, body)
+            .await
+    }
+
+    async fn delete_trading(&self, path: &str) -> Result<()> {
+        let url = build_url(&self.trading_base_url, path, &[])?;
+        let response = self.client.delete(url.clone()).send().await?;
+        decode_empty_response(response.status(), url, response.text().await?).await
     }
 
     async fn get_data_json<T>(
@@ -271,11 +318,28 @@ impl AlpacaHttpClient {
         let response = self.client.get(url.clone()).send().await?;
         decode_response(response.status(), url, response.text().await?).await
     }
+
+    async fn post_json<T, B>(
+        &self,
+        base_url: &str,
+        path: &str,
+        query_pairs: &[(&'static str, String)],
+        body: &B,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let url = build_url(base_url, path, query_pairs)?;
+        let response = self.client.post(url.clone()).json(body).send().await?;
+        decode_response(response.status(), url, response.text().await?).await
+    }
 }
 
 fn default_headers(credential: &AlpacaCredential) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(
         USER_AGENT,
         HeaderValue::from_static(NAUTILUS_ALPACA_USER_AGENT),
@@ -324,4 +388,16 @@ where
     }
 
     Ok(serde_json::from_str(&body)?)
+}
+
+async fn decode_empty_response(status: StatusCode, url: Url, body: String) -> Result<()> {
+    if !status.is_success() {
+        return Err(Error::HttpStatus {
+            status: status.as_u16(),
+            url: url.to_string(),
+            body,
+        });
+    }
+
+    Ok(())
 }

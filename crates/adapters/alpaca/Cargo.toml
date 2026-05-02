@@ -76,3 +76,10 @@ path = "bin/validate_mleg_order.rs"
 required-features = ["live"]
 doc = false
 test = false
+
+[[bin]]
+name = "alpaca-submit-mleg-order"
+path = "bin/submit_mleg_order.rs"
+required-features = ["live"]
+doc = false
+test = false
