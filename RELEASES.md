@@ -4,6 +4,7 @@ Released on TBD (UTC).
 
 ### Enhancements
 - Added continuous futures support for aggregated bars (#3921), thanks @faysou
+- Added `purge_instrument` cache method for trimming unused instruments (#3945), thanks for reporting @fedoraiver
 - Added `LoggerConfig.file_config` and `clear_log_file` support to the Rust `LiveNode` runtime (#3955), thanks @filipmacek
 - Added `LoggerConfig` Python constructor for direct construction without `from_spec` (#3955), thanks @filipmacek
 - Added Interactive Brokers PyO3 live client config support in `TradingNodeConfig` (#3964), thanks @faysou
@@ -19,7 +20,11 @@ Released on TBD (UTC).
 ### Security
 
 ### Fixes
+- Fixed `MessageBus` late wildcard subscriptions missing events on already-cached topics (#3942), thanks for reporting @graceyangfan
+- Fixed `OrderMatchingEngine` to propagate tick-size to `MatchingCore` (#3942), thanks for reporting @graceyangfan
 - Fixed `Strategy`/`Actor` clock callback leak on dispose (#3967), thanks for reporting @frslvr
+- Fixed `ExecTester` LIT pricing direction so reconciled BUY/SELL LIT orders satisfy the `trigger_price` invariant
+- Fixed v2 wrangler timestamp resolution to force nanoseconds before the int64 cast for pandas 3 compatibility (#3970), thanks @gzenz
 - Fixed Kraken symbol normalization for WS v2 compatibility (#3961), thanks @mcgrj
 - Fixed OKX missing `post_only` instrument status (#3966), thanks @jhavie
 - Fixed `OrderAny::from_events` panic on malformed `OrderInitialized`; reconciliation returns `Err` instead of crashing
@@ -31,21 +36,29 @@ Released on TBD (UTC).
 - Fixed dYdX reconciliation noise by dropping reports for orders already in a terminal state in the local cache
 - Fixed dYdX Python `_request_instrument(s)` to pass the full `_handle_data_response` argument set
 - Fixed dYdX Python `_subscribe_order_book_depth` to log a graceful warning instead of raising `NotImplementedError`
-- Fixed `ExecTester` LIT pricing direction so reconciled BUY/SELL LIT orders satisfy the `trigger_price` invariant
+- Fixed Hyperliquid spurious `OrderCanceled` on concurrent modifies (Python and Rust) (#3971), thanks @M-Advis
 
 ### Internal Improvements
+- Added `OrderMatchingCore::update_price_increment` primitive for tick-size propagation parity (Rust)
 - Added `ContinuousFutureAdjustmentType` enum and `BarBuilder` price adjustment pipeline (Rust)
 - Added native `is_externally_aggregated`/`is_internally_aggregated` methods on `BarType` (Rust)
+- Added live node stress harness with `trade_burst` and `cancel_starvation` scenarios (Rust)
+- Added `DataEngine` and `AsyncRunner` per-stage benches for the trade-to-cache path (Rust)
+- Added Python `TradingNode` parity stress harness for v1 vs v2 comparison
+- Added `cargo-flamegraph` to workspace tools with pinned version
+- Added `simulation` feature on `nautilus-live` so the stress harness runs under `cfg(madsim)` for DST validation
 - Refined data engine request workflow (#3928), thanks @faysou
 - Avoided object materialization in Rust stream Feather to parquet conversion (#3954), thanks @faysou
 - Improved Interactive Brokers Python 3.14 installation and integration test coverage
 - Improved live exec clients to log ERROR with `timeout_post_stop` hint when cancel tasks abort on disconnect
 - Improved `ExecTester` to refresh tracked orders from cache before modify/cancel-replace so they see venue acks
+- Improved live node biased select to dispatch exec commands ahead of market data
 - Upgraded `alloy` crate to v2.0.4
 - Upgraded `databento` crate to v0.49.0
 
 ### Documentation Updates
 - Added dYdX adapter notes for FOK deprecation, DAY rejection, equity-tier limit, and MIT/LIT round-tripping
+- Added DST docs caveats for process-global lazy state RNG consumption and `CacheView` factory blocker
 
 ### Deprecations
 
