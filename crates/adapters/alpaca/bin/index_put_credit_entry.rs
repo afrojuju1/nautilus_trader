@@ -63,6 +63,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use tokio::{
     sync::mpsc,
     time::{Instant, sleep, timeout},
@@ -219,6 +220,19 @@ async fn main() -> anyhow::Result<()> {
         config.quantity,
         config.state_path.display(),
     );
+    emit_operator_event(
+        "runner_start",
+        json!({
+            "underlyings": &config.underlyings,
+            "strategies": config.spread_kinds.iter().map(|kind| strategy_name(*kind)).collect::<Vec<_>>(),
+            "submit_enabled": config.submit_enabled,
+            "manage_enabled": config.manage_enabled,
+            "close_enabled": config.close_enabled,
+            "kill_switch": config.kill_switch,
+            "quantity": config.quantity,
+            "state_path": config.state_path.display().to_string(),
+        }),
+    );
 
     let mut data_config = AlpacaDataClientConfig::default();
     data_config.trading_base_url = env::var("ALPACA_TRADING_BASE_URL").ok();
@@ -229,6 +243,13 @@ async fn main() -> anyhow::Result<()> {
     loop {
         let trade_date = market_trade_date(&config);
         println!("strategy_iteration={iteration} trade_date={trade_date}");
+        emit_operator_event(
+            "strategy_iteration",
+            json!({
+                "iteration": iteration,
+                "trade_date": trade_date,
+            }),
+        );
 
         if manage_existing_entries(&http_client, &data_config, &config, &mut state).await? {
             save_state(&config.state_path, &state)?;
@@ -236,10 +257,29 @@ async fn main() -> anyhow::Result<()> {
 
         if config.kill_switch {
             println!("decision: skipped reason=kill_switch_enabled");
+            emit_operator_event(
+                "decision",
+                json!({
+                    "action": "skipped",
+                    "reason": "kill_switch_enabled",
+                    "trade_date": trade_date,
+                }),
+            );
         } else if !config.ignore_entry_window && !inside_entry_window(&config) {
             println!(
                 "decision: skipped reason=outside_entry_window window={}-{} timezone={}",
                 config.entry_start, config.entry_end, config.entry_timezone
+            );
+            emit_operator_event(
+                "decision",
+                json!({
+                    "action": "skipped",
+                    "reason": "outside_entry_window",
+                    "window_start": config.entry_start.to_string(),
+                    "window_end": config.entry_end.to_string(),
+                    "timezone": config.entry_timezone.to_string(),
+                    "trade_date": trade_date,
+                }),
             );
         } else {
             let selected =
@@ -257,6 +297,21 @@ async fn main() -> anyhow::Result<()> {
                         entry.candidate.score,
                         order_list_id,
                     );
+                    emit_operator_event(
+                        "decision",
+                        json!({
+                            "action": "submit",
+                            "underlying": &entry.underlying,
+                            "strategy": strategy_name(entry.kind),
+                            "short_symbol": &entry.candidate.short.symbol,
+                            "long_symbol": &entry.candidate.long.symbol,
+                            "credit": entry.candidate.credit,
+                            "return_on_risk": entry.candidate.return_on_risk,
+                            "score": entry.candidate.score,
+                            "order_list_id": &order_list_id,
+                            "trade_date": trade_date,
+                        }),
+                    );
                     let outcome =
                         submit_entry(&entry, &order_list_id, config.quantity, &config).await?;
                     if outcome.accepted > 0 {
@@ -267,13 +322,21 @@ async fn main() -> anyhow::Result<()> {
                             config.quantity,
                             order_list_id,
                             &entry.candidate,
-                            outcome.parent_order_id,
+                            outcome.parent_order_id.clone(),
                         );
                         save_state(&config.state_path, &state)?;
                     }
                     println!(
                         "submit_result: accepted={} rejected={}",
                         outcome.accepted, outcome.rejected
+                    );
+                    emit_operator_event(
+                        "submit_result",
+                        json!({
+                            "accepted": outcome.accepted,
+                            "rejected": outcome.rejected,
+                            "parent_order_id": outcome.parent_order_id,
+                        }),
                     );
                 }
                 Some(entry) => {
@@ -286,8 +349,32 @@ async fn main() -> anyhow::Result<()> {
                         entry.candidate.return_on_risk * 100.0,
                         entry.candidate.score,
                     );
+                    emit_operator_event(
+                        "decision",
+                        json!({
+                            "action": "dry_run",
+                            "reason": "submission_disabled",
+                            "underlying": &entry.underlying,
+                            "strategy": strategy_name(entry.kind),
+                            "short_symbol": &entry.candidate.short.symbol,
+                            "long_symbol": &entry.candidate.long.symbol,
+                            "credit": entry.candidate.credit,
+                            "return_on_risk": entry.candidate.return_on_risk,
+                            "score": entry.candidate.score,
+                            "trade_date": trade_date,
+                        }),
+                    );
                 }
-                None => println!("decision: no_entry"),
+                None => {
+                    println!("decision: no_entry");
+                    emit_operator_event(
+                        "decision",
+                        json!({
+                            "action": "no_entry",
+                            "trade_date": trade_date,
+                        }),
+                    );
+                }
             }
         }
 
@@ -961,6 +1048,18 @@ fn save_state(path: &Path, state: &StrategyState) -> anyhow::Result<()> {
     }
     fs::write(path, serde_json::to_string_pretty(state)?)?;
     Ok(())
+}
+
+fn emit_operator_event(event_type: &str, payload: Value) {
+    let mut event = Map::new();
+    event.insert("ts_utc".to_string(), Value::String(Utc::now().to_rfc3339()));
+    event.insert("type".to_string(), Value::String(event_type.to_string()));
+    if let Value::Object(fields) = payload {
+        event.extend(fields);
+    }
+    if let Ok(line) = serde_json::to_string(&Value::Object(event)) {
+        println!("operator_event={line}");
+    }
 }
 
 impl RunnerConfig {

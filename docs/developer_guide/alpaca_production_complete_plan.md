@@ -238,10 +238,20 @@ Goal: operate the engine without reading raw logs as the primary interface.
 Work:
 
 - Add CLI/status output for account, orders, positions, strategy state, last scan, last decision, and
-  last broker event.
+  last broker event. (Initial `alpaca-operator-status` binary complete with human and JSON output.)
 - Add alerts for rejected orders, websocket disconnect, stale working orders, unmanaged positions,
-  reconciliation mismatches, kill-switch activation, and service restart.
-- Add structured event logs for strategy decisions and broker state transitions.
+  reconciliation mismatches, kill-switch activation, and service restart. (Initial alert summary is
+  implemented in `alpaca-operator-status`; websocket disconnect alerts consume structured disconnect
+  events when the live engine emits them.)
+- Add structured event logs for strategy decisions and broker state transitions. (Runner emits
+  structured `operator_event=` JSON for start, iteration, decision, and submit result events.)
+
+Current status:
+
+- `alpaca-index-credit-control.sh operator` reports service, account, orders, positions, strategy
+  state, last scan, last decision, latest broker event, and alerts from one command.
+- On 2026-05-02, operator status was verified on `ade-nucbox-k8-plus` with the user service active,
+  kill-switch enabled, submission disabled, zero open orders, and zero positions.
 
 Exit criteria:
 

@@ -9,7 +9,8 @@ one runner can own the Alpaca account workflow.
 - `deploy/alpaca/alpaca-index-credit.env.example`: non-secret config template.
 - `deploy/alpaca/alpaca-index-credit-runner.sh`: `flock`-guarded runner wrapper.
 - `deploy/alpaca/alpaca-index-credit.service`: user systemd service.
-- `deploy/alpaca/alpaca-index-credit-control.sh`: status, health, start, stop, restart, logs.
+- `deploy/alpaca/alpaca-index-credit-control.sh`: operator status, health, start, stop, restart,
+  logs.
 - `deploy/alpaca/alpaca-index-credit.logrotate`: optional logrotate policy.
 
 ## Install
@@ -41,6 +42,8 @@ manual one-shot smoke test.
 systemctl --user start alpaca-index-credit.service
 systemctl --user stop alpaca-index-credit.service
 systemctl --user status alpaca-index-credit.service --no-pager
+deploy/alpaca/alpaca-index-credit-control.sh operator
+deploy/alpaca/alpaca-index-credit-control.sh operator --json
 deploy/alpaca/alpaca-index-credit-control.sh health
 deploy/alpaca/alpaca-index-credit-control.sh logs
 ```
@@ -74,6 +77,20 @@ the service exits without starting another Alpaca account owner.
 Paper/live endpoint selection is controlled by `ALPACA_TRADING_BASE_URL` and
 `ALPACA_TRADE_UPDATES_WS_URL`. Keep paper URLs in place until the rollout plan explicitly moves to a
 tiny live canary.
+
+## Operator Status
+
+`alpaca-index-credit-control.sh operator` runs the `alpaca-operator-status` binary from the repo and
+summarizes service state, account status, open orders, positions, strategy state, the last structured
+scan/decision event, the latest broker event, and operator alerts. Use `--json` for machine-readable
+output.
+
+The command reports one engine state:
+
+- `idle`: service/account are healthy with no open broker exposure.
+- `trading`: open orders or positions exist and no critical alert is active.
+- `blocked`: the engine is intentionally blocked by kill-switch or disabled submission.
+- `broken`: account, service, state, or exposure checks need operator intervention.
 
 ## Log Rotation
 

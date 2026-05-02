@@ -3,10 +3,11 @@ set -euo pipefail
 
 SERVICE="${NAUTILUS_ALPACA_SERVICE:-alpaca-index-credit.service}"
 ENV_FILE="${NAUTILUS_ALPACA_ENV_FILE:-$HOME/.config/nautilus-trader/alpaca/index-credit.env}"
+PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 
 usage() {
   cat <<EOF
-usage: $(basename "$0") <status|health|start|stop|restart|logs>
+usage: $(basename "$0") <status|operator|health|start|stop|restart|logs>
 
 Controls the user systemd service: $SERVICE
 EOF
@@ -19,9 +20,23 @@ require_env_file() {
   fi
 }
 
+run_operator_status() {
+  require_env_file
+  # shellcheck disable=SC1090
+  set -a; . "$ENV_FILE"; set +a
+  repo="${NAUTILUS_ALPACA_REPO:-$HOME/Projects/nautilus_trader}"
+  cd "$repo"
+  cargo run -p nautilus-alpaca --features live --bin alpaca-operator-status -- "$@"
+}
+
 case "${1:-}" in
   status)
-    systemctl --user status "$SERVICE" --no-pager
+    systemctl --user status "$SERVICE" --no-pager || true
+    run_operator_status || true
+    ;;
+  operator)
+    shift
+    run_operator_status "$@"
     ;;
   health)
     require_env_file
@@ -37,6 +52,9 @@ case "${1:-}" in
       echo "health=degraded reason=missing_lock service=$SERVICE lock_file=$lock_file"
       exit 1
     fi
+    repo="${NAUTILUS_ALPACA_REPO:-$HOME/Projects/nautilus_trader}"
+    cd "$repo"
+    cargo run -p nautilus-alpaca --features live --bin alpaca-operator-status -- --json >/dev/null
     echo "health=up service=$SERVICE lock_file=$lock_file log_file=$log_file"
     ;;
   start)
