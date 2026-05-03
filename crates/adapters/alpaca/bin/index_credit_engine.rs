@@ -15,7 +15,33 @@
 
 //! Native Nautilus entrypoint for the Alpaca index-credit account engine.
 
+use std::env;
+
+use nautilus_alpaca::index_credit::IndexCreditConfig;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("usage: alpaca-index-credit-engine [--check-config] [UNDERLYING[,UNDERLYING]...]");
+        return Ok(());
+    }
+    if args.iter().any(|arg| arg == "--check-config") {
+        let config = IndexCreditConfig::from_runtime_env()?;
+        println!(
+            "alpaca_index_credit_config: underlyings={} strategies={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} max_iterations={} interval_secs={} state_path={}",
+            config.underlyings.join(","),
+            config.enabled_strategy_names().join(","),
+            config.submit_enabled,
+            config.manage_enabled,
+            config.close_enabled,
+            config.kill_switch,
+            config.quantity,
+            config.max_iterations,
+            config.interval_secs,
+            config.state_path.display(),
+        );
+        return Ok(());
+    }
     nautilus_alpaca::index_credit_engine::run_index_credit_engine().await
 }

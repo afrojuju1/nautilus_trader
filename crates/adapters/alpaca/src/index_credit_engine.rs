@@ -540,9 +540,7 @@ async fn manage_existing_entries(
                     order.status.as_deref().unwrap_or("unknown"),
                 );
                 if order.status.as_deref() == Some("filled") {
-                    entry.closed = true;
-                    entry.close_parent_order_id = order.id;
-                    entry.closed_at_utc = Some(Utc::now().to_rfc3339());
+                    entry.mark_closed(order.id);
                     changed = true;
                 }
             }
@@ -570,7 +568,7 @@ async fn manage_existing_entries(
                 );
                 if config.manage_enabled {
                     cancel_parent_order_by_id(client, entry_order.id.as_deref()).await?;
-                    entry.canceled = true;
+                    entry.mark_canceled();
                     changed = true;
                 }
             }
@@ -581,7 +579,7 @@ async fn manage_existing_entries(
             entry_order.status.as_deref(),
             Some("canceled" | "expired" | "rejected")
         ) {
-            entry.canceled = true;
+            entry.mark_canceled();
             changed = true;
             println!(
                 "manage: entry_terminal order_list_id={} status={}",
@@ -618,9 +616,11 @@ async fn manage_existing_entries(
         let close_order_list_id = close_order_list_id(entry);
         let outcome = submit_close_entry(entry, &close_quote, &close_order_list_id, config).await?;
         if outcome.accepted > 0 {
-            entry.close_order_list_id = Some(close_order_list_id);
-            entry.close_parent_order_id = outcome.parent_order_id;
-            entry.close_reason = Some(close_reason);
+            entry.record_close_submission(
+                close_order_list_id,
+                outcome.parent_order_id,
+                close_reason,
+            );
             changed = true;
         }
     }

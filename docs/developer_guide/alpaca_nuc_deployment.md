@@ -35,6 +35,7 @@ for a manual one-shot smoke test override.
 ## Commands
 
 ```bash
+alpaca-index-credit-engine --check-config
 systemctl --user start alpaca-index-credit.service
 systemctl --user stop alpaca-index-credit.service
 systemctl --user status alpaca-index-credit.service --no-pager

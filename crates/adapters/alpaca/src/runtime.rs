@@ -197,6 +197,30 @@ impl StrategyStateEntry {
         }
         symbols
     }
+
+    /// Records a submitted close order for this entry.
+    pub fn record_close_submission(
+        &mut self,
+        close_order_list_id: String,
+        close_parent_order_id: Option<String>,
+        close_reason: String,
+    ) {
+        self.close_order_list_id = Some(close_order_list_id);
+        self.close_parent_order_id = close_parent_order_id;
+        self.close_reason = Some(close_reason);
+    }
+
+    /// Marks the entry closed.
+    pub fn mark_closed(&mut self, close_parent_order_id: Option<String>) {
+        self.closed = true;
+        self.close_parent_order_id = close_parent_order_id;
+        self.closed_at_utc = Some(Utc::now().to_rfc3339());
+    }
+
+    /// Marks the entry canceled or terminal without open exposure.
+    pub fn mark_canceled(&mut self) {
+        self.canceled = true;
+    }
 }
 
 /// Returns the strategy name for a credit-spread kind.
@@ -325,6 +349,93 @@ mod tests {
         assert!(loaded.entries[0].is_active());
         assert!(loaded.has_submitted_underlying("2026-05-02", "SPY"));
         assert!(!temp_state_path(&path).exists());
+    }
+
+    #[test]
+    fn iron_condor_state_lifecycle_tracks_four_legs_and_close() {
+        let mut state = StrategyState::default();
+        let candidate = iron_condor_candidate();
+        state.record_iron_condor_submission(
+            "2026-05-04".to_string(),
+            "SPY".to_string(),
+            1,
+            "open-list-1".to_string(),
+            &candidate,
+            Some("open-parent-1".to_string()),
+        );
+
+        assert!(state.has_submitted_underlying("2026-05-04", "SPY"));
+        let entry = state.entries.first_mut().unwrap();
+        assert!(entry.is_active());
+        assert!(entry.is_iron_condor());
+        assert_eq!(
+            entry.symbols(),
+            vec![
+                "SPY260508P00710000",
+                "SPY260508P00708000",
+                "SPY260508C00729000",
+                "SPY260508C00731000",
+            ],
+        );
+
+        entry.record_close_submission(
+            "close-list-1".to_string(),
+            Some("close-parent-1".to_string()),
+            "profit_target".to_string(),
+        );
+        assert!(entry.is_active());
+        assert_eq!(entry.close_order_list_id.as_deref(), Some("close-list-1"));
+        assert_eq!(entry.close_reason.as_deref(), Some("profit_target"));
+
+        entry.mark_closed(Some("close-parent-filled".to_string()));
+        assert!(!entry.is_active());
+        assert!(entry.closed);
+        assert_eq!(
+            entry.close_parent_order_id.as_deref(),
+            Some("close-parent-filled"),
+        );
+        assert!(entry.closed_at_utc.is_some());
+        assert!(!state.has_submitted_underlying("2026-05-04", "SPY"));
+    }
+
+    fn iron_condor_candidate() -> IronCondorCandidate {
+        IronCondorCandidate {
+            put: SpreadCandidate {
+                short: scored_contract("SPY260508P00710000", 710.0),
+                long: scored_contract("SPY260508P00708000", 708.0),
+                width: 2.0,
+                credit: 0.42,
+                max_loss: 1.58,
+                return_on_risk: 0.265,
+                score: 70.0,
+            },
+            call: SpreadCandidate {
+                short: scored_contract("SPY260508C00729000", 729.0),
+                long: scored_contract("SPY260508C00731000", 731.0),
+                width: 2.0,
+                credit: 0.39,
+                max_loss: 1.61,
+                return_on_risk: 0.242,
+                score: 68.0,
+            },
+            credit: 0.81,
+            max_loss: 1.19,
+            return_on_risk: 0.681,
+            score: 94.1,
+        }
+    }
+
+    fn scored_contract(symbol: &str, strike: f64) -> crate::strategy::ScoredContract {
+        crate::strategy::ScoredContract {
+            symbol: symbol.to_string(),
+            expiration_date: "2026-05-08".to_string(),
+            strike,
+            bid: 1.0,
+            ask: 1.1,
+            delta_abs: 0.22,
+            spread_pct: 0.05,
+            implied_volatility: Some(0.2),
+        }
     }
 
     fn unique_suffix() -> u128 {

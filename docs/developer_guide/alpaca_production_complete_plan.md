@@ -140,6 +140,9 @@ strategy submission disabled by default outside intentional paper tests.
 Runner commands:
 
 ```bash
+# Validate TOML/env config without scanning or submitting.
+cargo run -p nautilus-alpaca --features live --bin alpaca-index-credit-engine -- --check-config
+
 # Dry-run scan, no order submission.
 ALPACA_IGNORE_ENTRY_WINDOW=true \
   cargo run -p nautilus-alpaca --features live --bin alpaca-index-credit-engine -- SPY,QQQ,IWM
