@@ -414,11 +414,11 @@ Phase 7 earnings input policy:
   default entry policy.
 - The `earnings` module parses and filters events by entry window without Alpaca credentials.
 - Do not infer earnings dates from broker option chains or snapshots.
-- Alpha Vantage is the first approved low-cost upstream source. `alpaca-earnings-sync` downloads
+- Alpha Vantage is the first approved low-cost upstream source. `earnings-sync` downloads
   `EARNINGS_CALENDAR`, caches the raw CSV for 23 hours by default, and writes normalized events to
   `$XDG_STATE_HOME/nautilus_trader/earnings/earnings_events.csv` or
   `$HOME/.local/state/nautilus_trader/earnings/earnings_events.csv`.
-- `alpaca-earnings-sync` also writes `earnings_events_approved.csv`, which applies the default
+- `earnings-sync` also writes `earnings_events_approved.csv`, which applies the default
   strategy-safe filter: known timing only, future/default-window reports only, weekday reports only,
   and common listed-equity symbol shape only. Full raw normalized output remains available for
   diagnostics and manual review.
@@ -431,6 +431,20 @@ Phase 7 blockers:
   and source-quality review of the Alpha Vantage feed before live use.
 - Iron condors should wait until 4-leg open/close is paper-proven with the account engine.
 - Straddles/strangles should wait until long-premium management and max-loss behavior are specified.
+
+Parked next steps for earnings debit:
+
+- Add earnings strategy config for approved CSV path, call/put debit enablement, entry window, max
+  candidates, sizing, and submit gate. Submission remains disabled by default.
+- Add dry-run earnings selection: read `earnings_events_approved.csv`, scan eligible call/put debit
+  candidates, require Alpaca option-chain and snapshot liquidity, and emit explicit strategy
+  decisions without broker submission.
+- Host earnings debit in the single Alpaca account engine as another `StrategyRuntime`; do not add
+  another account-owning service.
+- Define long-premium management rules before any non-smoke paper open: max debit at entry,
+  profit target, stop loss, time stop, expiration-risk handling, and manual flatten behavior.
+- Validate in order: market-hours dry-run, submit-with-cancel smoke, paper open with defined close
+  management, then multi-day soak.
 
 ## Phase 8: Rollout
 
