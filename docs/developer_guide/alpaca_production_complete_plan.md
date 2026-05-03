@@ -44,6 +44,12 @@ Known gaps:
 - The `alpaca-index-put-credit-entry` runner is intentionally transitional and now mixes runtime
   config, strategy loop, broker I/O, and submission in one large binary. Continue moving reusable
   broker orchestration code into `src/` modules before live canary.
+- The account engine does not yet expose a clean strategy-hosting abstraction. Additional
+  strategies should plug into one account engine rather than becoming separate account-owning
+  runners.
+- The Python/core `OrderList` single-instrument constraint still blocks a simple Python-native MLeg
+  strategy path. Keep the Rust `SubmitOrderList` MLeg path until a deliberate multi-instrument
+  order-list abstraction is designed.
 - Multi-day paper proof with real management closes is still outstanding.
 - Websocket disconnect/reconnect and reconciliation events are wired, but they still need paper
   observation during an actual reconnect or broker event-loss scenario.
@@ -323,6 +329,44 @@ Current status:
 - Remaining Phase 6.5 work: extract broker orchestration helpers from the runner binary and
   paper-observe websocket reconnect/reconciliation events.
 
+## Phase 6.6: Account Engine Abstraction
+
+Goal: close the live-engine gap by making the Alpaca runtime a single account engine that hosts
+strategies, not a one-off strategy runner.
+
+Work:
+
+- Split the remaining runner logic into library modules:
+  - `runtime/config.rs`: environment/config parsing and validation.
+  - `runtime/engine.rs`: account-engine loop, lifecycle, iteration cadence, shutdown behavior.
+  - `runtime/selection.rs`: scan, admission, and candidate selection.
+  - `runtime/broker.rs`: submit, cancel, lookup, and reconciliation helper orchestration.
+- Define an account context that owns broker connectivity, account snapshots, orders, positions,
+  strategy state, operator events, and account-level risk controls.
+- Define a strategy runtime trait or equivalent interface so strategies produce decisions against
+  the account context instead of directly owning broker I/O.
+- Port index credit into that strategy interface while preserving current behavior and environment
+  gates.
+- Keep Alpaca broker-native MLeg submission on the Rust `SubmitOrderList` path. Do not relax the
+  Python/core `OrderList` single-instrument assumption just to support Alpaca option spreads.
+- Represent strategy output as explicit decisions such as skip, submit open, submit close, cancel,
+  force flatten, or alert. Broker submission remains account-engine responsibility.
+- Add unit tests for strategy decisions and account-engine orchestration without shelling out to
+  binaries.
+- Keep the deployed service as one process for the active Alpaca account; new strategies are config
+  entries inside that process.
+
+Exit criteria:
+
+- `bin/index_put_credit_entry.rs` is a thin entrypoint over library account-engine code.
+- Index credit behavior is preserved through tests and dry-run/paper smoke commands.
+- Adding another strategy does not require another account-owning systemd service.
+- Strategy decisions can be tested without Alpaca credentials.
+- The MLeg model boundary remains explicit and no global core/Python `OrderList` behavior is
+  weakened.
+
+Status: not started.
+
 ## Phase 7: Strategy Migration
 
 Migration order:
@@ -361,6 +405,7 @@ Rollout order:
 Pre-rollout gates:
 
 - Phase 6.5 is complete.
+- Phase 6.6 is complete for the index-credit account engine.
 - Paper account starts clean: active account, zero unmanaged positions, zero open orders unless the
   test intentionally creates them.
 - Operator status reports `idle`, `blocked`, or `trading` accurately during the whole paper run and
@@ -379,6 +424,7 @@ Current status:
 
 ## Immediate Next Milestone
 
-Finish the remaining Phase 6.5 broker-orchestration extraction and paper-observe websocket
-reconnect/reconciliation events. After that, run the paper workflow during market hours: dry-run
-scan, submit-with-cancel smoke, paper open with real management close, and multi-day paper soak.
+Implement Phase 6.6 for index credit: extract the account-engine loop, broker orchestration, and
+selection logic into library modules with a strategy-hosting interface. After that, run the
+market-hours paper workflow: dry-run scan, submit-with-cancel smoke, paper open with real management
+close, and multi-day paper soak.
