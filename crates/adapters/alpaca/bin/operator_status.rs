@@ -24,6 +24,7 @@ use nautilus_alpaca::{
         client::AlpacaHttpClient,
         models::{AlpacaAccount, AlpacaActivity, AlpacaOrder, AlpacaPosition, ListOrdersRequest},
     },
+    index_credit::IndexCreditConfig,
     runtime::{StrategyState, load_strategy_state, read_operator_events},
 };
 use serde::Serialize;
@@ -141,7 +142,7 @@ enum AlertSeverity {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = OperatorConfig::from_env();
+    let config = OperatorConfig::from_env()?;
     let mut data_config = AlpacaDataClientConfig::default();
     data_config.trading_base_url = env::var("ALPACA_TRADING_BASE_URL").ok();
     data_config.data_base_url = env::var("ALPACA_DATA_BASE_URL").ok();
@@ -180,7 +181,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 impl OperatorConfig {
-    fn from_env() -> Self {
+    fn from_env() -> anyhow::Result<Self> {
+        let strategy_config = IndexCreditConfig::from_runtime_env()?;
         let state_home = env::var("XDG_STATE_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| home_dir().join(".local/state"));
@@ -192,23 +194,19 @@ impl OperatorConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| default_state_dir.join("locks"));
 
-        Self {
+        Ok(Self {
             service_name: env::var("NAUTILUS_ALPACA_SERVICE")
                 .unwrap_or_else(|_| "alpaca-index-credit.service".to_string()),
-            state_path: env::var("ALPACA_INDEX_PUT_CREDIT_STATE_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| {
-                    default_state_dir.join("alpaca_index_put_credit_entry_state.json")
-                }),
+            state_path: strategy_config.state_path,
             log_path: log_dir.join("alpaca-index-credit.log"),
             lock_path: lock_dir.join("alpaca-index-credit.lock"),
-            stale_order_secs: env_u64("ALPACA_INDEX_CREDIT_STALE_ENTRY_SECS", 900) as i64,
-            kill_switch: env_bool("ALPACA_INDEX_CREDIT_KILL_SWITCH", false),
-            submit_enabled: env_bool("ALPACA_INDEX_PUT_CREDIT_SUBMIT", false),
-            manage_enabled: env_bool("ALPACA_INDEX_CREDIT_MANAGE", false),
-            close_enabled: env_bool("ALPACA_INDEX_CREDIT_CLOSE", false),
+            stale_order_secs: strategy_config.stale_entry_secs as i64,
+            kill_switch: strategy_config.kill_switch,
+            submit_enabled: strategy_config.submit_enabled,
+            manage_enabled: strategy_config.manage_enabled,
+            close_enabled: strategy_config.close_enabled,
             json_output: env::args().any(|arg| arg == "--json"),
-        }
+        })
     }
 }
 
@@ -412,7 +410,7 @@ fn build_alerts(
         alerts.push(alert(
             AlertSeverity::Info,
             "kill_switch_active",
-            "new entries are blocked by ALPACA_INDEX_CREDIT_KILL_SWITCH=true".to_string(),
+            "new entries are blocked by ALPACA_KILL_SWITCH=true".to_string(),
         ));
     }
     if !config.submit_enabled {
@@ -731,13 +729,6 @@ fn alert(severity: AlertSeverity, code: &'static str, message: String) -> Operat
         code,
         message,
     }
-}
-
-fn env_bool(name: &str, default: bool) -> bool {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<bool>().ok())
-        .unwrap_or(default)
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {

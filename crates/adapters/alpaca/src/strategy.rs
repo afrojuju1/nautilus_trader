@@ -156,6 +156,27 @@ impl Default for DebitSpreadScannerConfig {
     }
 }
 
+/// Configuration for the iron-condor scanner.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IronCondorScannerConfig {
+    /// Vertical credit-spread scanner configuration for both wings.
+    pub credit: PutCreditScannerConfig,
+    /// Minimum total credit / max loss.
+    pub min_return_on_risk: f64,
+    /// Whether put and call wing widths must match.
+    pub require_equal_widths: bool,
+}
+
+impl Default for IronCondorScannerConfig {
+    fn default() -> Self {
+        Self {
+            credit: PutCreditScannerConfig::default(),
+            min_return_on_risk: 0.18,
+            require_equal_widths: true,
+        }
+    }
+}
+
 /// One scored option contract eligible for strategy candidate building.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScoredContract {
@@ -217,6 +238,23 @@ pub struct DebitSpreadCandidate {
     pub score: f64,
 }
 
+/// One four-leg iron-condor candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IronCondorCandidate {
+    /// Put credit wing.
+    pub put: SpreadCandidate,
+    /// Call credit wing.
+    pub call: SpreadCandidate,
+    /// Total net credit.
+    pub credit: f64,
+    /// Maximum possible loss.
+    pub max_loss: f64,
+    /// Credit / max loss.
+    pub return_on_risk: f64,
+    /// Scanner score.
+    pub score: f64,
+}
+
 /// Scan result for one underlying.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PutCreditScanResult {
@@ -245,6 +283,21 @@ pub struct DebitSpreadScanResult {
     pub scoreable_count: usize,
     /// Ranked debit-spread candidates.
     pub candidates: Vec<DebitSpreadCandidate>,
+}
+
+/// Scan result for one iron-condor underlying.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IronCondorScanResult {
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Number of contracts loaded across put and call scans.
+    pub contract_count: usize,
+    /// Number of snapshots loaded across put and call scans.
+    pub snapshot_count: usize,
+    /// Number of scoreable contracts across put and call scans.
+    pub scoreable_count: usize,
+    /// Ranked iron-condor candidates.
+    pub candidates: Vec<IronCondorCandidate>,
 }
 
 /// Loads chain data and ranks put credit spread candidates for one underlying.
@@ -329,6 +382,32 @@ pub async fn scan_put_debit_underlying(
         DebitSpreadKind::Put,
     )
     .await
+}
+
+/// Loads chain data and ranks four-leg iron-condor candidates for one underlying.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_iron_condor_underlying(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &IronCondorScannerConfig,
+    underlying: impl Into<String>,
+) -> Result<IronCondorScanResult> {
+    let underlying = underlying.into();
+    let put =
+        scan_put_credit_underlying(client, data_config, &config.credit, underlying.clone()).await?;
+    let call = scan_call_credit_underlying(client, data_config, &config.credit, underlying.clone())
+        .await?;
+    let candidates = build_iron_condor_candidates(&put.candidates, &call.candidates, config);
+    Ok(IronCondorScanResult {
+        underlying,
+        contract_count: put.contract_count + call.contract_count,
+        snapshot_count: put.snapshot_count + call.snapshot_count,
+        scoreable_count: put.scoreable_count + call.scoreable_count,
+        candidates,
+    })
 }
 
 /// Loads chain data and ranks vertical credit spread candidates for one underlying.
@@ -677,6 +756,62 @@ pub fn build_debit_candidates_for_kind(
     candidates
 }
 
+/// Builds and ranks four-leg iron-condor candidates from put and call credit candidates.
+#[must_use]
+pub fn build_iron_condor_candidates(
+    put_candidates: &[SpreadCandidate],
+    call_candidates: &[SpreadCandidate],
+    config: &IronCondorScannerConfig,
+) -> Vec<IronCondorCandidate> {
+    let mut candidates = Vec::new();
+    for put in put_candidates {
+        for call in call_candidates {
+            if put.short.expiration_date != call.short.expiration_date {
+                continue;
+            }
+            if put.short.strike >= call.short.strike {
+                continue;
+            }
+            if config.require_equal_widths && strike_key(put.width) != strike_key(call.width) {
+                continue;
+            }
+
+            let credit = put.credit + call.credit;
+            let max_width = put.width.max(call.width);
+            let max_loss = max_width - credit;
+            if max_loss <= 0.0 {
+                continue;
+            }
+            let return_on_risk = credit / max_loss;
+            if return_on_risk < config.min_return_on_risk {
+                continue;
+            }
+
+            let wing_balance_penalty = ((put.credit - call.credit).abs() / credit).min(1.0);
+            let score = (put.score + call.score) / 2.0
+                + (return_on_risk / config.min_return_on_risk).min(2.0) * 15.0
+                - wing_balance_penalty * 10.0;
+
+            candidates.push(IronCondorCandidate {
+                put: put.clone(),
+                call: call.clone(),
+                credit,
+                max_loss,
+                return_on_risk,
+                score,
+            });
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates
+}
+
 fn strike_key(strike: f64) -> i64 {
     (strike * 1_000.0).round() as i64
 }
@@ -764,6 +899,46 @@ mod tests {
         assert_eq!(candidates[0].long.symbol, "SPY-P-708");
         assert_eq!(candidates[0].short.symbol, "SPY-P-705");
         assert!((candidates[0].debit - 0.60).abs() < 0.01);
+    }
+
+    #[test]
+    fn iron_condor_candidates_combine_put_and_call_credit_wings() {
+        let credit_config = PutCreditScannerConfig {
+            widths: vec![3.0],
+            min_return_on_risk: 0.01,
+            ..Default::default()
+        };
+        let config = IronCondorScannerConfig {
+            credit: credit_config.clone(),
+            min_return_on_risk: 0.01,
+            require_equal_widths: true,
+        };
+        let puts = build_candidates_for_kind(
+            &[
+                scored("SPY-P-705", 705.0, 2.00, 2.05),
+                scored("SPY-P-708", 708.0, 2.50, 2.60),
+            ],
+            &credit_config,
+            CreditSpreadKind::Put,
+        );
+        let calls = build_candidates_for_kind(
+            &[
+                scored("SPY-C-710", 710.0, 2.50, 2.60),
+                scored("SPY-C-713", 713.0, 2.00, 2.05),
+            ],
+            &credit_config,
+            CreditSpreadKind::Call,
+        );
+
+        let candidates = build_iron_condor_candidates(&puts, &calls, &config);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].put.short.symbol, "SPY-P-708");
+        assert_eq!(candidates[0].put.long.symbol, "SPY-P-705");
+        assert_eq!(candidates[0].call.short.symbol, "SPY-C-710");
+        assert_eq!(candidates[0].call.long.symbol, "SPY-C-713");
+        assert!((candidates[0].credit - 0.90).abs() < 0.01);
+        assert!((candidates[0].max_loss - 2.10).abs() < 0.01);
     }
 
     fn scored(symbol: &str, strike: f64, bid: f64, ask: f64) -> ScoredContract {

@@ -13,7 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Dry-run put credit spread scanner using Alpaca option contracts and snapshots.
+//! Legacy dry-run put-credit scanner using Alpaca option contracts and snapshots.
+//!
+//! The production account engine is `alpaca-index-credit-engine`.
 
 use std::{env, str::FromStr};
 

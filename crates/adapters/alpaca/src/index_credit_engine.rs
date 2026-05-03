@@ -16,7 +16,7 @@
 //! Account-engine runtime for the Alpaca index-credit strategy slice.
 //!
 //! This module owns the process loop and broker orchestration used by the installed
-//! `alpaca-index-put-credit-entry` binary. The binary stays as a thin entrypoint so the live
+//! `alpaca-index-credit-engine` binary. The binary stays as a thin entrypoint so the live
 //! runtime can be tested and evolved from library code.
 
 use std::{cell::RefCell, env, future::Future, pin::Pin, rc::Rc, str::FromStr, time::Duration};
@@ -30,13 +30,16 @@ use crate::{
         error::Error,
         models::{AlpacaOrder, OptionSnapshotsRequest},
     },
-    index_credit::{IndexCreditConfig, SelectedEntry, select_index_credit_entry},
+    index_credit::{
+        IndexCreditConfig, SelectedEntry, SelectedIndexEntry, SelectedIronCondorEntry,
+        select_index_strategy_entry,
+    },
     management::credit_spread_close_reason,
     runtime::{
         StrategyState, StrategyStateEntry, credit_spread_strategy_name, emit_operator_event,
         load_strategy_state, save_strategy_state_atomic,
     },
-    strategy::CreditSpreadKind,
+    strategy::{CreditSpreadKind, IronCondorCandidate},
     submit::{MlegSubmitLeg, MlegSubmitOrderListRequest, build_mleg_submit_order_list},
 };
 use chrono::{DateTime, Utc};
@@ -87,10 +90,20 @@ pub enum StrategyDecision {
         /// Selected entry candidate.
         entry: SelectedEntry,
     },
+    /// Iron-condor candidate was found, but submission is disabled.
+    DryRunIronCondor {
+        /// Selected iron-condor candidate.
+        entry: SelectedIronCondorEntry,
+    },
     /// Submit an opening broker-native MLeg order list.
     SubmitOpen {
         /// Selected entry candidate.
         entry: SelectedEntry,
+    },
+    /// Submit an opening broker-native iron-condor MLeg order list.
+    SubmitIronCondorOpen {
+        /// Selected iron-condor candidate.
+        entry: SelectedIronCondorEntry,
     },
 }
 
@@ -172,7 +185,7 @@ impl StrategyRuntime for IndexCreditStrategy {
                 EntryGateDecision::Continue => {}
             }
 
-            let selected = select_index_credit_entry(
+            let selected = select_index_strategy_entry(
                 context.client,
                 context.data_config,
                 context.config,
@@ -181,10 +194,16 @@ impl StrategyRuntime for IndexCreditStrategy {
             )
             .await?;
             Ok(match selected {
-                Some(entry) if context.config.submit_enabled => {
+                Some(SelectedIndexEntry::Credit(entry)) if context.config.submit_enabled => {
                     StrategyDecision::SubmitOpen { entry }
                 }
-                Some(entry) => StrategyDecision::DryRun { entry },
+                Some(SelectedIndexEntry::Credit(entry)) => StrategyDecision::DryRun { entry },
+                Some(SelectedIndexEntry::IronCondor(entry)) if context.config.submit_enabled => {
+                    StrategyDecision::SubmitIronCondorOpen { entry }
+                }
+                Some(SelectedIndexEntry::IronCondor(entry)) => {
+                    StrategyDecision::DryRunIronCondor { entry }
+                }
                 None => StrategyDecision::NoEntry,
             })
         })
@@ -212,12 +231,7 @@ pub async fn run_index_credit_engine() -> anyhow::Result<()> {
     println!(
         "index_credit_entry: underlyings={} strategies={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} state_path={}",
         config.underlyings.join(","),
-        config
-            .spread_kinds
-            .iter()
-            .map(|kind| strategy_name(*kind))
-            .collect::<Vec<_>>()
-            .join(","),
+        config.enabled_strategy_names().join(","),
         config.submit_enabled,
         config.manage_enabled,
         config.close_enabled,
@@ -229,7 +243,7 @@ pub async fn run_index_credit_engine() -> anyhow::Result<()> {
         "runner_start",
         json!({
             "underlyings": &config.underlyings,
-            "strategies": config.spread_kinds.iter().map(|kind| strategy_name(*kind)).collect::<Vec<_>>(),
+            "strategies": config.enabled_strategy_names(),
             "submit_enabled": config.submit_enabled,
             "manage_enabled": config.manage_enabled,
             "close_enabled": config.close_enabled,
@@ -377,6 +391,63 @@ async fn apply_strategy_decision(
             );
             Ok(outcome.accepted > 0)
         }
+        StrategyDecision::SubmitIronCondorOpen { entry } => {
+            let order_list_id = order_list_id(trade_date, &entry.underlying);
+            println!(
+                "decision: submit underlying={} short_put={} long_put={} short_call={} long_call={} credit={:.2} ror={:.1}% score={:.1} order_list_id={}",
+                entry.underlying,
+                entry.candidate.put.short.symbol,
+                entry.candidate.put.long.symbol,
+                entry.candidate.call.short.symbol,
+                entry.candidate.call.long.symbol,
+                entry.candidate.credit,
+                entry.candidate.return_on_risk * 100.0,
+                entry.candidate.score,
+                order_list_id,
+            );
+            emit_operator_event(
+                "decision",
+                json!({
+                    "action": "submit",
+                    "underlying": &entry.underlying,
+                    "strategy": "index_iron_condor_entry",
+                    "short_put_symbol": &entry.candidate.put.short.symbol,
+                    "long_put_symbol": &entry.candidate.put.long.symbol,
+                    "short_call_symbol": &entry.candidate.call.short.symbol,
+                    "long_call_symbol": &entry.candidate.call.long.symbol,
+                    "credit": entry.candidate.credit,
+                    "return_on_risk": entry.candidate.return_on_risk,
+                    "score": entry.candidate.score,
+                    "order_list_id": &order_list_id,
+                    "trade_date": trade_date,
+                }),
+            );
+            let outcome =
+                submit_iron_condor_entry(&entry, &order_list_id, config.quantity, config).await?;
+            if outcome.accepted > 0 {
+                state.record_iron_condor_submission(
+                    trade_date.to_string(),
+                    entry.underlying,
+                    config.quantity,
+                    order_list_id,
+                    &entry.candidate,
+                    outcome.parent_order_id.clone(),
+                );
+            }
+            println!(
+                "submit_result: accepted={} rejected={}",
+                outcome.accepted, outcome.rejected
+            );
+            emit_operator_event(
+                "submit_result",
+                json!({
+                    "accepted": outcome.accepted,
+                    "rejected": outcome.rejected,
+                    "parent_order_id": outcome.parent_order_id,
+                }),
+            );
+            Ok(outcome.accepted > 0)
+        }
         StrategyDecision::DryRun { entry } => {
             println!(
                 "decision: dry_run underlying={} short={} long={} credit={:.2} ror={:.1}% score={:.1} reason=submission_disabled",
@@ -396,6 +467,37 @@ async fn apply_strategy_decision(
                     "strategy": strategy_name(entry.kind),
                     "short_symbol": &entry.candidate.short.symbol,
                     "long_symbol": &entry.candidate.long.symbol,
+                    "credit": entry.candidate.credit,
+                    "return_on_risk": entry.candidate.return_on_risk,
+                    "score": entry.candidate.score,
+                    "trade_date": trade_date,
+                }),
+            );
+            Ok(false)
+        }
+        StrategyDecision::DryRunIronCondor { entry } => {
+            println!(
+                "decision: dry_run underlying={} short_put={} long_put={} short_call={} long_call={} credit={:.2} ror={:.1}% score={:.1} reason=submission_disabled",
+                entry.underlying,
+                entry.candidate.put.short.symbol,
+                entry.candidate.put.long.symbol,
+                entry.candidate.call.short.symbol,
+                entry.candidate.call.long.symbol,
+                entry.candidate.credit,
+                entry.candidate.return_on_risk * 100.0,
+                entry.candidate.score,
+            );
+            emit_operator_event(
+                "decision",
+                json!({
+                    "action": "dry_run",
+                    "reason": "submission_disabled",
+                    "underlying": &entry.underlying,
+                    "strategy": "index_iron_condor_entry",
+                    "short_put_symbol": &entry.candidate.put.short.symbol,
+                    "long_put_symbol": &entry.candidate.put.long.symbol,
+                    "short_call_symbol": &entry.candidate.call.short.symbol,
+                    "long_call_symbol": &entry.candidate.call.long.symbol,
                     "credit": entry.candidate.credit,
                     "return_on_risk": entry.candidate.return_on_risk,
                     "score": entry.candidate.score,
@@ -530,6 +632,8 @@ async fn manage_existing_entries(
 struct CloseQuote {
     short_ask: f64,
     long_bid: f64,
+    short_call_ask: Option<f64>,
+    long_call_bid: Option<f64>,
     debit: f64,
 }
 
@@ -538,10 +642,8 @@ async fn close_quote(
     data_config: &AlpacaDataClientConfig,
     entry: &StrategyStateEntry,
 ) -> anyhow::Result<Option<CloseQuote>> {
-    let mut request = OptionSnapshotsRequest::for_symbols([
-        entry.short_symbol.clone(),
-        entry.long_symbol.clone(),
-    ]);
+    let mut request =
+        OptionSnapshotsRequest::for_symbols(entry.symbols().into_iter().map(ToString::to_string));
     request.feed = Some(data_config.option_feed.as_str().to_string());
     let snapshots = client.option_snapshots(&request).await?.snapshots;
     let short_quote = snapshots
@@ -556,13 +658,37 @@ async fn close_quote(
     ) else {
         return Ok(None);
     };
-    let debit = short_ask - long_bid;
+    let mut debit = short_ask - long_bid;
+    let mut short_call_ask = None;
+    let mut long_call_bid = None;
+    if let (Some(short_call_symbol), Some(long_call_symbol)) = (
+        entry.short_call_symbol.as_deref(),
+        entry.long_call_symbol.as_deref(),
+    ) {
+        let short_call_quote = snapshots
+            .get(short_call_symbol)
+            .and_then(|snapshot| snapshot.latest_quote.as_ref());
+        let long_call_quote = snapshots
+            .get(long_call_symbol)
+            .and_then(|snapshot| snapshot.latest_quote.as_ref());
+        let (Some(call_short_ask), Some(call_long_bid)) = (
+            short_call_quote.and_then(|quote| quote.ask_price),
+            long_call_quote.and_then(|quote| quote.bid_price),
+        ) else {
+            return Ok(None);
+        };
+        debit += call_short_ask - call_long_bid;
+        short_call_ask = Some(call_short_ask);
+        long_call_bid = Some(call_long_bid);
+    }
     if debit <= 0.0 {
         return Ok(None);
     }
     Ok(Some(CloseQuote {
         short_ask,
         long_bid,
+        short_call_ask,
+        long_call_bid,
         debit,
     }))
 }
@@ -631,6 +757,61 @@ async fn submit_entry(
     })
 }
 
+async fn submit_iron_condor_entry(
+    entry: &SelectedIronCondorEntry,
+    order_list_id: &str,
+    quantity: u64,
+    config: &IndexCreditConfig,
+) -> anyhow::Result<SubmitOutcome> {
+    let exec_config = exec_config_from_env();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    replace_exec_event_sender(tx);
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let trader_id = TraderId::from("TRADER-001");
+    let client_id = ClientId::from(ALPACA_CLIENT_ID);
+    let account_id = AccountId::from("ALPACA-001");
+    let strategy_id = StrategyId::from(STRATEGY_FAMILY);
+    let core = ExecutionClientCore::new(
+        trader_id,
+        client_id,
+        Venue::new(ALPACA_VENUE),
+        OmsType::Netting,
+        account_id,
+        AccountType::Margin,
+        None,
+        cache,
+    );
+    let mut client = AlpacaExecutionClient::new(core, exec_config.clone())?;
+    client.start()?;
+    client.connect().await?;
+
+    let cmd = build_iron_condor_submit_order_list(
+        &entry.candidate,
+        order_list_id,
+        quantity,
+        trader_id,
+        Some(client_id),
+        strategy_id,
+    )?;
+    client.submit_order_list(cmd)?;
+
+    let (accepted, rejected) = collect_execution_events(&mut rx, 4).await;
+    let parent_order_id = lookup_parent_order(&exec_config, order_list_id).await?;
+    if config.cancel_after_accept && accepted > 0 {
+        cancel_parent_order(&exec_config, parent_order_id.as_deref()).await?;
+    }
+
+    client.disconnect().await?;
+    client.stop()?;
+
+    Ok(SubmitOutcome {
+        accepted,
+        rejected,
+        parent_order_id,
+    })
+}
+
 async fn submit_close_entry(
     entry: &StrategyStateEntry,
     quote: &CloseQuote,
@@ -670,7 +851,7 @@ async fn submit_close_entry(
     )?;
     client.submit_order_list(cmd)?;
 
-    let (accepted, rejected) = collect_execution_events(&mut rx, 2).await;
+    let (accepted, rejected) = collect_execution_events(&mut rx, entry.symbols().len()).await;
     let parent_order_id = lookup_parent_order(&exec_config, order_list_id).await?;
 
     client.disconnect().await?;
@@ -726,6 +907,65 @@ fn build_submit_order_list(
     })
 }
 
+fn build_iron_condor_submit_order_list(
+    candidate: &IronCondorCandidate,
+    order_list_id: &str,
+    quantity: u64,
+    trader_id: TraderId,
+    client_id: Option<ClientId>,
+    strategy_id: StrategyId,
+) -> anyhow::Result<SubmitOrderList> {
+    if quantity == 0 {
+        anyhow::bail!("quantity must be positive");
+    }
+
+    let order_list_id = OrderListId::from(order_list_id);
+    let quantity = Quantity::new(quantity as f64, 0);
+    build_mleg_submit_order_list(MlegSubmitOrderListRequest {
+        trader_id,
+        client_id,
+        strategy_id,
+        order_list_id,
+        legs: vec![
+            MlegSubmitLeg {
+                client_order_id: ClientOrderId::from(format!("{order_list_id}-short-put").as_str()),
+                instrument_id: alpaca_instrument_id(&candidate.put.short.symbol)?,
+                order_side: OrderSide::Sell,
+                quantity,
+                limit_price: Price::new(candidate.put.short.bid, 2),
+                reduce_only: false,
+            },
+            MlegSubmitLeg {
+                client_order_id: ClientOrderId::from(format!("{order_list_id}-long-put").as_str()),
+                instrument_id: alpaca_instrument_id(&candidate.put.long.symbol)?,
+                order_side: OrderSide::Buy,
+                quantity,
+                limit_price: Price::new(candidate.put.long.ask, 2),
+                reduce_only: false,
+            },
+            MlegSubmitLeg {
+                client_order_id: ClientOrderId::from(
+                    format!("{order_list_id}-short-call").as_str(),
+                ),
+                instrument_id: alpaca_instrument_id(&candidate.call.short.symbol)?,
+                order_side: OrderSide::Sell,
+                quantity,
+                limit_price: Price::new(candidate.call.short.bid, 2),
+                reduce_only: false,
+            },
+            MlegSubmitLeg {
+                client_order_id: ClientOrderId::from(format!("{order_list_id}-long-call").as_str()),
+                instrument_id: alpaca_instrument_id(&candidate.call.long.symbol)?,
+                order_side: OrderSide::Buy,
+                quantity,
+                limit_price: Price::new(candidate.call.long.ask, 2),
+                reduce_only: false,
+            },
+        ],
+        ts_init: get_atomic_clock_realtime().get_time_ns(),
+    })
+}
+
 fn build_close_submit_order_list(
     entry: &StrategyStateEntry,
     quote: &CloseQuote,
@@ -735,32 +975,63 @@ fn build_close_submit_order_list(
     strategy_id: StrategyId,
 ) -> anyhow::Result<SubmitOrderList> {
     let order_list_id = OrderListId::from(order_list_id);
-    let short_client_id = ClientOrderId::from(format!("{order_list_id}-short-close").as_str());
-    let long_client_id = ClientOrderId::from(format!("{order_list_id}-long-close").as_str());
     let quantity = Quantity::new(entry.quantity as f64, 0);
+    let mut legs = vec![
+        MlegSubmitLeg {
+            client_order_id: ClientOrderId::from(format!("{order_list_id}-short-close").as_str()),
+            instrument_id: alpaca_instrument_id(&entry.short_symbol)?,
+            order_side: OrderSide::Buy,
+            quantity,
+            limit_price: Price::new(quote.short_ask, 2),
+            reduce_only: true,
+        },
+        MlegSubmitLeg {
+            client_order_id: ClientOrderId::from(format!("{order_list_id}-long-close").as_str()),
+            instrument_id: alpaca_instrument_id(&entry.long_symbol)?,
+            order_side: OrderSide::Sell,
+            quantity,
+            limit_price: Price::new(quote.long_bid, 2),
+            reduce_only: true,
+        },
+    ];
+    if let (
+        Some(short_call_symbol),
+        Some(long_call_symbol),
+        Some(short_call_ask),
+        Some(long_call_bid),
+    ) = (
+        entry.short_call_symbol.as_deref(),
+        entry.long_call_symbol.as_deref(),
+        quote.short_call_ask,
+        quote.long_call_bid,
+    ) {
+        legs.push(MlegSubmitLeg {
+            client_order_id: ClientOrderId::from(
+                format!("{order_list_id}-short-call-close").as_str(),
+            ),
+            instrument_id: alpaca_instrument_id(short_call_symbol)?,
+            order_side: OrderSide::Buy,
+            quantity,
+            limit_price: Price::new(short_call_ask, 2),
+            reduce_only: true,
+        });
+        legs.push(MlegSubmitLeg {
+            client_order_id: ClientOrderId::from(
+                format!("{order_list_id}-long-call-close").as_str(),
+            ),
+            instrument_id: alpaca_instrument_id(long_call_symbol)?,
+            order_side: OrderSide::Sell,
+            quantity,
+            limit_price: Price::new(long_call_bid, 2),
+            reduce_only: true,
+        });
+    }
     build_mleg_submit_order_list(MlegSubmitOrderListRequest {
         trader_id,
         client_id,
         strategy_id,
         order_list_id,
-        legs: vec![
-            MlegSubmitLeg {
-                client_order_id: short_client_id,
-                instrument_id: alpaca_instrument_id(&entry.short_symbol)?,
-                order_side: OrderSide::Buy,
-                quantity,
-                limit_price: Price::new(quote.short_ask, 2),
-                reduce_only: true,
-            },
-            MlegSubmitLeg {
-                client_order_id: long_client_id,
-                instrument_id: alpaca_instrument_id(&entry.long_symbol)?,
-                order_side: OrderSide::Sell,
-                quantity,
-                limit_price: Price::new(quote.long_bid, 2),
-                reduce_only: true,
-            },
-        ],
+        legs,
         ts_init: get_atomic_clock_realtime().get_time_ns(),
     })
 }
@@ -773,7 +1044,7 @@ async fn collect_execution_events(
     let mut rejected = 0;
     let deadline = Instant::now()
         + Duration::from_secs(env_parse(
-            "ALPACA_INDEX_PUT_CREDIT_EVENT_TIMEOUT_SECS",
+            "ALPACA_EVENT_TIMEOUT_SECS",
             DEFAULT_EVENT_TIMEOUT_SECS,
         ));
 
@@ -957,12 +1228,13 @@ mod tests {
     use chrono::NaiveTime;
 
     use super::*;
-    use crate::strategy::PutCreditScannerConfig;
+    use crate::strategy::{IronCondorScannerConfig, PutCreditScannerConfig};
 
     fn config_for_gate_tests() -> IndexCreditConfig {
         IndexCreditConfig {
             underlyings: vec!["SPY".to_string()],
             spread_kinds: vec![CreditSpreadKind::Put],
+            iron_condor_enabled: false,
             max_iterations: 1,
             interval_secs: 300,
             quantity: 1,
@@ -983,6 +1255,7 @@ mod tests {
             entry_timezone: "America/New_York".parse().unwrap(),
             state_path: PathBuf::from("state.json"),
             scanner: PutCreditScannerConfig::default(),
+            iron_condor_scanner: IronCondorScannerConfig::default(),
         }
     }
 

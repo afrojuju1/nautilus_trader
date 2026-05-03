@@ -204,6 +204,9 @@ impl MlegOrderPayload {
         if self.legs.len() < 2 {
             return Err(validation("mleg orders require at least two legs"));
         }
+        if self.legs.len() > 4 {
+            return Err(validation("mleg orders support at most four legs"));
+        }
 
         let mut ratios = Vec::with_capacity(self.legs.len());
         for leg in &self.legs {
@@ -417,6 +420,56 @@ pub fn build_put_debit_spread_close_order(
     )
 }
 
+/// Builds a paper-safe iron-condor opening payload without submitting it.
+///
+/// # Errors
+///
+/// Returns an error when quantity or credit limit are invalid, or the generated payload fails local
+/// validation.
+pub fn build_iron_condor_open_order(
+    short_put_symbol: impl Into<String>,
+    long_put_symbol: impl Into<String>,
+    short_call_symbol: impl Into<String>,
+    long_call_symbol: impl Into<String>,
+    credit_limit: f64,
+    quantity: u64,
+) -> Result<MlegOrderPayload> {
+    build_iron_condor_order(
+        short_put_symbol,
+        long_put_symbol,
+        short_call_symbol,
+        long_call_symbol,
+        credit_limit,
+        quantity,
+        TradeIntent::Open,
+    )
+}
+
+/// Builds a paper-safe iron-condor closing payload without submitting it.
+///
+/// # Errors
+///
+/// Returns an error when quantity or debit limit are invalid, or the generated payload fails local
+/// validation.
+pub fn build_iron_condor_close_order(
+    short_put_symbol: impl Into<String>,
+    long_put_symbol: impl Into<String>,
+    short_call_symbol: impl Into<String>,
+    long_call_symbol: impl Into<String>,
+    debit_limit: f64,
+    quantity: u64,
+) -> Result<MlegOrderPayload> {
+    build_iron_condor_order(
+        short_put_symbol,
+        long_put_symbol,
+        short_call_symbol,
+        long_call_symbol,
+        debit_limit,
+        quantity,
+        TradeIntent::Close,
+    )
+}
+
 fn build_credit_spread_order(
     short_symbol: impl Into<String>,
     long_symbol: impl Into<String>,
@@ -448,6 +501,45 @@ fn build_credit_spread_order(
         vec![
             MlegOrderLeg::new(short_symbol, short_intent.side(), short_intent, "1"),
             MlegOrderLeg::new(long_symbol, long_intent.side(), long_intent, "1"),
+        ],
+    )
+}
+
+fn build_iron_condor_order(
+    short_put_symbol: impl Into<String>,
+    long_put_symbol: impl Into<String>,
+    short_call_symbol: impl Into<String>,
+    long_call_symbol: impl Into<String>,
+    limit: f64,
+    quantity: u64,
+    trade_intent: TradeIntent,
+) -> Result<MlegOrderPayload> {
+    if quantity == 0 {
+        return Err(validation("quantity must be positive"));
+    }
+    if limit <= 0.0 {
+        return Err(validation("limit must be positive"));
+    }
+
+    let (short_intent, long_intent) = match trade_intent {
+        TradeIntent::Open => (
+            AlpacaPositionIntent::SellToOpen,
+            AlpacaPositionIntent::BuyToOpen,
+        ),
+        TradeIntent::Close => (
+            AlpacaPositionIntent::BuyToClose,
+            AlpacaPositionIntent::SellToClose,
+        ),
+    };
+
+    MlegOrderPayload::new_limit(
+        quantity,
+        signed_net_limit_price(limit, NetPremiumKind::Credit, trade_intent),
+        vec![
+            MlegOrderLeg::new(short_put_symbol, short_intent.side(), short_intent, "1"),
+            MlegOrderLeg::new(long_put_symbol, long_intent.side(), long_intent, "1"),
+            MlegOrderLeg::new(short_call_symbol, short_intent.side(), short_intent, "1"),
+            MlegOrderLeg::new(long_call_symbol, long_intent.side(), long_intent, "1"),
         ],
     )
 }
@@ -609,6 +701,78 @@ mod tests {
         assert_eq!(
             payload.legs[1].position_intent,
             AlpacaPositionIntent::BuyToClose
+        );
+    }
+
+    #[test]
+    fn iron_condor_open_payload_uses_four_opening_legs_and_credit_signing() {
+        let payload = build_iron_condor_open_order(
+            "SPY260512P00708000",
+            "SPY260512P00705000",
+            "SPY260512C00712000",
+            "SPY260512C00715000",
+            0.95,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(payload.limit_price, "-0.95");
+        assert_eq!(payload.legs.len(), 4);
+        assert_eq!(payload.legs[0].side, AlpacaOrderSide::Sell);
+        assert_eq!(
+            payload.legs[0].position_intent,
+            AlpacaPositionIntent::SellToOpen
+        );
+        assert_eq!(payload.legs[1].side, AlpacaOrderSide::Buy);
+        assert_eq!(
+            payload.legs[1].position_intent,
+            AlpacaPositionIntent::BuyToOpen
+        );
+        assert_eq!(payload.legs[2].side, AlpacaOrderSide::Sell);
+        assert_eq!(
+            payload.legs[2].position_intent,
+            AlpacaPositionIntent::SellToOpen
+        );
+        assert_eq!(payload.legs[3].side, AlpacaOrderSide::Buy);
+        assert_eq!(
+            payload.legs[3].position_intent,
+            AlpacaPositionIntent::BuyToOpen
+        );
+    }
+
+    #[test]
+    fn iron_condor_close_payload_uses_four_closing_legs_and_debit_signing() {
+        let payload = build_iron_condor_close_order(
+            "SPY260512P00708000",
+            "SPY260512P00705000",
+            "SPY260512C00712000",
+            "SPY260512C00715000",
+            0.35,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(payload.limit_price, "0.35");
+        assert_eq!(payload.legs.len(), 4);
+        assert_eq!(payload.legs[0].side, AlpacaOrderSide::Buy);
+        assert_eq!(
+            payload.legs[0].position_intent,
+            AlpacaPositionIntent::BuyToClose
+        );
+        assert_eq!(payload.legs[1].side, AlpacaOrderSide::Sell);
+        assert_eq!(
+            payload.legs[1].position_intent,
+            AlpacaPositionIntent::SellToClose
+        );
+        assert_eq!(payload.legs[2].side, AlpacaOrderSide::Buy);
+        assert_eq!(
+            payload.legs[2].position_intent,
+            AlpacaPositionIntent::BuyToClose
+        );
+        assert_eq!(payload.legs[3].side, AlpacaOrderSide::Sell);
+        assert_eq!(
+            payload.legs[3].position_intent,
+            AlpacaPositionIntent::SellToClose
         );
     }
 }

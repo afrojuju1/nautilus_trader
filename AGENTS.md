@@ -45,9 +45,16 @@ Rules:
 
 ```bash
 cargo fmt -p nautilus-alpaca
+cargo test -p nautilus-alpaca --features live --lib
 cargo check -p nautilus-alpaca --features live --bins
 ```
 
+- Keep Alpaca verification tiered:
+- Unit/config/strategy/order changes: run the targeted checks above.
+- Build-only or docs-only deploy changes: run `cargo fmt -p nautilus-alpaca` and `cargo check -p nautilus-alpaca --features live --bins` when Rust code or scripts can affect binaries.
+- Broker/account probes: run only when touching account admission, execution submission, order reconciliation, or before/after a smoke test.
+- Systemd install/control checks: run only when deployment files, installed binaries, or service wiring changes.
+- Paper order smoke tests: run only intentionally, preferably during market hours, and cancel accepted smoke orders unless the user explicitly asks to leave orders open.
 - Live or paper Alpaca smoke tests must be real. Do not claim execution proof unless an actual command was run and the resulting account/orders state was checked.
 - Smoke tests that submit paper orders should cancel accepted orders unless the user explicitly asks to leave orders open.
 - Earnings-calendar input for Alpaca earnings strategies uses Alpha Vantage only through local secrets and cache. Keep `ALPHA_VANTAGE_API_KEY` in an untracked `.env` or external env file, never commit it. Refresh with `earnings-sync`; it caches raw Alpha Vantage `EARNINGS_CALENDAR` output for 23 hours by default, writes the full normalized feed to `$XDG_STATE_HOME/nautilus_trader/earnings/earnings_events.csv` or `$HOME/.local/state/nautilus_trader/earnings/earnings_events.csv`, and writes the stricter strategy-safe feed to `earnings_events_approved.csv` in the same directory.

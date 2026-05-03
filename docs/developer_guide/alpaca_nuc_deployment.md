@@ -6,7 +6,9 @@ one runner can own the Alpaca account workflow.
 
 ## Files
 
-- `deploy/alpaca/alpaca-index-credit.env.example`: non-secret config template.
+- `deploy/alpaca/alpaca-index-credit.env.example`: credentials, endpoints, service paths, and
+  emergency override template.
+- `deploy/alpaca/alpaca-index-credit.toml.example`: strategy/scanner/management config template.
 - `deploy/alpaca/alpaca-index-credit-install.sh`: builds release binaries and installs user files.
 - `deploy/alpaca/alpaca-index-credit-runner.sh`: `flock`-guarded runner wrapper.
 - `deploy/alpaca/alpaca-index-credit.service`: user systemd service.
@@ -22,13 +24,13 @@ From the repo root:
 deploy/alpaca/alpaca-index-credit-install.sh
 ```
 
-Edit `~/.config/nautilus-trader/alpaca/index-credit.env` and add Alpaca paper credentials. Leave
-`ALPACA_INDEX_CREDIT_KILL_SWITCH=true`, `ALPACA_INDEX_PUT_CREDIT_SUBMIT=false`,
-`ALPACA_INDEX_CREDIT_MANAGE=false`, and `ALPACA_INDEX_CREDIT_CLOSE=false` until paper proof is
-intentionally enabled.
+Edit `~/.config/nautilus-trader/alpaca/index-credit.env` and add Alpaca paper credentials. Keep
+`ALPACA_KILL_SWITCH=true`, `ALPACA_SUBMIT=false`, `ALPACA_MANAGE=false`, and `ALPACA_CLOSE=false`
+until paper proof is intentionally enabled.
 
-`ALPACA_INDEX_PUT_CREDIT_MAX_ITERATIONS=0` is continuous service mode. Set it to `1` only for a
-manual one-shot smoke test.
+Edit `~/.config/nautilus-trader/alpaca/index-credit.toml` for strategy/scanner/management settings.
+TOML `runtime.max_iterations = 0` is continuous service mode. Set `ALPACA_MAX_ITERATIONS=1` only
+for a manual one-shot smoke test override.
 
 ## Commands
 
@@ -55,25 +57,25 @@ Default state files from the env template:
 
 - Logs: `~/.local/state/nautilus_trader/logs/alpaca-index-credit.log`
 - Lock: `~/.local/state/nautilus_trader/locks/alpaca-index-credit.lock`
-- Strategy state: `~/.local/state/nautilus_trader/alpaca_index_put_credit_entry_state.json`
+- Strategy state: `~/.local/state/nautilus_trader/alpaca_index_credit_state.json`
 
 The runner wrapper takes an exclusive non-blocking lock. If another process already owns the lock,
 the service exits without starting another Alpaca account owner.
 
 The service runs installed release binaries by default:
 
-- Runner: `~/.local/bin/alpaca-index-put-credit-entry`
+- Runner: `~/.local/bin/alpaca-index-credit-engine`
 - Operator status: `~/.local/bin/alpaca-operator-status`
 
 Override with `NAUTILUS_ALPACA_RUNNER_BIN` or `NAUTILUS_ALPACA_OPERATOR_BIN` only for diagnostics.
 
 ## Safety Gates
 
-- `ALPACA_INDEX_CREDIT_KILL_SWITCH=true` blocks new entries.
-- `ALPACA_INDEX_PUT_CREDIT_SUBMIT=true` allows entry submission.
-- `ALPACA_INDEX_CREDIT_MANAGE=true` allows stale-entry cancellation and management actions.
-- `ALPACA_INDEX_CREDIT_CLOSE=true` allows close order submission when management is enabled.
-- `ALPACA_INDEX_CREDIT_FORCE_FLATTEN=true` treats every tracked open spread as a close candidate.
+- `ALPACA_KILL_SWITCH=true` blocks new entries.
+- `ALPACA_SUBMIT=true` allows entry submission.
+- `ALPACA_MANAGE=true` allows stale-entry cancellation and management actions.
+- `ALPACA_CLOSE=true` allows close order submission when management is enabled.
+- `ALPACA_FORCE_FLATTEN=true` treats every tracked open spread as a close candidate.
 
 Paper/live endpoint selection is controlled by `ALPACA_TRADING_BASE_URL` and
 `ALPACA_TRADE_UPDATES_WS_URL`. Keep paper URLs in place until the rollout plan explicitly moves to a

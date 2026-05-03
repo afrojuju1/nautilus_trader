@@ -123,20 +123,45 @@ pub fn check_put_credit_entry_admission(
     short_put_symbol: &str,
     long_put_symbol: &str,
 ) -> AdmissionDecision {
+    check_option_spread_entry_admission(
+        account,
+        positions,
+        open_orders,
+        &[short_put_symbol, long_put_symbol],
+    )
+}
+
+/// Checks account, position, and open-order state before opening an option spread.
+#[must_use]
+pub fn check_option_spread_entry_admission(
+    account: &AlpacaAccount,
+    positions: &[AlpacaPosition],
+    open_orders: &[AlpacaOrder],
+    candidate_symbols: &[&str],
+) -> AdmissionDecision {
     let mut reasons = Vec::new();
     check_account(account, &mut reasons);
 
-    let candidate_underlying = option_underlying_symbol(short_put_symbol);
-    if candidate_underlying.is_empty()
-        || candidate_underlying != option_underlying_symbol(long_put_symbol)
+    let candidate_underlyings = candidate_symbols
+        .iter()
+        .map(|symbol| option_underlying_symbol(symbol))
+        .collect::<BTreeSet<_>>();
+    let candidate_underlying = candidate_underlyings
+        .iter()
+        .next()
+        .cloned()
+        .unwrap_or_default();
+    if candidate_symbols.len() < 2
+        || candidate_underlying.is_empty()
+        || candidate_underlyings.len() != 1
     {
         reasons.push("candidate legs must resolve to the same option underlying".to_string());
     }
 
-    let candidate_symbols = BTreeSet::from([
-        short_put_symbol.trim().to_string(),
-        long_put_symbol.trim().to_string(),
-    ]);
+    let candidate_symbols = candidate_symbols
+        .iter()
+        .map(|symbol| symbol.trim().to_string())
+        .collect::<BTreeSet<_>>();
 
     for position in positions {
         let Some(symbol) = position.symbol.as_deref() else {
@@ -2647,6 +2672,38 @@ mod tests {
         assert_eq!(
             payload.legs[1].position_intent,
             AlpacaPositionIntent::BuyToOpen
+        );
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn build_mleg_payload_from_order_list_supports_four_leg_iron_condor_open() {
+        let orders = vec![
+            mleg_limit_order("O-1", "SPY260508P00500000", OrderSide::Sell, 0.55, false),
+            mleg_limit_order("O-2", "SPY260508P00495000", OrderSide::Buy, 0.20, false),
+            mleg_limit_order("O-3", "SPY260508C00520000", OrderSide::Sell, 0.60, false),
+            mleg_limit_order("O-4", "SPY260508C00525000", OrderSide::Buy, 0.25, false),
+        ];
+        let cmd = submit_order_list_for_orders("OL-IC-1", &orders);
+
+        let payload = build_mleg_payload_from_order_list(&cmd, &orders).unwrap();
+
+        assert_eq!(payload.client_order_id.as_deref(), Some("OL-IC-1"));
+        assert_eq!(payload.qty, "1");
+        assert_eq!(payload.limit_price, "-0.70");
+        assert_eq!(payload.legs.len(), 4);
+        assert_eq!(
+            payload
+                .legs
+                .iter()
+                .map(|leg| leg.position_intent)
+                .collect::<Vec<_>>(),
+            vec![
+                AlpacaPositionIntent::SellToOpen,
+                AlpacaPositionIntent::BuyToOpen,
+                AlpacaPositionIntent::SellToOpen,
+                AlpacaPositionIntent::BuyToOpen,
+            ]
         );
     }
 

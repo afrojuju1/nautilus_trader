@@ -24,7 +24,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::strategy::{CreditSpreadKind, SpreadCandidate};
+use crate::strategy::{CreditSpreadKind, IronCondorCandidate, SpreadCandidate};
 
 /// Persisted state for the Alpaca index credit runner.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -65,6 +65,42 @@ impl StrategyState {
             order_list_id,
             short_symbol: candidate.short.symbol.clone(),
             long_symbol: candidate.long.symbol.clone(),
+            short_call_symbol: None,
+            long_call_symbol: None,
+            quantity,
+            credit: candidate.credit,
+            score: candidate.score,
+            parent_order_id,
+            close_order_list_id: None,
+            close_parent_order_id: None,
+            close_reason: None,
+            submitted: true,
+            canceled: false,
+            closed: false,
+            recorded_at_utc: Utc::now().to_rfc3339(),
+            closed_at_utc: None,
+        });
+    }
+
+    /// Appends one submitted iron-condor entry to the state.
+    pub fn record_iron_condor_submission(
+        &mut self,
+        trade_date: String,
+        underlying: String,
+        quantity: u64,
+        order_list_id: String,
+        candidate: &IronCondorCandidate,
+        parent_order_id: Option<String>,
+    ) {
+        self.entries.push(StrategyStateEntry {
+            trade_date,
+            underlying,
+            strategy: "index_iron_condor_entry".to_string(),
+            order_list_id,
+            short_symbol: candidate.put.short.symbol.clone(),
+            long_symbol: candidate.put.long.symbol.clone(),
+            short_call_symbol: Some(candidate.call.short.symbol.clone()),
+            long_call_symbol: Some(candidate.call.long.symbol.clone()),
             quantity,
             credit: candidate.credit,
             score: candidate.score,
@@ -97,6 +133,12 @@ pub struct StrategyStateEntry {
     pub short_symbol: String,
     /// Long option symbol.
     pub long_symbol: String,
+    /// Short call option symbol for four-leg iron condors.
+    #[serde(default)]
+    pub short_call_symbol: Option<String>,
+    /// Long call option symbol for four-leg iron condors.
+    #[serde(default)]
+    pub long_call_symbol: Option<String>,
     /// Spread quantity.
     #[serde(default = "default_quantity")]
     pub quantity: u64,
@@ -135,6 +177,25 @@ impl StrategyStateEntry {
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.submitted && !self.canceled && !self.closed
+    }
+
+    /// Returns `true` when this entry stores four iron-condor legs.
+    #[must_use]
+    pub fn is_iron_condor(&self) -> bool {
+        self.short_call_symbol.is_some() && self.long_call_symbol.is_some()
+    }
+
+    /// Returns all option symbols tracked by this entry.
+    #[must_use]
+    pub fn symbols(&self) -> Vec<&str> {
+        let mut symbols = vec![self.short_symbol.as_str(), self.long_symbol.as_str()];
+        if let Some(symbol) = self.short_call_symbol.as_deref() {
+            symbols.push(symbol);
+        }
+        if let Some(symbol) = self.long_call_symbol.as_deref() {
+            symbols.push(symbol);
+        }
+        symbols
     }
 }
 
@@ -238,6 +299,8 @@ mod tests {
             order_list_id: "order-list-1".to_string(),
             short_symbol: "SPY260512P00708000".to_string(),
             long_symbol: "SPY260512P00705000".to_string(),
+            short_call_symbol: None,
+            long_call_symbol: None,
             quantity: 1,
             credit: 0.46,
             score: 61.9,

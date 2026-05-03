@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Native Nautilus runner entrypoint for the Alpaca index-credit account engine.
+//! Native Nautilus entrypoint for the Alpaca index-credit account engine.
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

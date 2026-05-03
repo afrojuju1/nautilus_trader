@@ -167,6 +167,8 @@ mod tests {
             order_list_id: "order-list-1".to_string(),
             short_symbol: "SPY260512P00708000".to_string(),
             long_symbol: "SPY260512P00705000".to_string(),
+            short_call_symbol: None,
+            long_call_symbol: None,
             quantity: 1,
             credit: 0.50,
             score: 60.0,

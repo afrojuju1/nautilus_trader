@@ -40,8 +40,8 @@ from `APCA_API_KEY_ID`/`APCA_API_SECRET_KEY`, then from the existing deployment 
 `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`.
 The contract provider can also convert Alpaca option contract payloads into Nautilus
 `OptionContract` instruments on venue `ALPACA`.
-An initial dry-run scanner (`alpaca-dry-run-put-credit`) screens active 5-10 DTE put credit spreads
-without submitting orders.
+An initial legacy diagnostic scanner (`alpaca-dry-run-put-credit`) screens active 5-10 DTE put
+credit spreads without submitting orders.
 The next runtime slice adds account, position, and open-order polling through Alpaca Trading REST
 plus a non-submitting multi-leg order payload builder/validator for paper put credit spread
 payloads.
@@ -123,17 +123,20 @@ Phase 3:
 
 Initial Phase 3 runner:
 
-- `alpaca-index-put-credit-entry` scans configured underlyings, applies account/position/open-order
+- `alpaca-index-credit-engine` scans configured underlyings, applies account/position/open-order
   admission checks, enforces daily duplicate-entry state, selects one candidate, and can submit a
   Nautilus `SubmitOrderList` through the Alpaca execution client when
-  `ALPACA_INDEX_PUT_CREDIT_SUBMIT=true`.
+  TOML `runtime.submit = true` or `ALPACA_SUBMIT=true`.
 - The same runner can scan Phase 7A `index_call_credit_entry` candidates by setting
-  `ALPACA_INDEX_CREDIT_STRATEGIES=call` or scan both vertical-credit directions with `both`.
+  `ALPACA_STRATEGIES=call` or scan both vertical-credit directions with `both`.
 - The runner evaluates stale entry cancellation and close triggers from persisted state. Broker
-  management actions are disabled unless `ALPACA_INDEX_CREDIT_MANAGE=true`; close order submission
-  also requires `ALPACA_INDEX_CREDIT_CLOSE=true`.
+  management actions are disabled unless TOML `runtime.manage = true` or `ALPACA_MANAGE=true`;
+  close order submission also requires TOML `runtime.close = true` or `ALPACA_CLOSE=true`.
 - Management triggers include profit target, stop-loss debit, max hold, expiration-risk exit,
   force-flatten, stale entry cancellation, and a kill switch for blocking new entries.
+- Strategy/scanner/management parameters live in `ALPACA_CONFIG_PATH`, defaulting to
+  `~/.config/nautilus-trader/alpaca/index-credit.toml`; env remains for secrets, endpoints, and
+  emergency runtime overrides.
 - Submission is disabled by default so paper soak can run safely before enabling execution.
 - Python strategy submission remains blocked by the current Python `OrderList` invariant that all
   orders share one `InstrumentId`; Alpaca MLeg entries require distinct option leg instruments, so

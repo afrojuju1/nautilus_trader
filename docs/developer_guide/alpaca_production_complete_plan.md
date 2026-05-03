@@ -41,7 +41,7 @@ Completed foundation:
 
 Known gaps:
 
-- The `alpaca-index-put-credit-entry` binary is now a thin entrypoint over library account-engine
+- The `alpaca-index-credit-engine` binary is now a thin entrypoint over library account-engine
   code, but the account engine still needs a clean strategy-hosting abstraction. Additional
   strategies should plug into one account engine rather than becoming separate account-owning
   runners.
@@ -114,19 +114,20 @@ Goal: run the first strategy fully inside Nautilus.
 Work:
 
 - Build a Nautilus-native put-credit strategy or strategy runner. (Initial
-  `alpaca-index-put-credit-entry` Rust runner complete; it scans, applies broker/state admission,
+  `alpaca-index-credit-engine` Rust runner complete; it scans, applies broker/state admission,
   selects one entry, and can submit through the Alpaca `SubmitOrderList` execution path when
   explicitly enabled.)
 - Port scanner parameters for underlyings, DTE, width, delta, open interest, leg spread, and minimum
-  return-on-risk. (Runner exposes these through `ALPACA_PUT_CREDIT_*` environment variables.)
+  return-on-risk. (Runner reads these from `ALPACA_CONFIG_PATH`, defaulting to
+  `~/.config/nautilus-trader/alpaca/index-credit.toml`.)
 - Add account/position/open-order admission checks. (Runner uses the Alpaca adapter admission gate.)
-- Add deterministic sizing and daily duplicate-entry controls. (Runner uses
-  `ALPACA_INDEX_PUT_CREDIT_QTY` and persists submitted entries by trade date and underlying.)
+- Add deterministic sizing and daily duplicate-entry controls. (Runner uses TOML `index.quantity`
+  and persists submitted entries by trade date and underlying.)
 - Build and submit Nautilus `SubmitOrderList` entries directly. (Submission is disabled by default;
-  set `ALPACA_INDEX_PUT_CREDIT_SUBMIT=true` for paper execution.)
+  set TOML `runtime.submit = true` or emergency override `ALPACA_SUBMIT=true` for paper execution.)
 - Persist enough local strategy state to avoid duplicate submits after restart. (Default state path
-  is `$XDG_STATE_HOME/nautilus_trader/alpaca_index_put_credit_entry_state.json` or
-  `$HOME/.local/state/nautilus_trader/alpaca_index_put_credit_entry_state.json`.)
+  is `$XDG_STATE_HOME/nautilus_trader/alpaca_index_credit_state.json` or
+  `$HOME/.local/state/nautilus_trader/alpaca_index_credit_state.json`.)
 - Remove any dependency on `spreads` execution intents, workers, or Docker runtime.
 
 Exit criteria:
@@ -140,22 +141,22 @@ Runner commands:
 
 ```bash
 # Dry-run scan, no order submission.
-ALPACA_INDEX_PUT_CREDIT_IGNORE_WINDOW=true \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-index-put-credit-entry -- SPY,QQQ,IWM
+ALPACA_IGNORE_ENTRY_WINDOW=true \
+  cargo run -p nautilus-alpaca --features live --bin alpaca-index-credit-engine -- SPY,QQQ,IWM
 
 # Paper submission path; use cancel-after-accept only for smoke testing.
-ALPACA_INDEX_PUT_CREDIT_SUBMIT=true \
-ALPACA_INDEX_PUT_CREDIT_CANCEL_AFTER_ACCEPT=true \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-index-put-credit-entry -- SPY,QQQ,IWM
+ALPACA_SUBMIT=true \
+ALPACA_CANCEL_AFTER_ACCEPT=true \
+  cargo run -p nautilus-alpaca --features live --bin alpaca-index-credit-engine -- SPY,QQQ,IWM
 ```
 
 Phase 7A call-credit mode:
 
 ```bash
 # Scan both index put-credit and index call-credit candidates; submission still disabled.
-ALPACA_INDEX_PUT_CREDIT_IGNORE_WINDOW=true \
-ALPACA_INDEX_CREDIT_STRATEGIES=both \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-index-put-credit-entry -- SPY,QQQ,IWM
+ALPACA_IGNORE_ENTRY_WINDOW=true \
+ALPACA_STRATEGIES=both \
+  cargo run -p nautilus-alpaca --features live --bin alpaca-index-credit-engine -- SPY,QQQ,IWM
 ```
 
 Implementation note:
@@ -182,10 +183,10 @@ Work:
 - Implement close MLeg order-list construction for verticals. (Initial reduce-only close
   `SubmitOrderList` construction complete for credit verticals.)
 - Add cancel stale entry and close orders. (Runner can cancel stale entry orders and submit close
-  orders only when `ALPACA_INDEX_CREDIT_MANAGE=true`; close submission also requires
-  `ALPACA_INDEX_CREDIT_CLOSE=true`.)
-- Add manual flatten and global kill switch. (Initial `ALPACA_INDEX_CREDIT_FORCE_FLATTEN` and
-  `ALPACA_INDEX_CREDIT_KILL_SWITCH` controls complete.)
+  orders only when TOML `runtime.manage = true` or `ALPACA_MANAGE=true`; close submission also
+  requires TOML `runtime.close = true` or `ALPACA_CLOSE=true`.)
+- Add manual flatten and global kill switch. (Initial `ALPACA_FORCE_FLATTEN` and
+  `ALPACA_KILL_SWITCH` controls complete.)
 - Reconcile close fills and mark positions flat. (Runner marks persisted entries closed after a
   filled close parent order is observed.)
 
@@ -202,25 +203,24 @@ Management controls:
 
 ```bash
 # Evaluate management without broker actions.
-ALPACA_INDEX_CREDIT_MANAGE=false \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-index-put-credit-entry
+ALPACA_MANAGE=false \
+  cargo run -p nautilus-alpaca --features live --bin alpaca-index-credit-engine
 
 # Allow stale-order cancel and close submission when triggers fire.
-ALPACA_INDEX_CREDIT_MANAGE=true \
-ALPACA_INDEX_CREDIT_CLOSE=true \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-index-put-credit-entry
+ALPACA_MANAGE=true \
+ALPACA_CLOSE=true \
+  cargo run -p nautilus-alpaca --features live --bin alpaca-index-credit-engine
 ```
 
 Key controls:
 
-- `ALPACA_INDEX_CREDIT_KILL_SWITCH=true` blocks new entries.
-- `ALPACA_INDEX_CREDIT_FORCE_FLATTEN=true` treats every tracked open spread as a close candidate.
-- `ALPACA_INDEX_CREDIT_STALE_ENTRY_SECS=900` cancels stale working entries when management is
-  enabled.
-- `ALPACA_INDEX_CREDIT_PROFIT_TARGET_CLOSE_FRACTION=0.50` closes when debit falls to 50% of entry
+- `ALPACA_KILL_SWITCH=true` blocks new entries.
+- `ALPACA_FORCE_FLATTEN=true` treats every tracked open spread as a close candidate.
+- TOML `management.stale_entry_secs = 900` cancels stale working entries when management is enabled.
+- TOML `management.profit_target_close_fraction = 0.50` closes when debit falls to 50% of entry
   credit.
-- `ALPACA_INDEX_CREDIT_STOP_LOSS_CLOSE_MULTIPLE=2.0` closes when debit reaches 2x entry credit.
-- `ALPACA_INDEX_CREDIT_EXPIRATION_EXIT_DAYS=1` closes near expiration risk.
+- TOML `management.stop_loss_close_multiple = 2.0` closes when debit reaches 2x entry credit.
+- TOML `management.expiration_exit_days = 1` closes near expiration risk.
 
 ## Phase 5: NUC Production Deployment
 
@@ -244,7 +244,7 @@ Current status:
 - Deployment files are documented in [Alpaca NUC Deployment](alpaca_nuc_deployment.md).
 - On 2026-05-02, `alpaca-index-credit.service` was installed, started, health-checked, and stopped
   on `ade-nucbox-k8-plus` with kill-switch enabled and submission disabled.
-- The runner supports `ALPACA_INDEX_PUT_CREDIT_MAX_ITERATIONS=0` for continuous service mode.
+- The runner supports TOML `runtime.max_iterations = 0` for continuous service mode.
 
 Exit criteria:
 
@@ -288,7 +288,7 @@ Goal: turn the proven runner/deployment slice into a maintainable single account
 
 Work:
 
-- Build and install release binaries for `alpaca-index-put-credit-entry` and
+- Build and install release binaries for `alpaca-index-credit-engine` and
   `alpaca-operator-status`; stop using `cargo run` from systemd and control scripts. (Complete:
   installer builds release binaries and service/control scripts execute installed binaries.)
 - Move strategy state structs, atomic state persistence, operator-event emission, and credit-spread
@@ -317,7 +317,7 @@ Exit criteria:
 Current status:
 
 - Release binaries were built and installed on `ade-nucbox-k8-plus` on 2026-05-02.
-- `alpaca-index-credit.service` was verified running `~/.local/bin/alpaca-index-put-credit-entry`
+- `alpaca-index-credit.service` was verified running `~/.local/bin/alpaca-index-credit-engine`
   instead of `cargo run`.
 - `alpaca-index-credit-control.sh operator|health` was verified running
   `~/.local/bin/alpaca-operator-status`.
@@ -362,7 +362,7 @@ Work:
 
 Exit criteria:
 
-- `bin/index_put_credit_entry.rs` is a thin entrypoint over library account-engine code.
+- `bin/index_credit_engine.rs` is a thin entrypoint over library account-engine code.
 - Index credit behavior is preserved through tests and dry-run/paper smoke commands.
 - Adding another strategy does not require another account-owning systemd service.
 - Strategy decisions can be tested without Alpaca credentials.
@@ -375,7 +375,7 @@ Current status:
   index-credit runtime.
 - Index-credit scan/admission/candidate selection now lives in library code as
   `select_index_credit_entry`.
-- The installed `alpaca-index-put-credit-entry` binary is now a thin Tokio entrypoint over
+- The installed `alpaca-index-credit-engine` binary is now a thin Tokio entrypoint over
   `index_credit_engine::run_index_credit_engine`.
 - The account-engine loop, management orchestration, and broker submit/cancel/lookup helpers now
   live in library code.
@@ -393,13 +393,13 @@ remains.
 Migration order:
 
 1. `index_put_credit_entry` (initial native runner complete)
-2. `index_call_credit_entry` (Phase 7A scanner path complete through
-   `ALPACA_INDEX_CREDIT_STRATEGIES=call|both`)
+2. `index_call_credit_entry` (Phase 7A scanner path complete through `ALPACA_STRATEGIES=call|both`)
 3. `earnings_call_debit_entry` (debit-spread Alpaca MLeg order payload builders complete; explicit
    earnings-event CSV input policy complete; initial call-debit scanner primitives complete)
 4. `earnings_put_debit_entry` (debit-spread Alpaca MLeg order payload builders complete; explicit
    earnings-event CSV input policy complete; initial put-debit scanner primitives complete)
-5. Iron condors after 4-leg open/close is proven
+5. Iron condors (native scanner, 4-leg open/close payload primitives, account-engine dry-run
+   hosting, and SPY dry-run proof complete; still needs paper submit/close proof)
 6. Straddles/strangles after long-premium management rules are proven
 
 Each strategy must have native open, management, close, reconciliation, paper validation, and
@@ -429,7 +429,12 @@ Phase 7 blockers:
 
 - Earnings debit strategies still need account-engine integration, management rules, paper proof,
   and source-quality review of the Alpha Vantage feed before live use.
-- Iron condors should wait until 4-leg open/close is paper-proven with the account engine.
+- Iron condors now have native candidate construction, four-leg Alpaca MLeg open/close payload
+  builders, hosted account-engine selection, dry-run decision emission, persisted four-leg state,
+  and four-leg close construction. On 2026-05-03, a real Alpaca dry-run scan selected an SPY iron
+  condor with submission disabled and the follow-up broker check showed zero positions and zero open
+  orders. They still need management-rule review, submit-with-cancel paper proof, and full
+  open/close paper proof before live enablement.
 - Straddles/strangles should wait until long-premium management and max-loss behavior are specified.
 
 Parked next steps for earnings debit:
