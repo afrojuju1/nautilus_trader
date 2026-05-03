@@ -37,6 +37,7 @@
 
 pub mod common;
 pub mod config;
+pub mod earnings;
 pub mod execution;
 #[cfg(feature = "live")]
 pub mod factories;

@@ -395,20 +395,30 @@ Migration order:
 1. `index_put_credit_entry` (initial native runner complete)
 2. `index_call_credit_entry` (Phase 7A scanner path complete through
    `ALPACA_INDEX_CREDIT_STRATEGIES=call|both`)
-3. `earnings_call_debit_entry` (debit-spread Alpaca MLeg order payload builders complete; scanner
-   and earnings-event input policy still required)
-4. `earnings_put_debit_entry` (debit-spread Alpaca MLeg order payload builders complete; scanner
-   and earnings-event input policy still required)
+3. `earnings_call_debit_entry` (debit-spread Alpaca MLeg order payload builders complete; explicit
+   earnings-event CSV input policy complete; scanner still required)
+4. `earnings_put_debit_entry` (debit-spread Alpaca MLeg order payload builders complete; explicit
+   earnings-event CSV input policy complete; scanner still required)
 5. Iron condors after 4-leg open/close is proven
 6. Straddles/strangles after long-premium management rules are proven
 
 Each strategy must have native open, management, close, reconciliation, paper validation, and
 operator visibility before live enablement.
 
+Phase 7 earnings input policy:
+
+- Earnings events must come from an operator-approved local CSV with
+  `underlying,report_date,timing,source` columns.
+- `report_date` is exchange-local `YYYY-MM-DD`.
+- `timing` must be `before_open`, `after_close`, or `unknown`; unknown timing is blocked by the
+  default entry policy.
+- The `earnings` module parses and filters events by entry window without Alpaca credentials.
+- Do not infer earnings dates from broker option chains or snapshots.
+
 Phase 7 blockers:
 
-- Earnings debit strategies need an approved earnings-calendar/input source and entry policy before
-  scanner implementation. Do not infer earnings dates from broker option chains.
+- Earnings debit strategies still need scanner implementation and an approved production source for
+  the local earnings CSV.
 - Iron condors should wait until 4-leg open/close is paper-proven with the account engine.
 - Straddles/strangles should wait until long-premium management and max-loss behavior are specified.
 
@@ -447,5 +457,4 @@ Current status:
 
 Run the market-hours paper workflow for the hosted account engine: dry-run scan,
 submit-with-cancel smoke, paper open with real management close, and multi-day paper soak. In
-parallel, advance Phase 7 earnings-debit migration only after the earnings-event input policy is
-approved.
+parallel, build the Phase 7 earnings-debit scanner against the explicit local earnings CSV policy.

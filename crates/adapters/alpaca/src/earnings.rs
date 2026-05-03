@@ -1,0 +1,341 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! Earnings-event input policy for Alpaca debit-spread strategy migration.
+//!
+//! This module intentionally consumes explicit earnings events supplied by an operator-approved
+//! source. It does not infer earnings dates from option chains or broker snapshots.
+
+use std::{fs, path::Path, str::FromStr};
+
+use chrono::NaiveDate;
+use thiserror::Error;
+
+/// Earnings-calendar parsing and policy error.
+#[derive(Debug, Error)]
+pub enum EarningsCalendarError {
+    /// The input did not include a header row.
+    #[error("earnings calendar is missing a header row")]
+    MissingHeader,
+    /// A required column is missing from the header row.
+    #[error("earnings calendar is missing required column `{0}`")]
+    MissingColumn(&'static str),
+    /// A data row did not have the same number of columns as the header.
+    #[error("earnings calendar line {line} has {actual} columns, expected {expected}")]
+    InvalidColumnCount {
+        /// One-based input line number.
+        line: usize,
+        /// Expected column count.
+        expected: usize,
+        /// Actual column count.
+        actual: usize,
+    },
+    /// A required field is empty.
+    #[error("earnings calendar line {line} has empty `{field}`")]
+    EmptyField {
+        /// One-based input line number.
+        line: usize,
+        /// Field name.
+        field: &'static str,
+    },
+    /// A report date could not be parsed.
+    #[error("earnings calendar line {line} has invalid report_date `{value}`")]
+    InvalidDate {
+        /// One-based input line number.
+        line: usize,
+        /// Invalid date value.
+        value: String,
+    },
+    /// A report timing value could not be parsed.
+    #[error("earnings calendar line {line} has invalid timing `{value}`")]
+    InvalidTiming {
+        /// One-based input line number.
+        line: usize,
+        /// Invalid timing value.
+        value: String,
+    },
+    /// File I/O failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+/// Earnings report timing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EarningsTiming {
+    /// Report is expected before the regular session opens.
+    BeforeOpen,
+    /// Report is expected after the regular session closes.
+    AfterClose,
+    /// Report timing is unknown.
+    Unknown,
+}
+
+impl EarningsTiming {
+    /// Returns the canonical lowercase label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeOpen => "before_open",
+            Self::AfterClose => "after_close",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl FromStr for EarningsTiming {
+    type Err = EarningsCalendarError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_timing(value).ok_or_else(|| EarningsCalendarError::InvalidTiming {
+            line: 0,
+            value: value.to_string(),
+        })
+    }
+}
+
+/// One approved earnings event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EarningsEvent {
+    /// Uppercase underlying symbol.
+    pub underlying: String,
+    /// Report date in the exchange-local calendar.
+    pub report_date: NaiveDate,
+    /// Expected report timing.
+    pub timing: EarningsTiming,
+    /// Operator-approved event source label.
+    pub source: String,
+}
+
+/// Entry policy for earnings debit-spread candidates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EarningsEntryPolicy {
+    /// Earliest allowed entry, expressed as days before report date.
+    pub max_days_before_report: i64,
+    /// Latest allowed entry, expressed as days before report date.
+    pub min_days_before_report: i64,
+    /// Whether unknown report timing can be traded.
+    pub allow_unknown_timing: bool,
+}
+
+impl Default for EarningsEntryPolicy {
+    fn default() -> Self {
+        Self {
+            max_days_before_report: 7,
+            min_days_before_report: 0,
+            allow_unknown_timing: false,
+        }
+    }
+}
+
+impl EarningsEntryPolicy {
+    /// Returns approved events eligible for a strategy entry on `trade_date`.
+    #[must_use]
+    pub fn eligible_events<'a>(
+        &self,
+        events: &'a [EarningsEvent],
+        trade_date: NaiveDate,
+    ) -> Vec<&'a EarningsEvent> {
+        events
+            .iter()
+            .filter(|event| self.allow_unknown_timing || event.timing != EarningsTiming::Unknown)
+            .filter(|event| {
+                let days_before = event
+                    .report_date
+                    .signed_duration_since(trade_date)
+                    .num_days();
+                self.min_days_before_report <= days_before
+                    && days_before <= self.max_days_before_report
+            })
+            .collect()
+    }
+}
+
+/// Loads earnings events from a simple CSV file.
+///
+/// The CSV must have these columns: `underlying,report_date,timing,source`. Quoted fields and
+/// embedded commas are intentionally unsupported; use stable source labels without commas.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or the CSV content is invalid.
+pub fn load_earnings_events_csv(path: &Path) -> Result<Vec<EarningsEvent>, EarningsCalendarError> {
+    parse_earnings_events_csv(&fs::read_to_string(path)?)
+}
+
+/// Parses earnings events from simple CSV text.
+///
+/// The CSV must have these columns: `underlying,report_date,timing,source`. Extra columns are
+/// allowed and ignored.
+///
+/// # Errors
+///
+/// Returns an error when required columns are missing or any data row is invalid.
+pub fn parse_earnings_events_csv(input: &str) -> Result<Vec<EarningsEvent>, EarningsCalendarError> {
+    let mut rows = input
+        .lines()
+        .enumerate()
+        .map(|(index, line)| (index + 1, line.trim()))
+        .filter(|(_, line)| !line.is_empty() && !line.starts_with('#'));
+
+    let Some((_, header)) = rows.next() else {
+        return Err(EarningsCalendarError::MissingHeader);
+    };
+    let headers = split_csv_row(header);
+    let underlying_index = required_column(&headers, "underlying")?;
+    let report_date_index = required_column(&headers, "report_date")?;
+    let timing_index = required_column(&headers, "timing")?;
+    let source_index = required_column(&headers, "source")?;
+
+    let mut events = Vec::new();
+    for (line, row) in rows {
+        let columns = split_csv_row(row);
+        if columns.len() != headers.len() {
+            return Err(EarningsCalendarError::InvalidColumnCount {
+                line,
+                expected: headers.len(),
+                actual: columns.len(),
+            });
+        }
+
+        let underlying =
+            required_field(&columns, underlying_index, line, "underlying")?.to_ascii_uppercase();
+        let report_date = NaiveDate::parse_from_str(
+            required_field(&columns, report_date_index, line, "report_date")?,
+            "%Y-%m-%d",
+        )
+        .map_err(|_| EarningsCalendarError::InvalidDate {
+            line,
+            value: columns[report_date_index].to_string(),
+        })?;
+        let timing_value = required_field(&columns, timing_index, line, "timing")?;
+        let timing =
+            parse_timing(timing_value).ok_or_else(|| EarningsCalendarError::InvalidTiming {
+                line,
+                value: timing_value.to_string(),
+            })?;
+        let source = required_field(&columns, source_index, line, "source")?.to_string();
+
+        events.push(EarningsEvent {
+            underlying,
+            report_date,
+            timing,
+            source,
+        });
+    }
+
+    Ok(events)
+}
+
+fn required_column(headers: &[String], name: &'static str) -> Result<usize, EarningsCalendarError> {
+    headers
+        .iter()
+        .position(|header| header == name)
+        .ok_or(EarningsCalendarError::MissingColumn(name))
+}
+
+fn required_field<'a>(
+    columns: &'a [String],
+    index: usize,
+    line: usize,
+    field: &'static str,
+) -> Result<&'a str, EarningsCalendarError> {
+    let value = columns[index].trim();
+    if value.is_empty() {
+        return Err(EarningsCalendarError::EmptyField { line, field });
+    }
+    Ok(value)
+}
+
+fn split_csv_row(row: &str) -> Vec<String> {
+    row.split(',')
+        .map(|value| value.trim().to_string())
+        .collect()
+}
+
+fn parse_timing(value: &str) -> Option<EarningsTiming> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "before_open" | "before" | "bmo" => Some(EarningsTiming::BeforeOpen),
+        "after_close" | "after" | "amc" => Some(EarningsTiming::AfterClose),
+        "unknown" | "unk" => Some(EarningsTiming::Unknown),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_earnings_events_csv_accepts_approved_events() {
+        let events = parse_earnings_events_csv(
+            "underlying,report_date,timing,source\nSPY,2026-05-05,after_close,manual\nqqq,2026-05-06,bmo,manual\n",
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].underlying, "SPY");
+        assert_eq!(events[0].timing, EarningsTiming::AfterClose);
+        assert_eq!(events[1].underlying, "QQQ");
+        assert_eq!(events[1].timing, EarningsTiming::BeforeOpen);
+    }
+
+    #[test]
+    fn parse_earnings_events_csv_rejects_invalid_timing() {
+        let error = parse_earnings_events_csv(
+            "underlying,report_date,timing,source\nSPY,2026-05-05,during_session,manual\n",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EarningsCalendarError::InvalidTiming { line: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn earnings_policy_filters_window_and_unknown_timing() {
+        let events = parse_earnings_events_csv(
+            "underlying,report_date,timing,source\nSPY,2026-05-05,after_close,manual\nQQQ,2026-05-12,after_close,manual\nIWM,2026-05-05,unknown,manual\n",
+        )
+        .unwrap();
+        let policy = EarningsEntryPolicy::default();
+        let trade_date = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
+
+        let eligible = policy.eligible_events(&events, trade_date);
+
+        assert_eq!(
+            eligible
+                .iter()
+                .map(|event| event.underlying.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SPY"]
+        );
+    }
+
+    #[test]
+    fn earnings_policy_can_allow_unknown_timing() {
+        let events = parse_earnings_events_csv(
+            "underlying,report_date,timing,source\nIWM,2026-05-05,unknown,manual\n",
+        )
+        .unwrap();
+        let policy = EarningsEntryPolicy {
+            allow_unknown_timing: true,
+            ..EarningsEntryPolicy::default()
+        };
+        let trade_date = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
+
+        assert_eq!(policy.eligible_events(&events, trade_date).len(), 1);
+    }
+}
