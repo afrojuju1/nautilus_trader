@@ -22,7 +22,8 @@ use std::{
 };
 
 use nautilus_alpaca::earnings::{
-    format_earnings_events_csv, parse_alpha_vantage_earnings_calendar_csv,
+    EarningsEntryPolicy, EarningsEvent, EarningsTiming, format_earnings_events_csv,
+    parse_alpha_vantage_earnings_calendar_csv,
 };
 use url::Url;
 
@@ -49,28 +50,31 @@ async fn main() -> anyhow::Result<()> {
 
     let events = parse_alpha_vantage_earnings_calendar_csv(&raw)?;
     write_atomic(&args.output_path, &format_earnings_events_csv(&events))?;
+    let approved_events = EarningsEntryPolicy::default()
+        .eligible_events(&events, args.trade_date)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    write_atomic(
+        &args.approved_path,
+        &format_earnings_events_csv(&approved_events),
+    )?;
 
-    let before_open = events
-        .iter()
-        .filter(|event| event.timing.as_str() == "before_open")
-        .count();
-    let after_close = events
-        .iter()
-        .filter(|event| event.timing.as_str() == "after_close")
-        .count();
-    let unknown = events
-        .iter()
-        .filter(|event| event.timing.as_str() == "unknown")
-        .count();
+    let raw_counts = quality_counts(&events);
+    let approved_counts = quality_counts(&approved_events);
     println!(
-        "earnings_sync: source={} events={} before_open={} after_close={} unknown={} raw_path={} output_path={}",
+        "earnings_sync: source={} events={} before_open={} after_close={} unknown={} approved_events={} approved_before_open={} approved_after_close={} raw_path={} output_path={} approved_path={}",
         raw_source.as_str(),
         events.len(),
-        before_open,
-        after_close,
-        unknown,
+        raw_counts.before_open,
+        raw_counts.after_close,
+        raw_counts.unknown,
+        approved_events.len(),
+        approved_counts.before_open,
+        approved_counts.after_close,
         args.raw_path.display(),
         args.output_path.display(),
+        args.approved_path.display(),
     );
 
     Ok(())
@@ -81,9 +85,11 @@ struct Args {
     api_key: String,
     horizon: String,
     output_path: PathBuf,
+    approved_path: PathBuf,
     raw_path: PathBuf,
     cache_secs: u64,
     force: bool,
+    trade_date: chrono::NaiveDate,
 }
 
 impl Args {
@@ -91,6 +97,9 @@ impl Args {
         let mut output_path = env::var("ALPACA_EARNINGS_EVENTS_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| default_cache_dir().join("earnings_events.csv"));
+        let mut approved_path = env::var("ALPACA_EARNINGS_APPROVED_EVENTS_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| default_cache_dir().join("earnings_events_approved.csv"));
         let mut raw_path = env::var("ALPHA_VANTAGE_EARNINGS_RAW_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
@@ -103,6 +112,7 @@ impl Args {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(DEFAULT_CACHE_SECS);
         let mut force = false;
+        let mut trade_date = chrono::Utc::now().date_naive();
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -119,11 +129,23 @@ impl Args {
                             .ok_or_else(|| anyhow::anyhow!("--output requires a value"))?,
                     );
                 }
+                "--approved-output" => {
+                    approved_path =
+                        PathBuf::from(args.next().ok_or_else(|| {
+                            anyhow::anyhow!("--approved-output requires a value")
+                        })?);
+                }
                 "--raw" => {
                     raw_path = PathBuf::from(
                         args.next()
                             .ok_or_else(|| anyhow::anyhow!("--raw requires a value"))?,
                     );
+                }
+                "--trade-date" => {
+                    trade_date = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--trade-date requires a value"))?
+                        .parse::<chrono::NaiveDate>()?;
                 }
                 _ => anyhow::bail!("unknown argument `{arg}`"),
             }
@@ -135,11 +157,32 @@ impl Args {
             api_key,
             horizon,
             output_path,
+            approved_path,
             raw_path,
             cache_secs,
             force,
+            trade_date,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct QualityCounts {
+    before_open: usize,
+    after_close: usize,
+    unknown: usize,
+}
+
+fn quality_counts(events: &[EarningsEvent]) -> QualityCounts {
+    let mut counts = QualityCounts::default();
+    for event in events {
+        match event.timing {
+            EarningsTiming::BeforeOpen => counts.before_open += 1,
+            EarningsTiming::AfterClose => counts.after_close += 1,
+            EarningsTiming::Unknown => counts.unknown += 1,
+        }
+    }
+    counts
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -418,6 +418,10 @@ Phase 7 earnings input policy:
   `EARNINGS_CALENDAR`, caches the raw CSV for 23 hours by default, and writes normalized events to
   `$XDG_STATE_HOME/nautilus_trader/earnings/earnings_events.csv` or
   `$HOME/.local/state/nautilus_trader/earnings/earnings_events.csv`.
+- `alpaca-earnings-sync` also writes `earnings_events_approved.csv`, which applies the default
+  strategy-safe filter: known timing only, future/default-window reports only, weekday reports only,
+  and common listed-equity symbol shape only. Full raw normalized output remains available for
+  diagnostics and manual review.
 - `DebitSpreadScannerConfig`, `scan_call_debit_underlying`, `scan_put_debit_underlying`, and
   pure candidate builders now cover initial earnings-debit scanner mechanics.
 

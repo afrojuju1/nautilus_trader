@@ -20,7 +20,7 @@
 
 use std::{fs, path::Path, str::FromStr};
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use thiserror::Error;
 
 /// Earnings-calendar parsing and policy error.
@@ -135,6 +135,10 @@ pub struct EarningsEntryPolicy {
     pub min_days_before_report: i64,
     /// Whether unknown report timing can be traded.
     pub allow_unknown_timing: bool,
+    /// Whether weekend report dates can be traded.
+    pub allow_weekend_reports: bool,
+    /// Whether symbols outside the common listed-equity shape can be traded.
+    pub allow_non_common_symbols: bool,
 }
 
 impl Default for EarningsEntryPolicy {
@@ -143,6 +147,8 @@ impl Default for EarningsEntryPolicy {
             max_days_before_report: 7,
             min_days_before_report: 0,
             allow_unknown_timing: false,
+            allow_weekend_reports: false,
+            allow_non_common_symbols: false,
         }
     }
 }
@@ -158,6 +164,10 @@ impl EarningsEntryPolicy {
         events
             .iter()
             .filter(|event| self.allow_unknown_timing || event.timing != EarningsTiming::Unknown)
+            .filter(|event| self.allow_weekend_reports || is_weekday(event.report_date))
+            .filter(|event| {
+                self.allow_non_common_symbols || is_common_listed_equity_symbol(&event.underlying)
+            })
             .filter(|event| {
                 let days_before = event
                     .report_date
@@ -168,6 +178,15 @@ impl EarningsEntryPolicy {
             })
             .collect()
     }
+}
+
+/// Returns only events allowed by the default production input-quality policy.
+#[must_use]
+pub fn production_quality_events(
+    events: &[EarningsEvent],
+    trade_date: NaiveDate,
+) -> Vec<&EarningsEvent> {
+    EarningsEntryPolicy::default().eligible_events(events, trade_date)
 }
 
 /// Loads earnings events from a simple CSV file.
@@ -399,6 +418,15 @@ fn alpha_vantage_timing(value: Option<&str>) -> Option<EarningsTiming> {
     }
 }
 
+fn is_weekday(date: NaiveDate) -> bool {
+    date.weekday().number_from_monday() <= 5
+}
+
+fn is_common_listed_equity_symbol(symbol: &str) -> bool {
+    let len = symbol.len();
+    (1..=4).contains(&len) && symbol.chars().all(|ch| ch.is_ascii_uppercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +476,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["SPY"]
         );
+    }
+
+    #[test]
+    fn earnings_policy_filters_weekends_and_non_common_symbols() {
+        let events = parse_earnings_events_csv(
+            "underlying,report_date,timing,source\nSPY,2026-05-05,after_close,manual\nBRK.B,2026-05-05,after_close,manual\nNABZY,2026-05-05,after_close,manual\nQQQ,2026-05-09,after_close,manual\n",
+        )
+        .unwrap();
+        let policy = EarningsEntryPolicy::default();
+        let trade_date = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
+
+        let eligible = policy.eligible_events(&events, trade_date);
+
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].underlying, "SPY");
     }
 
     #[test]
