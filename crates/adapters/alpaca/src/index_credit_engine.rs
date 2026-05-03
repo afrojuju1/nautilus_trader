@@ -19,7 +19,7 @@
 //! `alpaca-index-put-credit-entry` binary. The binary stays as a thin entrypoint so the live
 //! runtime can be tested and evolved from library code.
 
-use std::{cell::RefCell, env, rc::Rc, str::FromStr, time::Duration};
+use std::{cell::RefCell, env, future::Future, pin::Pin, rc::Rc, str::FromStr, time::Duration};
 
 use crate::{
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
@@ -72,6 +72,132 @@ struct SubmitOutcome {
     parent_order_id: Option<String>,
 }
 
+/// Strategy decision emitted into the Alpaca account engine.
+#[derive(Clone, Debug)]
+pub enum StrategyDecision {
+    /// No broker action should be taken because an account-level gate blocked entries.
+    Skip {
+        /// Stable skip reason.
+        reason: &'static str,
+    },
+    /// No eligible candidate was found.
+    NoEntry,
+    /// Candidate was found, but submission is disabled.
+    DryRun {
+        /// Selected entry candidate.
+        entry: SelectedEntry,
+    },
+    /// Submit an opening broker-native MLeg order list.
+    SubmitOpen {
+        /// Selected entry candidate.
+        entry: SelectedEntry,
+    },
+}
+
+/// Account-engine context passed to hosted strategies for one iteration.
+#[derive(Debug)]
+pub struct AccountEngineContext<'a> {
+    client: &'a AlpacaHttpClient,
+    data_config: &'a AlpacaDataClientConfig,
+    config: &'a IndexCreditConfig,
+    state: &'a StrategyState,
+    trade_date: &'a str,
+}
+
+impl<'a> AccountEngineContext<'a> {
+    fn new(
+        client: &'a AlpacaHttpClient,
+        data_config: &'a AlpacaDataClientConfig,
+        config: &'a IndexCreditConfig,
+        state: &'a StrategyState,
+        trade_date: &'a str,
+    ) -> Self {
+        Self {
+            client,
+            data_config,
+            config,
+            state,
+            trade_date,
+        }
+    }
+
+    /// Returns the market trade date for this iteration.
+    #[must_use]
+    pub fn trade_date(&self) -> &str {
+        self.trade_date
+    }
+}
+
+/// Strategy interface hosted by the single Alpaca account engine.
+pub trait StrategyRuntime {
+    /// Stable strategy runtime name.
+    fn name(&self) -> &'static str;
+
+    /// Evaluates one strategy iteration and emits an account-engine decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if strategy evaluation needs broker data and broker I/O fails.
+    fn evaluate<'a>(
+        &'a self,
+        context: AccountEngineContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<StrategyDecision>> + 'a>>;
+}
+
+/// Index-credit strategy implementation hosted by the Alpaca account engine.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IndexCreditStrategy;
+
+impl StrategyRuntime for IndexCreditStrategy {
+    fn name(&self) -> &'static str {
+        "index_credit"
+    }
+
+    fn evaluate<'a>(
+        &'a self,
+        context: AccountEngineContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<StrategyDecision>> + 'a>> {
+        Box::pin(async move {
+            match entry_gate_decision(context.config, Utc::now()) {
+                EntryGateDecision::KillSwitch => {
+                    return Ok(StrategyDecision::Skip {
+                        reason: "kill_switch_enabled",
+                    });
+                }
+                EntryGateDecision::OutsideEntryWindow => {
+                    return Ok(StrategyDecision::Skip {
+                        reason: "outside_entry_window",
+                    });
+                }
+                EntryGateDecision::Continue => {}
+            }
+
+            let selected = select_index_credit_entry(
+                context.client,
+                context.data_config,
+                context.config,
+                context.state,
+                context.trade_date,
+            )
+            .await?;
+            Ok(match selected {
+                Some(entry) if context.config.submit_enabled => {
+                    StrategyDecision::SubmitOpen { entry }
+                }
+                Some(entry) => StrategyDecision::DryRun { entry },
+                None => StrategyDecision::NoEntry,
+            })
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryGateDecision {
+    Continue,
+    KillSwitch,
+    OutsideEntryWindow,
+}
+
 /// Runs the Alpaca index-credit account engine until configured shutdown.
 ///
 /// # Errors
@@ -81,6 +207,7 @@ struct SubmitOutcome {
 pub async fn run_index_credit_engine() -> anyhow::Result<()> {
     let config = IndexCreditConfig::from_env()?;
     let mut state = load_strategy_state(&config.state_path)?;
+    let strategy = IndexCreditStrategy;
 
     println!(
         "index_credit_entry: underlyings={} strategies={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} state_path={}",
@@ -109,6 +236,7 @@ pub async fn run_index_credit_engine() -> anyhow::Result<()> {
             "kill_switch": config.kill_switch,
             "quantity": config.quantity,
             "state_path": config.state_path.display().to_string(),
+            "hosted_strategy": strategy.name(),
         }),
     );
 
@@ -133,17 +261,40 @@ pub async fn run_index_credit_engine() -> anyhow::Result<()> {
             save_strategy_state_atomic(&config.state_path, &state)?;
         }
 
-        if config.kill_switch {
-            println!("decision: skipped reason=kill_switch_enabled");
-            emit_operator_event(
-                "decision",
-                json!({
-                    "action": "skipped",
-                    "reason": "kill_switch_enabled",
-                    "trade_date": trade_date,
-                }),
-            );
-        } else if !config.ignore_entry_window && !inside_entry_window(&config) {
+        let decision = strategy
+            .evaluate(AccountEngineContext::new(
+                &http_client,
+                &data_config,
+                &config,
+                &state,
+                &trade_date,
+            ))
+            .await?;
+        if apply_strategy_decision(decision, &config, &mut state, &trade_date).await? {
+            save_strategy_state_atomic(&config.state_path, &state)?;
+        }
+
+        if config.max_iterations != 0 && iteration >= config.max_iterations {
+            break;
+        }
+
+        iteration = iteration.saturating_add(1);
+        sleep(Duration::from_secs(config.interval_secs)).await;
+    }
+
+    Ok(())
+}
+
+async fn apply_strategy_decision(
+    decision: StrategyDecision,
+    config: &IndexCreditConfig,
+    state: &mut StrategyState,
+    trade_date: &str,
+) -> anyhow::Result<bool> {
+    match decision {
+        StrategyDecision::Skip {
+            reason: "outside_entry_window",
+        } => {
             println!(
                 "decision: skipped reason=outside_entry_window window={}-{} timezone={}",
                 config.entry_start, config.entry_end, config.entry_timezone
@@ -159,113 +310,112 @@ pub async fn run_index_credit_engine() -> anyhow::Result<()> {
                     "trade_date": trade_date,
                 }),
             );
-        } else {
-            let selected =
-                select_index_credit_entry(&http_client, &data_config, &config, &state, &trade_date)
-                    .await?;
-            match selected {
-                Some(entry) if config.submit_enabled => {
-                    let order_list_id = order_list_id(&trade_date, &entry.underlying);
-                    println!(
-                        "decision: submit underlying={} short={} long={} credit={:.2} ror={:.1}% score={:.1} order_list_id={}",
-                        entry.underlying,
-                        entry.candidate.short.symbol,
-                        entry.candidate.long.symbol,
-                        entry.candidate.credit,
-                        entry.candidate.return_on_risk * 100.0,
-                        entry.candidate.score,
-                        order_list_id,
-                    );
-                    emit_operator_event(
-                        "decision",
-                        json!({
-                            "action": "submit",
-                            "underlying": &entry.underlying,
-                            "strategy": strategy_name(entry.kind),
-                            "short_symbol": &entry.candidate.short.symbol,
-                            "long_symbol": &entry.candidate.long.symbol,
-                            "credit": entry.candidate.credit,
-                            "return_on_risk": entry.candidate.return_on_risk,
-                            "score": entry.candidate.score,
-                            "order_list_id": &order_list_id,
-                            "trade_date": trade_date,
-                        }),
-                    );
-                    let outcome =
-                        submit_entry(&entry, &order_list_id, config.quantity, &config).await?;
-                    if outcome.accepted > 0 {
-                        state.record_submission(
-                            trade_date.clone(),
-                            entry.underlying,
-                            entry.kind,
-                            config.quantity,
-                            order_list_id,
-                            &entry.candidate,
-                            outcome.parent_order_id.clone(),
-                        );
-                        save_strategy_state_atomic(&config.state_path, &state)?;
-                    }
-                    println!(
-                        "submit_result: accepted={} rejected={}",
-                        outcome.accepted, outcome.rejected
-                    );
-                    emit_operator_event(
-                        "submit_result",
-                        json!({
-                            "accepted": outcome.accepted,
-                            "rejected": outcome.rejected,
-                            "parent_order_id": outcome.parent_order_id,
-                        }),
-                    );
-                }
-                Some(entry) => {
-                    println!(
-                        "decision: dry_run underlying={} short={} long={} credit={:.2} ror={:.1}% score={:.1} reason=submission_disabled",
-                        entry.underlying,
-                        entry.candidate.short.symbol,
-                        entry.candidate.long.symbol,
-                        entry.candidate.credit,
-                        entry.candidate.return_on_risk * 100.0,
-                        entry.candidate.score,
-                    );
-                    emit_operator_event(
-                        "decision",
-                        json!({
-                            "action": "dry_run",
-                            "reason": "submission_disabled",
-                            "underlying": &entry.underlying,
-                            "strategy": strategy_name(entry.kind),
-                            "short_symbol": &entry.candidate.short.symbol,
-                            "long_symbol": &entry.candidate.long.symbol,
-                            "credit": entry.candidate.credit,
-                            "return_on_risk": entry.candidate.return_on_risk,
-                            "score": entry.candidate.score,
-                            "trade_date": trade_date,
-                        }),
-                    );
-                }
-                None => {
-                    println!("decision: no_entry");
-                    emit_operator_event(
-                        "decision",
-                        json!({
-                            "action": "no_entry",
-                            "trade_date": trade_date,
-                        }),
-                    );
-                }
+            Ok(false)
+        }
+        StrategyDecision::Skip { reason } => {
+            println!("decision: skipped reason={reason}");
+            emit_operator_event(
+                "decision",
+                json!({
+                    "action": "skipped",
+                    "reason": reason,
+                    "trade_date": trade_date,
+                }),
+            );
+            Ok(false)
+        }
+        StrategyDecision::SubmitOpen { entry } => {
+            let order_list_id = order_list_id(trade_date, &entry.underlying);
+            println!(
+                "decision: submit underlying={} short={} long={} credit={:.2} ror={:.1}% score={:.1} order_list_id={}",
+                entry.underlying,
+                entry.candidate.short.symbol,
+                entry.candidate.long.symbol,
+                entry.candidate.credit,
+                entry.candidate.return_on_risk * 100.0,
+                entry.candidate.score,
+                order_list_id,
+            );
+            emit_operator_event(
+                "decision",
+                json!({
+                    "action": "submit",
+                    "underlying": &entry.underlying,
+                    "strategy": strategy_name(entry.kind),
+                    "short_symbol": &entry.candidate.short.symbol,
+                    "long_symbol": &entry.candidate.long.symbol,
+                    "credit": entry.candidate.credit,
+                    "return_on_risk": entry.candidate.return_on_risk,
+                    "score": entry.candidate.score,
+                    "order_list_id": &order_list_id,
+                    "trade_date": trade_date,
+                }),
+            );
+            let outcome = submit_entry(&entry, &order_list_id, config.quantity, config).await?;
+            if outcome.accepted > 0 {
+                state.record_submission(
+                    trade_date.to_string(),
+                    entry.underlying,
+                    entry.kind,
+                    config.quantity,
+                    order_list_id,
+                    &entry.candidate,
+                    outcome.parent_order_id.clone(),
+                );
             }
+            println!(
+                "submit_result: accepted={} rejected={}",
+                outcome.accepted, outcome.rejected
+            );
+            emit_operator_event(
+                "submit_result",
+                json!({
+                    "accepted": outcome.accepted,
+                    "rejected": outcome.rejected,
+                    "parent_order_id": outcome.parent_order_id,
+                }),
+            );
+            Ok(outcome.accepted > 0)
         }
-
-        if config.max_iterations != 0 && iteration >= config.max_iterations {
-            break;
+        StrategyDecision::DryRun { entry } => {
+            println!(
+                "decision: dry_run underlying={} short={} long={} credit={:.2} ror={:.1}% score={:.1} reason=submission_disabled",
+                entry.underlying,
+                entry.candidate.short.symbol,
+                entry.candidate.long.symbol,
+                entry.candidate.credit,
+                entry.candidate.return_on_risk * 100.0,
+                entry.candidate.score,
+            );
+            emit_operator_event(
+                "decision",
+                json!({
+                    "action": "dry_run",
+                    "reason": "submission_disabled",
+                    "underlying": &entry.underlying,
+                    "strategy": strategy_name(entry.kind),
+                    "short_symbol": &entry.candidate.short.symbol,
+                    "long_symbol": &entry.candidate.long.symbol,
+                    "credit": entry.candidate.credit,
+                    "return_on_risk": entry.candidate.return_on_risk,
+                    "score": entry.candidate.score,
+                    "trade_date": trade_date,
+                }),
+            );
+            Ok(false)
         }
-
-        iteration = iteration.saturating_add(1);
-        sleep(Duration::from_secs(config.interval_secs)).await;
+        StrategyDecision::NoEntry => {
+            println!("decision: no_entry");
+            emit_operator_event(
+                "decision",
+                json!({
+                    "action": "no_entry",
+                    "trade_date": trade_date,
+                }),
+            );
+            Ok(false)
+        }
     }
-
-    Ok(())
 }
 
 async fn manage_existing_entries(
@@ -760,9 +910,19 @@ fn age_secs_from_rfc3339(value: &str) -> Option<u64> {
         .map(|duration| duration.as_secs())
 }
 
-fn inside_entry_window(config: &IndexCreditConfig) -> bool {
-    let now = Utc::now().with_timezone(&config.entry_timezone).time();
+fn inside_entry_window_at(config: &IndexCreditConfig, now: DateTime<Utc>) -> bool {
+    let now = now.with_timezone(&config.entry_timezone).time();
     config.entry_start <= now && now <= config.entry_end
+}
+
+fn entry_gate_decision(config: &IndexCreditConfig, now: DateTime<Utc>) -> EntryGateDecision {
+    if config.kill_switch {
+        EntryGateDecision::KillSwitch
+    } else if !config.ignore_entry_window && !inside_entry_window_at(config, now) {
+        EntryGateDecision::OutsideEntryWindow
+    } else {
+        EntryGateDecision::Continue
+    }
 }
 
 fn market_trade_date(config: &IndexCreditConfig) -> String {
@@ -788,4 +948,88 @@ where
         .ok()
         .and_then(|value| value.parse::<T>().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use chrono::NaiveTime;
+
+    use super::*;
+    use crate::strategy::PutCreditScannerConfig;
+
+    fn config_for_gate_tests() -> IndexCreditConfig {
+        IndexCreditConfig {
+            underlyings: vec!["SPY".to_string()],
+            spread_kinds: vec![CreditSpreadKind::Put],
+            max_iterations: 1,
+            interval_secs: 300,
+            quantity: 1,
+            submit_enabled: false,
+            manage_enabled: false,
+            kill_switch: false,
+            force_flatten: false,
+            cancel_after_accept: false,
+            stale_entry_secs: 900,
+            close_enabled: false,
+            profit_target_close_fraction: 0.50,
+            stop_loss_close_multiple: 2.0,
+            max_hold_secs: 0,
+            expiration_exit_days: 1,
+            ignore_entry_window: false,
+            entry_start: NaiveTime::from_hms_opt(9, 45, 0).unwrap(),
+            entry_end: NaiveTime::from_hms_opt(14, 30, 0).unwrap(),
+            entry_timezone: "America/New_York".parse().unwrap(),
+            state_path: PathBuf::from("state.json"),
+            scanner: PutCreditScannerConfig::default(),
+        }
+    }
+
+    #[test]
+    fn entry_gate_allows_inside_window() {
+        let config = config_for_gate_tests();
+        let now = DateTime::parse_from_rfc3339("2026-05-04T14:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            entry_gate_decision(&config, now),
+            EntryGateDecision::Continue
+        );
+    }
+
+    #[test]
+    fn entry_gate_blocks_outside_window_without_credentials() {
+        let config = config_for_gate_tests();
+        let now = DateTime::parse_from_rfc3339("2026-05-04T21:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            entry_gate_decision(&config, now),
+            EntryGateDecision::OutsideEntryWindow
+        );
+    }
+
+    #[test]
+    fn entry_gate_prefers_kill_switch() {
+        let mut config = config_for_gate_tests();
+        config.kill_switch = true;
+        let now = DateTime::parse_from_rfc3339("2026-05-04T21:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            entry_gate_decision(&config, now),
+            EntryGateDecision::KillSwitch
+        );
+    }
+
+    #[test]
+    fn index_credit_strategy_has_stable_host_name() {
+        let strategy = IndexCreditStrategy;
+
+        assert_eq!(strategy.name(), "index_credit");
+    }
 }

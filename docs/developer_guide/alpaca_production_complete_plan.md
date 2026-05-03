@@ -343,17 +343,20 @@ Work:
   - `runtime/broker.rs`: submit, cancel, lookup, and reconciliation helper orchestration. (Initial
     index-credit submit/cancel/lookup orchestration moved to `index_credit_engine`.)
 - Define an account context that owns broker connectivity, account snapshots, orders, positions,
-  strategy state, operator events, and account-level risk controls.
+  strategy state, operator events, and account-level risk controls. (Initial
+  `AccountEngineContext` complete for hosted index-credit decisions.)
 - Define a strategy runtime trait or equivalent interface so strategies produce decisions against
-  the account context instead of directly owning broker I/O.
+  the account context instead of directly owning broker I/O. (Initial `StrategyRuntime` trait
+  complete.)
 - Port index credit into that strategy interface while preserving current behavior and environment
-  gates.
+  gates. (Complete for entry decisions; management still runs inside the account engine.)
 - Keep Alpaca broker-native MLeg submission on the Rust `SubmitOrderList` path. Do not relax the
   Python/core `OrderList` single-instrument assumption just to support Alpaca option spreads.
 - Represent strategy output as explicit decisions such as skip, submit open, submit close, cancel,
-  force flatten, or alert. Broker submission remains account-engine responsibility.
+  force flatten, or alert. Broker submission remains account-engine responsibility. (Initial
+  `StrategyDecision` covers skip, no-entry, dry-run, and submit-open.)
 - Add unit tests for strategy decisions and account-engine orchestration without shelling out to
-  binaries.
+  binaries. (Initial credential-free entry-gate tests complete.)
 - Keep the deployed service as one process for the active Alpaca account; new strategies are config
   entries inside that process.
 
@@ -376,12 +379,14 @@ Current status:
   `index_credit_engine::run_index_credit_engine`.
 - The account-engine loop, management orchestration, and broker submit/cancel/lookup helpers now
   live in library code.
-- Direct tests cover underlying parsing and scanner-width parsing.
+- The engine hosts `IndexCreditStrategy` through `StrategyRuntime`, receives explicit
+  `StrategyDecision` values, and keeps broker submission as account-engine responsibility.
+- Direct tests cover underlying parsing, scanner-width parsing, and credential-free entry gates.
 - Installed release binary was rebuilt and service health-checked after extraction on 2026-05-02.
-- Remaining Phase 6.6 work: introduce the strategy-hosting interface and paper-observe the
-  extracted engine during market hours.
+- Remaining Phase 6.6 work: paper-observe the extracted hosted engine during market hours.
 
-Status: account-engine extraction complete; strategy-hosting interface remains.
+Status: engineering complete for index-credit account-engine hosting; market-hours paper proof
+remains.
 
 ## Phase 7: Strategy Migration
 
@@ -440,6 +445,7 @@ Current status:
 
 ## Immediate Next Milestone
 
-Introduce the strategy-hosting interface for the single Alpaca account engine, then run the
-market-hours paper workflow: dry-run scan, submit-with-cancel smoke, paper open with real
-management close, and multi-day paper soak.
+Run the market-hours paper workflow for the hosted account engine: dry-run scan,
+submit-with-cancel smoke, paper open with real management close, and multi-day paper soak. In
+parallel, advance Phase 7 earnings-debit migration only after the earnings-event input policy is
+approved.
