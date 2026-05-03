@@ -41,10 +41,8 @@ Completed foundation:
 
 Known gaps:
 
-- The `alpaca-index-put-credit-entry` runner is intentionally transitional and now mixes runtime
-  strategy loop, broker I/O, and submission in one large binary. Continue moving reusable engine
-  loop and broker orchestration code into `src/` modules before live canary.
-- The account engine does not yet expose a clean strategy-hosting abstraction. Additional
+- The `alpaca-index-put-credit-entry` binary is now a thin entrypoint over library account-engine
+  code, but the account engine still needs a clean strategy-hosting abstraction. Additional
   strategies should plug into one account engine rather than becoming separate account-owning
   runners.
 - The Python/core `OrderList` single-instrument constraint still blocks a simple Python-native MLeg
@@ -298,8 +296,8 @@ Work:
   persistence, and operator events moved to `runtime`; close-decision helpers moved to
   `management`.)
 - Make the bin targets thin entrypoints over library code so tests can cover runtime decisions
-  without shelling out to binaries. (Partial: runtime state and management decisions have direct
-  tests; runner remains a transitional binary.)
+  without shelling out to binaries. (Index-credit runner entrypoint complete; runtime state and
+  management decisions have direct tests.)
 - Replace direct JSON state writes with atomic temp-file write plus rename.
 - Share the strategy state schema between the runner and operator status command.
 - Emit structured websocket disconnect/reconnect and broker reconciliation events from the Alpaca
@@ -326,8 +324,7 @@ Current status:
 - Strategy state persistence is atomic and shared between runner and operator status through the
   `runtime` module.
 - Credit-spread close decisions are shared through the `management` module with direct unit tests.
-- Remaining Phase 6.5 work: extract broker orchestration helpers from the runner binary and
-  paper-observe websocket reconnect/reconciliation events.
+- Remaining Phase 6.5 work: paper-observe websocket reconnect/reconciliation events.
 
 ## Phase 6.6: Account Engine Abstraction
 
@@ -340,9 +337,11 @@ Work:
   - `runtime/config.rs`: environment/config parsing and validation. (Initial index-credit config
     moved to `index_credit`.)
   - `runtime/engine.rs`: account-engine loop, lifecycle, iteration cadence, shutdown behavior.
+    (Initial index-credit account-engine loop moved to `index_credit_engine`.)
   - `runtime/selection.rs`: scan, admission, and candidate selection. (Initial index-credit
     selection moved to `index_credit`.)
-  - `runtime/broker.rs`: submit, cancel, lookup, and reconciliation helper orchestration.
+  - `runtime/broker.rs`: submit, cancel, lookup, and reconciliation helper orchestration. (Initial
+    index-credit submit/cancel/lookup orchestration moved to `index_credit_engine`.)
 - Define an account context that owns broker connectivity, account snapshots, orders, positions,
   strategy state, operator events, and account-level risk controls.
 - Define a strategy runtime trait or equivalent interface so strategies produce decisions against
@@ -373,12 +372,16 @@ Current status:
   index-credit runtime.
 - Index-credit scan/admission/candidate selection now lives in library code as
   `select_index_credit_entry`.
+- The installed `alpaca-index-put-credit-entry` binary is now a thin Tokio entrypoint over
+  `index_credit_engine::run_index_credit_engine`.
+- The account-engine loop, management orchestration, and broker submit/cancel/lookup helpers now
+  live in library code.
 - Direct tests cover underlying parsing and scanner-width parsing.
 - Installed release binary was rebuilt and service health-checked after extraction on 2026-05-02.
-- Remaining Phase 6.6 work: extract the account-engine loop and broker submit/cancel/lookup
-  orchestration from `bin/index_put_credit_entry.rs`, then introduce the strategy-hosting interface.
+- Remaining Phase 6.6 work: introduce the strategy-hosting interface and paper-observe the
+  extracted engine during market hours.
 
-Status: partial.
+Status: account-engine extraction complete; strategy-hosting interface remains.
 
 ## Phase 7: Strategy Migration
 
@@ -437,7 +440,6 @@ Current status:
 
 ## Immediate Next Milestone
 
-Continue Phase 6.6 for index credit: extract the account-engine loop and broker orchestration into
-library modules, then introduce the strategy-hosting interface. After that, run the market-hours
-paper workflow: dry-run scan, submit-with-cancel smoke, paper open with real management close, and
-multi-day paper soak.
+Introduce the strategy-hosting interface for the single Alpaca account engine, then run the
+market-hours paper workflow: dry-run scan, submit-with-cancel smoke, paper open with real
+management close, and multi-day paper soak.
