@@ -414,13 +414,17 @@ Phase 7 earnings input policy:
   default entry policy.
 - The `earnings` module parses and filters events by entry window without Alpaca credentials.
 - Do not infer earnings dates from broker option chains or snapshots.
+- Alpha Vantage is the first approved low-cost upstream source. `alpaca-earnings-sync` downloads
+  `EARNINGS_CALENDAR`, caches the raw CSV for 23 hours by default, and writes normalized events to
+  `$XDG_STATE_HOME/nautilus_trader/earnings/earnings_events.csv` or
+  `$HOME/.local/state/nautilus_trader/earnings/earnings_events.csv`.
 - `DebitSpreadScannerConfig`, `scan_call_debit_underlying`, `scan_put_debit_underlying`, and
   pure candidate builders now cover initial earnings-debit scanner mechanics.
 
 Phase 7 blockers:
 
 - Earnings debit strategies still need account-engine integration, management rules, paper proof,
-  and an approved production source for the local earnings CSV.
+  and source-quality review of the Alpha Vantage feed before live use.
 - Iron condors should wait until 4-leg open/close is paper-proven with the account engine.
 - Straddles/strangles should wait until long-premium management and max-loss behavior are specified.
 

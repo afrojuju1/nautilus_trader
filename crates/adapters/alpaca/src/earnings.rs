@@ -66,6 +66,14 @@ pub enum EarningsCalendarError {
         /// Invalid timing value.
         value: String,
     },
+    /// An upstream row is missing a required source column.
+    #[error("earnings calendar source row line {line} is missing `{field}`")]
+    MissingSourceField {
+        /// One-based input line number.
+        line: usize,
+        /// Field name.
+        field: &'static str,
+    },
     /// File I/O failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -238,6 +246,79 @@ pub fn parse_earnings_events_csv(input: &str) -> Result<Vec<EarningsEvent>, Earn
     Ok(events)
 }
 
+/// Parses Alpha Vantage `EARNINGS_CALENDAR` CSV into normalized earnings events.
+///
+/// Alpha Vantage returns `symbol,name,reportDate,fiscalDateEnding,estimate,currency,timeOfTheDay`.
+/// This adapter keeps only the event fields needed by the strategy input policy.
+///
+/// # Errors
+///
+/// Returns an error when required Alpha Vantage columns are missing or a data row is invalid.
+pub fn parse_alpha_vantage_earnings_calendar_csv(
+    input: &str,
+) -> Result<Vec<EarningsEvent>, EarningsCalendarError> {
+    let mut rows = input
+        .lines()
+        .enumerate()
+        .map(|(index, line)| (index + 1, line.trim()))
+        .filter(|(_, line)| !line.is_empty());
+
+    let Some((_, header)) = rows.next() else {
+        return Err(EarningsCalendarError::MissingHeader);
+    };
+    let headers = split_csv_row(header);
+    let symbol_index = required_column(&headers, "symbol")?;
+    let report_date_index = required_column(&headers, "reportDate")?;
+    let timing_index = required_column(&headers, "timeOfTheDay")?;
+
+    let mut events = Vec::new();
+    for (line, row) in rows {
+        let columns = split_csv_row(row);
+        let symbol = source_field(&columns, symbol_index, line, "symbol")?.to_ascii_uppercase();
+        let report_date_value = source_field(&columns, report_date_index, line, "reportDate")?;
+        let report_date =
+            NaiveDate::parse_from_str(report_date_value, "%Y-%m-%d").map_err(|_| {
+                EarningsCalendarError::InvalidDate {
+                    line,
+                    value: report_date_value.to_string(),
+                }
+            })?;
+        let timing = alpha_vantage_timing(columns.get(timing_index).map(String::as_str))
+            .ok_or_else(|| EarningsCalendarError::InvalidTiming {
+                line,
+                value: columns
+                    .get(timing_index)
+                    .cloned()
+                    .unwrap_or_else(|| "<missing>".to_string()),
+            })?;
+
+        events.push(EarningsEvent {
+            underlying: symbol,
+            report_date,
+            timing,
+            source: "alpha_vantage".to_string(),
+        });
+    }
+
+    Ok(events)
+}
+
+/// Formats earnings events as normalized CSV.
+#[must_use]
+pub fn format_earnings_events_csv(events: &[EarningsEvent]) -> String {
+    let mut output = String::from("underlying,report_date,timing,source\n");
+    for event in events {
+        output.push_str(&format!(
+            "{},{},{},{}\n",
+            event.underlying,
+            event.report_date,
+            event.timing.as_str(),
+            event.source
+        ));
+    }
+    output
+}
+
 fn required_column(headers: &[String], name: &'static str) -> Result<usize, EarningsCalendarError> {
     headers
         .iter()
@@ -258,10 +339,43 @@ fn required_field<'a>(
     Ok(value)
 }
 
+fn source_field<'a>(
+    columns: &'a [String],
+    index: usize,
+    line: usize,
+    field: &'static str,
+) -> Result<&'a str, EarningsCalendarError> {
+    columns
+        .get(index)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or(EarningsCalendarError::MissingSourceField { line, field })
+}
+
 fn split_csv_row(row: &str) -> Vec<String> {
-    row.split(',')
-        .map(|value| value.trim().to_string())
-        .collect()
+    let mut columns = Vec::new();
+    let mut current = String::new();
+    let mut chars = row.chars().peekable();
+    let mut quoted = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                current.push('"');
+                chars.next();
+            }
+            '"' => {
+                quoted = !quoted;
+            }
+            ',' if !quoted => {
+                columns.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    columns.push(current.trim().to_string());
+    columns
 }
 
 fn parse_timing(value: &str) -> Option<EarningsTiming> {
@@ -270,6 +384,18 @@ fn parse_timing(value: &str) -> Option<EarningsTiming> {
         "after_close" | "after" | "amc" => Some(EarningsTiming::AfterClose),
         "unknown" | "unk" => Some(EarningsTiming::Unknown),
         _ => None,
+    }
+}
+
+fn alpha_vantage_timing(value: Option<&str>) -> Option<EarningsTiming> {
+    let value = value.unwrap_or_default().trim();
+    if value.is_empty() {
+        return Some(EarningsTiming::Unknown);
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "pre-market" => Some(EarningsTiming::BeforeOpen),
+        "post-market" => Some(EarningsTiming::AfterClose),
+        _ => parse_timing(value),
     }
 }
 
@@ -337,5 +463,34 @@ mod tests {
         let trade_date = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
 
         assert_eq!(policy.eligible_events(&events, trade_date).len(), 1);
+    }
+
+    #[test]
+    fn parse_alpha_vantage_calendar_handles_quoted_company_names() {
+        let events = parse_alpha_vantage_earnings_calendar_csv(
+            "symbol,name,reportDate,fiscalDateEnding,estimate,currency,timeOfTheDay\nBCC,\"BOISE CASCADE, L.L.C.\",2026-05-04,2026-03-31,0.43,USD,post-market\nADCT,ADC THERAPEUTICS SA,2026-05-04,2026-03-31,-0.19,USD,pre-market\nNABZY,NABZY,2026-05-03,2026-03-31,,USD,\n",
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].underlying, "BCC");
+        assert_eq!(
+            events[0].report_date,
+            NaiveDate::from_ymd_opt(2026, 5, 4).unwrap()
+        );
+        assert_eq!(events[0].timing, EarningsTiming::AfterClose);
+        assert_eq!(events[1].timing, EarningsTiming::BeforeOpen);
+        assert_eq!(events[2].timing, EarningsTiming::Unknown);
+    }
+
+    #[test]
+    fn format_earnings_events_csv_round_trips_normalized_events() {
+        let events = parse_alpha_vantage_earnings_calendar_csv(
+            "symbol,name,reportDate,fiscalDateEnding,estimate,currency,timeOfTheDay\nADCT,ADC THERAPEUTICS SA,2026-05-04,2026-03-31,-0.19,USD,pre-market\n",
+        )
+        .unwrap();
+        let normalized = format_earnings_events_csv(&events);
+
+        assert_eq!(parse_earnings_events_csv(&normalized).unwrap(), events);
     }
 }

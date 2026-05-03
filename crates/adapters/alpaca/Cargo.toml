@@ -118,6 +118,13 @@ doc = false
 test = false
 
 [[bin]]
+name = "alpaca-earnings-sync"
+path = "bin/earnings_sync.rs"
+required-features = ["live"]
+doc = false
+test = false
+
+[[bin]]
 name = "alpaca-operator-status"
 path = "bin/operator_status.rs"
 required-features = ["live"]
