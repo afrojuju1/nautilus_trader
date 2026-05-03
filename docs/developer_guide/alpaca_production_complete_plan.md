@@ -42,8 +42,8 @@ Completed foundation:
 Known gaps:
 
 - The `alpaca-index-put-credit-entry` runner is intentionally transitional and now mixes runtime
-  config, strategy loop, broker I/O, and submission in one large binary. Continue moving reusable
-  broker orchestration code into `src/` modules before live canary.
+  strategy loop, broker I/O, and submission in one large binary. Continue moving reusable engine
+  loop and broker orchestration code into `src/` modules before live canary.
 - The account engine does not yet expose a clean strategy-hosting abstraction. Additional
   strategies should plug into one account engine rather than becoming separate account-owning
   runners.
@@ -337,9 +337,11 @@ strategies, not a one-off strategy runner.
 Work:
 
 - Split the remaining runner logic into library modules:
-  - `runtime/config.rs`: environment/config parsing and validation.
+  - `runtime/config.rs`: environment/config parsing and validation. (Initial index-credit config
+    moved to `index_credit`.)
   - `runtime/engine.rs`: account-engine loop, lifecycle, iteration cadence, shutdown behavior.
-  - `runtime/selection.rs`: scan, admission, and candidate selection.
+  - `runtime/selection.rs`: scan, admission, and candidate selection. (Initial index-credit
+    selection moved to `index_credit`.)
   - `runtime/broker.rs`: submit, cancel, lookup, and reconciliation helper orchestration.
 - Define an account context that owns broker connectivity, account snapshots, orders, positions,
   strategy state, operator events, and account-level risk controls.
@@ -365,7 +367,18 @@ Exit criteria:
 - The MLeg model boundary remains explicit and no global core/Python `OrderList` behavior is
   weakened.
 
-Status: not started.
+Current status:
+
+- `IndexCreditConfig` now lives in library code and owns environment parsing/validation for the
+  index-credit runtime.
+- Index-credit scan/admission/candidate selection now lives in library code as
+  `select_index_credit_entry`.
+- Direct tests cover underlying parsing and scanner-width parsing.
+- Installed release binary was rebuilt and service health-checked after extraction on 2026-05-02.
+- Remaining Phase 6.6 work: extract the account-engine loop and broker submit/cancel/lookup
+  orchestration from `bin/index_put_credit_entry.rs`, then introduce the strategy-hosting interface.
+
+Status: partial.
 
 ## Phase 7: Strategy Migration
 
@@ -424,7 +437,7 @@ Current status:
 
 ## Immediate Next Milestone
 
-Implement Phase 6.6 for index credit: extract the account-engine loop, broker orchestration, and
-selection logic into library modules with a strategy-hosting interface. After that, run the
-market-hours paper workflow: dry-run scan, submit-with-cancel smoke, paper open with real management
-close, and multi-day paper soak.
+Continue Phase 6.6 for index credit: extract the account-engine loop and broker orchestration into
+library modules, then introduce the strategy-hosting interface. After that, run the market-hours
+paper workflow: dry-run scan, submit-with-cancel smoke, paper open with real management close, and
+multi-day paper soak.

@@ -19,29 +19,25 @@
 //! put-credit candidate, and either records a dry-run decision or submits a real Nautilus
 //! `SubmitOrderList` through the Alpaca execution client. Submission is disabled by default.
 
-use std::{cell::RefCell, env, path::PathBuf, rc::Rc, str::FromStr, time::Duration};
+use std::{cell::RefCell, env, rc::Rc, str::FromStr, time::Duration};
 
-use chrono::{DateTime, NaiveTime, Utc};
-use chrono_tz::Tz;
+use chrono::{DateTime, Utc};
 use nautilus_alpaca::{
     AlpacaExecutionClient,
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
-    execution::check_put_credit_entry_admission,
     http::{
         client::AlpacaHttpClient,
         error::Error,
-        models::{AlpacaOrder, ListOrdersRequest, OptionSnapshotsRequest},
+        models::{AlpacaOrder, OptionSnapshotsRequest},
     },
-    management::{CreditSpreadManagementConfig, credit_spread_close_reason},
+    index_credit::{IndexCreditConfig, SelectedEntry, select_index_credit_entry},
+    management::credit_spread_close_reason,
     runtime::{
         StrategyState, StrategyStateEntry, credit_spread_strategy_name, emit_operator_event,
         load_strategy_state, save_strategy_state_atomic,
     },
-    strategy::{
-        CreditSpreadKind, PutCreditScannerConfig, SpreadCandidate, scan_call_credit_underlying,
-        scan_put_credit_underlying,
-    },
+    strategy::CreditSpreadKind,
     submit::{MlegSubmitLeg, MlegSubmitOrderListRequest, build_mleg_submit_order_list},
 };
 use nautilus_common::{
@@ -69,39 +65,6 @@ use tokio::{
 const DEFAULT_EVENT_TIMEOUT_SECS: u64 = 20;
 const STRATEGY_FAMILY: &str = "INDEX-PUT-CREDIT-ENTRY";
 
-#[derive(Debug)]
-struct RunnerConfig {
-    underlyings: Vec<String>,
-    spread_kinds: Vec<CreditSpreadKind>,
-    max_iterations: u64,
-    interval_secs: u64,
-    quantity: u64,
-    submit_enabled: bool,
-    manage_enabled: bool,
-    kill_switch: bool,
-    force_flatten: bool,
-    cancel_after_accept: bool,
-    stale_entry_secs: u64,
-    close_enabled: bool,
-    profit_target_close_fraction: f64,
-    stop_loss_close_multiple: f64,
-    max_hold_secs: u64,
-    expiration_exit_days: i64,
-    ignore_entry_window: bool,
-    entry_start: NaiveTime,
-    entry_end: NaiveTime,
-    entry_timezone: Tz,
-    state_path: PathBuf,
-    scanner: PutCreditScannerConfig,
-}
-
-#[derive(Clone, Debug)]
-struct SelectedEntry {
-    underlying: String,
-    kind: CreditSpreadKind,
-    candidate: SpreadCandidate,
-}
-
 #[derive(Clone, Debug)]
 struct SubmitOutcome {
     accepted: usize,
@@ -111,7 +74,7 @@ struct SubmitOutcome {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = RunnerConfig::from_env()?;
+    let config = IndexCreditConfig::from_env()?;
     let mut state = load_strategy_state(&config.state_path)?;
 
     println!(
@@ -193,7 +156,8 @@ async fn main() -> anyhow::Result<()> {
             );
         } else {
             let selected =
-                select_entry(&http_client, &data_config, &config, &state, &trade_date).await?;
+                select_index_credit_entry(&http_client, &data_config, &config, &state, &trade_date)
+                    .await?;
             match selected {
                 Some(entry) if config.submit_enabled => {
                     let order_list_id = order_list_id(&trade_date, &entry.underlying);
@@ -299,94 +263,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn select_entry(
-    client: &AlpacaHttpClient,
-    data_config: &AlpacaDataClientConfig,
-    config: &RunnerConfig,
-    state: &StrategyState,
-    trade_date: &str,
-) -> anyhow::Result<Option<SelectedEntry>> {
-    let account = client.account().await?;
-    let positions = client.positions().await?;
-    let open_orders = client.orders(&ListOrdersRequest::open_nested()).await?;
-    let mut selected: Option<SelectedEntry> = None;
-
-    for underlying in &config.underlyings {
-        if state.has_submitted_underlying(trade_date, underlying) {
-            println!("{underlying}: admission_rejected reason=daily_duplicate_state");
-            continue;
-        }
-
-        for kind in &config.spread_kinds {
-            let result = match kind {
-                CreditSpreadKind::Put => {
-                    scan_put_credit_underlying(client, data_config, &config.scanner, underlying)
-                        .await?
-                }
-                CreditSpreadKind::Call => {
-                    scan_call_credit_underlying(client, data_config, &config.scanner, underlying)
-                        .await?
-                }
-            };
-            let Some(best) = result.candidates.first() else {
-                println!(
-                    "{underlying}: no_candidate strategy={} contracts={} snapshots={} scoreable={}",
-                    strategy_name(*kind),
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                );
-                continue;
-            };
-
-            let admission = check_put_credit_entry_admission(
-                &account,
-                &positions,
-                &open_orders,
-                &best.short.symbol,
-                &best.long.symbol,
-            );
-            if !admission.allowed {
-                println!(
-                    "{underlying}: admission_rejected strategy={} short={} long={} reasons={}",
-                    strategy_name(*kind),
-                    best.short.symbol,
-                    best.long.symbol,
-                    admission.reasons.join(" | "),
-                );
-                continue;
-            }
-
-            println!(
-                "{underlying}: candidate strategy={} short={} long={} credit={:.2} ror={:.1}% score={:.1}",
-                strategy_name(*kind),
-                best.short.symbol,
-                best.long.symbol,
-                best.credit,
-                best.return_on_risk * 100.0,
-                best.score,
-            );
-
-            if selected
-                .as_ref()
-                .is_none_or(|current| best.score > current.candidate.score)
-            {
-                selected = Some(SelectedEntry {
-                    underlying: underlying.clone(),
-                    kind: *kind,
-                    candidate: best.clone(),
-                });
-            }
-        }
-    }
-
-    Ok(selected)
-}
-
 async fn manage_existing_entries(
     client: &AlpacaHttpClient,
     data_config: &AlpacaDataClientConfig,
-    config: &RunnerConfig,
+    config: &IndexCreditConfig,
     state: &mut StrategyState,
 ) -> anyhow::Result<bool> {
     let mut changed = false;
@@ -533,7 +413,7 @@ async fn close_quote(
 }
 
 fn close_reason(
-    config: &RunnerConfig,
+    config: &IndexCreditConfig,
     entry: &StrategyStateEntry,
     close_debit: f64,
 ) -> Option<String> {
@@ -545,7 +425,7 @@ async fn submit_entry(
     entry: &SelectedEntry,
     order_list_id: &str,
     quantity: u64,
-    config: &RunnerConfig,
+    config: &IndexCreditConfig,
 ) -> anyhow::Result<SubmitOutcome> {
     let exec_config = exec_config_from_env();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -600,7 +480,7 @@ async fn submit_close_entry(
     entry: &StrategyStateEntry,
     quote: &CloseQuote,
     order_list_id: &str,
-    _config: &RunnerConfig,
+    _config: &IndexCreditConfig,
 ) -> anyhow::Result<SubmitOutcome> {
     let exec_config = exec_config_from_env();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -875,181 +755,16 @@ fn age_secs_from_rfc3339(value: &str) -> Option<u64> {
         .map(|duration| duration.as_secs())
 }
 
-fn inside_entry_window(config: &RunnerConfig) -> bool {
+fn inside_entry_window(config: &IndexCreditConfig) -> bool {
     let now = Utc::now().with_timezone(&config.entry_timezone).time();
     config.entry_start <= now && now <= config.entry_end
 }
 
-fn market_trade_date(config: &RunnerConfig) -> String {
+fn market_trade_date(config: &IndexCreditConfig) -> String {
     Utc::now()
         .with_timezone(&config.entry_timezone)
         .date_naive()
         .to_string()
-}
-
-impl RunnerConfig {
-    fn management_config(&self) -> CreditSpreadManagementConfig {
-        CreditSpreadManagementConfig {
-            force_flatten: self.force_flatten,
-            profit_target_close_fraction: self.profit_target_close_fraction,
-            stop_loss_close_multiple: self.stop_loss_close_multiple,
-            max_hold_secs: self.max_hold_secs,
-            expiration_exit_days: self.expiration_exit_days,
-        }
-    }
-
-    fn from_env() -> anyhow::Result<Self> {
-        Ok(Self {
-            underlyings: underlyings_from_env(),
-            spread_kinds: spread_kinds_from_env()?,
-            max_iterations: env_parse("ALPACA_INDEX_PUT_CREDIT_MAX_ITERATIONS", 1_u64),
-            interval_secs: env_parse("ALPACA_INDEX_PUT_CREDIT_INTERVAL_SECS", 300_u64),
-            quantity: env_parse("ALPACA_INDEX_PUT_CREDIT_QTY", 1_u64),
-            submit_enabled: env_bool("ALPACA_INDEX_PUT_CREDIT_SUBMIT", false),
-            manage_enabled: env_bool("ALPACA_INDEX_CREDIT_MANAGE", false),
-            kill_switch: env_bool("ALPACA_INDEX_CREDIT_KILL_SWITCH", false),
-            force_flatten: env_bool("ALPACA_INDEX_CREDIT_FORCE_FLATTEN", false),
-            cancel_after_accept: env_bool("ALPACA_INDEX_PUT_CREDIT_CANCEL_AFTER_ACCEPT", false),
-            stale_entry_secs: env_parse("ALPACA_INDEX_CREDIT_STALE_ENTRY_SECS", 900_u64),
-            close_enabled: env_bool("ALPACA_INDEX_CREDIT_CLOSE", false),
-            profit_target_close_fraction: env_parse(
-                "ALPACA_INDEX_CREDIT_PROFIT_TARGET_CLOSE_FRACTION",
-                0.50_f64,
-            ),
-            stop_loss_close_multiple: env_parse(
-                "ALPACA_INDEX_CREDIT_STOP_LOSS_CLOSE_MULTIPLE",
-                2.0_f64,
-            ),
-            max_hold_secs: env_parse("ALPACA_INDEX_CREDIT_MAX_HOLD_SECS", 0_u64),
-            expiration_exit_days: env_parse("ALPACA_INDEX_CREDIT_EXPIRATION_EXIT_DAYS", 1_i64),
-            ignore_entry_window: env_bool("ALPACA_INDEX_PUT_CREDIT_IGNORE_WINDOW", false),
-            entry_start: parse_time_env("ALPACA_INDEX_PUT_CREDIT_ENTRY_START", "09:45")?,
-            entry_end: parse_time_env("ALPACA_INDEX_PUT_CREDIT_ENTRY_END", "14:30")?,
-            entry_timezone: env::var("ALPACA_INDEX_PUT_CREDIT_ENTRY_TZ")
-                .unwrap_or_else(|_| "America/New_York".to_string())
-                .parse::<Tz>()?,
-            state_path: env::var("ALPACA_INDEX_PUT_CREDIT_STATE_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| default_state_path()),
-            scanner: scanner_config_from_env(),
-        })
-    }
-}
-
-fn spread_kinds_from_env() -> anyhow::Result<Vec<CreditSpreadKind>> {
-    let value = env::var("ALPACA_INDEX_CREDIT_STRATEGIES")
-        .unwrap_or_else(|_| "put".to_string())
-        .to_ascii_lowercase();
-    let mut kinds = Vec::new();
-    for raw in value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        match raw {
-            "put" | "put_credit" | "index_put_credit_entry" => {
-                kinds.push(CreditSpreadKind::Put);
-            }
-            "call" | "call_credit" | "index_call_credit_entry" => {
-                kinds.push(CreditSpreadKind::Call);
-            }
-            "both" | "all" => {
-                kinds.push(CreditSpreadKind::Put);
-                kinds.push(CreditSpreadKind::Call);
-            }
-            other => anyhow::bail!("unsupported ALPACA_INDEX_CREDIT_STRATEGIES value {other}"),
-        }
-    }
-    if kinds.is_empty() {
-        kinds.push(CreditSpreadKind::Put);
-    }
-    kinds.sort_by_key(|kind| match kind {
-        CreditSpreadKind::Put => 0,
-        CreditSpreadKind::Call => 1,
-    });
-    kinds.dedup();
-    Ok(kinds)
-}
-
-fn underlyings_from_env() -> Vec<String> {
-    let args = env::args().skip(1).collect::<Vec<_>>();
-    if !args.is_empty() {
-        return split_underlyings(args);
-    }
-    env::var("ALPACA_INDEX_PUT_CREDIT_UNDERLYINGS")
-        .ok()
-        .map(|value| split_underlyings([value]))
-        .filter(|values| !values.is_empty())
-        .unwrap_or_else(|| {
-            ["SPY", "QQQ", "IWM", "DIA", "GLD"]
-                .into_iter()
-                .map(ToString::to_string)
-                .collect()
-        })
-}
-
-fn split_underlyings(values: impl IntoIterator<Item = String>) -> Vec<String> {
-    values
-        .into_iter()
-        .flat_map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-fn scanner_config_from_env() -> PutCreditScannerConfig {
-    PutCreditScannerConfig {
-        min_dte: env_parse("ALPACA_PUT_CREDIT_MIN_DTE", 5_i64),
-        max_dte: env_parse("ALPACA_PUT_CREDIT_MAX_DTE", 10_i64),
-        short_delta_min: env_parse("ALPACA_PUT_CREDIT_SHORT_DELTA_MIN", 0.18_f64),
-        short_delta_max: env_parse("ALPACA_PUT_CREDIT_SHORT_DELTA_MAX", 0.28_f64),
-        widths: env::var("ALPACA_PUT_CREDIT_WIDTHS")
-            .ok()
-            .and_then(|value| parse_csv_f64(&value))
-            .unwrap_or_else(|| vec![2.0, 3.0, 5.0]),
-        min_open_interest: env_parse("ALPACA_PUT_CREDIT_MIN_OPEN_INTEREST", 200_u64),
-        max_leg_spread_pct: env_parse("ALPACA_PUT_CREDIT_MAX_LEG_SPREAD_PCT", 0.15_f64),
-        min_return_on_risk: env_parse("ALPACA_PUT_CREDIT_MIN_RETURN_ON_RISK", 0.13_f64),
-    }
-}
-
-fn parse_csv_f64(value: &str) -> Option<Vec<f64>> {
-    let values = value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::parse::<f64>)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    (!values.is_empty()).then_some(values)
-}
-
-fn parse_time_env(name: &str, default: &str) -> anyhow::Result<NaiveTime> {
-    Ok(NaiveTime::parse_from_str(
-        &env::var(name).unwrap_or_else(|_| default.to_string()),
-        "%H:%M",
-    )?)
-}
-
-fn default_state_path() -> PathBuf {
-    if let Some(value) = env::var_os("XDG_STATE_HOME") {
-        return PathBuf::from(value)
-            .join("nautilus_trader")
-            .join("alpaca_index_put_credit_entry_state.json");
-    }
-    if let Some(value) = env::var_os("HOME") {
-        return PathBuf::from(value)
-            .join(".local")
-            .join("state")
-            .join("nautilus_trader")
-            .join("alpaca_index_put_credit_entry_state.json");
-    }
-    PathBuf::from("alpaca_index_put_credit_entry_state.json")
 }
 
 fn exec_config_from_env() -> AlpacaExecClientConfig {
@@ -1058,13 +773,6 @@ fn exec_config_from_env() -> AlpacaExecClientConfig {
     config.trade_updates_ws_url = env::var("ALPACA_TRADE_UPDATES_WS_URL").ok();
     config.external_order_filtering = false;
     config
-}
-
-fn env_bool(name: &str, default: bool) -> bool {
-    env::var(name)
-        .ok()
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(default)
 }
 
 fn env_parse<T>(name: &str, default: T) -> T

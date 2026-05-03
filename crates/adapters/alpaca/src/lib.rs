@@ -42,6 +42,8 @@ pub mod execution;
 pub mod factories;
 pub mod http;
 #[cfg(feature = "live")]
+pub mod index_credit;
+#[cfg(feature = "live")]
 pub mod management;
 pub mod orders;
 pub mod parse;
