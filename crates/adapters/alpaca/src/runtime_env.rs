@@ -1,0 +1,68 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! Runtime environment loading for deployed Alpaca account-engine utilities.
+
+use std::{env, path::PathBuf};
+
+/// Loads the deployed Alpaca index-credit environment file when present.
+///
+/// Existing process environment variables win over file values, so callers can still override
+/// individual settings explicitly.
+///
+/// # Errors
+///
+/// Returns an error if `NAUTILUS_ALPACA_ENV_FILE` points to a missing/unreadable file, the default
+/// env file cannot be inspected, or the env file is invalid.
+pub fn load_index_credit_env_file() -> anyhow::Result<Option<PathBuf>> {
+    let (path, explicit) = env::var_os("NAUTILUS_ALPACA_ENV_FILE")
+        .map(|path| (PathBuf::from(path), true))
+        .unwrap_or_else(|| (default_index_credit_env_path(), false));
+
+    match path.try_exists() {
+        Ok(true) => {
+            dotenvy::from_path(&path).map_err(|error| {
+                anyhow::anyhow!("failed to load Alpaca env file {}: {error}", path.display())
+            })?;
+            Ok(Some(path))
+        }
+        Ok(false) if explicit => {
+            anyhow::bail!("missing Alpaca env file {}", path.display())
+        }
+        Ok(false) => Ok(None),
+        Err(error) => anyhow::bail!(
+            "failed to inspect Alpaca env file {}: {error}",
+            path.display()
+        ),
+    }
+}
+
+fn default_index_credit_env_path() -> PathBuf {
+    default_config_home()
+        .join("nautilus-trader")
+        .join("alpaca")
+        .join("index-credit.env")
+}
+
+fn default_config_home() -> PathBuf {
+    if let Some(value) = env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(value);
+    }
+    home_dir().join(".config")
+}
+
+fn home_dir() -> PathBuf {
+    env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
+}

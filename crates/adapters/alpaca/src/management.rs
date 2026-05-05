@@ -176,6 +176,8 @@ mod tests {
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
+            close_attempts: 0,
+            last_close_submitted_at_utc: None,
             submitted: true,
             canceled: false,
             closed: false,

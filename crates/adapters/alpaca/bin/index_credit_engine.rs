@@ -29,14 +29,27 @@ async fn main() -> anyhow::Result<()> {
     if args.iter().any(|arg| arg == "--check-config") {
         let config = IndexCreditConfig::from_runtime_env()?;
         println!(
-            "alpaca_index_credit_config: underlyings={} strategies={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} max_iterations={} interval_secs={} state_path={}",
+            "alpaca_index_credit_config: underlyings={} strategies={} dry_run_strategies={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} max_iterations={} interval_secs={} state_path={}",
             config.underlyings.join(","),
             config.enabled_strategy_names().join(","),
+            config.dry_run_strategy_names().join(","),
             config.submit_enabled,
             config.manage_enabled,
             config.close_enabled,
             config.kill_switch,
             config.quantity,
+            format_limit(config.max_active_entries),
+            format_limit(config.max_daily_submits),
+            format_limit(config.max_open_orders),
+            format_limit(config.max_active_entries_per_underlying),
+            format_limit(config.max_active_entries_per_sector),
+            config.stale_close_secs,
+            config.close_regular_hours_only,
+            config.close_start,
+            config.close_end,
+            config.close_price_cushion,
+            config.max_close_attempts,
+            config.close_reprice_cooldown_secs,
             config.max_iterations,
             config.interval_secs,
             config.state_path.display(),
@@ -44,4 +57,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     nautilus_alpaca::index_credit_engine::run_index_credit_engine().await
+}
+
+fn format_limit(limit: Option<usize>) -> String {
+    limit.map_or_else(|| "unlimited".to_string(), |value| value.to_string())
 }

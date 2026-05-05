@@ -28,6 +28,10 @@ Edit `~/.config/nautilus-trader/alpaca/index-credit.env` and add Alpaca paper cr
 `ALPACA_KILL_SWITCH=true`, `ALPACA_SUBMIT=false`, `ALPACA_MANAGE=false`, and `ALPACA_CLOSE=false`
 until paper proof is intentionally enabled.
 
+The installed engine, operator status command, and account/order probe auto-load
+`~/.config/nautilus-trader/alpaca/index-credit.env` when present. Set
+`NAUTILUS_ALPACA_ENV_FILE` only when intentionally pointing at a different env file.
+
 Edit `~/.config/nautilus-trader/alpaca/index-credit.toml` for strategy/scanner/management settings.
 TOML `runtime.max_iterations = 0` is continuous service mode. Set `ALPACA_MAX_ITERATIONS=1` only
 for a manual one-shot smoke test override.
@@ -77,6 +81,24 @@ Override with `NAUTILUS_ALPACA_RUNNER_BIN` or `NAUTILUS_ALPACA_OPERATOR_BIN` onl
 - `ALPACA_MANAGE=true` allows stale-entry cancellation and management actions.
 - `ALPACA_CLOSE=true` allows close order submission when management is enabled.
 - `ALPACA_FORCE_FLATTEN=true` treats every tracked open spread as a close candidate.
+- TOML `runtime.dry_run_strategies = ["iron_condor"]` lets a strategy scan and emit decisions
+  without submitting while other enabled strategies can remain live.
+- TOML `management.close_regular_hours_only = true` blocks non-forced close submissions outside the
+  configured close window. `ALPACA_FORCE_FLATTEN=true` bypasses this guard for explicit flattening.
+- TOML `management.stale_close_secs` controls close-order cancel/reprice timing separately from
+  stale entry cancellation.
+- TOML `management.close_price_cushion` adds an explicit debit cushion to close limits to reduce
+  parked close orders.
+- TOML `management.max_close_attempts` caps accepted close submissions per entry. Set `0` only for
+  unlimited reprice attempts.
+- TOML `management.close_reprice_cooldown_secs` delays resubmission after a close attempt.
+- TOML `[risk] max_active_entries`, `max_daily_submits`, and `max_open_orders` cap account-level
+  exposure before any hosted strategy can submit. Env overrides are available as
+  `ALPACA_MAX_ACTIVE_ENTRIES`, `ALPACA_MAX_DAILY_SUBMITS`, and `ALPACA_MAX_OPEN_ORDERS`.
+- TOML `[risk] max_active_entries_per_underlying`, `max_active_entries_per_sector`, and
+  `[risk.sectors]` cap concentration by symbol and configured correlation group. Env overrides are
+  available for the two numeric caps as `ALPACA_MAX_ACTIVE_ENTRIES_PER_UNDERLYING` and
+  `ALPACA_MAX_ACTIVE_ENTRIES_PER_SECTOR`.
 
 Paper/live endpoint selection is controlled by `ALPACA_TRADING_BASE_URL` and
 `ALPACA_TRADE_UPDATES_WS_URL`. Keep paper URLs in place until the rollout plan explicitly moves to a
@@ -95,6 +117,49 @@ The command reports one engine state:
 - `trading`: open orders or positions exist and no critical alert is active.
 - `blocked`: the engine is intentionally blocked by kill-switch or disabled submission.
 - `broken`: account, service, state, or exposure checks need operator intervention.
+
+## Operator Runbook
+
+Normal overnight monitoring:
+
+```bash
+alpaca-operator-status --json
+cargo run -p nautilus-alpaca --features live --bin alpaca-check-account-orders
+```
+
+Expected overnight state with an open managed spread is service `active`, open orders `0`, unmanaged
+positions `0`, and `last_decision.reason = outside_entry_window`.
+
+Force flatten:
+
+```bash
+sed -i 's/^ALPACA_FORCE_FLATTEN=.*/ALPACA_FORCE_FLATTEN=true/' \
+  ~/.config/nautilus-trader/alpaca/index-credit.env
+systemctl --user restart alpaca-index-credit.service
+alpaca-operator-status --json
+```
+
+After the account is flat, set `ALPACA_FORCE_FLATTEN=false` and restart the service.
+
+Stuck close order:
+
+- Check `orders.open`, `active_entries[].close_attempts`, and `last_management_block`.
+- The engine cancels stale close orders after `management.stale_close_secs`.
+- If `close_attempts_exhausted` appears, inspect the spread, then either increase
+  `management.max_close_attempts`, set `ALPACA_FORCE_FLATTEN=true`, or flatten manually at the
+  broker.
+
+Unmanaged position:
+
+- Treat `unmanaged_positions` as critical.
+- Do not enable more entries.
+- Compare `alpaca-check-account-orders` against the strategy state file, then either restore state
+  from a known-good copy or flatten the unmanaged broker exposure.
+
+Rejected MLeg:
+
+- Check `recent_rejected_orders` and the latest broker event.
+- Keep `max_active_entries = 1` and `max_open_orders = 1` until the rejection reason is understood.
 
 ## Log Rotation
 

@@ -21,7 +21,11 @@ use nautilus_alpaca::{
     AlpacaExecutionClient,
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
-    http::{client::AlpacaHttpClient, error::Error, models::ReplaceOrderRequest},
+    http::{
+        client::AlpacaHttpClient,
+        error::Error,
+        models::{AlpacaOrder, ReplaceOrderRequest},
+    },
     strategy::{PutCreditScannerConfig, scan_put_credit_underlying},
     submit::{MlegSubmitLeg, MlegSubmitOrderListRequest, build_mleg_submit_order_list},
 };
@@ -112,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
     client.submit_order_list(cmd)?;
 
     let terminal_events = collect_execution_events(&mut rx).await;
-    if let Err(error) = replace_parent_if_requested(
+    let replacement_parent_order_id = match replace_parent_if_requested(
         &exec_config,
         &order_list_id,
         &spec,
@@ -120,9 +124,19 @@ async fn main() -> anyhow::Result<()> {
     )
     .await
     {
-        println!("replace: failed error={error}");
-    }
-    cleanup_if_accepted(&exec_config, &order_list_id, terminal_events.accepted > 0).await?;
+        Ok(order_id) => order_id,
+        Err(error) => {
+            println!("replace: failed error={error}");
+            None
+        }
+    };
+    cleanup_if_accepted(
+        &exec_config,
+        &order_list_id,
+        replacement_parent_order_id.as_deref(),
+        terminal_events.accepted > 0,
+    )
+    .await?;
 
     client.disconnect().await?;
     client.stop()?;
@@ -328,6 +342,7 @@ fn print_order_event(order_event: &nautilus_model::events::OrderEventAny) {
 async fn cleanup_if_accepted(
     config: &AlpacaExecClientConfig,
     order_list_id: &str,
+    parent_order_id: Option<&str>,
     accepted: bool,
 ) -> anyhow::Result<()> {
     if !accepted || !env_bool("ALPACA_ORDER_LIST_HARNESS_CANCEL_OPEN", true) {
@@ -335,23 +350,23 @@ async fn cleanup_if_accepted(
     }
 
     let client = AlpacaHttpClient::from_exec_config(config)?;
-    match client.order_by_client_order_id(order_list_id, true).await {
-        Ok(order) if order.is_terminal() => {
-            println!(
-                "cleanup: parent_order_id={} status={} terminal=true",
-                order.id.as_deref().unwrap_or("unknown"),
-                order.status.as_deref().unwrap_or("unknown"),
-            );
-        }
-        Ok(order) => {
-            let Some(order_id) = order.id.as_deref() else {
-                println!("cleanup: accepted parent order had no id");
-                return Ok(());
-            };
-            client.cancel_order(order_id).await?;
-            println!("cleanup: cancel_requested parent_order_id={order_id}");
-            poll_canceled_parent(&client, order_id).await?;
-        }
+    if let Some(order_id) = parent_order_id.filter(|value| !value.trim().is_empty()) {
+        return cleanup_order_lookup(&client, client.order_by_id(order_id, true).await).await;
+    }
+
+    cleanup_order_lookup(
+        &client,
+        client.order_by_client_order_id(order_list_id, true).await,
+    )
+    .await
+}
+
+async fn cleanup_order_lookup(
+    client: &AlpacaHttpClient,
+    result: std::result::Result<AlpacaOrder, Error>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(order) => cleanup_parent_order(client, &order).await?,
         Err(Error::HttpStatus { status, body, .. }) => {
             println!("cleanup: parent_lookup_failed status={status} body={body}");
         }
@@ -361,14 +376,36 @@ async fn cleanup_if_accepted(
     Ok(())
 }
 
+async fn cleanup_parent_order(
+    client: &AlpacaHttpClient,
+    order: &AlpacaOrder,
+) -> anyhow::Result<()> {
+    if order.is_terminal() {
+        println!(
+            "cleanup: parent_order_id={} status={} terminal=true",
+            order.id.as_deref().unwrap_or("unknown"),
+            order.status.as_deref().unwrap_or("unknown"),
+        );
+        return Ok(());
+    }
+
+    let Some(order_id) = order.id.as_deref() else {
+        println!("cleanup: accepted parent order had no id");
+        return Ok(());
+    };
+    client.cancel_order(order_id).await?;
+    println!("cleanup: cancel_requested parent_order_id={order_id}");
+    poll_canceled_parent(client, order_id).await
+}
+
 async fn replace_parent_if_requested(
     config: &AlpacaExecClientConfig,
     order_list_id: &str,
     spec: &HarnessOrderSpec,
     accepted: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     if !accepted || !env_bool("ALPACA_ORDER_LIST_HARNESS_REPLACE_OPEN", false) {
-        return Ok(());
+        return Ok(None);
     }
 
     let client = AlpacaHttpClient::from_exec_config(config)?;
@@ -379,11 +416,12 @@ async fn replace_parent_if_requested(
                 order.id.as_deref().unwrap_or("unknown"),
                 order.status.as_deref().unwrap_or("unknown"),
             );
+            Ok(None)
         }
         Ok(order) => {
             let Some(order_id) = order.id.as_deref() else {
                 println!("replace: accepted parent order had no id");
-                return Ok(());
+                return Ok(None);
             };
             let current_credit = spec.short_limit_price - spec.long_limit_price;
             let replacement_credit = env::var("ALPACA_ORDER_LIST_HARNESS_REPLACE_CREDIT")
@@ -408,14 +446,14 @@ async fn replace_parent_if_requested(
                 replaced.status.as_deref().unwrap_or("unknown"),
                 replaced.limit_price.as_deref().unwrap_or("unknown"),
             );
+            Ok(replaced.id.or_else(|| Some(order_id.to_string())))
         }
         Err(Error::HttpStatus { status, body, .. }) => {
             println!("replace: parent_lookup_failed status={status} body={body}");
+            Ok(None)
         }
         Err(error) => return Err(error.into()),
     }
-
-    Ok(())
 }
 
 async fn poll_canceled_parent(client: &AlpacaHttpClient, order_id: &str) -> anyhow::Result<()> {

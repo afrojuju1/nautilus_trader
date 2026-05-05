@@ -16,6 +16,7 @@
 //! Index credit strategy configuration and candidate selection.
 
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     str::FromStr,
@@ -24,13 +25,14 @@ use std::{
 use chrono::NaiveTime;
 use chrono_tz::Tz;
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::{
     config::AlpacaDataClientConfig,
     execution::check_option_spread_entry_admission,
     http::{client::AlpacaHttpClient, models::ListOrdersRequest},
     management::CreditSpreadManagementConfig,
-    runtime::{StrategyState, credit_spread_strategy_name},
+    runtime::{StrategyState, credit_spread_strategy_name, emit_operator_event},
     strategy::{
         CreditSpreadKind, IronCondorCandidate, IronCondorScannerConfig, PutCreditScannerConfig,
         SpreadCandidate, scan_call_credit_underlying, scan_iron_condor_underlying,
@@ -47,6 +49,22 @@ pub struct IndexCreditConfig {
     pub spread_kinds: Vec<CreditSpreadKind>,
     /// Whether the index iron-condor strategy is enabled.
     pub iron_condor_enabled: bool,
+    /// Credit spread kinds which scan but never submit.
+    pub dry_run_spread_kinds: Vec<CreditSpreadKind>,
+    /// Whether iron-condor candidates scan but never submit.
+    pub iron_condor_dry_run: bool,
+    /// Maximum active strategy entries. `None` means unlimited.
+    pub max_active_entries: Option<usize>,
+    /// Maximum accepted strategy submissions for one trade date. `None` means unlimited.
+    pub max_daily_submits: Option<usize>,
+    /// Maximum working broker orders before new entries are blocked. `None` means unlimited.
+    pub max_open_orders: Option<usize>,
+    /// Maximum active entries for one underlying. `None` means unlimited.
+    pub max_active_entries_per_underlying: Option<usize>,
+    /// Maximum active entries for one configured sector/correlation group. `None` means unlimited.
+    pub max_active_entries_per_sector: Option<usize>,
+    /// Underlying to sector/correlation-group mapping.
+    pub sectors: BTreeMap<String, String>,
     /// Maximum loop iterations. Zero means run continuously.
     pub max_iterations: u64,
     /// Delay between iterations.
@@ -65,8 +83,22 @@ pub struct IndexCreditConfig {
     pub cancel_after_accept: bool,
     /// Stale entry timeout.
     pub stale_entry_secs: u64,
+    /// Stale close timeout.
+    pub stale_close_secs: u64,
     /// Whether close order submission is enabled.
     pub close_enabled: bool,
+    /// Whether non-forced close submissions are limited to regular options hours.
+    pub close_regular_hours_only: bool,
+    /// Close window start.
+    pub close_start: NaiveTime,
+    /// Close window end.
+    pub close_end: NaiveTime,
+    /// Additional debit allowed on submitted close limits.
+    pub close_price_cushion: f64,
+    /// Maximum accepted close submissions per entry. Zero means unlimited.
+    pub max_close_attempts: u32,
+    /// Minimum delay after a close submission before another close may be submitted.
+    pub close_reprice_cooldown_secs: u64,
     /// Profit-target close fraction.
     pub profit_target_close_fraction: f64,
     /// Stop-loss close multiple.
@@ -99,6 +131,7 @@ impl IndexCreditConfig {
     ///
     /// Returns an error when config, strategy names, times, or timezone values are invalid.
     pub fn from_env() -> anyhow::Result<Self> {
+        crate::runtime_env::load_index_credit_env_file()?;
         build_index_credit_config(
             load_runtime_config_file_from_env()?,
             env::args().skip(1).collect::<Vec<_>>(),
@@ -111,6 +144,7 @@ impl IndexCreditConfig {
     ///
     /// Returns an error when config, strategy names, times, or timezone values are invalid.
     pub fn from_runtime_env() -> anyhow::Result<Self> {
+        crate::runtime_env::load_index_credit_env_file()?;
         build_index_credit_config(load_runtime_config_file_from_env()?, Vec::new())
     }
 
@@ -138,6 +172,40 @@ impl IndexCreditConfig {
             names.push("index_iron_condor_entry");
         }
         names
+    }
+
+    /// Returns strategy names which are configured for dry-run selection only.
+    #[must_use]
+    pub fn dry_run_strategy_names(&self) -> Vec<&'static str> {
+        let mut names = self
+            .dry_run_spread_kinds
+            .iter()
+            .map(|kind| credit_spread_strategy_name(*kind))
+            .collect::<Vec<_>>();
+        if self.iron_condor_dry_run {
+            names.push("index_iron_condor_entry");
+        }
+        names
+    }
+
+    /// Returns whether a selected credit-spread kind may submit live orders.
+    #[must_use]
+    pub fn credit_submit_enabled(&self, kind: CreditSpreadKind) -> bool {
+        self.submit_enabled && !self.dry_run_spread_kinds.contains(&kind)
+    }
+
+    /// Returns whether a selected iron condor may submit live orders.
+    #[must_use]
+    pub fn iron_condor_submit_enabled(&self) -> bool {
+        self.submit_enabled && !self.iron_condor_dry_run
+    }
+
+    /// Returns the configured sector/correlation group for an underlying.
+    #[must_use]
+    pub fn sector_for(&self, underlying: &str) -> Option<&str> {
+        self.sectors
+            .get(&underlying.to_ascii_uppercase())
+            .map(String::as_str)
     }
 }
 
@@ -221,8 +289,59 @@ pub async fn select_index_strategy_entry(
     let mut selected: Option<SelectedIndexEntry> = None;
 
     for underlying in &config.underlyings {
+        if let Some(limit) = config.max_active_entries_per_underlying {
+            let current = active_underlying_count(state, underlying);
+            if current >= limit {
+                println!(
+                    "{underlying}: admission_rejected reason=risk_max_active_entries_per_underlying current={} limit={}",
+                    current, limit,
+                );
+                emit_operator_event(
+                    "scanner_diagnostic",
+                    json!({
+                        "underlying": underlying,
+                        "result": "admission_rejected",
+                        "reason": "risk_max_active_entries_per_underlying",
+                        "current": current,
+                        "limit": limit,
+                    }),
+                );
+                continue;
+            }
+        }
+        if let Some(limit) = config.max_active_entries_per_sector
+            && let Some(sector) = config.sector_for(underlying)
+        {
+            let current = active_sector_count(state, &config.sectors, sector);
+            if current >= limit {
+                println!(
+                    "{underlying}: admission_rejected reason=risk_max_active_entries_per_sector sector={} current={} limit={}",
+                    sector, current, limit,
+                );
+                emit_operator_event(
+                    "scanner_diagnostic",
+                    json!({
+                        "underlying": underlying,
+                        "result": "admission_rejected",
+                        "reason": "risk_max_active_entries_per_sector",
+                        "sector": sector,
+                        "current": current,
+                        "limit": limit,
+                    }),
+                );
+                continue;
+            }
+        }
+
         if state.has_submitted_underlying(trade_date, underlying) {
             println!("{underlying}: admission_rejected reason=daily_duplicate_state");
+            emit_operator_event(
+                "scanner_diagnostic",
+                json!({
+                    "underlying": underlying,
+                    "reason": "daily_duplicate_state",
+                }),
+            );
             continue;
         }
 
@@ -238,12 +357,30 @@ pub async fn select_index_strategy_entry(
                 }
             };
             let Some(best) = result.candidates.first() else {
-                println!(
-                    "{underlying}: no_candidate strategy={} contracts={} snapshots={} scoreable={}",
-                    credit_spread_strategy_name(*kind),
+                let reason = no_candidate_reason(
                     result.contract_count,
                     result.snapshot_count,
                     result.scoreable_count,
+                );
+                println!(
+                    "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={}",
+                    credit_spread_strategy_name(*kind),
+                    reason,
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                );
+                emit_operator_event(
+                    "scanner_diagnostic",
+                    json!({
+                        "underlying": underlying,
+                        "strategy": credit_spread_strategy_name(*kind),
+                        "result": "no_candidate",
+                        "reason": reason,
+                        "contracts": result.contract_count,
+                        "snapshots": result.snapshot_count,
+                        "scoreable": result.scoreable_count,
+                    }),
                 );
                 continue;
             };
@@ -262,6 +399,17 @@ pub async fn select_index_strategy_entry(
                     best.long.symbol,
                     admission.reasons.join(" | "),
                 );
+                emit_operator_event(
+                    "scanner_diagnostic",
+                    json!({
+                        "underlying": underlying,
+                        "strategy": credit_spread_strategy_name(*kind),
+                        "result": "admission_rejected",
+                        "short_symbol": &best.short.symbol,
+                        "long_symbol": &best.long.symbol,
+                        "reasons": admission.reasons,
+                    }),
+                );
                 continue;
             }
 
@@ -273,6 +421,19 @@ pub async fn select_index_strategy_entry(
                 best.credit,
                 best.return_on_risk * 100.0,
                 best.score,
+            );
+            emit_operator_event(
+                "scanner_diagnostic",
+                json!({
+                    "underlying": underlying,
+                    "strategy": credit_spread_strategy_name(*kind),
+                    "result": "candidate",
+                    "short_symbol": &best.short.symbol,
+                    "long_symbol": &best.long.symbol,
+                    "credit": best.credit,
+                    "return_on_risk": best.return_on_risk,
+                    "score": best.score,
+                }),
             );
 
             if selected
@@ -296,9 +457,26 @@ pub async fn select_index_strategy_entry(
             )
             .await?;
             let Some(best) = result.candidates.first() else {
+                let reason = no_candidate_reason(
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                );
                 println!(
-                    "{underlying}: no_candidate strategy=index_iron_condor_entry contracts={} snapshots={} scoreable={}",
-                    result.contract_count, result.snapshot_count, result.scoreable_count,
+                    "{underlying}: no_candidate strategy=index_iron_condor_entry reason={} contracts={} snapshots={} scoreable={}",
+                    reason, result.contract_count, result.snapshot_count, result.scoreable_count,
+                );
+                emit_operator_event(
+                    "scanner_diagnostic",
+                    json!({
+                        "underlying": underlying,
+                        "strategy": "index_iron_condor_entry",
+                        "result": "no_candidate",
+                        "reason": reason,
+                        "contracts": result.contract_count,
+                        "snapshots": result.snapshot_count,
+                        "scoreable": result.scoreable_count,
+                    }),
                 );
                 continue;
             };
@@ -323,6 +501,19 @@ pub async fn select_index_strategy_entry(
                     best.call.long.symbol,
                     admission.reasons.join(" | "),
                 );
+                emit_operator_event(
+                    "scanner_diagnostic",
+                    json!({
+                        "underlying": underlying,
+                        "strategy": "index_iron_condor_entry",
+                        "result": "admission_rejected",
+                        "short_put_symbol": &best.put.short.symbol,
+                        "long_put_symbol": &best.put.long.symbol,
+                        "short_call_symbol": &best.call.short.symbol,
+                        "long_call_symbol": &best.call.long.symbol,
+                        "reasons": admission.reasons,
+                    }),
+                );
                 continue;
             }
 
@@ -335,6 +526,21 @@ pub async fn select_index_strategy_entry(
                 best.credit,
                 best.return_on_risk * 100.0,
                 best.score,
+            );
+            emit_operator_event(
+                "scanner_diagnostic",
+                json!({
+                    "underlying": underlying,
+                    "strategy": "index_iron_condor_entry",
+                    "result": "candidate",
+                    "short_put_symbol": &best.put.short.symbol,
+                    "long_put_symbol": &best.put.long.symbol,
+                    "short_call_symbol": &best.call.short.symbol,
+                    "long_call_symbol": &best.call.long.symbol,
+                    "credit": best.credit,
+                    "return_on_risk": best.return_on_risk,
+                    "score": best.score,
+                }),
             );
 
             if selected
@@ -366,12 +572,14 @@ struct RuntimeConfigFile {
     scanner: ScannerSection,
     iron_condor: IronCondorSection,
     management: ManagementSection,
+    risk: RiskSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RuntimeSection {
     strategies: Vec<String>,
+    dry_run_strategies: Vec<String>,
     max_iterations: Option<u64>,
     interval_secs: Option<u64>,
     submit: Option<bool>,
@@ -419,10 +627,28 @@ struct IronCondorSection {
 #[serde(default)]
 struct ManagementSection {
     stale_entry_secs: Option<u64>,
+    stale_close_secs: Option<u64>,
+    close_regular_hours_only: Option<bool>,
+    close_start: Option<String>,
+    close_end: Option<String>,
+    close_price_cushion: Option<f64>,
+    max_close_attempts: Option<u32>,
+    close_reprice_cooldown_secs: Option<u64>,
     profit_target_close_fraction: Option<f64>,
     stop_loss_close_multiple: Option<f64>,
     max_hold_secs: Option<u64>,
     expiration_exit_days: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RiskSection {
+    max_active_entries: Option<usize>,
+    max_daily_submits: Option<usize>,
+    max_open_orders: Option<usize>,
+    max_active_entries_per_underlying: Option<usize>,
+    max_active_entries_per_sector: Option<usize>,
+    sectors: BTreeMap<String, String>,
 }
 
 fn load_runtime_config_file_from_env() -> anyhow::Result<RuntimeConfigFile> {
@@ -474,11 +700,28 @@ fn build_index_credit_config(
             }
         });
     let strategy_config = strategy_config_from_values(strategy_values)?;
+    let dry_run_strategy_values = env::var("ALPACA_DRY_RUN_STRATEGIES")
+        .ok()
+        .map(|value| split_strings([value]))
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| file.runtime.dry_run_strategies.clone());
+    let dry_run_strategy_config = dry_run_strategy_config_from_values(dry_run_strategy_values)?;
     let scanner = scanner_config_from_file(&file.scanner);
+    let stale_entry_secs = file.management.stale_entry_secs.unwrap_or(900);
     Ok(IndexCreditConfig {
         underlyings: underlyings_from_sources(cli_underlyings, &file.index),
         spread_kinds: strategy_config.credit_kinds,
         iron_condor_enabled: strategy_config.iron_condor_enabled,
+        dry_run_spread_kinds: dry_run_strategy_config.credit_kinds,
+        iron_condor_dry_run: dry_run_strategy_config.iron_condor_enabled,
+        max_active_entries: env_parse("ALPACA_MAX_ACTIVE_ENTRIES").or(file.risk.max_active_entries),
+        max_daily_submits: env_parse("ALPACA_MAX_DAILY_SUBMITS").or(file.risk.max_daily_submits),
+        max_open_orders: env_parse("ALPACA_MAX_OPEN_ORDERS").or(file.risk.max_open_orders),
+        max_active_entries_per_underlying: env_parse("ALPACA_MAX_ACTIVE_ENTRIES_PER_UNDERLYING")
+            .or(file.risk.max_active_entries_per_underlying),
+        max_active_entries_per_sector: env_parse("ALPACA_MAX_ACTIVE_ENTRIES_PER_SECTOR")
+            .or(file.risk.max_active_entries_per_sector),
+        sectors: sector_map_from_file(file.risk.sectors),
         max_iterations: env_parse("ALPACA_MAX_ITERATIONS")
             .or(file.runtime.max_iterations)
             .unwrap_or(1),
@@ -501,10 +744,26 @@ fn build_index_credit_config(
         cancel_after_accept: env_bool("ALPACA_CANCEL_AFTER_ACCEPT")
             .or(file.runtime.cancel_after_accept)
             .unwrap_or(false),
-        stale_entry_secs: file.management.stale_entry_secs.unwrap_or(900),
+        stale_entry_secs,
+        stale_close_secs: file.management.stale_close_secs.unwrap_or(stale_entry_secs),
         close_enabled: env_bool("ALPACA_CLOSE")
             .or(file.runtime.close)
             .unwrap_or(false),
+        close_regular_hours_only: env_bool("ALPACA_CLOSE_REGULAR_HOURS_ONLY")
+            .or(file.management.close_regular_hours_only)
+            .unwrap_or(true),
+        close_start: parse_time_value(file.management.close_start.as_deref(), "09:30")?,
+        close_end: parse_time_value(file.management.close_end.as_deref(), "16:00")?,
+        close_price_cushion: env_parse("ALPACA_CLOSE_PRICE_CUSHION")
+            .or(file.management.close_price_cushion)
+            .unwrap_or(0.0)
+            .max(0.0),
+        max_close_attempts: env_parse("ALPACA_MAX_CLOSE_ATTEMPTS")
+            .or(file.management.max_close_attempts)
+            .unwrap_or(3),
+        close_reprice_cooldown_secs: env_parse("ALPACA_CLOSE_REPRICE_COOLDOWN_SECS")
+            .or(file.management.close_reprice_cooldown_secs)
+            .unwrap_or(30),
         profit_target_close_fraction: file.management.profit_target_close_fraction.unwrap_or(0.50),
         stop_loss_close_multiple: file.management.stop_loss_close_multiple.unwrap_or(2.0),
         max_hold_secs: file.management.max_hold_secs.unwrap_or(0),
@@ -574,6 +833,16 @@ fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyCo
     })
 }
 
+fn dry_run_strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyConfig> {
+    if values.is_empty() {
+        return Ok(StrategyConfig {
+            credit_kinds: Vec::new(),
+            iron_condor_enabled: false,
+        });
+    }
+    strategy_config_from_values(values)
+}
+
 fn underlyings_from_sources(cli_underlyings: Vec<String>, config: &IndexSection) -> Vec<String> {
     let args = split_strings(cli_underlyings);
     if !args.is_empty() {
@@ -600,11 +869,81 @@ fn split_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
+fn no_candidate_reason(
+    contract_count: usize,
+    snapshot_count: usize,
+    scoreable_count: usize,
+) -> &'static str {
+    if contract_count == 0 {
+        "no_contracts"
+    } else if snapshot_count == 0 {
+        "no_snapshots"
+    } else if scoreable_count == 0 {
+        "no_scoreable_spreads"
+    } else {
+        "no_ranked_candidate"
+    }
+}
+
+fn active_underlying_count(state: &StrategyState, underlying: &str) -> usize {
+    state
+        .entries
+        .iter()
+        .filter(|entry| entry.is_active() && entry.underlying.eq_ignore_ascii_case(underlying))
+        .count()
+}
+
+fn active_sector_count(
+    state: &StrategyState,
+    sectors: &BTreeMap<String, String>,
+    sector: &str,
+) -> usize {
+    state
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.is_active()
+                && sectors
+                    .get(&entry.underlying.to_ascii_uppercase())
+                    .is_some_and(|entry_sector| entry_sector == sector)
+        })
+        .count()
+}
+
 fn default_underlyings() -> Vec<String> {
     ["SPY", "QQQ", "IWM", "DIA", "GLD"]
         .into_iter()
         .map(ToString::to_string)
         .collect()
+}
+
+fn sector_map_from_file(config: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let map = if config.is_empty() {
+        default_sector_map()
+    } else {
+        config
+    };
+    map.into_iter()
+        .map(|(underlying, sector)| (underlying.to_ascii_uppercase(), sector))
+        .collect()
+}
+
+fn default_sector_map() -> BTreeMap<String, String> {
+    [
+        ("SPY", "broad_index"),
+        ("QQQ", "broad_index"),
+        ("IWM", "broad_index"),
+        ("DIA", "broad_index"),
+        ("GLD", "metals"),
+        ("TLT", "rates"),
+        ("XLE", "energy"),
+        ("XLF", "financials"),
+        ("XLK", "technology"),
+        ("XLV", "healthcare"),
+    ]
+    .into_iter()
+    .map(|(underlying, sector)| (underlying.to_string(), sector.to_string()))
+    .collect()
 }
 
 fn scanner_config_from_file(config: &ScannerSection) -> PutCreditScannerConfig {
@@ -713,6 +1052,7 @@ mod tests {
             r#"
 [runtime]
 strategies = ["put", "iron_condor"]
+dry_run_strategies = ["iron_condor"]
 max_iterations = 0
 submit = false
 manage = true
@@ -742,8 +1082,26 @@ min_return_on_risk = 0.20
 wing_min_return_on_risk = 0.11
 require_equal_widths = true
 
+[risk]
+max_active_entries = 1
+max_daily_submits = 1
+max_open_orders = 1
+max_active_entries_per_underlying = 1
+max_active_entries_per_sector = 3
+
+[risk.sectors]
+SPY = "broad_index"
+QQQ = "broad_index"
+
 [management]
 stale_entry_secs = 600
+stale_close_secs = 120
+close_regular_hours_only = true
+close_start = "09:30"
+close_end = "16:00"
+close_price_cushion = 0.02
+max_close_attempts = 4
+close_reprice_cooldown_secs = 45
 profit_target_close_fraction = 0.45
 stop_loss_close_multiple = 1.8
 max_hold_secs = 3600
@@ -753,10 +1111,27 @@ expiration_exit_days = 2
         .unwrap();
 
         assert_eq!(config.runtime.strategies, vec!["put", "iron_condor"]);
+        assert_eq!(config.runtime.dry_run_strategies, vec!["iron_condor"]);
         assert_eq!(config.index.underlyings, vec!["SPY", "QQQ"]);
         assert_eq!(config.scanner.widths, Some(vec![2.0, 5.0]));
         assert_eq!(config.iron_condor.min_return_on_risk, Some(0.20));
+        assert_eq!(config.risk.max_active_entries, Some(1));
+        assert_eq!(config.risk.max_daily_submits, Some(1));
+        assert_eq!(config.risk.max_open_orders, Some(1));
+        assert_eq!(config.risk.max_active_entries_per_underlying, Some(1));
+        assert_eq!(config.risk.max_active_entries_per_sector, Some(3));
+        assert_eq!(
+            config.risk.sectors.get("SPY").map(String::as_str),
+            Some("broad_index"),
+        );
         assert_eq!(config.management.stale_entry_secs, Some(600));
+        assert_eq!(config.management.stale_close_secs, Some(120));
+        assert_eq!(config.management.close_regular_hours_only, Some(true));
+        assert_eq!(config.management.close_start.as_deref(), Some("09:30"));
+        assert_eq!(config.management.close_end.as_deref(), Some("16:00"));
+        assert_eq!(config.management.close_price_cushion, Some(0.02));
+        assert_eq!(config.management.max_close_attempts, Some(4));
+        assert_eq!(config.management.close_reprice_cooldown_secs, Some(45));
     }
 
     #[test]
@@ -768,5 +1143,17 @@ expiration_exit_days = 2
             vec![CreditSpreadKind::Put, CreditSpreadKind::Call],
         );
         assert!(config.iron_condor_enabled);
+    }
+
+    #[test]
+    fn dry_run_strategy_config_has_no_default_strategy() {
+        let config = dry_run_strategy_config_from_values(Vec::new()).unwrap();
+
+        assert!(config.credit_kinds.is_empty());
+        assert!(!config.iron_condor_enabled);
+
+        let config = dry_run_strategy_config_from_values(vec!["put".to_string()]).unwrap();
+        assert_eq!(config.credit_kinds, vec![CreditSpreadKind::Put]);
+        assert!(!config.iron_condor_enabled);
     }
 }

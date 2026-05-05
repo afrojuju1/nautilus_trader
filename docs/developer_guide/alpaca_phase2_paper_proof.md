@@ -77,8 +77,27 @@ Market-hours revalidation note:
 - On May 2, 2026, Alpaca paper accepted a parent MLeg and both legs, but rejected the replace call
   with `cannot replace order in accepted status`; cleanup then canceled the parent and final account
   checks showed zero open orders and zero positions.
-- Re-run this proof during regular market hours with `ALPACA_ORDER_LIST_HARNESS_REPLACE_OPEN=true`
-  and record whether Alpaca allows replacing the parent MLeg once the broker state is replaceable.
+- On May 4, 2026 during regular market hours, Alpaca paper accepted a SPY put-credit MLeg,
+  accepted both legs, and accepted a parent replace from `-0.47` to `-0.46` with returned
+  status `new`. The original cleanup path attempted to cancel the replaced parent, so the active
+  replacement parent was canceled manually; final account checks showed zero open orders, zero
+  positions, and zero fills.
+- On May 4, 2026 the installed account engine opened SPY and QQQ put-credit spreads under paper,
+  then `ALPACA_FORCE_FLATTEN=true` submitted real paper close MLegs. QQQ filled immediately; SPY
+  required stale close cancellation and repricing before filling. Final account checks showed zero
+  open orders, zero positions, and both strategy entries closed in state.
+- On May 4, 2026 the call-credit scanner selected QQQ, submitted
+  `QQQ260512C00685000/QQQ260512C00687000` for `0.54` credit, Alpaca accepted both legs, and the
+  paper account held one managed QQQ call-credit spread with zero open orders. The runtime was then
+  restored to `strategies = ["put", "call"]`, `max_active_entries = 1`, `max_daily_submits = 1`,
+  and `max_open_orders = 1`.
+- After the May 4, 2026 market close, a one-shot engine pass temporarily made the managed QQQ call
+  spread eligible by `max_hold`; `management.close_regular_hours_only = true` blocked the close with
+  `outside_close_window`, and the broker account still showed zero open orders.
+- On May 5, 2026 after the service hardening install, the same one-shot after-hours gate proof was
+  repeated on the installed binary. The engine emitted `management_block` with
+  `reason=outside_close_window`; account checks still showed zero open orders and the managed QQQ
+  call-credit position.
 
 ## Direct Lifecycle Proof
 

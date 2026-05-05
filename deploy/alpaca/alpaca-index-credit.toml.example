@@ -2,6 +2,7 @@
 
 [runtime]
 strategies = ["put"]
+dry_run_strategies = []
 # 0 means run continuously for service mode. Set to 1 for one-shot smoke tests.
 max_iterations = 0
 interval_secs = 300
@@ -36,8 +37,36 @@ min_return_on_risk = 0.18
 wing_min_return_on_risk = 0.10
 require_equal_widths = true
 
+[risk]
+# Account-level caps checked before any hosted strategy can submit a new entry.
+# Omit a field or set it through env only when the cap should be unlimited.
+max_active_entries = 1
+max_daily_submits = 1
+max_open_orders = 1
+max_active_entries_per_underlying = 1
+max_active_entries_per_sector = 3
+
+[risk.sectors]
+SPY = "broad_index"
+QQQ = "broad_index"
+IWM = "broad_index"
+DIA = "broad_index"
+GLD = "metals"
+TLT = "rates"
+XLE = "energy"
+XLF = "financials"
+XLK = "technology"
+XLV = "healthcare"
+
 [management]
 stale_entry_secs = 900
+stale_close_secs = 120
+close_regular_hours_only = true
+close_start = "09:30"
+close_end = "16:00"
+close_price_cushion = 0.02
+max_close_attempts = 3
+close_reprice_cooldown_secs = 30
 profit_target_close_fraction = 0.50
 stop_loss_close_multiple = 2.0
 max_hold_secs = 0

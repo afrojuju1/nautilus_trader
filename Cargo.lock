@@ -5219,6 +5219,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "chrono-tz",
+ "dotenvy",
  "log",
  "nautilus-common",
  "nautilus-core",

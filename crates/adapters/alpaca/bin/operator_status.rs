@@ -15,7 +15,12 @@
 
 //! Operator status command for the supervised Alpaca account engine.
 
-use std::{collections::BTreeSet, env, path::PathBuf, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    path::PathBuf,
+    process::Command,
+};
 
 use chrono::{DateTime, Duration, Utc};
 use nautilus_alpaca::{
@@ -37,10 +42,19 @@ struct OperatorConfig {
     log_path: PathBuf,
     lock_path: PathBuf,
     stale_order_secs: i64,
+    max_close_attempts: u32,
+    trade_date: String,
     kill_switch: bool,
     submit_enabled: bool,
     manage_enabled: bool,
     close_enabled: bool,
+    dry_run_strategies: Vec<String>,
+    max_active_entries: Option<usize>,
+    max_daily_submits: Option<usize>,
+    max_open_orders: Option<usize>,
+    max_active_entries_per_underlying: Option<usize>,
+    max_active_entries_per_sector: Option<usize>,
+    sectors: BTreeMap<String, String>,
     json_output: bool,
 }
 
@@ -53,8 +67,12 @@ struct OperatorStatus {
     orders: OrdersStatus,
     positions: PositionsStatus,
     strategy_state: StrategyStateStatus,
+    active_entries: Vec<ActiveEntryStatus>,
+    risk: RiskStatus,
     last_scan: Option<Value>,
+    last_scanner_diagnostic: Option<Value>,
     last_decision: Option<Value>,
+    last_management_block: Option<Value>,
     last_broker_event: Option<Value>,
     alerts: Vec<OperatorAlert>,
 }
@@ -81,6 +99,7 @@ struct ServiceStatus {
     submit_enabled: bool,
     manage_enabled: bool,
     close_enabled: bool,
+    dry_run_strategies: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,6 +142,35 @@ struct StrategyStateStatus {
     closed_entries: usize,
     canceled_entries: usize,
     last_recorded_at_utc: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RiskStatus {
+    trade_date: String,
+    active_entries: usize,
+    max_active_entries: Option<usize>,
+    daily_submits: usize,
+    max_daily_submits: Option<usize>,
+    open_orders: usize,
+    max_open_orders: Option<usize>,
+    active_entries_by_underlying: BTreeMap<String, usize>,
+    max_active_entries_per_underlying: Option<usize>,
+    active_entries_by_sector: BTreeMap<String, usize>,
+    max_active_entries_per_sector: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ActiveEntryStatus {
+    underlying: String,
+    strategy: String,
+    symbols: Vec<String>,
+    credit: f64,
+    score: f64,
+    close_reason: Option<String>,
+    close_order_list_id: Option<String>,
+    close_attempts: u32,
+    last_close_submitted_at_utc: Option<String>,
+    recorded_at_utc: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -193,6 +241,11 @@ impl OperatorConfig {
         let lock_dir = env::var("NAUTILUS_ALPACA_LOCK_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| default_state_dir.join("locks"));
+        let dry_run_strategies = strategy_config
+            .dry_run_strategy_names()
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
 
         Ok(Self {
             service_name: env::var("NAUTILUS_ALPACA_SERVICE")
@@ -201,10 +254,22 @@ impl OperatorConfig {
             log_path: log_dir.join("alpaca-index-credit.log"),
             lock_path: lock_dir.join("alpaca-index-credit.lock"),
             stale_order_secs: strategy_config.stale_entry_secs as i64,
+            max_close_attempts: strategy_config.max_close_attempts,
+            trade_date: Utc::now()
+                .with_timezone(&strategy_config.entry_timezone)
+                .date_naive()
+                .to_string(),
             kill_switch: strategy_config.kill_switch,
             submit_enabled: strategy_config.submit_enabled,
             manage_enabled: strategy_config.manage_enabled,
             close_enabled: strategy_config.close_enabled,
+            dry_run_strategies,
+            max_active_entries: strategy_config.max_active_entries,
+            max_daily_submits: strategy_config.max_daily_submits,
+            max_open_orders: strategy_config.max_open_orders,
+            max_active_entries_per_underlying: strategy_config.max_active_entries_per_underlying,
+            max_active_entries_per_sector: strategy_config.max_active_entries_per_sector,
+            sectors: strategy_config.sectors,
             json_output: env::args().any(|arg| arg == "--json"),
         })
     }
@@ -315,6 +380,26 @@ fn build_status(
             .filter_map(|entry| non_empty(&entry.recorded_at_utc))
             .max(),
     };
+    let active_entries = active_entry_statuses(state);
+    let active_entries_by_underlying = active_entries_by_underlying(state);
+    let active_entries_by_sector = active_entries_by_sector(state, &config.sectors);
+    let risk = RiskStatus {
+        trade_date: config.trade_date.clone(),
+        active_entries: strategy_state.active_entries,
+        max_active_entries: config.max_active_entries,
+        daily_submits: state
+            .entries
+            .iter()
+            .filter(|entry| entry.submitted && entry.trade_date == config.trade_date)
+            .count(),
+        max_daily_submits: config.max_daily_submits,
+        open_orders: orders_status.open,
+        max_open_orders: config.max_open_orders,
+        active_entries_by_underlying,
+        max_active_entries_per_underlying: config.max_active_entries_per_underlying,
+        active_entries_by_sector,
+        max_active_entries_per_sector: config.max_active_entries_per_sector,
+    };
 
     let service = ServiceStatus {
         name: config.service_name.clone(),
@@ -328,10 +413,13 @@ fn build_status(
         submit_enabled: config.submit_enabled,
         manage_enabled: config.manage_enabled,
         close_enabled: config.close_enabled,
+        dry_run_strategies: config.dry_run_strategies.clone(),
     };
 
     let last_scan = latest_event(events, "strategy_iteration");
+    let last_scanner_diagnostic = latest_event(events, "scanner_diagnostic");
     let last_decision = latest_event(events, "decision");
+    let last_management_block = latest_event(events, "management_block");
     let last_broker_event = latest_broker_event(recent_orders, activities);
 
     let mut alerts = build_alerts(
@@ -341,6 +429,8 @@ fn build_status(
         &orders_status,
         &positions_status,
         &strategy_state,
+        &active_entries,
+        &risk,
         open_orders,
         events,
     );
@@ -366,8 +456,12 @@ fn build_status(
         orders: orders_status,
         positions: positions_status,
         strategy_state,
+        active_entries,
+        risk,
         last_scan,
+        last_scanner_diagnostic,
         last_decision,
+        last_management_block,
         last_broker_event,
         alerts,
     }
@@ -380,6 +474,8 @@ fn build_alerts(
     orders: &OrdersStatus,
     positions: &PositionsStatus,
     strategy_state: &StrategyStateStatus,
+    active_entries: &[ActiveEntryStatus],
+    risk: &RiskStatus,
     open_orders: &[AlpacaOrder],
     events: &[Value],
 ) -> Vec<OperatorAlert> {
@@ -465,6 +561,103 @@ fn build_alerts(
             "broker exposure exists but the local strategy state file is missing".to_string(),
         ));
     }
+    if let Some(limit) = risk.max_active_entries
+        && risk.active_entries >= limit
+    {
+        alerts.push(alert(
+            AlertSeverity::Warning,
+            "risk_max_active_entries",
+            format!(
+                "active strategy entries are at the configured cap: {}/{}",
+                risk.active_entries, limit
+            ),
+        ));
+    }
+    if let Some(limit) = risk.max_active_entries_per_underlying {
+        for (underlying, current) in risk
+            .active_entries_by_underlying
+            .iter()
+            .filter(|(_, current)| **current >= limit)
+        {
+            alerts.push(alert(
+                AlertSeverity::Warning,
+                "risk_max_active_entries_per_underlying",
+                format!(
+                    "{} active entries are at the per-underlying cap: {}/{}",
+                    underlying, current, limit
+                ),
+            ));
+        }
+    }
+    if let Some(limit) = risk.max_active_entries_per_sector {
+        for (sector, current) in risk
+            .active_entries_by_sector
+            .iter()
+            .filter(|(_, current)| **current >= limit)
+        {
+            alerts.push(alert(
+                AlertSeverity::Warning,
+                "risk_max_active_entries_per_sector",
+                format!(
+                    "{} active entries are at the sector cap: {}/{}",
+                    sector, current, limit
+                ),
+            ));
+        }
+    }
+    if let Some(limit) = risk.max_daily_submits
+        && risk.daily_submits >= limit
+    {
+        alerts.push(alert(
+            AlertSeverity::Warning,
+            "risk_max_daily_submits",
+            format!(
+                "daily submissions for {} are at the configured cap: {}/{}",
+                risk.trade_date, risk.daily_submits, limit
+            ),
+        ));
+    }
+    if let Some(limit) = risk.max_open_orders
+        && risk.open_orders >= limit
+    {
+        alerts.push(alert(
+            AlertSeverity::Warning,
+            "risk_max_open_orders",
+            format!(
+                "open orders are at the configured cap: {}/{}",
+                risk.open_orders, limit
+            ),
+        ));
+    }
+    if config.max_close_attempts > 0 {
+        for entry in active_entries
+            .iter()
+            .filter(|entry| entry.close_attempts >= config.max_close_attempts)
+        {
+            alerts.push(alert(
+                AlertSeverity::Critical,
+                "close_attempts_exhausted",
+                format!(
+                    "{} {} close attempts are exhausted: {}/{}",
+                    entry.underlying,
+                    entry.strategy,
+                    entry.close_attempts,
+                    config.max_close_attempts,
+                ),
+            ));
+        }
+    }
+    if let Some(event) = latest_recent_event(events, "management_block", 3600) {
+        let reason = event
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        alerts.push(alert(
+            AlertSeverity::Warning,
+            "management_block",
+            format!("recent management block: {reason}"),
+        ));
+    }
     if recent_event_count(events, "runner_start", 3600) > 1 {
         alerts.push(alert(
             AlertSeverity::Warning,
@@ -521,13 +714,14 @@ fn print_human_status(status: &OperatorStatus) {
         status.engine_state, status.checked_at_utc
     );
     println!(
-        "service: name={} active={} kill_switch={} submit={} manage={} close={} lock={} log={}",
+        "service: name={} active={} kill_switch={} submit={} manage={} close={} dry_run_strategies={} lock={} log={}",
         status.service.name,
         status.service.active_state.as_deref().unwrap_or("unknown"),
         status.service.kill_switch,
         status.service.submit_enabled,
         status.service.manage_enabled,
         status.service.close_enabled,
+        status.service.dry_run_strategies.join(","),
         status.service.lock_file,
         status.service.log_file,
     );
@@ -566,6 +760,34 @@ fn print_human_status(status: &OperatorStatus) {
         status.strategy_state.canceled_entries,
         status.strategy_state.path,
     );
+    for entry in &status.active_entries {
+        println!(
+            "active_entry: underlying={} strategy={} symbols={} credit={:.2} close_attempts={} close_reason={} close_order_list_id={} last_close_submitted_at={}",
+            entry.underlying,
+            entry.strategy,
+            entry.symbols.join(","),
+            entry.credit,
+            entry.close_attempts,
+            entry.close_reason.as_deref().unwrap_or("none"),
+            entry.close_order_list_id.as_deref().unwrap_or("none"),
+            entry
+                .last_close_submitted_at_utc
+                .as_deref()
+                .unwrap_or("none"),
+        );
+    }
+    println!(
+        "risk: trade_date={} active_entries={}/{} daily_submits={}/{} open_orders={}/{} per_underlying={} per_sector={}",
+        status.risk.trade_date,
+        status.risk.active_entries,
+        format_limit(status.risk.max_active_entries),
+        status.risk.daily_submits,
+        format_limit(status.risk.max_daily_submits),
+        status.risk.open_orders,
+        format_limit(status.risk.max_open_orders),
+        format_limit(status.risk.max_active_entries_per_underlying),
+        format_limit(status.risk.max_active_entries_per_sector),
+    );
     println!(
         "last_scan: {}",
         status
@@ -574,9 +796,23 @@ fn print_human_status(status: &OperatorStatus) {
             .map_or_else(|| "none".to_string(), compact_json)
     );
     println!(
+        "last_scanner_diagnostic: {}",
+        status
+            .last_scanner_diagnostic
+            .as_ref()
+            .map_or_else(|| "none".to_string(), compact_json)
+    );
+    println!(
         "last_decision: {}",
         status
             .last_decision
+            .as_ref()
+            .map_or_else(|| "none".to_string(), compact_json)
+    );
+    println!(
+        "last_management_block: {}",
+        status
+            .last_management_block
             .as_ref()
             .map_or_else(|| "none".to_string(), compact_json)
     );
@@ -594,6 +830,10 @@ fn print_human_status(status: &OperatorStatus) {
             alert.severity, alert.code, alert.message
         );
     }
+}
+
+fn format_limit(limit: Option<usize>) -> String {
+    limit.map_or_else(|| "unlimited".to_string(), |value| value.to_string())
 }
 
 fn open_orders_request() -> ListOrdersRequest {
@@ -643,6 +883,22 @@ fn recent_event_count(events: &[Value], event_type: &str, lookback_secs: i64) ->
         .count()
 }
 
+fn latest_recent_event(events: &[Value], event_type: &str, lookback_secs: i64) -> Option<Value> {
+    let cutoff = Utc::now() - Duration::seconds(lookback_secs);
+    events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.get("type").and_then(Value::as_str) == Some(event_type)
+                && event
+                    .get("ts_utc")
+                    .and_then(Value::as_str)
+                    .and_then(parse_utc)
+                    .is_some_and(|ts| ts >= cutoff)
+        })
+        .cloned()
+}
+
 fn latest_broker_event(orders: &[AlpacaOrder], activities: &[AlpacaActivity]) -> Option<Value> {
     if let Some(activity) = activities.first() {
         return Some(json!({
@@ -670,14 +926,58 @@ fn latest_broker_event(orders: &[AlpacaOrder], activities: &[AlpacaActivity]) ->
 fn active_strategy_symbols(state: &StrategyState) -> BTreeSet<String> {
     let mut symbols = BTreeSet::new();
     for entry in state.entries.iter().filter(|entry| entry.is_active()) {
-        if !entry.short_symbol.is_empty() {
-            symbols.insert(entry.short_symbol.clone());
-        }
-        if !entry.long_symbol.is_empty() {
-            symbols.insert(entry.long_symbol.clone());
+        for symbol in entry.symbols() {
+            if !symbol.is_empty() {
+                symbols.insert(symbol.to_string());
+            }
         }
     }
     symbols
+}
+
+fn active_entries_by_underlying(state: &StrategyState) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for entry in state.entries.iter().filter(|entry| entry.is_active()) {
+        *counts.entry(entry.underlying.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn active_entries_by_sector(
+    state: &StrategyState,
+    sectors: &BTreeMap<String, String>,
+) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for entry in state.entries.iter().filter(|entry| entry.is_active()) {
+        if let Some(sector) = sectors.get(&entry.underlying.to_ascii_uppercase()) {
+            *counts.entry(sector.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+fn active_entry_statuses(state: &StrategyState) -> Vec<ActiveEntryStatus> {
+    state
+        .entries
+        .iter()
+        .filter(|entry| entry.is_active())
+        .map(|entry| ActiveEntryStatus {
+            underlying: entry.underlying.clone(),
+            strategy: entry.strategy.clone(),
+            symbols: entry
+                .symbols()
+                .into_iter()
+                .map(ToString::to_string)
+                .collect(),
+            credit: entry.credit,
+            score: entry.score,
+            close_reason: entry.close_reason.clone(),
+            close_order_list_id: entry.close_order_list_id.clone(),
+            close_attempts: entry.close_attempts,
+            last_close_submitted_at_utc: entry.last_close_submitted_at_utc.clone(),
+            recorded_at_utc: entry.recorded_at_utc.clone(),
+        })
+        .collect()
 }
 
 fn order_is_stale(order: &AlpacaOrder, now: DateTime<Utc>, stale_order_secs: i64) -> bool {

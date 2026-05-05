@@ -1907,10 +1907,11 @@ fn build_mleg_payload_from_order_list(
     if net_credit == 0.0 {
         anyhow::bail!("Alpaca MLeg signed net limit price must be non-zero");
     }
-    let premium_kind = if net_credit > 0.0 {
-        NetPremiumKind::Credit
-    } else {
-        NetPremiumKind::Debit
+    let premium_kind = match trade_intent {
+        TradeIntent::Open if net_credit > 0.0 => NetPremiumKind::Credit,
+        TradeIntent::Open => NetPremiumKind::Debit,
+        TradeIntent::Close if net_credit < 0.0 => NetPremiumKind::Credit,
+        TradeIntent::Close => NetPremiumKind::Debit,
     };
     let signed_limit_price = signed_net_limit_price(net_credit.abs(), premium_kind, trade_intent);
 
@@ -2672,6 +2673,56 @@ mod tests {
         assert_eq!(
             payload.legs[1].position_intent,
             AlpacaPositionIntent::BuyToOpen
+        );
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn build_mleg_payload_from_order_list_uses_signed_credit_close_price() {
+        let orders = vec![
+            mleg_limit_order("O-1", "SPY260508P00500000", OrderSide::Buy, 0.75, true),
+            mleg_limit_order("O-2", "SPY260508P00495000", OrderSide::Sell, 0.25, true),
+        ];
+        let cmd = submit_order_list_for_orders("OL-CLOSE-1", &orders);
+
+        let payload = build_mleg_payload_from_order_list(&cmd, &orders).unwrap();
+
+        assert_eq!(payload.client_order_id.as_deref(), Some("OL-CLOSE-1"));
+        assert_eq!(payload.qty, "1");
+        assert_eq!(payload.limit_price, "0.50");
+        assert_eq!(payload.legs.len(), 2);
+        assert_eq!(
+            payload.legs[0].position_intent,
+            AlpacaPositionIntent::BuyToClose
+        );
+        assert_eq!(
+            payload.legs[1].position_intent,
+            AlpacaPositionIntent::SellToClose
+        );
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn build_mleg_payload_from_order_list_uses_signed_debit_close_price() {
+        let orders = vec![
+            mleg_limit_order("O-1", "SPY260508P00500000", OrderSide::Sell, 1.55, true),
+            mleg_limit_order("O-2", "SPY260508P00495000", OrderSide::Buy, 0.40, true),
+        ];
+        let cmd = submit_order_list_for_orders("OL-DEBIT-CLOSE-1", &orders);
+
+        let payload = build_mleg_payload_from_order_list(&cmd, &orders).unwrap();
+
+        assert_eq!(payload.client_order_id.as_deref(), Some("OL-DEBIT-CLOSE-1"));
+        assert_eq!(payload.qty, "1");
+        assert_eq!(payload.limit_price, "-1.15");
+        assert_eq!(payload.legs.len(), 2);
+        assert_eq!(
+            payload.legs[0].position_intent,
+            AlpacaPositionIntent::SellToClose
+        );
+        assert_eq!(
+            payload.legs[1].position_intent,
+            AlpacaPositionIntent::BuyToClose
         );
     }
 

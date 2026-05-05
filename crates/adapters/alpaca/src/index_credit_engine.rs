@@ -19,7 +19,10 @@
 //! `alpaca-index-credit-engine` binary. The binary stays as a thin entrypoint so the live
 //! runtime can be tested and evolved from library code.
 
-use std::{cell::RefCell, env, future::Future, pin::Pin, rc::Rc, str::FromStr, time::Duration};
+use std::{
+    cell::RefCell, collections::BTreeSet, env, future::Future, pin::Pin, rc::Rc, str::FromStr,
+    time::Duration,
+};
 
 use crate::{
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
@@ -28,7 +31,7 @@ use crate::{
     http::{
         client::AlpacaHttpClient,
         error::Error,
-        models::{AlpacaOrder, OptionSnapshotsRequest},
+        models::{AlpacaOrder, AlpacaPosition, ListOrdersRequest, OptionSnapshotsRequest},
     },
     index_credit::{
         IndexCreditConfig, SelectedEntry, SelectedIndexEntry, SelectedIronCondorEntry,
@@ -85,6 +88,15 @@ pub enum StrategyDecision {
     },
     /// No eligible candidate was found.
     NoEntry,
+    /// New entries are blocked by account-level risk caps.
+    RiskBlocked {
+        /// Stable risk reason.
+        reason: &'static str,
+        /// Current observed count.
+        current: usize,
+        /// Configured limit.
+        limit: usize,
+    },
     /// Candidate was found, but submission is disabled.
     DryRun {
         /// Selected entry candidate.
@@ -185,6 +197,31 @@ impl StrategyRuntime for IndexCreditStrategy {
                 EntryGateDecision::Continue => {}
             }
 
+            match risk_gate_decision(&context).await? {
+                RiskGateDecision::Continue => {}
+                RiskGateDecision::MaxActiveEntries { current, limit } => {
+                    return Ok(StrategyDecision::RiskBlocked {
+                        reason: "risk_max_active_entries",
+                        current,
+                        limit,
+                    });
+                }
+                RiskGateDecision::MaxDailySubmits { current, limit } => {
+                    return Ok(StrategyDecision::RiskBlocked {
+                        reason: "risk_max_daily_submits",
+                        current,
+                        limit,
+                    });
+                }
+                RiskGateDecision::MaxOpenOrders { current, limit } => {
+                    return Ok(StrategyDecision::RiskBlocked {
+                        reason: "risk_max_open_orders",
+                        current,
+                        limit,
+                    });
+                }
+            }
+
             let selected = select_index_strategy_entry(
                 context.client,
                 context.data_config,
@@ -194,11 +231,15 @@ impl StrategyRuntime for IndexCreditStrategy {
             )
             .await?;
             Ok(match selected {
-                Some(SelectedIndexEntry::Credit(entry)) if context.config.submit_enabled => {
+                Some(SelectedIndexEntry::Credit(entry))
+                    if context.config.credit_submit_enabled(entry.kind) =>
+                {
                     StrategyDecision::SubmitOpen { entry }
                 }
                 Some(SelectedIndexEntry::Credit(entry)) => StrategyDecision::DryRun { entry },
-                Some(SelectedIndexEntry::IronCondor(entry)) if context.config.submit_enabled => {
+                Some(SelectedIndexEntry::IronCondor(entry))
+                    if context.config.iron_condor_submit_enabled() =>
+                {
                     StrategyDecision::SubmitIronCondorOpen { entry }
                 }
                 Some(SelectedIndexEntry::IronCondor(entry)) => {
@@ -215,6 +256,14 @@ enum EntryGateDecision {
     Continue,
     KillSwitch,
     OutsideEntryWindow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RiskGateDecision {
+    Continue,
+    MaxActiveEntries { current: usize, limit: usize },
+    MaxDailySubmits { current: usize, limit: usize },
+    MaxOpenOrders { current: usize, limit: usize },
 }
 
 /// Runs the Alpaca index-credit account engine until configured shutdown.
@@ -244,11 +293,25 @@ pub async fn run_index_credit_engine() -> anyhow::Result<()> {
         json!({
             "underlyings": &config.underlyings,
             "strategies": config.enabled_strategy_names(),
+            "dry_run_strategies": config.dry_run_strategy_names(),
             "submit_enabled": config.submit_enabled,
             "manage_enabled": config.manage_enabled,
             "close_enabled": config.close_enabled,
             "kill_switch": config.kill_switch,
             "quantity": config.quantity,
+            "max_active_entries": config.max_active_entries,
+            "max_daily_submits": config.max_daily_submits,
+            "max_open_orders": config.max_open_orders,
+            "max_active_entries_per_underlying": config.max_active_entries_per_underlying,
+            "max_active_entries_per_sector": config.max_active_entries_per_sector,
+            "sectors": &config.sectors,
+            "stale_close_secs": config.stale_close_secs,
+            "close_regular_hours_only": config.close_regular_hours_only,
+            "close_start": config.close_start.to_string(),
+            "close_end": config.close_end.to_string(),
+            "close_price_cushion": config.close_price_cushion,
+            "max_close_attempts": config.max_close_attempts,
+            "close_reprice_cooldown_secs": config.close_reprice_cooldown_secs,
             "state_path": config.state_path.display().to_string(),
             "hosted_strategy": strategy.name(),
         }),
@@ -258,6 +321,10 @@ pub async fn run_index_credit_engine() -> anyhow::Result<()> {
     data_config.trading_base_url = env::var("ALPACA_TRADING_BASE_URL").ok();
     data_config.data_base_url = env::var("ALPACA_DATA_BASE_URL").ok();
     let http_client = AlpacaHttpClient::from_data_config(&data_config)?;
+
+    if reconcile_strategy_state(&http_client, &mut state).await? {
+        save_strategy_state_atomic(&config.state_path, &state)?;
+    }
 
     let mut iteration = 1_u64;
     loop {
@@ -333,6 +400,24 @@ async fn apply_strategy_decision(
                 json!({
                     "action": "skipped",
                     "reason": reason,
+                    "trade_date": trade_date,
+                }),
+            );
+            Ok(false)
+        }
+        StrategyDecision::RiskBlocked {
+            reason,
+            current,
+            limit,
+        } => {
+            println!("decision: skipped reason={reason} current={current} limit={limit}");
+            emit_operator_event(
+                "decision",
+                json!({
+                    "action": "skipped",
+                    "reason": reason,
+                    "current": current,
+                    "limit": limit,
                     "trade_date": trade_date,
                 }),
             );
@@ -520,6 +605,214 @@ async fn apply_strategy_decision(
     }
 }
 
+async fn risk_gate_decision(
+    context: &AccountEngineContext<'_>,
+) -> anyhow::Result<RiskGateDecision> {
+    if let Some(limit) = context.config.max_active_entries {
+        let current = context
+            .state
+            .entries
+            .iter()
+            .filter(|entry| entry.is_active())
+            .count();
+        if current >= limit {
+            return Ok(RiskGateDecision::MaxActiveEntries { current, limit });
+        }
+    }
+
+    if let Some(limit) = context.config.max_daily_submits {
+        let current = context
+            .state
+            .entries
+            .iter()
+            .filter(|entry| entry.submitted && entry.trade_date == context.trade_date)
+            .count();
+        if current >= limit {
+            return Ok(RiskGateDecision::MaxDailySubmits { current, limit });
+        }
+    }
+
+    if let Some(limit) = context.config.max_open_orders {
+        let current = context
+            .client
+            .orders(&ListOrdersRequest::open_nested())
+            .await?
+            .len();
+        if current >= limit {
+            return Ok(RiskGateDecision::MaxOpenOrders { current, limit });
+        }
+    }
+
+    Ok(RiskGateDecision::Continue)
+}
+
+async fn reconcile_strategy_state(
+    client: &AlpacaHttpClient,
+    state: &mut StrategyState,
+) -> anyhow::Result<bool> {
+    let positions = client.positions().await?;
+    let open_orders = client.orders(&ListOrdersRequest::open_nested()).await?;
+    let position_symbols = position_symbols(&positions);
+    let open_order_symbols = order_symbols(&open_orders);
+    let active_symbols = active_state_symbols(state);
+    let unmanaged_symbols = position_symbols
+        .difference(&active_symbols)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unmanaged_symbols.is_empty() {
+        println!(
+            "reconcile: unmanaged_positions symbols={}",
+            unmanaged_symbols.join(","),
+        );
+        emit_operator_event(
+            "reconciliation_warning",
+            json!({
+                "reason": "unmanaged_positions",
+                "symbols": unmanaged_symbols,
+            }),
+        );
+    }
+
+    let mut changed = false;
+    for entry in state.entries.iter_mut().filter(|entry| entry.is_active()) {
+        let mut action = reconciliation_action(entry, &position_symbols, &open_order_symbols, None);
+        if action == ReconciliationAction::MarkClosed {
+            let order_status = lookup_parent_order_snapshot(client, &entry.order_list_id)
+                .await?
+                .and_then(|order| order.status);
+            action = reconciliation_action(
+                entry,
+                &position_symbols,
+                &open_order_symbols,
+                order_status.as_deref(),
+            );
+        }
+
+        match action {
+            ReconciliationAction::None => {}
+            ReconciliationAction::MarkClosed => {
+                println!(
+                    "reconcile: mark_closed underlying={} order_list_id={} reason=broker_flat",
+                    entry.underlying, entry.order_list_id,
+                );
+                emit_operator_event(
+                    "reconciliation_repair",
+                    json!({
+                        "action": "mark_closed",
+                        "reason": "broker_flat",
+                        "underlying": entry.underlying,
+                        "order_list_id": entry.order_list_id,
+                    }),
+                );
+                entry.mark_closed(None);
+                changed = true;
+            }
+            ReconciliationAction::MarkCanceled => {
+                println!(
+                    "reconcile: mark_canceled underlying={} order_list_id={} reason=entry_terminal_without_position",
+                    entry.underlying, entry.order_list_id,
+                );
+                emit_operator_event(
+                    "reconciliation_repair",
+                    json!({
+                        "action": "mark_canceled",
+                        "reason": "entry_terminal_without_position",
+                        "underlying": entry.underlying,
+                        "order_list_id": entry.order_list_id,
+                    }),
+                );
+                entry.mark_canceled();
+                changed = true;
+            }
+            ReconciliationAction::PartialPosition => {
+                println!(
+                    "reconcile: partial_position underlying={} symbols={}",
+                    entry.underlying,
+                    entry.symbols().join(","),
+                );
+                emit_operator_event(
+                    "reconciliation_warning",
+                    json!({
+                        "reason": "partial_position",
+                        "underlying": entry.underlying,
+                        "symbols": entry.symbols(),
+                    }),
+                );
+            }
+        }
+    }
+
+    Ok(changed)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconciliationAction {
+    None,
+    MarkClosed,
+    MarkCanceled,
+    PartialPosition,
+}
+
+fn reconciliation_action(
+    entry: &StrategyStateEntry,
+    position_symbols: &BTreeSet<String>,
+    open_order_symbols: &BTreeSet<String>,
+    entry_order_status: Option<&str>,
+) -> ReconciliationAction {
+    let symbols = entry.symbols();
+    let position_matches = symbols
+        .iter()
+        .filter(|symbol| {
+            position_symbols
+                .iter()
+                .any(|candidate| candidate == *symbol)
+        })
+        .count();
+    let open_order_matches = symbols
+        .iter()
+        .filter(|symbol| {
+            open_order_symbols
+                .iter()
+                .any(|candidate| candidate == *symbol)
+        })
+        .count();
+
+    if position_matches == 0 && open_order_matches == 0 {
+        if matches!(
+            entry_order_status,
+            Some("canceled" | "expired" | "rejected")
+        ) {
+            ReconciliationAction::MarkCanceled
+        } else {
+            ReconciliationAction::MarkClosed
+        }
+    } else if position_matches > 0 && position_matches < symbols.len() {
+        ReconciliationAction::PartialPosition
+    } else {
+        ReconciliationAction::None
+    }
+}
+
+fn active_state_symbols(state: &StrategyState) -> BTreeSet<String> {
+    state
+        .entries
+        .iter()
+        .filter(|entry| entry.is_active())
+        .flat_map(|entry| entry.symbols().into_iter().map(ToString::to_string))
+        .collect()
+}
+
+fn position_symbols(positions: &[AlpacaPosition]) -> BTreeSet<String> {
+    positions
+        .iter()
+        .filter_map(|position| position.symbol.clone())
+        .collect()
+}
+
+fn order_symbols(orders: &[AlpacaOrder]) -> BTreeSet<String> {
+    orders.iter().flat_map(AlpacaOrder::symbols).collect()
+}
+
 async fn manage_existing_entries(
     client: &AlpacaHttpClient,
     data_config: &AlpacaDataClientConfig,
@@ -541,6 +834,28 @@ async fn manage_existing_entries(
                 );
                 if order.status.as_deref() == Some("filled") {
                     entry.mark_closed(order.id);
+                    changed = true;
+                } else if order.is_working() {
+                    let stale = config.stale_close_secs > 0
+                        && order_age_secs(&order).is_some_and(|age| age >= config.stale_close_secs);
+                    if stale {
+                        println!(
+                            "manage: stale_close order_list_id={} status={} manage_enabled={}",
+                            close_order_list_id,
+                            order.status.as_deref().unwrap_or("unknown"),
+                            config.manage_enabled,
+                        );
+                        if config.manage_enabled && config.close_enabled {
+                            cancel_parent_order_by_id(client, order.id.as_deref()).await?;
+                            entry.clear_close_submission();
+                            changed = true;
+                        }
+                    }
+                } else if matches!(
+                    order.status.as_deref(),
+                    Some("canceled" | "expired" | "rejected")
+                ) {
+                    entry.clear_close_submission();
                     changed = true;
                 }
             }
@@ -612,9 +927,77 @@ async fn manage_existing_entries(
         if !(config.manage_enabled && config.close_enabled) {
             continue;
         }
+        if close_attempts_exhausted(config, entry) {
+            println!(
+                "manage: close_blocked underlying={} trigger={} reason=max_close_attempts attempts={} limit={}",
+                entry.underlying, close_reason, entry.close_attempts, config.max_close_attempts,
+            );
+            emit_operator_event(
+                "management_block",
+                json!({
+                    "action": "close_blocked",
+                    "reason": "max_close_attempts",
+                    "underlying": entry.underlying,
+                    "trigger": close_reason,
+                    "attempts": entry.close_attempts,
+                    "limit": config.max_close_attempts,
+                }),
+            );
+            continue;
+        }
+        if let Some(remaining_secs) = close_reprice_cooldown_remaining_secs(config, entry) {
+            println!(
+                "manage: close_blocked underlying={} trigger={} reason=close_reprice_cooldown remaining_secs={}",
+                entry.underlying, close_reason, remaining_secs,
+            );
+            emit_operator_event(
+                "management_block",
+                json!({
+                    "action": "close_blocked",
+                    "reason": "close_reprice_cooldown",
+                    "underlying": entry.underlying,
+                    "trigger": close_reason,
+                    "remaining_secs": remaining_secs,
+                }),
+            );
+            continue;
+        }
+        if close_submission_gate_decision(config, Utc::now())
+            == CloseSubmissionGateDecision::OutsideCloseWindow
+        {
+            println!(
+                "manage: close_blocked underlying={} trigger={} reason=outside_close_window window={}-{} timezone={}",
+                entry.underlying,
+                close_reason,
+                config.close_start,
+                config.close_end,
+                config.entry_timezone,
+            );
+            emit_operator_event(
+                "management_block",
+                json!({
+                    "action": "close_blocked",
+                    "reason": "outside_close_window",
+                    "underlying": entry.underlying,
+                    "trigger": close_reason,
+                    "window_start": config.close_start.to_string(),
+                    "window_end": config.close_end.to_string(),
+                    "timezone": config.entry_timezone.to_string(),
+                }),
+            );
+            continue;
+        }
 
         let close_order_list_id = close_order_list_id(entry);
-        let outcome = submit_close_entry(entry, &close_quote, &close_order_list_id, config).await?;
+        let submit_quote = close_quote.with_price_cushion(config.close_price_cushion);
+        if config.close_price_cushion > 0.0 {
+            println!(
+                "manage: close_limit underlying={} raw_debit={:.2} cushion={:.2} limit_debit={:.2}",
+                entry.underlying, close_quote.debit, config.close_price_cushion, submit_quote.debit,
+            );
+        }
+        let outcome =
+            submit_close_entry(entry, &submit_quote, &close_order_list_id, config).await?;
         if outcome.accepted > 0 {
             entry.record_close_submission(
                 close_order_list_id,
@@ -635,6 +1018,29 @@ struct CloseQuote {
     short_call_ask: Option<f64>,
     long_call_bid: Option<f64>,
     debit: f64,
+}
+
+impl CloseQuote {
+    fn with_price_cushion(self, cushion: f64) -> Self {
+        let cushion = cushion.max(0.0);
+        if cushion == 0.0 {
+            return self;
+        }
+
+        let mut quote = self;
+        let short_leg_count = if quote.short_call_ask.is_some() {
+            2.0
+        } else {
+            1.0
+        };
+        let per_short_leg_cushion = cushion / short_leg_count;
+        quote.short_ask += per_short_leg_cushion;
+        if let Some(short_call_ask) = quote.short_call_ask.as_mut() {
+            *short_call_ask += per_short_leg_cushion;
+        }
+        quote.debit += cushion;
+        quote
+    }
 }
 
 async fn close_quote(
@@ -1186,6 +1592,52 @@ fn inside_entry_window_at(config: &IndexCreditConfig, now: DateTime<Utc>) -> boo
     config.entry_start <= now && now <= config.entry_end
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloseSubmissionGateDecision {
+    Continue,
+    OutsideCloseWindow,
+}
+
+fn close_submission_gate_decision(
+    config: &IndexCreditConfig,
+    now: DateTime<Utc>,
+) -> CloseSubmissionGateDecision {
+    if config.force_flatten
+        || !config.close_regular_hours_only
+        || inside_close_window_at(config, now)
+    {
+        CloseSubmissionGateDecision::Continue
+    } else {
+        CloseSubmissionGateDecision::OutsideCloseWindow
+    }
+}
+
+fn inside_close_window_at(config: &IndexCreditConfig, now: DateTime<Utc>) -> bool {
+    let now = now.with_timezone(&config.entry_timezone).time();
+    config.close_start <= now && now <= config.close_end
+}
+
+fn close_attempts_exhausted(config: &IndexCreditConfig, entry: &StrategyStateEntry) -> bool {
+    !config.force_flatten
+        && config.max_close_attempts > 0
+        && entry.close_attempts >= config.max_close_attempts
+}
+
+fn close_reprice_cooldown_remaining_secs(
+    config: &IndexCreditConfig,
+    entry: &StrategyStateEntry,
+) -> Option<u64> {
+    if config.force_flatten || config.close_reprice_cooldown_secs == 0 {
+        return None;
+    }
+
+    let age = entry
+        .last_close_submitted_at_utc
+        .as_deref()
+        .and_then(age_secs_from_rfc3339)?;
+    (age < config.close_reprice_cooldown_secs).then_some(config.close_reprice_cooldown_secs - age)
+}
+
 fn entry_gate_decision(config: &IndexCreditConfig, now: DateTime<Utc>) -> EntryGateDecision {
     if config.kill_switch {
         EntryGateDecision::KillSwitch
@@ -1223,7 +1675,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
 
     use chrono::NaiveTime;
 
@@ -1235,6 +1687,14 @@ mod tests {
             underlyings: vec!["SPY".to_string()],
             spread_kinds: vec![CreditSpreadKind::Put],
             iron_condor_enabled: false,
+            dry_run_spread_kinds: Vec::new(),
+            iron_condor_dry_run: false,
+            max_active_entries: None,
+            max_daily_submits: None,
+            max_open_orders: None,
+            max_active_entries_per_underlying: None,
+            max_active_entries_per_sector: None,
+            sectors: BTreeMap::new(),
             max_iterations: 1,
             interval_secs: 300,
             quantity: 1,
@@ -1244,7 +1704,14 @@ mod tests {
             force_flatten: false,
             cancel_after_accept: false,
             stale_entry_secs: 900,
+            stale_close_secs: 120,
             close_enabled: false,
+            close_regular_hours_only: true,
+            close_start: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            close_end: NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+            close_price_cushion: 0.02,
+            max_close_attempts: 3,
+            close_reprice_cooldown_secs: 30,
             profit_target_close_fraction: 0.50,
             stop_loss_close_multiple: 2.0,
             max_hold_secs: 0,
@@ -1300,9 +1767,139 @@ mod tests {
     }
 
     #[test]
+    fn close_submission_gate_blocks_after_regular_hours() {
+        let config = config_for_gate_tests();
+        let now = DateTime::parse_from_rfc3339("2026-05-04T21:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            close_submission_gate_decision(&config, now),
+            CloseSubmissionGateDecision::OutsideCloseWindow,
+        );
+    }
+
+    #[test]
+    fn close_submission_gate_allows_force_flatten_after_regular_hours() {
+        let mut config = config_for_gate_tests();
+        config.force_flatten = true;
+        let now = DateTime::parse_from_rfc3339("2026-05-04T21:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            close_submission_gate_decision(&config, now),
+            CloseSubmissionGateDecision::Continue,
+        );
+    }
+
+    #[test]
+    fn close_quote_cushion_increases_credit_spread_limit_debit() {
+        let quote = CloseQuote {
+            short_ask: 0.70,
+            long_bid: 0.20,
+            short_call_ask: None,
+            long_call_bid: None,
+            debit: 0.50,
+        };
+
+        let cushioned = quote.with_price_cushion(0.02);
+
+        assert!((cushioned.short_ask - 0.72).abs() < 1e-9);
+        assert!((cushioned.long_bid - 0.20).abs() < 1e-9);
+        assert!((cushioned.debit - 0.52).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reconciliation_action_marks_closed_when_broker_is_flat() {
+        assert_eq!(
+            reconciliation_action(
+                &state_entry(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                Some("filled"),
+            ),
+            ReconciliationAction::MarkClosed,
+        );
+    }
+
+    #[test]
+    fn reconciliation_action_marks_canceled_for_terminal_entry_without_position() {
+        assert_eq!(
+            reconciliation_action(
+                &state_entry(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                Some("canceled"),
+            ),
+            ReconciliationAction::MarkCanceled,
+        );
+    }
+
+    #[test]
+    fn reconciliation_action_detects_partial_position_match() {
+        let position_symbols = BTreeSet::from(["SPY260512P00708000".to_string()]);
+
+        assert_eq!(
+            reconciliation_action(&state_entry(), &position_symbols, &BTreeSet::new(), None,),
+            ReconciliationAction::PartialPosition,
+        );
+    }
+
+    #[test]
+    fn close_attempt_limit_blocks_non_forced_submission() {
+        let config = config_for_gate_tests();
+        let mut entry = state_entry();
+        entry.close_attempts = config.max_close_attempts;
+
+        assert!(close_attempts_exhausted(&config, &entry));
+
+        let mut forced = config_for_gate_tests();
+        forced.force_flatten = true;
+        assert!(!close_attempts_exhausted(&forced, &entry));
+    }
+
+    #[test]
+    fn close_reprice_cooldown_reports_remaining_time() {
+        let mut config = config_for_gate_tests();
+        config.close_reprice_cooldown_secs = 60;
+        let mut entry = state_entry();
+        entry.last_close_submitted_at_utc = Some(Utc::now().to_rfc3339());
+
+        assert!(close_reprice_cooldown_remaining_secs(&config, &entry).is_some());
+    }
+
+    #[test]
     fn index_credit_strategy_has_stable_host_name() {
         let strategy = IndexCreditStrategy;
 
         assert_eq!(strategy.name(), "index_credit");
+    }
+
+    fn state_entry() -> StrategyStateEntry {
+        StrategyStateEntry {
+            trade_date: "2026-05-04".to_string(),
+            underlying: "SPY".to_string(),
+            strategy: credit_spread_strategy_name(CreditSpreadKind::Put).to_string(),
+            order_list_id: "open-list-1".to_string(),
+            short_symbol: "SPY260512P00708000".to_string(),
+            long_symbol: "SPY260512P00705000".to_string(),
+            short_call_symbol: None,
+            long_call_symbol: None,
+            quantity: 1,
+            credit: 0.50,
+            score: 60.0,
+            parent_order_id: Some("open-parent-1".to_string()),
+            close_order_list_id: None,
+            close_parent_order_id: None,
+            close_reason: None,
+            close_attempts: 0,
+            last_close_submitted_at_utc: None,
+            submitted: true,
+            canceled: false,
+            closed: false,
+            recorded_at_utc: "2026-05-04T14:00:00Z".to_string(),
+            closed_at_utc: None,
+        }
     }
 }

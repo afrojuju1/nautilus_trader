@@ -74,6 +74,8 @@ impl StrategyState {
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
+            close_attempts: 0,
+            last_close_submitted_at_utc: None,
             submitted: true,
             canceled: false,
             closed: false,
@@ -108,6 +110,8 @@ impl StrategyState {
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
+            close_attempts: 0,
+            last_close_submitted_at_utc: None,
             submitted: true,
             canceled: false,
             closed: false,
@@ -157,6 +161,12 @@ pub struct StrategyStateEntry {
     /// Close trigger reason.
     #[serde(default)]
     pub close_reason: Option<String>,
+    /// Number of accepted close submissions for this entry.
+    #[serde(default)]
+    pub close_attempts: u32,
+    /// Last close submission timestamp.
+    #[serde(default)]
+    pub last_close_submitted_at_utc: Option<String>,
     /// Whether entry submission was accepted/recorded.
     pub submitted: bool,
     /// Whether the entry was canceled or terminal without an open position.
@@ -208,6 +218,15 @@ impl StrategyStateEntry {
         self.close_order_list_id = Some(close_order_list_id);
         self.close_parent_order_id = close_parent_order_id;
         self.close_reason = Some(close_reason);
+        self.close_attempts = self.close_attempts.saturating_add(1);
+        self.last_close_submitted_at_utc = Some(Utc::now().to_rfc3339());
+    }
+
+    /// Clears a submitted close order so management can submit a replacement.
+    pub fn clear_close_submission(&mut self) {
+        self.close_order_list_id = None;
+        self.close_parent_order_id = None;
+        self.close_reason = None;
     }
 
     /// Marks the entry closed.
@@ -332,6 +351,8 @@ mod tests {
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
+            close_attempts: 0,
+            last_close_submitted_at_utc: None,
             submitted: true,
             canceled: false,
             closed: false,
@@ -386,6 +407,8 @@ mod tests {
         assert!(entry.is_active());
         assert_eq!(entry.close_order_list_id.as_deref(), Some("close-list-1"));
         assert_eq!(entry.close_reason.as_deref(), Some("profit_target"));
+        assert_eq!(entry.close_attempts, 1);
+        assert!(entry.last_close_submitted_at_utc.is_some());
 
         entry.mark_closed(Some("close-parent-filled".to_string()));
         assert!(!entry.is_active());

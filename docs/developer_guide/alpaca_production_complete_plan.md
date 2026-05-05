@@ -220,6 +220,13 @@ Key controls:
 - `ALPACA_KILL_SWITCH=true` blocks new entries.
 - `ALPACA_FORCE_FLATTEN=true` treats every tracked open spread as a close candidate.
 - TOML `management.stale_entry_secs = 900` cancels stale working entries when management is enabled.
+- TOML `management.stale_close_secs = 120` cancels stale working close orders for reprice
+  independently from stale entries.
+- TOML `management.close_regular_hours_only = true` blocks non-forced close submissions outside
+  regular option hours; forced flatten remains available for explicit operator action.
+- TOML `management.close_price_cushion = 0.02` adds a small debit cushion to close limits.
+- TOML `management.max_close_attempts = 3` caps accepted close submissions per entry.
+- TOML `management.close_reprice_cooldown_secs = 30` delays close resubmission after an attempt.
 - TOML `management.profit_target_close_fraction = 0.50` closes when debit falls to 50% of entry
   credit.
 - TOML `management.stop_loss_close_multiple = 2.0` closes when debit reaches 2x entry credit.
@@ -385,6 +392,9 @@ Current status:
 - The engine hosts `IndexCreditStrategy` through `StrategyRuntime`, receives explicit
   `StrategyDecision` values, and keeps broker submission as account-engine responsibility.
 - Direct tests cover underlying parsing, scanner-width parsing, and credential-free entry gates.
+- Account-level risk caps are now part of the account engine and operator status:
+  `max_active_entries`, `max_daily_submits`, and `max_open_orders` block new hosted-strategy
+  submissions before any strategy can add exposure.
 - Installed release binary was rebuilt and service health-checked after extraction on 2026-05-02.
 - Remaining Phase 6.6 work: paper-observe the extracted hosted engine during market hours.
 
@@ -402,7 +412,8 @@ Migration order:
 4. `earnings_put_debit_entry` (debit-spread Alpaca MLeg order payload builders complete; explicit
    earnings-event CSV input policy complete; initial put-debit scanner primitives complete)
 5. Iron condors (native scanner, 4-leg open/close payload primitives, account-engine dry-run
-   hosting, and SPY dry-run proof complete; still needs paper submit/close proof)
+   hosting, SPY dry-run proof complete, and strategy-level dry-run gating available while put/call
+   credit spreads remain live; still needs paper submit/close proof)
 6. Straddles/strangles after long-premium management rules are proven
 
 Each strategy must have native open, management, close, reconciliation, paper validation, and
@@ -430,14 +441,28 @@ Phase 7 earnings input policy:
 
 Phase 7 blockers:
 
+- Other strategy setup sequence:
+  1. Keep existing paper positions under management before adding exposure.
+  2. Enforce account-level caps before enabling additional strategies.
+  3. Show cap status and cap alerts in operator status.
+  4. Paper-prove caps with existing open strategy state.
+  5. Enable `index_call_credit_entry` under strict caps.
+  6. Paper-prove one call-credit open/management/close lifecycle. (Open proof complete on
+     May 4, 2026; close proof remains under management.)
+  7. Expand to put-plus-call only after single-call proof is clean. (Initial 10-symbol scan list is
+     enabled under one-entry caps.)
+  8. Enable iron condor scanning as dry-run only while put/call credit spreads remain live.
+  9. Park earnings debit until explicitly resumed.
 - Earnings debit strategies still need account-engine integration, management rules, paper proof,
-  and source-quality review of the Alpha Vantage feed before live use.
+  and source-quality review of the Alpha Vantage feed before live use. Earnings work is intentionally
+  skipped for the current scanner expansion.
 - Iron condors now have native candidate construction, four-leg Alpaca MLeg open/close payload
   builders, hosted account-engine selection, dry-run decision emission, persisted four-leg state,
-  and four-leg close construction. On 2026-05-03, a real Alpaca dry-run scan selected an SPY iron
-  condor with submission disabled and the follow-up broker check showed zero positions and zero open
-  orders. They still need management-rule review, submit-with-cancel paper proof, and full
-  open/close paper proof before live enablement.
+  four-leg close construction, and `runtime.dry_run_strategies` gating so iron condors can scan
+  without submitting while other strategies submit. On 2026-05-03, a real Alpaca dry-run scan
+  selected an SPY iron condor with submission disabled and the follow-up broker check showed zero
+  positions and zero open orders. They still need management-rule review, submit-with-cancel paper
+  proof, and full open/close paper proof before live enablement.
 - Straddles/strangles should wait until long-premium management and max-loss behavior are specified.
 
 Parked next steps for earnings debit:
