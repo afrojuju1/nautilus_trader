@@ -1,0 +1,131 @@
+# Copy to ~/.config/nautilus-trader/alpaca/base-index-credit.toml.
+# Account configs explicitly inherit this file with `extends`.
+
+[runtime]
+# 0 means run continuously for service mode. Set to 1 for one-shot smoke tests.
+max_iterations = 0
+interval_secs = 300
+force_flatten = false
+cancel_after_accept = false
+ignore_entry_window = false
+
+[index]
+underlyings = ["SPY", "QQQ", "IWM", "DIA", "GLD", "GDX", "SLV", "TLT", "XLE", "XLF", "XLK", "XLV", "XLY", "XLI", "XLP", "XLU", "XLB", "XLC", "SMH", "USO", "XOP", "XOM"]
+quantity = 1
+entry_start = "09:45"
+entry_end = "14:30"
+entry_timezone = "America/New_York"
+
+[scanner]
+min_dte = 5
+max_dte = 10
+short_delta_min = 0.18
+short_delta_max = 0.28
+widths = [2.0, 3.0, 5.0]
+min_open_interest = 200
+max_leg_spread_pct = 0.15
+min_return_on_risk = 0.13
+min_credit_to_width = 0.08
+
+[iron_condor]
+min_return_on_risk = 0.18
+wing_min_return_on_risk = 0.10
+require_equal_widths = true
+
+[debit_scanner]
+min_dte = 5
+max_dte = 45
+long_delta_min = 0.45
+long_delta_max = 0.65
+widths = [2.0, 3.0, 5.0]
+min_open_interest = 200
+max_leg_spread_pct = 0.15
+max_debit_to_width = 0.55
+min_debit_to_width = 0.20
+min_reward_to_risk = 0.75
+
+[naked_scanner]
+min_dte = 3
+max_dte = 7
+short_delta_min = 0.08
+short_delta_max = 0.16
+min_open_interest = 1000
+max_spread_pct = 0.08
+min_credit = 0.20
+min_bid_size = 1
+min_ask_size = 1
+min_daily_volume = 50
+min_implied_volatility = 0.15
+max_implied_volatility = 0.90
+min_annualized_premium_yield = 0.10
+max_buying_power_usage_pct = 0.10
+min_return_on_buying_power = 0.0005
+min_breakeven_pop = 0.70
+max_probability_of_touch = 0.45
+min_distance_to_breakeven_pct = 0.005
+min_expected_move_coverage = 1.00
+min_score = 70.0
+
+[naked_1_3dte_scanner]
+# Optional profile for strategies `naked_call_1_3dte` and `naked_put_1_3dte`.
+min_dte = 1
+max_dte = 3
+short_delta_min = 0.06
+short_delta_max = 0.14
+min_open_interest = 1000
+max_spread_pct = 0.08
+min_credit = 0.12
+min_bid_size = 1
+min_ask_size = 1
+min_daily_volume = 100
+min_implied_volatility = 0.12
+max_implied_volatility = 1.00
+min_annualized_premium_yield = 0.12
+max_buying_power_usage_pct = 0.10
+min_return_on_buying_power = 0.0004
+min_breakeven_pop = 0.72
+max_probability_of_touch = 0.40
+min_distance_to_breakeven_pct = 0.004
+min_expected_move_coverage = 1.10
+min_score = 72.0
+
+[risk]
+max_active_entries_per_underlying = 1
+
+[risk.sectors]
+SPY = "broad_index"
+QQQ = "broad_index"
+IWM = "broad_index"
+DIA = "broad_index"
+GLD = "metals"
+GDX = "metals"
+SLV = "metals"
+TLT = "rates"
+XLE = "energy"
+USO = "energy"
+XOP = "energy"
+XOM = "energy"
+XLB = "materials"
+XLC = "communication_services"
+XLF = "financials"
+XLK = "technology"
+XLV = "healthcare"
+XLY = "consumer_discretionary"
+XLI = "industrials"
+XLP = "consumer_staples"
+XLU = "utilities"
+SMH = "semiconductors"
+
+[management]
+stale_entry_secs = 900
+stale_close_secs = 120
+close_regular_hours_only = true
+close_start = "09:30"
+close_end = "16:00"
+close_price_cushion = 0.02
+max_close_attempts = 3
+close_reprice_cooldown_secs = 30
+profit_target_close_fraction = 0.50
+stop_loss_close_multiple = 2.0
+max_hold_secs = 0
+expiration_exit_days = 1

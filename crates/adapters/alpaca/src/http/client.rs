@@ -33,6 +33,7 @@ use crate::{
             AlpacaAccount, AlpacaActivity, AlpacaOrder, AlpacaPosition, ListActivitiesRequest,
             ListOptionContractsRequest, ListOrdersRequest, OptionContractsResponse,
             OptionSnapshotsRequest, OptionSnapshotsResponse, ReplaceOrderRequest,
+            StockSnapshotsRequest, StockSnapshotsResponse,
         },
     },
     orders::{MlegOrderPayload, SimpleOrderPayload},
@@ -219,6 +220,19 @@ impl AlpacaHttpClient {
             next_page_token: None,
             page_token: None,
         })
+    }
+
+    /// Lists stock snapshots from Alpaca's Market Data API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be decoded.
+    pub async fn stock_snapshots(
+        &self,
+        request: &StockSnapshotsRequest,
+    ) -> Result<StockSnapshotsResponse> {
+        self.get_data_json("/v2/stocks/snapshots", &request.query_pairs())
+            .await
     }
 
     /// Returns the current Alpaca trading account.

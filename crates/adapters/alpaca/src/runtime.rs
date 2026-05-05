@@ -365,6 +365,8 @@ pub fn naked_option_strategy_name(kind: NakedOptionKind) -> &'static str {
     match kind {
         NakedOptionKind::Call => "index_naked_call_entry",
         NakedOptionKind::Put => "index_naked_put_entry",
+        NakedOptionKind::CallOneToThreeDte => "index_naked_call_1_3dte_entry",
+        NakedOptionKind::PutOneToThreeDte => "index_naked_put_1_3dte_entry",
     }
 }
 
@@ -545,6 +547,11 @@ mod tests {
         let candidate = crate::strategy::NakedOptionCandidate {
             short: scored_contract("SPY260508P00710000", 710.0),
             credit: 0.72,
+            capital_requirement_model:
+                crate::strategy::OptionCapitalRequirementModel::CashSecuredPut,
+            estimated_buying_power_requirement: 71_000.0,
+            buying_power_usage_pct: Some(0.071),
+            return_on_buying_power: 0.001014,
             score: 75.0,
         };
         state.record_naked_option_submission(
@@ -606,8 +613,12 @@ mod tests {
             ask: 1.1,
             delta_abs: 0.22,
             spread_pct: 0.05,
+            bid_size: 10,
+            ask_size: 10,
+            volume: 100,
             open_interest: 1_000,
             implied_volatility: Some(0.2),
+            metrics: None,
         }
     }
 

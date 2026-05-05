@@ -39,10 +39,11 @@ use crate::{
     },
     strategy::{
         CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, DebitSpreadScannerConfig,
-        IronCondorCandidate, IronCondorScannerConfig, NakedOptionCandidate, NakedOptionKind,
-        NakedOptionScannerConfig, PutCreditScannerConfig, SpreadCandidate,
+        IronCondorCandidate, IronCondorScannerConfig, NakedOptionCandidate,
+        NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig,
+        PutCreditScannerConfig, SpreadCandidate, annualized_premium_yield,
         scan_call_credit_underlying, scan_call_debit_underlying, scan_iron_condor_underlying,
-        scan_naked_call_underlying, scan_naked_put_underlying, scan_put_credit_underlying,
+        scan_naked_option_underlying_with_capital, scan_put_credit_underlying,
         scan_put_debit_underlying,
     },
 };
@@ -140,6 +141,8 @@ pub struct IndexCreditConfig {
     pub debit_scanner: DebitSpreadScannerConfig,
     /// Naked-option scanner config.
     pub naked_scanner: NakedOptionScannerConfig,
+    /// 1-3 DTE naked-option scanner config.
+    pub naked_1_3dte_scanner: NakedOptionScannerConfig,
     /// Loaded fleet registry, if configured.
     pub fleet: Option<ResolvedFleetConfig>,
     /// Current fleet account ID, if this runtime matched one.
@@ -257,6 +260,16 @@ impl IndexCreditConfig {
         self.submit_enabled && !self.dry_run_naked_kinds.contains(&kind)
     }
 
+    /// Returns the scanner config for a naked-option strategy profile.
+    #[must_use]
+    pub fn naked_scanner_for(&self, kind: NakedOptionKind) -> &NakedOptionScannerConfig {
+        if kind.is_one_to_three_dte() {
+            &self.naked_1_3dte_scanner
+        } else {
+            &self.naked_scanner
+        }
+    }
+
     /// Returns the configured sector/correlation group for an underlying.
     #[must_use]
     pub fn sector_for(&self, underlying: &str) -> Option<&str> {
@@ -371,6 +384,7 @@ pub async fn select_index_strategy_entry(
     trade_date: &str,
 ) -> anyhow::Result<Option<SelectedIndexEntry>> {
     let account = client.account().await?;
+    let options_buying_power = account_options_buying_power(&account);
     let positions = client.positions().await?;
     let open_orders = client.orders(&ListOrdersRequest::open_nested()).await?;
     let mut selected: Option<SelectedIndexEntry> = None;
@@ -507,12 +521,13 @@ pub async fn select_index_strategy_entry(
                     result.scoreable_count,
                 );
                 println!(
-                    "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={}",
+                    "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={} rejections={}",
                     credit_spread_strategy_name(*kind),
                     reason,
                     result.contract_count,
                     result.snapshot_count,
                     result.scoreable_count,
+                    format_rejection_counts(&result.rejection_counts),
                 );
                 emit_operator_event(
                     "scanner_diagnostic",
@@ -524,6 +539,7 @@ pub async fn select_index_strategy_entry(
                         "contracts": result.contract_count,
                         "snapshots": result.snapshot_count,
                         "scoreable": result.scoreable_count,
+                        "rejections": &result.rejection_counts,
                     }),
                 );
                 continue;
@@ -577,6 +593,7 @@ pub async fn select_index_strategy_entry(
                     "credit": best.credit,
                     "return_on_risk": best.return_on_risk,
                     "score": best.score,
+                    "rejections": &result.rejection_counts,
                 }),
             );
 
@@ -607,8 +624,12 @@ pub async fn select_index_strategy_entry(
                     result.scoreable_count,
                 );
                 println!(
-                    "{underlying}: no_candidate strategy=index_iron_condor_entry reason={} contracts={} snapshots={} scoreable={}",
-                    reason, result.contract_count, result.snapshot_count, result.scoreable_count,
+                    "{underlying}: no_candidate strategy=index_iron_condor_entry reason={} contracts={} snapshots={} scoreable={} rejections={}",
+                    reason,
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                    format_rejection_counts(&result.rejection_counts),
                 );
                 emit_operator_event(
                     "scanner_diagnostic",
@@ -620,6 +641,7 @@ pub async fn select_index_strategy_entry(
                         "contracts": result.contract_count,
                         "snapshots": result.snapshot_count,
                         "scoreable": result.scoreable_count,
+                        "rejections": &result.rejection_counts,
                     }),
                 );
                 continue;
@@ -684,6 +706,7 @@ pub async fn select_index_strategy_entry(
                     "credit": best.credit,
                     "return_on_risk": best.return_on_risk,
                     "score": best.score,
+                    "rejections": &result.rejection_counts,
                 }),
             );
 
@@ -726,12 +749,13 @@ pub async fn select_index_strategy_entry(
                     result.scoreable_count,
                 );
                 println!(
-                    "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={}",
+                    "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={} rejections={}",
                     debit_spread_strategy_name(*kind),
                     reason,
                     result.contract_count,
                     result.snapshot_count,
                     result.scoreable_count,
+                    format_rejection_counts(&result.rejection_counts),
                 );
                 emit_operator_event(
                     "scanner_diagnostic",
@@ -743,6 +767,7 @@ pub async fn select_index_strategy_entry(
                         "contracts": result.contract_count,
                         "snapshots": result.snapshot_count,
                         "scoreable": result.scoreable_count,
+                        "rejections": &result.rejection_counts,
                     }),
                 );
                 continue;
@@ -796,6 +821,7 @@ pub async fn select_index_strategy_entry(
                     "debit": best.debit,
                     "reward_to_risk": best.reward_to_risk,
                     "score": best.score,
+                    "rejections": &result.rejection_counts,
                 }),
             );
 
@@ -812,26 +838,18 @@ pub async fn select_index_strategy_entry(
         }
 
         for kind in &config.naked_kinds {
-            let result = match kind {
-                NakedOptionKind::Call => {
-                    scan_naked_call_underlying(
-                        client,
-                        data_config,
-                        &config.naked_scanner,
-                        underlying,
-                    )
-                    .await?
-                }
-                NakedOptionKind::Put => {
-                    scan_naked_put_underlying(
-                        client,
-                        data_config,
-                        &config.naked_scanner,
-                        underlying,
-                    )
-                    .await?
-                }
-            };
+            let result = scan_naked_option_underlying_with_capital(
+                client,
+                data_config,
+                config.naked_scanner_for(*kind),
+                underlying,
+                *kind,
+                Some(NakedOptionCapitalContext {
+                    options_buying_power,
+                    quantity: config.quantity,
+                }),
+            )
+            .await?;
             let Some(best) = result.candidates.first() else {
                 let reason = no_candidate_reason(
                     result.contract_count,
@@ -839,12 +857,13 @@ pub async fn select_index_strategy_entry(
                     result.scoreable_count,
                 );
                 println!(
-                    "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={}",
+                    "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={} rejections={}",
                     naked_option_strategy_name(*kind),
                     reason,
                     result.contract_count,
                     result.snapshot_count,
                     result.scoreable_count,
+                    format_rejection_counts(&result.rejection_counts),
                 );
                 emit_operator_event(
                     "scanner_diagnostic",
@@ -856,6 +875,7 @@ pub async fn select_index_strategy_entry(
                         "contracts": result.contract_count,
                         "snapshots": result.snapshot_count,
                         "scoreable": result.scoreable_count,
+                        "rejections": &result.rejection_counts,
                     }),
                 );
                 continue;
@@ -887,14 +907,36 @@ pub async fn select_index_strategy_entry(
                 continue;
             }
 
-            println!(
-                "{underlying}: candidate strategy={} short={} credit={:.2} delta={:.2} score={:.1}",
-                naked_option_strategy_name(*kind),
-                best.short.symbol,
-                best.credit,
-                best.short.delta_abs,
-                best.score,
-            );
+            let metrics = best.short.metrics.as_ref();
+            if let Some(metrics) = metrics {
+                println!(
+                    "{underlying}: candidate strategy={} short={} credit={:.2} delta={:.2} pop={:.1}% touch={:.1}% be_dist={:.1}% em_cov={:.2} bpr=${:.0} bp_use={} rbp={:.3}% score={:.1}",
+                    naked_option_strategy_name(*kind),
+                    best.short.symbol,
+                    best.credit,
+                    best.short.delta_abs,
+                    metrics.breakeven_pop * 100.0,
+                    metrics.probability_of_touch_est * 100.0,
+                    metrics.distance_to_breakeven_pct * 100.0,
+                    metrics.expected_move_coverage,
+                    best.estimated_buying_power_requirement,
+                    format_optional_pct(best.buying_power_usage_pct),
+                    best.return_on_buying_power * 100.0,
+                    best.score,
+                );
+            } else {
+                println!(
+                    "{underlying}: candidate strategy={} short={} credit={:.2} delta={:.2} bpr=${:.0} bp_use={} rbp={:.3}% score={:.1}",
+                    naked_option_strategy_name(*kind),
+                    best.short.symbol,
+                    best.credit,
+                    best.short.delta_abs,
+                    best.estimated_buying_power_requirement,
+                    format_optional_pct(best.buying_power_usage_pct),
+                    best.return_on_buying_power * 100.0,
+                    best.score,
+                );
+            }
             emit_operator_event(
                 "scanner_diagnostic",
                 json!({
@@ -904,7 +946,41 @@ pub async fn select_index_strategy_entry(
                     "short_symbol": &best.short.symbol,
                     "credit": best.credit,
                     "delta_abs": best.short.delta_abs,
+                    "dte": best.short.dte,
+                    "strike": best.short.strike,
+                    "spread_pct": best.short.spread_pct,
+                    "bid_size": best.short.bid_size,
+                    "ask_size": best.short.ask_size,
+                    "volume": best.short.volume,
+                    "open_interest": best.short.open_interest,
+                    "implied_volatility": best.short.implied_volatility,
+                    "account_options_buying_power": options_buying_power,
+                    "capital_requirement_model": best.capital_requirement_model.as_str(),
+                    "estimated_buying_power_requirement": best.estimated_buying_power_requirement,
+                    "buying_power_usage_pct": best.buying_power_usage_pct,
+                    "return_on_buying_power": best.return_on_buying_power,
+                    "annualized_premium_yield": annualized_premium_yield(
+                        best.credit,
+                        best.short.strike,
+                        best.short.dte,
+                    ),
+                    "underlying_price": metrics.map(|metrics| metrics.underlying_price),
+                    "breakeven": metrics.map(|metrics| metrics.breakeven),
+                    "strike_itm_probability": metrics.map(|metrics| metrics.strike_itm_probability),
+                    "delta_pop_proxy": metrics.map(|metrics| metrics.delta_pop_proxy),
+                    "breakeven_pop": metrics.map(|metrics| metrics.breakeven_pop),
+                    "probability_of_touch_est": metrics.map(|metrics| metrics.probability_of_touch_est),
+                    "expected_move": metrics.map(|metrics| metrics.expected_move),
+                    "expected_move_pct": metrics.map(|metrics| metrics.expected_move_pct),
+                    "distance_to_strike_pct": metrics.map(|metrics| metrics.distance_to_strike_pct),
+                    "distance_to_breakeven_pct": metrics.map(|metrics| metrics.distance_to_breakeven_pct),
+                    "expected_move_coverage": metrics.map(|metrics| metrics.expected_move_coverage),
+                    "model_delta_abs": metrics.map(|metrics| metrics.model_delta_abs),
+                    "model_gamma": metrics.map(|metrics| metrics.model_gamma),
+                    "model_theta": metrics.map(|metrics| metrics.model_theta),
+                    "model_vega": metrics.map(|metrics| metrics.model_vega),
                     "score": best.score,
+                    "rejections": &result.rejection_counts,
                 }),
             );
 
@@ -935,14 +1011,35 @@ struct StrategyConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RuntimeConfigFile {
+    extends: Option<PathBuf>,
     runtime: RuntimeSection,
     index: IndexSection,
     scanner: ScannerSection,
     iron_condor: IronCondorSection,
     debit_scanner: DebitScannerSection,
     naked_scanner: NakedScannerSection,
+    naked_1_3dte_scanner: NakedScannerSection,
     management: ManagementSection,
     risk: RiskSection,
+}
+
+impl RuntimeConfigFile {
+    fn merge_parent(self, parent: Self) -> Self {
+        Self {
+            extends: None,
+            runtime: self.runtime.merge_parent(parent.runtime),
+            index: self.index.merge_parent(parent.index),
+            scanner: self.scanner.merge_parent(parent.scanner),
+            iron_condor: self.iron_condor.merge_parent(parent.iron_condor),
+            debit_scanner: self.debit_scanner.merge_parent(parent.debit_scanner),
+            naked_scanner: self.naked_scanner.merge_parent(parent.naked_scanner),
+            naked_1_3dte_scanner: self
+                .naked_1_3dte_scanner
+                .merge_parent(parent.naked_1_3dte_scanner),
+            management: self.management.merge_parent(parent.management),
+            risk: self.risk.merge_parent(parent.risk),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -962,6 +1059,25 @@ struct RuntimeSection {
     state_path: Option<PathBuf>,
 }
 
+impl RuntimeSection {
+    fn merge_parent(self, parent: Self) -> Self {
+        Self {
+            strategies: merge_vec(self.strategies, parent.strategies),
+            dry_run_strategies: merge_vec(self.dry_run_strategies, parent.dry_run_strategies),
+            max_iterations: self.max_iterations.or(parent.max_iterations),
+            interval_secs: self.interval_secs.or(parent.interval_secs),
+            submit: self.submit.or(parent.submit),
+            manage: self.manage.or(parent.manage),
+            close: self.close.or(parent.close),
+            kill_switch: self.kill_switch.or(parent.kill_switch),
+            force_flatten: self.force_flatten.or(parent.force_flatten),
+            cancel_after_accept: self.cancel_after_accept.or(parent.cancel_after_accept),
+            ignore_entry_window: self.ignore_entry_window.or(parent.ignore_entry_window),
+            state_path: self.state_path.or(parent.state_path),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct IndexSection {
@@ -970,6 +1086,18 @@ struct IndexSection {
     entry_start: Option<String>,
     entry_end: Option<String>,
     entry_timezone: Option<String>,
+}
+
+impl IndexSection {
+    fn merge_parent(self, parent: Self) -> Self {
+        Self {
+            underlyings: merge_vec(self.underlyings, parent.underlyings),
+            quantity: self.quantity.or(parent.quantity),
+            entry_start: self.entry_start.or(parent.entry_start),
+            entry_end: self.entry_end.or(parent.entry_end),
+            entry_timezone: self.entry_timezone.or(parent.entry_timezone),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -986,12 +1114,40 @@ struct ScannerSection {
     min_credit_to_width: Option<f64>,
 }
 
+impl ScannerSection {
+    fn merge_parent(self, parent: Self) -> Self {
+        Self {
+            min_dte: self.min_dte.or(parent.min_dte),
+            max_dte: self.max_dte.or(parent.max_dte),
+            short_delta_min: self.short_delta_min.or(parent.short_delta_min),
+            short_delta_max: self.short_delta_max.or(parent.short_delta_max),
+            widths: self.widths.or(parent.widths),
+            min_open_interest: self.min_open_interest.or(parent.min_open_interest),
+            max_leg_spread_pct: self.max_leg_spread_pct.or(parent.max_leg_spread_pct),
+            min_return_on_risk: self.min_return_on_risk.or(parent.min_return_on_risk),
+            min_credit_to_width: self.min_credit_to_width.or(parent.min_credit_to_width),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct IronCondorSection {
     min_return_on_risk: Option<f64>,
     wing_min_return_on_risk: Option<f64>,
     require_equal_widths: Option<bool>,
+}
+
+impl IronCondorSection {
+    fn merge_parent(self, parent: Self) -> Self {
+        Self {
+            min_return_on_risk: self.min_return_on_risk.or(parent.min_return_on_risk),
+            wing_min_return_on_risk: self
+                .wing_min_return_on_risk
+                .or(parent.wing_min_return_on_risk),
+            require_equal_widths: self.require_equal_widths.or(parent.require_equal_widths),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1009,6 +1165,23 @@ struct DebitScannerSection {
     min_reward_to_risk: Option<f64>,
 }
 
+impl DebitScannerSection {
+    fn merge_parent(self, parent: Self) -> Self {
+        Self {
+            min_dte: self.min_dte.or(parent.min_dte),
+            max_dte: self.max_dte.or(parent.max_dte),
+            long_delta_min: self.long_delta_min.or(parent.long_delta_min),
+            long_delta_max: self.long_delta_max.or(parent.long_delta_max),
+            widths: self.widths.or(parent.widths),
+            min_open_interest: self.min_open_interest.or(parent.min_open_interest),
+            max_leg_spread_pct: self.max_leg_spread_pct.or(parent.max_leg_spread_pct),
+            max_debit_to_width: self.max_debit_to_width.or(parent.max_debit_to_width),
+            min_debit_to_width: self.min_debit_to_width.or(parent.min_debit_to_width),
+            min_reward_to_risk: self.min_reward_to_risk.or(parent.min_reward_to_risk),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct NakedScannerSection {
@@ -1019,6 +1192,62 @@ struct NakedScannerSection {
     min_open_interest: Option<u64>,
     max_spread_pct: Option<f64>,
     min_credit: Option<f64>,
+    min_bid_size: Option<u64>,
+    min_ask_size: Option<u64>,
+    min_daily_volume: Option<u64>,
+    min_implied_volatility: Option<f64>,
+    max_implied_volatility: Option<f64>,
+    min_annualized_premium_yield: Option<f64>,
+    max_buying_power_usage_pct: Option<f64>,
+    min_return_on_buying_power: Option<f64>,
+    min_breakeven_pop: Option<f64>,
+    max_probability_of_touch: Option<f64>,
+    min_distance_to_breakeven_pct: Option<f64>,
+    min_expected_move_coverage: Option<f64>,
+    min_score: Option<f64>,
+}
+
+impl NakedScannerSection {
+    fn merge_parent(self, parent: Self) -> Self {
+        Self {
+            min_dte: self.min_dte.or(parent.min_dte),
+            max_dte: self.max_dte.or(parent.max_dte),
+            short_delta_min: self.short_delta_min.or(parent.short_delta_min),
+            short_delta_max: self.short_delta_max.or(parent.short_delta_max),
+            min_open_interest: self.min_open_interest.or(parent.min_open_interest),
+            max_spread_pct: self.max_spread_pct.or(parent.max_spread_pct),
+            min_credit: self.min_credit.or(parent.min_credit),
+            min_bid_size: self.min_bid_size.or(parent.min_bid_size),
+            min_ask_size: self.min_ask_size.or(parent.min_ask_size),
+            min_daily_volume: self.min_daily_volume.or(parent.min_daily_volume),
+            min_implied_volatility: self
+                .min_implied_volatility
+                .or(parent.min_implied_volatility),
+            max_implied_volatility: self
+                .max_implied_volatility
+                .or(parent.max_implied_volatility),
+            min_annualized_premium_yield: self
+                .min_annualized_premium_yield
+                .or(parent.min_annualized_premium_yield),
+            max_buying_power_usage_pct: self
+                .max_buying_power_usage_pct
+                .or(parent.max_buying_power_usage_pct),
+            min_return_on_buying_power: self
+                .min_return_on_buying_power
+                .or(parent.min_return_on_buying_power),
+            min_breakeven_pop: self.min_breakeven_pop.or(parent.min_breakeven_pop),
+            max_probability_of_touch: self
+                .max_probability_of_touch
+                .or(parent.max_probability_of_touch),
+            min_distance_to_breakeven_pct: self
+                .min_distance_to_breakeven_pct
+                .or(parent.min_distance_to_breakeven_pct),
+            min_expected_move_coverage: self
+                .min_expected_move_coverage
+                .or(parent.min_expected_move_coverage),
+            min_score: self.min_score.or(parent.min_score),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1038,6 +1267,33 @@ struct ManagementSection {
     expiration_exit_days: Option<i64>,
 }
 
+impl ManagementSection {
+    fn merge_parent(self, parent: Self) -> Self {
+        Self {
+            stale_entry_secs: self.stale_entry_secs.or(parent.stale_entry_secs),
+            stale_close_secs: self.stale_close_secs.or(parent.stale_close_secs),
+            close_regular_hours_only: self
+                .close_regular_hours_only
+                .or(parent.close_regular_hours_only),
+            close_start: self.close_start.or(parent.close_start),
+            close_end: self.close_end.or(parent.close_end),
+            close_price_cushion: self.close_price_cushion.or(parent.close_price_cushion),
+            max_close_attempts: self.max_close_attempts.or(parent.max_close_attempts),
+            close_reprice_cooldown_secs: self
+                .close_reprice_cooldown_secs
+                .or(parent.close_reprice_cooldown_secs),
+            profit_target_close_fraction: self
+                .profit_target_close_fraction
+                .or(parent.profit_target_close_fraction),
+            stop_loss_close_multiple: self
+                .stop_loss_close_multiple
+                .or(parent.stop_loss_close_multiple),
+            max_hold_secs: self.max_hold_secs.or(parent.max_hold_secs),
+            expiration_exit_days: self.expiration_exit_days.or(parent.expiration_exit_days),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RiskSection {
@@ -1047,6 +1303,23 @@ struct RiskSection {
     max_active_entries_per_underlying: Option<usize>,
     max_active_entries_per_sector: Option<usize>,
     sectors: BTreeMap<String, String>,
+}
+
+impl RiskSection {
+    fn merge_parent(self, parent: Self) -> Self {
+        Self {
+            max_active_entries: self.max_active_entries.or(parent.max_active_entries),
+            max_daily_submits: self.max_daily_submits.or(parent.max_daily_submits),
+            max_open_orders: self.max_open_orders.or(parent.max_open_orders),
+            max_active_entries_per_underlying: self
+                .max_active_entries_per_underlying
+                .or(parent.max_active_entries_per_underlying),
+            max_active_entries_per_sector: self
+                .max_active_entries_per_sector
+                .or(parent.max_active_entries_per_sector),
+            sectors: merge_map(self.sectors, parent.sectors),
+        }
+    }
 }
 
 fn load_runtime_config_file_from_env() -> anyhow::Result<RuntimeConfigFile> {
@@ -1076,22 +1349,64 @@ fn current_fleet_account_config_path() -> anyhow::Result<Option<PathBuf>> {
 }
 
 fn load_runtime_config_file(path: &Path, explicit: bool) -> anyhow::Result<RuntimeConfigFile> {
-    match fs::read_to_string(path) {
-        Ok(raw) => parse_runtime_config(&raw),
-        Err(error) if !explicit && error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(RuntimeConfigFile::default())
-        }
+    match path.try_exists() {
+        Ok(false) if !explicit => return Ok(RuntimeConfigFile::default()),
+        Ok(_) => {}
         Err(error) => {
             anyhow::bail!(
-                "failed to read Alpaca runtime config {}: {error}",
+                "failed to inspect Alpaca runtime config {}: {error}",
                 path.display()
-            )
+            );
         }
     }
+    load_runtime_config_file_with_extends(path, &mut Vec::new())
 }
 
+fn load_runtime_config_file_with_extends(
+    path: &Path,
+    stack: &mut Vec<PathBuf>,
+) -> anyhow::Result<RuntimeConfigFile> {
+    let identity = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if stack.contains(&identity) {
+        let chain = stack
+            .iter()
+            .chain(std::iter::once(&identity))
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        anyhow::bail!("circular Alpaca runtime config inheritance: {chain}");
+    }
+
+    let raw = fs::read_to_string(path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to read Alpaca runtime config {}: {error}",
+            path.display()
+        )
+    })?;
+    stack.push(identity);
+    let result = (|| {
+        let config = parse_runtime_config_at_path(&raw, path)?;
+        if let Some(parent_path) = config.extends.as_deref() {
+            let parent_path = resolve_config_extends_path(path, parent_path);
+            let parent = load_runtime_config_file_with_extends(&parent_path, stack)?;
+            Ok(config.merge_parent(parent))
+        } else {
+            Ok(config)
+        }
+    })();
+    stack.pop();
+    result
+}
+
+#[cfg(test)]
 fn parse_runtime_config(raw: &str) -> anyhow::Result<RuntimeConfigFile> {
     toml::from_str(raw).map_err(|error| anyhow::anyhow!("invalid Alpaca runtime config: {error}"))
+}
+
+fn parse_runtime_config_at_path(raw: &str, path: &Path) -> anyhow::Result<RuntimeConfigFile> {
+    toml::from_str(raw).map_err(|error| {
+        anyhow::anyhow!("invalid Alpaca runtime config {}: {error}", path.display())
+    })
 }
 
 fn build_index_credit_config(
@@ -1202,6 +1517,7 @@ fn build_index_credit_config(
         iron_condor_scanner: iron_condor_scanner_config_from_file(&scanner, &file.iron_condor),
         debit_scanner: debit_scanner_config_from_file(&file.debit_scanner),
         naked_scanner: naked_scanner_config_from_file(&file.naked_scanner),
+        naked_1_3dte_scanner: naked_1_3dte_scanner_config_from_file(&file.naked_1_3dte_scanner),
         scanner,
         fleet,
         fleet_account_id: None,
@@ -1256,6 +1572,16 @@ fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyCo
             "naked_put" | "short_put" | "index_naked_put_entry" => {
                 naked_kinds.push(NakedOptionKind::Put);
             }
+            "naked_call_1_3dte" | "short_call_1_3dte" | "index_naked_call_1_3dte_entry" => {
+                naked_kinds.push(NakedOptionKind::CallOneToThreeDte);
+            }
+            "naked_put_1_3dte" | "short_put_1_3dte" | "index_naked_put_1_3dte_entry" => {
+                naked_kinds.push(NakedOptionKind::PutOneToThreeDte);
+            }
+            "naked_1_3dte" | "undefined_risk_1_3dte" | "short_premium_1_3dte" => {
+                naked_kinds.push(NakedOptionKind::CallOneToThreeDte);
+                naked_kinds.push(NakedOptionKind::PutOneToThreeDte);
+            }
             "naked" | "undefined_risk" | "short_premium_undefined" => {
                 naked_kinds.push(NakedOptionKind::Call);
                 naked_kinds.push(NakedOptionKind::Put);
@@ -1280,6 +1606,8 @@ fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyCo
     naked_kinds.sort_by_key(|kind| match kind {
         NakedOptionKind::Call => 0,
         NakedOptionKind::Put => 1,
+        NakedOptionKind::CallOneToThreeDte => 2,
+        NakedOptionKind::PutOneToThreeDte => 3,
     });
     naked_kinds.dedup();
     Ok(StrategyConfig {
@@ -1331,13 +1659,14 @@ fn apply_fleet_policy(config: &mut IndexCreditConfig) {
                 account.id
             ));
         }
-        if config.naked_kinds.contains(&NakedOptionKind::Call) && !account.permissions.naked_calls {
+        if config.naked_kinds.iter().any(|kind| kind.is_call()) && !account.permissions.naked_calls
+        {
             config.fleet_policy_blocks.push(format!(
                 "fleet_permission_naked_calls_required:{}",
                 account.id
             ));
         }
-        if config.naked_kinds.contains(&NakedOptionKind::Put) && !account.permissions.naked_puts {
+        if config.naked_kinds.iter().any(|kind| kind.is_put()) && !account.permissions.naked_puts {
             config.fleet_policy_blocks.push(format!(
                 "fleet_permission_naked_puts_required:{}",
                 account.id
@@ -1345,6 +1674,14 @@ fn apply_fleet_policy(config: &mut IndexCreditConfig) {
         }
         if let Some(limit) = account.risk_budget.max_active_entries {
             config.max_active_entries = Some(min_limit(config.max_active_entries, limit));
+        }
+        if let Some(limit) = account.risk_budget.max_buying_power_pct {
+            config.naked_scanner.max_buying_power_usage_pct =
+                config.naked_scanner.max_buying_power_usage_pct.min(limit);
+            config.naked_1_3dte_scanner.max_buying_power_usage_pct = config
+                .naked_1_3dte_scanner
+                .max_buying_power_usage_pct
+                .min(limit);
         }
     } else {
         config
@@ -1401,6 +1738,27 @@ fn split_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
+fn merge_vec<T>(child: Vec<T>, parent: Vec<T>) -> Vec<T> {
+    if child.is_empty() { parent } else { child }
+}
+
+fn merge_map<K: Ord, V>(child: BTreeMap<K, V>, parent: BTreeMap<K, V>) -> BTreeMap<K, V> {
+    let mut merged = parent;
+    merged.extend(child);
+    merged
+}
+
+fn resolve_config_extends_path(config_path: &Path, parent_path: &Path) -> PathBuf {
+    if parent_path.is_absolute() {
+        parent_path.to_path_buf()
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(parent_path)
+    }
+}
+
 fn no_candidate_reason(
     contract_count: usize,
     snapshot_count: usize,
@@ -1415,6 +1773,42 @@ fn no_candidate_reason(
     } else {
         "no_ranked_candidate"
     }
+}
+
+fn account_options_buying_power(account: &crate::http::models::AlpacaAccount) -> Option<f64> {
+    parse_account_amount(
+        account
+            .options_buying_power
+            .as_deref()
+            .or(account.buying_power.as_deref())
+            .or(account.cash.as_deref()),
+    )
+}
+
+fn parse_account_amount(value: Option<&str>) -> Option<f64> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| *value > 0.0)
+}
+
+fn format_optional_pct(value: Option<f64>) -> String {
+    value.map_or_else(
+        || "n/a".to_string(),
+        |value| format!("{:.2}%", value * 100.0),
+    )
+}
+
+fn format_rejection_counts(rejections: &BTreeMap<String, usize>) -> String {
+    if rejections.is_empty() {
+        return "none".to_string();
+    }
+    rejections
+        .iter()
+        .map(|(reason, count)| format!("{reason}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn active_underlying_count(state: &StrategyState, underlying: &str) -> usize {
@@ -1491,10 +1885,13 @@ fn fleet_sector_limit_state(
 }
 
 fn default_underlyings() -> Vec<String> {
-    ["SPY", "QQQ", "IWM", "DIA", "GLD"]
-        .into_iter()
-        .map(ToString::to_string)
-        .collect()
+    [
+        "SPY", "QQQ", "IWM", "DIA", "GLD", "GDX", "SLV", "TLT", "XLE", "XLF", "XLK", "XLV", "XLY",
+        "XLI", "XLP", "XLU", "XLB", "XLC", "SMH", "USO", "XOP", "XOM",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
 }
 
 fn sector_map_from_file(config: BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -1515,11 +1912,23 @@ fn default_sector_map() -> BTreeMap<String, String> {
         ("IWM", "broad_index"),
         ("DIA", "broad_index"),
         ("GLD", "metals"),
+        ("GDX", "metals"),
+        ("SLV", "metals"),
         ("TLT", "rates"),
         ("XLE", "energy"),
+        ("USO", "energy"),
+        ("XOP", "energy"),
+        ("XOM", "energy"),
+        ("XLB", "materials"),
+        ("XLC", "communication_services"),
         ("XLF", "financials"),
         ("XLK", "technology"),
         ("XLV", "healthcare"),
+        ("XLY", "consumer_discretionary"),
+        ("XLI", "industrials"),
+        ("XLP", "consumer_staples"),
+        ("XLU", "utilities"),
+        ("SMH", "semiconductors"),
     ]
     .into_iter()
     .map(|(underlying, sector)| (underlying.to_string(), sector.to_string()))
@@ -1577,6 +1986,44 @@ fn naked_scanner_config_from_file(config: &NakedScannerSection) -> NakedOptionSc
         min_open_interest: config.min_open_interest.unwrap_or(500),
         max_spread_pct: config.max_spread_pct.unwrap_or(0.12),
         min_credit: config.min_credit.unwrap_or(0.25),
+        min_bid_size: config.min_bid_size.unwrap_or(1),
+        min_ask_size: config.min_ask_size.unwrap_or(1),
+        min_daily_volume: config.min_daily_volume.unwrap_or(1),
+        min_implied_volatility: config.min_implied_volatility.unwrap_or(0.0),
+        max_implied_volatility: config.max_implied_volatility.unwrap_or(1.50),
+        min_annualized_premium_yield: config.min_annualized_premium_yield.unwrap_or(0.10),
+        max_buying_power_usage_pct: config.max_buying_power_usage_pct.unwrap_or(0.10),
+        min_return_on_buying_power: config.min_return_on_buying_power.unwrap_or(0.0005),
+        min_breakeven_pop: config.min_breakeven_pop.unwrap_or(0.65),
+        max_probability_of_touch: config.max_probability_of_touch.unwrap_or(0.70),
+        min_distance_to_breakeven_pct: config.min_distance_to_breakeven_pct.unwrap_or(0.005),
+        min_expected_move_coverage: config.min_expected_move_coverage.unwrap_or(0.75),
+        min_score: config.min_score.unwrap_or(55.0),
+    }
+}
+
+fn naked_1_3dte_scanner_config_from_file(config: &NakedScannerSection) -> NakedOptionScannerConfig {
+    NakedOptionScannerConfig {
+        min_dte: config.min_dte.unwrap_or(1),
+        max_dte: config.max_dte.unwrap_or(3),
+        short_delta_min: config.short_delta_min.unwrap_or(0.06),
+        short_delta_max: config.short_delta_max.unwrap_or(0.14),
+        min_open_interest: config.min_open_interest.unwrap_or(1_000),
+        max_spread_pct: config.max_spread_pct.unwrap_or(0.08),
+        min_credit: config.min_credit.unwrap_or(0.12),
+        min_bid_size: config.min_bid_size.unwrap_or(1),
+        min_ask_size: config.min_ask_size.unwrap_or(1),
+        min_daily_volume: config.min_daily_volume.unwrap_or(100),
+        min_implied_volatility: config.min_implied_volatility.unwrap_or(0.12),
+        max_implied_volatility: config.max_implied_volatility.unwrap_or(1.00),
+        min_annualized_premium_yield: config.min_annualized_premium_yield.unwrap_or(0.12),
+        max_buying_power_usage_pct: config.max_buying_power_usage_pct.unwrap_or(0.10),
+        min_return_on_buying_power: config.min_return_on_buying_power.unwrap_or(0.0004),
+        min_breakeven_pop: config.min_breakeven_pop.unwrap_or(0.72),
+        max_probability_of_touch: config.max_probability_of_touch.unwrap_or(0.40),
+        min_distance_to_breakeven_pct: config.min_distance_to_breakeven_pct.unwrap_or(0.004),
+        min_expected_move_coverage: config.min_expected_move_coverage.unwrap_or(1.10),
+        min_score: config.min_score.unwrap_or(72.0),
     }
 }
 
@@ -1655,6 +2102,70 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_inherits_parent_sections() {
+        let parent = parse_runtime_config(
+            r#"
+[runtime]
+max_iterations = 0
+
+[index]
+underlyings = ["SPY", "GLD"]
+quantity = 1
+
+[naked_scanner]
+max_buying_power_usage_pct = 0.10
+min_score = 70.0
+
+[risk]
+max_active_entries_per_underlying = 1
+
+[risk.sectors]
+SPY = "broad_index"
+GLD = "metals"
+"#,
+        )
+        .unwrap();
+        let child = parse_runtime_config(
+            r#"
+extends = "base.toml"
+
+[runtime]
+strategies = ["naked_put"]
+
+[naked_scanner]
+max_buying_power_usage_pct = 0.03
+
+[risk]
+max_active_entries = 3
+
+[risk.sectors]
+GDX = "metals"
+"#,
+        )
+        .unwrap();
+
+        let merged = child.merge_parent(parent);
+
+        assert!(merged.extends.is_none());
+        assert_eq!(merged.runtime.strategies, vec!["naked_put"]);
+        assert_eq!(merged.runtime.max_iterations, Some(0));
+        assert_eq!(merged.index.underlyings, vec!["SPY", "GLD"]);
+        assert_eq!(merged.index.quantity, Some(1));
+        assert_eq!(merged.naked_scanner.max_buying_power_usage_pct, Some(0.03),);
+        assert_eq!(merged.naked_scanner.min_score, Some(70.0));
+        assert_eq!(merged.risk.max_active_entries, Some(3));
+        assert_eq!(merged.risk.max_active_entries_per_underlying, Some(1));
+        assert_eq!(
+            merged.risk.sectors.get("SPY").map(String::as_str),
+            Some("broad_index"),
+        );
+        assert_eq!(
+            merged.risk.sectors.get("GDX").map(String::as_str),
+            Some("metals"),
+        );
+    }
+
+    #[test]
     fn parse_runtime_config_reads_strategy_scanner_and_management_sections() {
         let config = parse_runtime_config(
             r#"
@@ -1704,13 +2215,48 @@ min_debit_to_width = 0.25
 min_reward_to_risk = 0.80
 
 [naked_scanner]
-min_dte = 7
-max_dte = 21
-short_delta_min = 0.10
-short_delta_max = 0.20
-min_open_interest = 500
-max_spread_pct = 0.12
-min_credit = 0.25
+min_dte = 3
+max_dte = 7
+short_delta_min = 0.08
+short_delta_max = 0.16
+min_open_interest = 1000
+max_spread_pct = 0.08
+min_credit = 0.20
+min_bid_size = 1
+min_ask_size = 1
+min_daily_volume = 50
+min_implied_volatility = 0.15
+max_implied_volatility = 0.90
+min_annualized_premium_yield = 0.10
+max_buying_power_usage_pct = 0.10
+min_return_on_buying_power = 0.0005
+min_breakeven_pop = 0.70
+max_probability_of_touch = 0.45
+min_distance_to_breakeven_pct = 0.005
+min_expected_move_coverage = 1.00
+min_score = 70.0
+
+[naked_1_3dte_scanner]
+min_dte = 1
+max_dte = 3
+short_delta_min = 0.06
+short_delta_max = 0.14
+min_open_interest = 1000
+max_spread_pct = 0.08
+min_credit = 0.12
+min_bid_size = 1
+min_ask_size = 1
+min_daily_volume = 100
+min_implied_volatility = 0.12
+max_implied_volatility = 1.00
+min_annualized_premium_yield = 0.12
+max_buying_power_usage_pct = 0.10
+min_return_on_buying_power = 0.0004
+min_breakeven_pop = 0.72
+max_probability_of_touch = 0.40
+min_distance_to_breakeven_pct = 0.004
+min_expected_move_coverage = 1.10
+min_score = 72.0
 
 [risk]
 max_active_entries = 1
@@ -1748,9 +2294,48 @@ expiration_exit_days = 2
         assert_eq!(config.iron_condor.min_return_on_risk, Some(0.20));
         assert_eq!(config.debit_scanner.widths, Some(vec![3.0, 5.0]));
         assert_eq!(config.debit_scanner.min_debit_to_width, Some(0.25));
-        assert_eq!(config.naked_scanner.min_dte, Some(7));
-        assert_eq!(config.naked_scanner.max_spread_pct, Some(0.12));
-        assert_eq!(config.naked_scanner.min_credit, Some(0.25));
+        assert_eq!(config.naked_scanner.min_dte, Some(3));
+        assert_eq!(config.naked_scanner.max_spread_pct, Some(0.08));
+        assert_eq!(config.naked_scanner.min_credit, Some(0.20));
+        assert_eq!(config.naked_scanner.min_daily_volume, Some(50));
+        assert_eq!(config.naked_scanner.min_implied_volatility, Some(0.15));
+        assert_eq!(
+            config.naked_scanner.min_annualized_premium_yield,
+            Some(0.10)
+        );
+        assert_eq!(config.naked_scanner.max_buying_power_usage_pct, Some(0.10));
+        assert_eq!(
+            config.naked_scanner.min_return_on_buying_power,
+            Some(0.0005)
+        );
+        assert_eq!(config.naked_scanner.min_breakeven_pop, Some(0.70));
+        assert_eq!(config.naked_scanner.max_probability_of_touch, Some(0.45));
+        assert_eq!(
+            config.naked_scanner.min_distance_to_breakeven_pct,
+            Some(0.005)
+        );
+        assert_eq!(config.naked_scanner.min_expected_move_coverage, Some(1.00));
+        assert_eq!(config.naked_scanner.min_score, Some(70.0));
+        assert_eq!(config.naked_1_3dte_scanner.min_dte, Some(1));
+        assert_eq!(config.naked_1_3dte_scanner.max_dte, Some(3));
+        assert_eq!(config.naked_1_3dte_scanner.min_credit, Some(0.12));
+        assert_eq!(
+            config.naked_1_3dte_scanner.max_buying_power_usage_pct,
+            Some(0.10)
+        );
+        assert_eq!(
+            config.naked_1_3dte_scanner.min_return_on_buying_power,
+            Some(0.0004)
+        );
+        assert_eq!(
+            config.naked_1_3dte_scanner.max_probability_of_touch,
+            Some(0.40)
+        );
+        assert_eq!(
+            config.naked_1_3dte_scanner.min_expected_move_coverage,
+            Some(1.10)
+        );
+        assert_eq!(config.naked_1_3dte_scanner.min_score, Some(72.0));
         assert_eq!(config.risk.max_active_entries, Some(1));
         assert_eq!(config.risk.max_daily_submits, Some(1));
         assert_eq!(config.risk.max_open_orders, Some(1));
@@ -1798,14 +2383,22 @@ expiration_exit_days = 2
 
     #[test]
     fn strategy_config_accepts_naked_strategies() {
-        let config = strategy_config_from_values(vec!["naked_call,naked_put".to_string()]).unwrap();
+        let config = strategy_config_from_values(vec![
+            "naked_call,naked_put,naked_call_1_3dte,naked_put_1_3dte".to_string(),
+        ])
+        .unwrap();
 
         assert!(config.credit_kinds.is_empty());
         assert!(!config.iron_condor_enabled);
         assert!(config.debit_kinds.is_empty());
         assert_eq!(
             config.naked_kinds,
-            vec![NakedOptionKind::Call, NakedOptionKind::Put],
+            vec![
+                NakedOptionKind::Call,
+                NakedOptionKind::Put,
+                NakedOptionKind::CallOneToThreeDte,
+                NakedOptionKind::PutOneToThreeDte,
+            ],
         );
     }
 

@@ -10,6 +10,8 @@ uses a file lock so only one runner can own a given Alpaca account workflow.
   emergency override template.
 - `deploy/alpaca/alpaca-index-credit.account.env.example`: account-scoped env template for future
   supervised account instances.
+- `deploy/alpaca/alpaca-index-credit.base.toml.example`: shared strategy universe, scanner, sector,
+  and management defaults inherited by account configs.
 - `deploy/alpaca/alpaca-index-credit.toml.example`: strategy/scanner/management config template.
 - `deploy/alpaca/alpaca-fleet.toml.example`: read-only fleet registry template.
 - `deploy/alpaca/alpaca-index-credit-install.sh`: builds release binaries and installs user files.
@@ -37,9 +39,11 @@ The installed engine, operator status command, and account/order probe auto-load
 `~/.config/nautilus-trader/alpaca/index-credit.env` when present. Set
 `NAUTILUS_ALPACA_ENV_FILE` only when intentionally pointing at a different env file.
 
-Edit `~/.config/nautilus-trader/alpaca/index-credit.toml` for strategy/scanner/management settings.
-TOML `runtime.max_iterations = 0` is continuous service mode. Set `ALPACA_MAX_ITERATIONS=1` only
-for a manual one-shot smoke test override.
+Edit `~/.config/nautilus-trader/alpaca/base-index-credit.toml` for shared scanner, universe,
+sector, and management settings. Account configs can set top-level `extends` to inherit from that
+base, then override only strategy identity, state path, risk caps, or account-specific scanner
+limits. TOML `runtime.max_iterations = 0` is continuous service mode. Set
+`ALPACA_MAX_ITERATIONS=1` only for a manual one-shot smoke test override.
 
 The installer also creates `~/.config/nautilus-trader/alpaca/fleet.toml` if missing. The fleet
 registry is read-only operator metadata; credentials remain in each account env file.
@@ -178,8 +182,20 @@ role and strategy set.
   spread candidates before ranking. Candidate ranking also favors centered DTE and stronger
   minimum-leg open interest.
 - TOML `[naked_scanner]` controls undefined-risk single-leg short option candidates. It filters by
-  DTE, absolute delta, open interest, bid/ask spread, and minimum credit before the account-level
-  fleet permission gate can allow any naked-call or naked-put submission.
+  DTE, absolute delta, open interest, bid/ask spread, minimum credit, displayed quote size, option
+  volume, implied-volatility range, annualized premium yield, breakeven POP, estimated touch
+  probability, spot-to-breakeven distance, expected-move coverage, estimated buying-power usage,
+  return on estimated buying-power requirement, and composite candidate score before the
+  account-level fleet permission gate can allow any naked-call or naked-put submission.
+- The deployed undefined-risk paper profile is intentionally short-DTE focused (`3-7` DTE) so the
+  annualized-yield gate can find liquid candidates without reaching too close to the money.
+- TOML `[naked_1_3dte_scanner]` controls the optional `naked_call_1_3dte` and
+  `naked_put_1_3dte` strategies. This profile is stricter on POP, touch risk, expected-move
+  coverage, and liquidity because near-expiration short options have faster gamma changes.
+- Naked-option scanner diagnostics include `account_options_buying_power`,
+  `estimated_buying_power_requirement`, `buying_power_usage_pct`, `return_on_buying_power`, and the
+  `capital_requirement_model`. Short puts use a cash-secured reserve estimate; short calls use an
+  estimated Reg-T style requirement because max loss is undefined.
 - TOML `[risk] max_active_entries`, `max_daily_submits`, and `max_open_orders` cap account-level
   exposure before any hosted strategy can submit. Env overrides are available as
   `ALPACA_MAX_ACTIVE_ENTRIES`, `ALPACA_MAX_DAILY_SUBMITS`, and `ALPACA_MAX_OPEN_ORDERS`.
@@ -192,6 +208,8 @@ role and strategy set.
 - Fleet `[fleet] max_active_entries`, `max_active_entries_per_underlying`, and
   `max_active_entries_per_sector` cap exposure across enabled accounts using the account
   `state_path` values in the registry.
+- Fleet account `risk_budget.max_buying_power_pct`, when configured, tightens the naked scanner's
+  `max_buying_power_usage_pct` for that account.
 
 Paper/live endpoint selection is controlled by `ALPACA_TRADING_BASE_URL` and
 `ALPACA_TRADE_UPDATES_WS_URL`. Keep paper URLs in place until the rollout plan explicitly moves to a
@@ -213,6 +231,10 @@ partial fills and accepted/new orders that have not filled yet so stale order ha
 separated from ordinary working-order latency. `last_management_snapshot` includes the latest
 managed spread mark, net premium kind, unrealized PnL, hold time, days to expiration, and any active
 close trigger.
+
+Scanner diagnostics include a `rejections` map keyed by filter reason, so a no-candidate scan can be
+attributed to liquidity, quote quality, delta range, POP/touch gates, buying-power usage, score, or
+spread-construction filters instead of only reporting a generic no-candidate result.
 
 The command reports one engine state:
 

@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
 use serde_json::Value;
 
 /// Alpaca option contract type.
@@ -176,6 +176,37 @@ impl OptionSnapshotsRequest {
         pairs.push(("limit", self.limit.to_string()));
         if let Some(value) = &self.page_token {
             pairs.push(("page_token", value.clone()));
+        }
+        pairs
+    }
+}
+
+/// Request parameters for stock snapshots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StockSnapshotsRequest {
+    /// Stock symbols.
+    pub symbols: Vec<String>,
+    /// Stock data feed.
+    pub feed: Option<String>,
+}
+
+impl StockSnapshotsRequest {
+    /// Creates a snapshot request for the given symbols.
+    #[must_use]
+    pub fn for_symbols(symbols: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            symbols: symbols.into_iter().map(Into::into).collect(),
+            feed: None,
+        }
+    }
+
+    pub(crate) fn query_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = Vec::new();
+        if !self.symbols.is_empty() {
+            pairs.push(("symbols", self.symbols.join(",")));
+        }
+        if let Some(value) = &self.feed {
+            pairs.push(("feed", value.clone()));
         }
         pairs
     }
@@ -605,6 +636,26 @@ impl OptionSnapshotsResponse {
     }
 }
 
+/// Response from Alpaca's stock snapshots endpoint.
+#[derive(Clone, Debug, Serialize)]
+pub struct StockSnapshotsResponse {
+    /// Snapshots keyed by stock symbol.
+    pub snapshots: BTreeMap<String, AlpacaStockSnapshot>,
+}
+
+impl<'de> Deserialize<'de> for StockSnapshotsResponse {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let source = value.get("snapshots").cloned().unwrap_or(value);
+        let snapshots = BTreeMap::<String, AlpacaStockSnapshot>::deserialize(source)
+            .map_err(D::Error::custom)?;
+        Ok(Self { snapshots })
+    }
+}
+
 /// Response from Alpaca's option contracts endpoint.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OptionContractsResponse {
@@ -720,6 +771,119 @@ impl AlpacaOptionSnapshot {
                 .as_ref()
                 .is_some_and(AlpacaOptionGreeks::has_any)
     }
+}
+
+/// Alpaca stock snapshot model.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AlpacaStockSnapshot {
+    /// Latest quote.
+    #[serde(default, alias = "latestQuote", alias = "latest_quote")]
+    pub latest_quote: Option<AlpacaStockQuote>,
+    /// Latest trade.
+    #[serde(default, alias = "latestTrade", alias = "latest_trade")]
+    pub latest_trade: Option<AlpacaStockTrade>,
+    /// Latest minute bar.
+    #[serde(default, alias = "minuteBar", alias = "minute_bar")]
+    pub minute_bar: Option<AlpacaStockBar>,
+    /// Latest daily bar.
+    #[serde(default, alias = "dailyBar", alias = "daily_bar")]
+    pub daily_bar: Option<AlpacaStockBar>,
+    /// Previous daily bar.
+    #[serde(default, alias = "prevDailyBar", alias = "prev_daily_bar")]
+    pub prev_daily_bar: Option<AlpacaStockBar>,
+}
+
+impl AlpacaStockSnapshot {
+    /// Returns the best available spot proxy for scanner metrics.
+    #[must_use]
+    pub fn latest_price(&self) -> Option<f64> {
+        self.latest_quote
+            .as_ref()
+            .and_then(AlpacaStockQuote::midpoint)
+            .or_else(|| self.latest_trade.as_ref().and_then(|trade| trade.price))
+            .or_else(|| self.minute_bar.as_ref().and_then(|bar| bar.close))
+            .or_else(|| self.daily_bar.as_ref().and_then(|bar| bar.close))
+            .or_else(|| self.prev_daily_bar.as_ref().and_then(|bar| bar.close))
+            .filter(|price| *price > 0.0)
+    }
+}
+
+/// Alpaca stock quote model.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AlpacaStockQuote {
+    /// Ask price.
+    #[serde(default, alias = "ap", deserialize_with = "deserialize_optional_f64")]
+    pub ask_price: Option<f64>,
+    /// Ask size.
+    #[serde(default, alias = "as", deserialize_with = "deserialize_optional_u64")]
+    pub ask_size: Option<u64>,
+    /// Bid price.
+    #[serde(default, alias = "bp", deserialize_with = "deserialize_optional_f64")]
+    pub bid_price: Option<f64>,
+    /// Bid size.
+    #[serde(default, alias = "bs", deserialize_with = "deserialize_optional_u64")]
+    pub bid_size: Option<u64>,
+    /// Timestamp.
+    #[serde(default, alias = "t")]
+    pub timestamp: Option<String>,
+}
+
+impl AlpacaStockQuote {
+    /// Returns `true` when the quote has positive bid/ask prices and ask is not below bid.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        match (self.bid_price, self.ask_price) {
+            (Some(bid), Some(ask)) => bid > 0.0 && ask > 0.0 && ask >= bid,
+            _ => false,
+        }
+    }
+
+    /// Returns the quote midpoint, if the quote is valid.
+    #[must_use]
+    pub fn midpoint(&self) -> Option<f64> {
+        if self.is_valid() {
+            Some((self.bid_price? + self.ask_price?) / 2.0)
+        } else {
+            None
+        }
+    }
+}
+
+/// Alpaca stock trade model.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AlpacaStockTrade {
+    /// Price.
+    #[serde(default, alias = "p", deserialize_with = "deserialize_optional_f64")]
+    pub price: Option<f64>,
+    /// Size.
+    #[serde(default, alias = "s", deserialize_with = "deserialize_optional_u64")]
+    pub size: Option<u64>,
+    /// Timestamp.
+    #[serde(default, alias = "t")]
+    pub timestamp: Option<String>,
+}
+
+/// Alpaca stock bar model.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AlpacaStockBar {
+    /// Open price.
+    #[serde(default, alias = "o", deserialize_with = "deserialize_optional_f64")]
+    pub open: Option<f64>,
+    /// High price.
+    #[serde(default, alias = "h", deserialize_with = "deserialize_optional_f64")]
+    pub high: Option<f64>,
+    /// Low price.
+    #[serde(default, alias = "l", deserialize_with = "deserialize_optional_f64")]
+    pub low: Option<f64>,
+    /// Close price.
+    #[serde(default, alias = "c", deserialize_with = "deserialize_optional_f64")]
+    pub close: Option<f64>,
+    /// Volume.
+    #[serde(default, alias = "v", deserialize_with = "deserialize_optional_u64")]
+    pub volume: Option<u64>,
+    /// Timestamp.
+    #[serde(default, alias = "t")]
+    pub timestamp: Option<String>,
 }
 
 /// Alpaca option quote model.

@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO="${NAUTILUS_ALPACA_REPO:-$HOME/Projects/nautilus_trader}"
 ENV_FILE="${NAUTILUS_ALPACA_ENV_FILE:-$HOME/.config/nautilus-trader/alpaca/index-credit.env}"
+BASE_CONFIG_FILE="${ALPACA_BASE_CONFIG_PATH:-$HOME/.config/nautilus-trader/alpaca/base-index-credit.toml}"
 CONFIG_FILE="${ALPACA_CONFIG_PATH:-$HOME/.config/nautilus-trader/alpaca/index-credit.toml}"
 FLEET_CONFIG_FILE="${NAUTILUS_ALPACA_FLEET_CONFIG:-$HOME/.config/nautilus-trader/alpaca/fleet.toml}"
 ACCOUNT_ENV_DIR="${NAUTILUS_ALPACA_ACCOUNT_ENV_DIR:-$HOME/.config/nautilus-trader/alpaca/accounts}"
@@ -33,6 +34,9 @@ install -Dm644 deploy/alpaca/alpaca-index-credit@.service \
 if [[ ! -f "$ENV_FILE" ]]; then
   install -Dm600 deploy/alpaca/alpaca-index-credit.env.example "$ENV_FILE"
 fi
+if [[ ! -f "$BASE_CONFIG_FILE" ]]; then
+  install -Dm600 deploy/alpaca/alpaca-index-credit.base.toml.example "$BASE_CONFIG_FILE"
+fi
 if [[ ! -f "$CONFIG_FILE" ]]; then
   install -Dm600 deploy/alpaca/alpaca-index-credit.toml.example "$CONFIG_FILE"
 fi
@@ -45,6 +49,7 @@ systemctl --user daemon-reload
 
 echo "installed alpaca-index-credit runtime"
 echo "env_file=$ENV_FILE"
+echo "base_config_file=$BASE_CONFIG_FILE"
 echo "config_file=$CONFIG_FILE"
 echo "fleet_config_file=$FLEET_CONFIG_FILE"
 echo "account_env_dir=$ACCOUNT_ENV_DIR"

@@ -43,7 +43,10 @@ use crate::{
         emit_operator_event, load_strategy_state, naked_option_strategy_name,
         save_strategy_state_atomic,
     },
-    strategy::{CreditSpreadKind, DebitSpreadCandidate, IronCondorCandidate, NakedOptionCandidate},
+    strategy::{
+        CreditSpreadKind, DebitSpreadCandidate, IronCondorCandidate, NakedOptionCandidate,
+        annualized_premium_yield,
+    },
     submit::{
         MlegSubmitLeg, MlegSubmitOrderListRequest, SimpleSubmitOrderRequest,
         build_mleg_submit_order_list, build_simple_submit_order,
@@ -637,15 +640,38 @@ async fn apply_strategy_decision(
         }
         StrategyDecision::SubmitNakedOptionOpen { entry } => {
             let order_list_id = order_list_id(trade_date, &entry.underlying);
-            println!(
-                "decision: submit underlying={} short={} credit={:.2} delta={:.2} score={:.1} order_list_id={}",
-                entry.underlying,
-                entry.candidate.short.symbol,
-                entry.candidate.credit,
-                entry.candidate.short.delta_abs,
-                entry.candidate.score,
-                order_list_id,
-            );
+            let metrics = entry.candidate.short.metrics.as_ref();
+            if let Some(metrics) = metrics {
+                println!(
+                    "decision: submit underlying={} short={} credit={:.2} delta={:.2} pop={:.1}% touch={:.1}% be_dist={:.1}% em_cov={:.2} bpr=${:.0} bp_use={} rbp={:.3}% score={:.1} order_list_id={}",
+                    entry.underlying,
+                    entry.candidate.short.symbol,
+                    entry.candidate.credit,
+                    entry.candidate.short.delta_abs,
+                    metrics.breakeven_pop * 100.0,
+                    metrics.probability_of_touch_est * 100.0,
+                    metrics.distance_to_breakeven_pct * 100.0,
+                    metrics.expected_move_coverage,
+                    entry.candidate.estimated_buying_power_requirement,
+                    format_optional_pct(entry.candidate.buying_power_usage_pct),
+                    entry.candidate.return_on_buying_power * 100.0,
+                    entry.candidate.score,
+                    order_list_id,
+                );
+            } else {
+                println!(
+                    "decision: submit underlying={} short={} credit={:.2} delta={:.2} bpr=${:.0} bp_use={} rbp={:.3}% score={:.1} order_list_id={}",
+                    entry.underlying,
+                    entry.candidate.short.symbol,
+                    entry.candidate.credit,
+                    entry.candidate.short.delta_abs,
+                    entry.candidate.estimated_buying_power_requirement,
+                    format_optional_pct(entry.candidate.buying_power_usage_pct),
+                    entry.candidate.return_on_buying_power * 100.0,
+                    entry.candidate.score,
+                    order_list_id,
+                );
+            }
             emit_operator_event(
                 "decision",
                 json!({
@@ -655,6 +681,38 @@ async fn apply_strategy_decision(
                     "short_symbol": &entry.candidate.short.symbol,
                     "credit": entry.candidate.credit,
                     "delta_abs": entry.candidate.short.delta_abs,
+                    "dte": entry.candidate.short.dte,
+                    "strike": entry.candidate.short.strike,
+                    "spread_pct": entry.candidate.short.spread_pct,
+                    "bid_size": entry.candidate.short.bid_size,
+                    "ask_size": entry.candidate.short.ask_size,
+                    "volume": entry.candidate.short.volume,
+                    "open_interest": entry.candidate.short.open_interest,
+                    "implied_volatility": entry.candidate.short.implied_volatility,
+                    "capital_requirement_model": entry.candidate.capital_requirement_model.as_str(),
+                    "estimated_buying_power_requirement": entry.candidate.estimated_buying_power_requirement,
+                    "buying_power_usage_pct": entry.candidate.buying_power_usage_pct,
+                    "return_on_buying_power": entry.candidate.return_on_buying_power,
+                    "annualized_premium_yield": annualized_premium_yield(
+                        entry.candidate.credit,
+                        entry.candidate.short.strike,
+                        entry.candidate.short.dte,
+                    ),
+                    "underlying_price": metrics.map(|metrics| metrics.underlying_price),
+                    "breakeven": metrics.map(|metrics| metrics.breakeven),
+                    "strike_itm_probability": metrics.map(|metrics| metrics.strike_itm_probability),
+                    "delta_pop_proxy": metrics.map(|metrics| metrics.delta_pop_proxy),
+                    "breakeven_pop": metrics.map(|metrics| metrics.breakeven_pop),
+                    "probability_of_touch_est": metrics.map(|metrics| metrics.probability_of_touch_est),
+                    "expected_move": metrics.map(|metrics| metrics.expected_move),
+                    "expected_move_pct": metrics.map(|metrics| metrics.expected_move_pct),
+                    "distance_to_strike_pct": metrics.map(|metrics| metrics.distance_to_strike_pct),
+                    "distance_to_breakeven_pct": metrics.map(|metrics| metrics.distance_to_breakeven_pct),
+                    "expected_move_coverage": metrics.map(|metrics| metrics.expected_move_coverage),
+                    "model_delta_abs": metrics.map(|metrics| metrics.model_delta_abs),
+                    "model_gamma": metrics.map(|metrics| metrics.model_gamma),
+                    "model_theta": metrics.map(|metrics| metrics.model_theta),
+                    "model_vega": metrics.map(|metrics| metrics.model_vega),
                     "score": entry.candidate.score,
                     "order_list_id": &order_list_id,
                     "trade_date": trade_date,
@@ -773,14 +831,36 @@ async fn apply_strategy_decision(
             Ok(false)
         }
         StrategyDecision::DryRunNakedOption { entry } => {
-            println!(
-                "decision: dry_run underlying={} short={} credit={:.2} delta={:.2} score={:.1} reason=submission_disabled",
-                entry.underlying,
-                entry.candidate.short.symbol,
-                entry.candidate.credit,
-                entry.candidate.short.delta_abs,
-                entry.candidate.score,
-            );
+            let metrics = entry.candidate.short.metrics.as_ref();
+            if let Some(metrics) = metrics {
+                println!(
+                    "decision: dry_run underlying={} short={} credit={:.2} delta={:.2} pop={:.1}% touch={:.1}% be_dist={:.1}% em_cov={:.2} bpr=${:.0} bp_use={} rbp={:.3}% score={:.1} reason=submission_disabled",
+                    entry.underlying,
+                    entry.candidate.short.symbol,
+                    entry.candidate.credit,
+                    entry.candidate.short.delta_abs,
+                    metrics.breakeven_pop * 100.0,
+                    metrics.probability_of_touch_est * 100.0,
+                    metrics.distance_to_breakeven_pct * 100.0,
+                    metrics.expected_move_coverage,
+                    entry.candidate.estimated_buying_power_requirement,
+                    format_optional_pct(entry.candidate.buying_power_usage_pct),
+                    entry.candidate.return_on_buying_power * 100.0,
+                    entry.candidate.score,
+                );
+            } else {
+                println!(
+                    "decision: dry_run underlying={} short={} credit={:.2} delta={:.2} bpr=${:.0} bp_use={} rbp={:.3}% score={:.1} reason=submission_disabled",
+                    entry.underlying,
+                    entry.candidate.short.symbol,
+                    entry.candidate.credit,
+                    entry.candidate.short.delta_abs,
+                    entry.candidate.estimated_buying_power_requirement,
+                    format_optional_pct(entry.candidate.buying_power_usage_pct),
+                    entry.candidate.return_on_buying_power * 100.0,
+                    entry.candidate.score,
+                );
+            }
             emit_operator_event(
                 "decision",
                 json!({
@@ -791,6 +871,38 @@ async fn apply_strategy_decision(
                     "short_symbol": &entry.candidate.short.symbol,
                     "credit": entry.candidate.credit,
                     "delta_abs": entry.candidate.short.delta_abs,
+                    "dte": entry.candidate.short.dte,
+                    "strike": entry.candidate.short.strike,
+                    "spread_pct": entry.candidate.short.spread_pct,
+                    "bid_size": entry.candidate.short.bid_size,
+                    "ask_size": entry.candidate.short.ask_size,
+                    "volume": entry.candidate.short.volume,
+                    "open_interest": entry.candidate.short.open_interest,
+                    "implied_volatility": entry.candidate.short.implied_volatility,
+                    "capital_requirement_model": entry.candidate.capital_requirement_model.as_str(),
+                    "estimated_buying_power_requirement": entry.candidate.estimated_buying_power_requirement,
+                    "buying_power_usage_pct": entry.candidate.buying_power_usage_pct,
+                    "return_on_buying_power": entry.candidate.return_on_buying_power,
+                    "annualized_premium_yield": annualized_premium_yield(
+                        entry.candidate.credit,
+                        entry.candidate.short.strike,
+                        entry.candidate.short.dte,
+                    ),
+                    "underlying_price": metrics.map(|metrics| metrics.underlying_price),
+                    "breakeven": metrics.map(|metrics| metrics.breakeven),
+                    "strike_itm_probability": metrics.map(|metrics| metrics.strike_itm_probability),
+                    "delta_pop_proxy": metrics.map(|metrics| metrics.delta_pop_proxy),
+                    "breakeven_pop": metrics.map(|metrics| metrics.breakeven_pop),
+                    "probability_of_touch_est": metrics.map(|metrics| metrics.probability_of_touch_est),
+                    "expected_move": metrics.map(|metrics| metrics.expected_move),
+                    "expected_move_pct": metrics.map(|metrics| metrics.expected_move_pct),
+                    "distance_to_strike_pct": metrics.map(|metrics| metrics.distance_to_strike_pct),
+                    "distance_to_breakeven_pct": metrics.map(|metrics| metrics.distance_to_breakeven_pct),
+                    "expected_move_coverage": metrics.map(|metrics| metrics.expected_move_coverage),
+                    "model_delta_abs": metrics.map(|metrics| metrics.model_delta_abs),
+                    "model_gamma": metrics.map(|metrics| metrics.model_gamma),
+                    "model_theta": metrics.map(|metrics| metrics.model_theta),
+                    "model_vega": metrics.map(|metrics| metrics.model_vega),
                     "score": entry.candidate.score,
                     "trade_date": trade_date,
                 }),
@@ -2152,6 +2264,13 @@ fn strategy_name(kind: CreditSpreadKind) -> &'static str {
     credit_spread_strategy_name(kind)
 }
 
+fn format_optional_pct(value: Option<f64>) -> String {
+    value.map_or_else(
+        || "n/a".to_string(),
+        |value| format!("{:.2}%", value * 100.0),
+    )
+}
+
 fn order_age_secs(order: &AlpacaOrder) -> Option<u64> {
     order
         .submitted_at
@@ -2316,6 +2435,7 @@ mod tests {
             iron_condor_scanner: IronCondorScannerConfig::default(),
             debit_scanner: DebitSpreadScannerConfig::default(),
             naked_scanner: crate::strategy::NakedOptionScannerConfig::default(),
+            naked_1_3dte_scanner: crate::strategy::NakedOptionScannerConfig::default(),
             fleet: None,
             fleet_account_id: None,
             fleet_policy_blocks: Vec::new(),
@@ -2604,10 +2724,19 @@ mod tests {
                 ask: 0.92,
                 delta_abs: 0.16,
                 spread_pct: 0.08,
+                bid_size: 10,
+                ask_size: 10,
+                volume: 100,
                 open_interest: 1_200,
                 implied_volatility: Some(0.22),
+                metrics: None,
             },
             credit: 0.71,
+            capital_requirement_model:
+                crate::strategy::OptionCapitalRequirementModel::CashSecuredPut,
+            estimated_buying_power_requirement: 70_800.0,
+            buying_power_usage_pct: Some(0.0708),
+            return_on_buying_power: 0.001003,
             score: 72.0,
         }
     }
