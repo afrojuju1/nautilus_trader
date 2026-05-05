@@ -35,15 +35,19 @@ use crate::{
     },
     index_credit::{
         IndexCreditConfig, SelectedDebitEntry, SelectedEntry, SelectedIndexEntry,
-        SelectedIronCondorEntry, select_index_strategy_entry,
+        SelectedIronCondorEntry, SelectedNakedOptionEntry, select_index_strategy_entry,
     },
     management::{credit_spread_close_reason, days_to_expiration, recorded_age_secs},
     runtime::{
         StrategyState, StrategyStateEntry, credit_spread_strategy_name, debit_spread_strategy_name,
-        emit_operator_event, load_strategy_state, save_strategy_state_atomic,
+        emit_operator_event, load_strategy_state, naked_option_strategy_name,
+        save_strategy_state_atomic,
     },
-    strategy::{CreditSpreadKind, DebitSpreadCandidate, IronCondorCandidate},
-    submit::{MlegSubmitLeg, MlegSubmitOrderListRequest, build_mleg_submit_order_list},
+    strategy::{CreditSpreadKind, DebitSpreadCandidate, IronCondorCandidate, NakedOptionCandidate},
+    submit::{
+        MlegSubmitLeg, MlegSubmitOrderListRequest, SimpleSubmitOrderRequest,
+        build_mleg_submit_order_list, build_simple_submit_order,
+    },
 };
 use chrono::{DateTime, Utc};
 use nautilus_common::{
@@ -112,6 +116,11 @@ pub enum StrategyDecision {
         /// Selected debit-spread candidate.
         entry: SelectedDebitEntry,
     },
+    /// Naked-option candidate was found, but submission is disabled.
+    DryRunNakedOption {
+        /// Selected naked-option candidate.
+        entry: SelectedNakedOptionEntry,
+    },
     /// Submit an opening broker-native MLeg order list.
     SubmitOpen {
         /// Selected entry candidate.
@@ -126,6 +135,11 @@ pub enum StrategyDecision {
     SubmitDebitOpen {
         /// Selected debit-spread candidate.
         entry: SelectedDebitEntry,
+    },
+    /// Submit an opening broker-native naked-option simple order.
+    SubmitNakedOptionOpen {
+        /// Selected naked-option candidate.
+        entry: SelectedNakedOptionEntry,
     },
 }
 
@@ -268,6 +282,14 @@ impl StrategyRuntime for IndexCreditStrategy {
                     StrategyDecision::SubmitDebitOpen { entry }
                 }
                 Some(SelectedIndexEntry::Debit(entry)) => StrategyDecision::DryRunDebit { entry },
+                Some(SelectedIndexEntry::NakedOption(entry))
+                    if context.config.naked_submit_enabled(entry.kind) =>
+                {
+                    StrategyDecision::SubmitNakedOptionOpen { entry }
+                }
+                Some(SelectedIndexEntry::NakedOption(entry)) => {
+                    StrategyDecision::DryRunNakedOption { entry }
+                }
                 None => StrategyDecision::NoEntry,
             })
         })
@@ -613,6 +635,58 @@ async fn apply_strategy_decision(
             );
             Ok(outcome.accepted > 0)
         }
+        StrategyDecision::SubmitNakedOptionOpen { entry } => {
+            let order_list_id = order_list_id(trade_date, &entry.underlying);
+            println!(
+                "decision: submit underlying={} short={} credit={:.2} delta={:.2} score={:.1} order_list_id={}",
+                entry.underlying,
+                entry.candidate.short.symbol,
+                entry.candidate.credit,
+                entry.candidate.short.delta_abs,
+                entry.candidate.score,
+                order_list_id,
+            );
+            emit_operator_event(
+                "decision",
+                json!({
+                    "action": "submit",
+                    "underlying": &entry.underlying,
+                    "strategy": naked_option_strategy_name(entry.kind),
+                    "short_symbol": &entry.candidate.short.symbol,
+                    "credit": entry.candidate.credit,
+                    "delta_abs": entry.candidate.short.delta_abs,
+                    "score": entry.candidate.score,
+                    "order_list_id": &order_list_id,
+                    "trade_date": trade_date,
+                }),
+            );
+            let outcome =
+                submit_naked_option_entry(&entry, &order_list_id, config.quantity, config).await?;
+            if outcome.accepted > 0 {
+                state.record_naked_option_submission(
+                    trade_date.to_string(),
+                    entry.underlying,
+                    entry.kind,
+                    config.quantity,
+                    order_list_id,
+                    &entry.candidate,
+                    outcome.parent_order_id.clone(),
+                );
+            }
+            println!(
+                "submit_result: accepted={} rejected={}",
+                outcome.accepted, outcome.rejected
+            );
+            emit_operator_event(
+                "submit_result",
+                json!({
+                    "accepted": outcome.accepted,
+                    "rejected": outcome.rejected,
+                    "parent_order_id": outcome.parent_order_id,
+                }),
+            );
+            Ok(outcome.accepted > 0)
+        }
         StrategyDecision::DryRun { entry } => {
             println!(
                 "decision: dry_run underlying={} short={} long={} credit={:.2} ror={:.1}% score={:.1} reason=submission_disabled",
@@ -692,6 +766,31 @@ async fn apply_strategy_decision(
                     "short_symbol": &entry.candidate.short.symbol,
                     "debit": entry.candidate.debit,
                     "reward_to_risk": entry.candidate.reward_to_risk,
+                    "score": entry.candidate.score,
+                    "trade_date": trade_date,
+                }),
+            );
+            Ok(false)
+        }
+        StrategyDecision::DryRunNakedOption { entry } => {
+            println!(
+                "decision: dry_run underlying={} short={} credit={:.2} delta={:.2} score={:.1} reason=submission_disabled",
+                entry.underlying,
+                entry.candidate.short.symbol,
+                entry.candidate.credit,
+                entry.candidate.short.delta_abs,
+                entry.candidate.score,
+            );
+            emit_operator_event(
+                "decision",
+                json!({
+                    "action": "dry_run",
+                    "reason": "submission_disabled",
+                    "underlying": &entry.underlying,
+                    "strategy": naked_option_strategy_name(entry.kind),
+                    "short_symbol": &entry.candidate.short.symbol,
+                    "credit": entry.candidate.credit,
+                    "delta_abs": entry.candidate.short.delta_abs,
                     "score": entry.candidate.score,
                     "trade_date": trade_date,
                 }),
@@ -1223,13 +1322,25 @@ async fn close_quote(
     let short_quote = snapshots
         .get(&entry.short_symbol)
         .and_then(|snapshot| snapshot.latest_quote.as_ref());
+    let Some(short_ask) = short_quote.and_then(|quote| quote.ask_price) else {
+        return Ok(None);
+    };
+    if entry.is_naked_option() {
+        if short_ask <= 0.0 {
+            return Ok(None);
+        }
+        return Ok(Some(CloseQuote {
+            short_ask,
+            long_bid: 0.0,
+            short_call_ask: None,
+            long_call_bid: None,
+            debit: short_ask,
+        }));
+    }
     let long_quote = snapshots
         .get(&entry.long_symbol)
         .and_then(|snapshot| snapshot.latest_quote.as_ref());
-    let (Some(short_ask), Some(long_bid)) = (
-        short_quote.and_then(|quote| quote.ask_price),
-        long_quote.and_then(|quote| quote.bid_price),
-    ) else {
+    let Some(long_bid) = long_quote.and_then(|quote| quote.bid_price) else {
         return Ok(None);
     };
     let mut debit = if entry.is_debit_spread() {
@@ -1536,6 +1647,61 @@ async fn submit_debit_entry(
     })
 }
 
+async fn submit_naked_option_entry(
+    entry: &SelectedNakedOptionEntry,
+    order_list_id: &str,
+    quantity: u64,
+    config: &IndexCreditConfig,
+) -> anyhow::Result<SubmitOutcome> {
+    let exec_config = exec_config_from_env();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    replace_exec_event_sender(tx);
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let trader_id = TraderId::from("TRADER-001");
+    let client_id = ClientId::from(ALPACA_CLIENT_ID);
+    let account_id = AccountId::from("ALPACA-001");
+    let strategy_id = StrategyId::from(STRATEGY_FAMILY);
+    let core = ExecutionClientCore::new(
+        trader_id,
+        client_id,
+        Venue::new(ALPACA_VENUE),
+        OmsType::Netting,
+        account_id,
+        AccountType::Margin,
+        None,
+        cache,
+    );
+    let mut client = AlpacaExecutionClient::new(core, exec_config.clone())?;
+    client.start()?;
+    client.connect().await?;
+
+    let cmd = build_naked_option_submit_order(
+        &entry.candidate,
+        order_list_id,
+        quantity,
+        trader_id,
+        Some(client_id),
+        strategy_id,
+    )?;
+    client.submit_order(cmd)?;
+
+    let (accepted, rejected) = collect_execution_events(&mut rx, 1).await;
+    let parent_order_id = lookup_parent_order(&exec_config, order_list_id).await?;
+    if config.cancel_after_accept && accepted > 0 {
+        cancel_parent_order(&exec_config, parent_order_id.as_deref()).await?;
+    }
+
+    client.disconnect().await?;
+    client.stop()?;
+
+    Ok(SubmitOutcome {
+        accepted,
+        rejected,
+        parent_order_id,
+    })
+}
+
 async fn submit_close_entry(
     entry: &StrategyStateEntry,
     quote: &CloseQuote,
@@ -1565,15 +1731,27 @@ async fn submit_close_entry(
     client.start()?;
     client.connect().await?;
 
-    let cmd = build_close_submit_order_list(
-        entry,
-        quote,
-        order_list_id,
-        trader_id,
-        Some(client_id),
-        strategy_id,
-    )?;
-    client.submit_order_list(cmd)?;
+    if entry.is_naked_option() {
+        let cmd = build_naked_option_close_order(
+            entry,
+            quote,
+            order_list_id,
+            trader_id,
+            Some(client_id),
+            strategy_id,
+        )?;
+        client.submit_order(cmd)?;
+    } else {
+        let cmd = build_close_submit_order_list(
+            entry,
+            quote,
+            order_list_id,
+            trader_id,
+            Some(client_id),
+            strategy_id,
+        )?;
+        client.submit_order_list(cmd)?;
+    }
 
     let (accepted, rejected) = collect_execution_events(&mut rx, entry.symbols().len()).await;
     let parent_order_id = lookup_parent_order(&exec_config, order_list_id).await?;
@@ -1727,6 +1905,54 @@ fn build_debit_submit_order_list(
                 reduce_only: false,
             },
         ],
+        ts_init: get_atomic_clock_realtime().get_time_ns(),
+    })
+}
+
+fn build_naked_option_submit_order(
+    candidate: &NakedOptionCandidate,
+    client_order_id: &str,
+    quantity: u64,
+    trader_id: TraderId,
+    client_id: Option<ClientId>,
+    strategy_id: StrategyId,
+) -> anyhow::Result<nautilus_common::messages::execution::SubmitOrder> {
+    if quantity == 0 {
+        anyhow::bail!("quantity must be positive");
+    }
+
+    build_simple_submit_order(SimpleSubmitOrderRequest {
+        trader_id,
+        client_id,
+        strategy_id,
+        client_order_id: ClientOrderId::from(client_order_id),
+        instrument_id: alpaca_instrument_id(&candidate.short.symbol)?,
+        order_side: OrderSide::Sell,
+        quantity: Quantity::new(quantity as f64, 0),
+        limit_price: Price::new(candidate.short.bid, 2),
+        reduce_only: false,
+        ts_init: get_atomic_clock_realtime().get_time_ns(),
+    })
+}
+
+fn build_naked_option_close_order(
+    entry: &StrategyStateEntry,
+    quote: &CloseQuote,
+    client_order_id: &str,
+    trader_id: TraderId,
+    client_id: Option<ClientId>,
+    strategy_id: StrategyId,
+) -> anyhow::Result<nautilus_common::messages::execution::SubmitOrder> {
+    build_simple_submit_order(SimpleSubmitOrderRequest {
+        trader_id,
+        client_id,
+        strategy_id,
+        client_order_id: ClientOrderId::from(client_order_id),
+        instrument_id: alpaca_instrument_id(&entry.short_symbol)?,
+        order_side: OrderSide::Buy,
+        quantity: Quantity::new(entry.quantity as f64, 0),
+        limit_price: Price::new(quote.short_ask, 2),
+        reduce_only: true,
         ts_init: get_atomic_clock_realtime().get_time_ns(),
     })
 }
@@ -2049,9 +2275,11 @@ mod tests {
             spread_kinds: vec![CreditSpreadKind::Put],
             iron_condor_enabled: false,
             debit_kinds: Vec::new(),
+            naked_kinds: Vec::new(),
             dry_run_spread_kinds: Vec::new(),
             iron_condor_dry_run: false,
             dry_run_debit_kinds: Vec::new(),
+            dry_run_naked_kinds: Vec::new(),
             max_active_entries: None,
             max_daily_submits: None,
             max_open_orders: None,
@@ -2087,6 +2315,7 @@ mod tests {
             scanner: PutCreditScannerConfig::default(),
             iron_condor_scanner: IronCondorScannerConfig::default(),
             debit_scanner: DebitSpreadScannerConfig::default(),
+            naked_scanner: crate::strategy::NakedOptionScannerConfig::default(),
             fleet: None,
             fleet_account_id: None,
             fleet_policy_blocks: Vec::new(),
@@ -2269,6 +2498,59 @@ mod tests {
         assert_eq!(strategy.name(), "index_credit");
     }
 
+    #[test]
+    fn naked_option_order_builders_use_simple_open_and_close_orders() {
+        let candidate = naked_option_candidate();
+        let trader_id = TraderId::from("TRADER-001");
+        let client_id = ClientId::from(ALPACA_CLIENT_ID);
+        let strategy_id = StrategyId::from(STRATEGY_FAMILY);
+
+        let open = build_naked_option_submit_order(
+            &candidate,
+            "open-list-1",
+            2,
+            trader_id,
+            Some(client_id),
+            strategy_id,
+        )
+        .unwrap();
+
+        assert_eq!(open.client_order_id, ClientOrderId::from("open-list-1"));
+        assert_eq!(open.order_init.order_side, OrderSide::Sell);
+        assert!(!open.order_init.reduce_only);
+        assert_eq!(open.order_init.quantity, Quantity::new(2.0, 0));
+        assert_eq!(open.order_init.price, Some(Price::new(0.71, 2)));
+
+        let mut entry = state_entry();
+        entry.strategy = naked_option_strategy_name(crate::strategy::NakedOptionKind::Put).into();
+        entry.short_symbol = candidate.short.symbol.clone();
+        entry.long_symbol.clear();
+        entry.quantity = 2;
+        let quote = CloseQuote {
+            short_ask: 0.92,
+            long_bid: 0.0,
+            short_call_ask: None,
+            long_call_bid: None,
+            debit: 0.92,
+        };
+
+        let close = build_naked_option_close_order(
+            &entry,
+            &quote,
+            "close-list-1",
+            trader_id,
+            Some(client_id),
+            strategy_id,
+        )
+        .unwrap();
+
+        assert_eq!(close.client_order_id, ClientOrderId::from("close-list-1"));
+        assert_eq!(close.order_init.order_side, OrderSide::Buy);
+        assert!(close.order_init.reduce_only);
+        assert_eq!(close.order_init.quantity, Quantity::new(2.0, 0));
+        assert_eq!(close.order_init.price, Some(Price::new(0.92, 2)));
+    }
+
     fn state_entry() -> StrategyStateEntry {
         StrategyStateEntry {
             trade_date: "2026-05-04".to_string(),
@@ -2309,5 +2591,24 @@ mod tests {
         entry.credit = 0.0;
         entry.debit = Some(1.00);
         entry
+    }
+
+    fn naked_option_candidate() -> NakedOptionCandidate {
+        NakedOptionCandidate {
+            short: crate::strategy::ScoredContract {
+                symbol: "SPY260512P00708000".to_string(),
+                expiration_date: "2026-05-12".to_string(),
+                dte: 7,
+                strike: 708.0,
+                bid: 0.71,
+                ask: 0.92,
+                delta_abs: 0.16,
+                spread_pct: 0.08,
+                open_interest: 1_200,
+                implied_volatility: Some(0.22),
+            },
+            credit: 0.71,
+            score: 72.0,
+        }
     }
 }

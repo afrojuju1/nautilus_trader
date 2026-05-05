@@ -60,6 +60,13 @@ struct OperatorConfig {
     json_output: bool,
 }
 
+#[derive(Debug)]
+struct AccountRuntimeDefaults {
+    service_name: String,
+    log_dir: Option<PathBuf>,
+    lock_dir: Option<PathBuf>,
+}
+
 #[derive(Debug, Serialize)]
 struct OperatorStatus {
     checked_at_utc: String,
@@ -239,16 +246,37 @@ async fn main() -> anyhow::Result<()> {
 impl OperatorConfig {
     fn from_env() -> anyhow::Result<Self> {
         let strategy_config = IndexCreditConfig::from_runtime_env()?;
+        let account_defaults = strategy_config.fleet.as_ref().and_then(|fleet| {
+            fleet
+                .current_account()
+                .map(|account| AccountRuntimeDefaults {
+                    service_name: account.service.clone(),
+                    log_dir: fleet.log_dir(account),
+                    lock_dir: fleet.lock_dir(account),
+                })
+        });
         let state_home = env::var("XDG_STATE_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| home_dir().join(".local/state"));
         let default_state_dir = state_home.join("nautilus_trader");
         let log_dir = env::var("NAUTILUS_ALPACA_LOG_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| default_state_dir.join("logs"));
+            .ok()
+            .or_else(|| {
+                account_defaults
+                    .as_ref()
+                    .and_then(|defaults| defaults.log_dir.clone())
+            })
+            .unwrap_or_else(|| default_state_dir.join("logs"));
         let lock_dir = env::var("NAUTILUS_ALPACA_LOCK_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| default_state_dir.join("locks"));
+            .ok()
+            .or_else(|| {
+                account_defaults
+                    .as_ref()
+                    .and_then(|defaults| defaults.lock_dir.clone())
+            })
+            .unwrap_or_else(|| default_state_dir.join("locks"));
         let dry_run_strategies = strategy_config
             .dry_run_strategy_names()
             .into_iter()
@@ -257,7 +285,13 @@ impl OperatorConfig {
 
         Ok(Self {
             service_name: env::var("NAUTILUS_ALPACA_SERVICE")
-                .unwrap_or_else(|_| "alpaca-index-credit.service".to_string()),
+                .ok()
+                .or_else(|| {
+                    account_defaults
+                        .as_ref()
+                        .map(|defaults| defaults.service_name.clone())
+                })
+                .unwrap_or_else(|| "alpaca-index-credit.service".to_string()),
             state_path: strategy_config.state_path,
             log_path: log_dir.join("alpaca-index-credit.log"),
             lock_path: lock_dir.join("alpaca-index-credit.lock"),

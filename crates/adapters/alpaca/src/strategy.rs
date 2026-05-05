@@ -82,6 +82,24 @@ impl DebitSpreadKind {
     }
 }
 
+/// Naked short option family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NakedOptionKind {
+    /// Naked short call.
+    Call,
+    /// Naked short put.
+    Put,
+}
+
+impl NakedOptionKind {
+    fn option_type(self) -> AlpacaOptionType {
+        match self {
+            Self::Call => AlpacaOptionType::Call,
+            Self::Put => AlpacaOptionType::Put,
+        }
+    }
+}
+
 /// Configuration for the credit spread scanner.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PutCreditScannerConfig {
@@ -159,6 +177,39 @@ impl Default for DebitSpreadScannerConfig {
             max_debit_to_width: 0.55,
             min_debit_to_width: 0.20,
             min_reward_to_risk: 0.75,
+        }
+    }
+}
+
+/// Configuration for naked short option entries.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NakedOptionScannerConfig {
+    /// Minimum days to expiration.
+    pub min_dte: i64,
+    /// Maximum days to expiration.
+    pub max_dte: i64,
+    /// Minimum absolute short-option delta.
+    pub short_delta_min: f64,
+    /// Maximum absolute short-option delta.
+    pub short_delta_max: f64,
+    /// Minimum open interest.
+    pub min_open_interest: u64,
+    /// Maximum bid/ask spread as a fraction of midpoint.
+    pub max_spread_pct: f64,
+    /// Minimum option credit.
+    pub min_credit: f64,
+}
+
+impl Default for NakedOptionScannerConfig {
+    fn default() -> Self {
+        Self {
+            min_dte: 7,
+            max_dte: 21,
+            short_delta_min: 0.10,
+            short_delta_max: 0.20,
+            min_open_interest: 500,
+            max_spread_pct: 0.12,
+            min_credit: 0.25,
         }
     }
 }
@@ -266,6 +317,17 @@ pub struct IronCondorCandidate {
     pub score: f64,
 }
 
+/// One naked short option candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NakedOptionCandidate {
+    /// Short option contract.
+    pub short: ScoredContract,
+    /// Entry credit.
+    pub credit: f64,
+    /// Scanner score.
+    pub score: f64,
+}
+
 /// Scan result for one underlying.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PutCreditScanResult {
@@ -309,6 +371,21 @@ pub struct IronCondorScanResult {
     pub scoreable_count: usize,
     /// Ranked iron-condor candidates.
     pub candidates: Vec<IronCondorCandidate>,
+}
+
+/// Scan result for one naked option underlying.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NakedOptionScanResult {
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Number of contracts loaded.
+    pub contract_count: usize,
+    /// Number of snapshots loaded.
+    pub snapshot_count: usize,
+    /// Number of scoreable contracts.
+    pub scoreable_count: usize,
+    /// Ranked naked-option candidates.
+    pub candidates: Vec<NakedOptionCandidate>,
 }
 
 /// Loads chain data and ranks put credit spread candidates for one underlying.
@@ -391,6 +468,48 @@ pub async fn scan_put_debit_underlying(
         config,
         underlying,
         DebitSpreadKind::Put,
+    )
+    .await
+}
+
+/// Loads chain data and ranks naked call candidates for one underlying.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_naked_call_underlying(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &NakedOptionScannerConfig,
+    underlying: impl Into<String>,
+) -> Result<NakedOptionScanResult> {
+    scan_naked_option_underlying(
+        client,
+        data_config,
+        config,
+        underlying,
+        NakedOptionKind::Call,
+    )
+    .await
+}
+
+/// Loads chain data and ranks naked put candidates for one underlying.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_naked_put_underlying(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &NakedOptionScannerConfig,
+    underlying: impl Into<String>,
+) -> Result<NakedOptionScanResult> {
+    scan_naked_option_underlying(
+        client,
+        data_config,
+        config,
+        underlying,
+        NakedOptionKind::Put,
     )
     .await
 }
@@ -511,6 +630,51 @@ pub async fn scan_debit_spread_underlying(
     })
 }
 
+/// Loads chain data and ranks naked short option candidates for one underlying.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_naked_option_underlying(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &NakedOptionScannerConfig,
+    underlying: impl Into<String>,
+    kind: NakedOptionKind,
+) -> Result<NakedOptionScanResult> {
+    let underlying = underlying.into();
+    let today = OffsetDateTime::now_utc().date();
+    let min_expiration = (today + Duration::days(config.min_dte)).to_string();
+    let max_expiration = (today + Duration::days(config.max_dte)).to_string();
+    let provider = AlpacaOptionContractProvider::new(client.clone());
+
+    let contracts = provider
+        .load_active_contracts(
+            underlying.clone(),
+            min_expiration,
+            max_expiration,
+            Some(kind.option_type()),
+        )
+        .await?;
+    let symbols = contracts
+        .iter()
+        .map(|contract| contract.symbol.clone())
+        .collect::<Vec<_>>();
+    let mut snapshots_request = OptionSnapshotsRequest::for_symbols(symbols);
+    snapshots_request.feed = Some(data_config.option_feed.as_str().to_string());
+    let snapshots = client.option_snapshots(&snapshots_request).await?.snapshots;
+
+    let scored = score_naked_option_contracts(&contracts, &snapshots, config);
+    let candidates = build_naked_option_candidates(&scored, config);
+    Ok(NakedOptionScanResult {
+        underlying,
+        contract_count: contracts.len(),
+        snapshot_count: snapshots.len(),
+        scoreable_count: scored.len(),
+        candidates,
+    })
+}
+
 /// Scores contracts that have enough quote, Greek, and liquidity data.
 #[must_use]
 pub fn score_contracts(
@@ -590,6 +754,55 @@ pub fn score_debit_contracts(
 
             let delta_abs = snapshot.greeks.as_ref()?.delta?.abs();
             if delta_abs < config.long_delta_min || delta_abs > config.long_delta_max {
+                return None;
+            }
+
+            Some(ScoredContract {
+                symbol: contract.symbol.clone(),
+                expiration_date: contract.expiration_date.clone(),
+                dte: days_to_expiration(&contract.expiration_date)?,
+                strike: contract.strike_price.parse::<f64>().ok()?,
+                bid,
+                ask,
+                delta_abs,
+                spread_pct,
+                open_interest,
+                implied_volatility: snapshot.implied_volatility,
+            })
+        })
+        .collect()
+}
+
+/// Scores contracts for naked short option entries.
+#[must_use]
+pub fn score_naked_option_contracts(
+    contracts: &[AlpacaOptionContract],
+    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    config: &NakedOptionScannerConfig,
+) -> Vec<ScoredContract> {
+    contracts
+        .iter()
+        .filter_map(|contract| {
+            let open_interest = contract
+                .open_interest
+                .as_deref()
+                .and_then(|value| value.parse::<u64>().ok())?;
+            if open_interest < config.min_open_interest {
+                return None;
+            }
+
+            let snapshot = snapshots.get(&contract.symbol)?;
+            let quote = snapshot.latest_quote.as_ref()?;
+            let bid = quote.bid_price?;
+            let ask = quote.ask_price?;
+            let midpoint = quote.midpoint()?;
+            let spread_pct = (ask - bid) / midpoint;
+            if spread_pct > config.max_spread_pct || bid < config.min_credit {
+                return None;
+            }
+
+            let delta_abs = snapshot.greeks.as_ref()?.delta?.abs();
+            if delta_abs < config.short_delta_min || delta_abs > config.short_delta_max {
                 return None;
             }
 
@@ -786,6 +999,45 @@ pub fn build_debit_candidates_for_kind(
             });
         }
     }
+
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates
+}
+
+/// Builds and ranks naked short option candidates from scored contracts.
+#[must_use]
+pub fn build_naked_option_candidates(
+    contracts: &[ScoredContract],
+    config: &NakedOptionScannerConfig,
+) -> Vec<NakedOptionCandidate> {
+    let mut candidates = contracts
+        .iter()
+        .map(|short| {
+            let delta_midpoint = (config.short_delta_min + config.short_delta_max) / 2.0;
+            let delta_half_range = (config.short_delta_max - config.short_delta_min) / 2.0;
+            let delta_score =
+                (1.0 - ((short.delta_abs - delta_midpoint).abs() / delta_half_range)).max(0.0);
+            let credit_score = (short.bid / config.min_credit.max(0.01)).min(3.0) / 3.0;
+            let term_score = term_score(short.dte, config.min_dte, config.max_dte);
+            let liquidity_score = liquidity_score(short.open_interest, config.min_open_interest);
+            let spread_penalty = (short.spread_pct / config.max_spread_pct).min(1.0);
+            let score = delta_score * 35.0
+                + credit_score * 30.0
+                + term_score * 15.0
+                + liquidity_score * 10.0
+                - spread_penalty * 10.0;
+            NakedOptionCandidate {
+                short: short.clone(),
+                credit: short.bid,
+                score,
+            }
+        })
+        .collect::<Vec<_>>();
 
     candidates.sort_by(|left, right| {
         right
@@ -1023,6 +1275,24 @@ mod tests {
         let candidates = build_candidates_for_kind(&contracts, &config, CreditSpreadKind::Put);
 
         assert_eq!(candidates[0].short.expiration_date, "2026-05-15");
+    }
+
+    #[test]
+    fn naked_option_candidates_rank_single_short_options() {
+        let config = NakedOptionScannerConfig {
+            min_credit: 0.20,
+            ..Default::default()
+        };
+        let contracts = vec![
+            scored("SPY-C-710", 710.0, 0.30, 0.34),
+            scored("SPY-C-713", 713.0, 0.50, 0.54),
+        ];
+
+        let candidates = build_naked_option_candidates(&contracts, &config);
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].short.symbol, "SPY-C-713");
+        assert!((candidates[0].credit - 0.50).abs() < 0.01);
     }
 
     #[test]

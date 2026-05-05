@@ -15,7 +15,7 @@
 
 //! Shared Nautilus `SubmitOrderList` builders for Alpaca multi-leg orders.
 
-use nautilus_common::messages::execution::SubmitOrderList;
+use nautilus_common::messages::execution::{SubmitOrder, SubmitOrderList};
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     enums::{OrderSide, OrderType, TimeInForce},
@@ -24,6 +24,31 @@ use nautilus_model::{
     orders::OrderList,
     types::{Price, Quantity},
 };
+
+/// Request for building a Nautilus simple `SubmitOrder`.
+#[derive(Clone, Copy, Debug)]
+pub struct SimpleSubmitOrderRequest {
+    /// Trader ID.
+    pub trader_id: TraderId,
+    /// Optional execution client ID.
+    pub client_id: Option<ClientId>,
+    /// Strategy ID.
+    pub strategy_id: StrategyId,
+    /// Client order ID.
+    pub client_order_id: ClientOrderId,
+    /// Instrument ID.
+    pub instrument_id: InstrumentId,
+    /// Buy or sell side.
+    pub order_side: OrderSide,
+    /// Quantity.
+    pub quantity: Quantity,
+    /// Positive limit price.
+    pub limit_price: Price,
+    /// Whether this order is reduce-only.
+    pub reduce_only: bool,
+    /// Initialization timestamp.
+    pub ts_init: UnixNanos,
+}
 
 /// One leg in a multi-leg Nautilus order-list command.
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +82,40 @@ pub struct MlegSubmitOrderListRequest {
     pub legs: Vec<MlegSubmitLeg>,
     /// Initialization timestamp.
     pub ts_init: UnixNanos,
+}
+
+/// Builds a Nautilus `SubmitOrder` for a broker-native simple order.
+///
+/// # Errors
+///
+/// Returns an error when quantity or limit price is not positive.
+pub fn build_simple_submit_order(request: SimpleSubmitOrderRequest) -> anyhow::Result<SubmitOrder> {
+    if !request.quantity.is_positive() {
+        anyhow::bail!(
+            "order {} quantity must be positive",
+            request.client_order_id
+        );
+    }
+    if !request.limit_price.is_positive() {
+        anyhow::bail!(
+            "order {} limit price must be positive",
+            request.client_order_id
+        );
+    }
+    let order_init = simple_order_init(request);
+    Ok(SubmitOrder::new(
+        request.trader_id,
+        request.client_id,
+        request.strategy_id,
+        request.instrument_id,
+        request.client_order_id,
+        order_init,
+        None,
+        None,
+        None,
+        UUID4::new(),
+        request.ts_init,
+    ))
 }
 
 /// Builds a Nautilus `SubmitOrderList` for a broker-native multi-leg order.
@@ -128,6 +187,44 @@ pub fn build_mleg_submit_order_list(
         UUID4::new(),
         request.ts_init,
     ))
+}
+
+fn simple_order_init(request: SimpleSubmitOrderRequest) -> OrderInitialized {
+    OrderInitialized::new(
+        request.trader_id,
+        request.strategy_id,
+        request.instrument_id,
+        request.client_order_id,
+        request.order_side,
+        OrderType::Limit,
+        request.quantity,
+        TimeInForce::Day,
+        false,
+        request.reduce_only,
+        false,
+        false,
+        UUID4::new(),
+        request.ts_init,
+        request.ts_init,
+        Some(request.limit_price),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 fn order_init(

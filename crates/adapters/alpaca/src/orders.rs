@@ -103,6 +103,122 @@ impl MlegOrderLeg {
     }
 }
 
+/// Alpaca simple single-leg order payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SimpleOrderPayload {
+    /// Alpaca asset symbol.
+    pub symbol: String,
+    /// Number of contracts or shares.
+    pub qty: String,
+    /// Order side.
+    pub side: AlpacaOrderSide,
+    /// Alpaca order type.
+    #[serde(rename = "type")]
+    pub order_type: String,
+    /// Time in force.
+    pub time_in_force: String,
+    /// Simple order class.
+    pub order_class: String,
+    /// Option position intent.
+    pub position_intent: AlpacaPositionIntent,
+    /// Optional parent client order ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,
+    /// Limit price for limit orders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_price: Option<String>,
+}
+
+impl SimpleOrderPayload {
+    /// Creates a simple option limit order payload and validates it locally.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload is malformed.
+    pub fn new_option_limit(
+        symbol: impl Into<String>,
+        quantity: u64,
+        position_intent: AlpacaPositionIntent,
+        limit_price: f64,
+    ) -> Result<Self> {
+        let payload = Self {
+            symbol: symbol.into(),
+            qty: quantity.to_string(),
+            side: position_intent.side(),
+            order_type: "limit".to_string(),
+            time_in_force: "day".to_string(),
+            order_class: "simple".to_string(),
+            position_intent,
+            client_order_id: None,
+            limit_price: Some(format!("{limit_price:.2}")),
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    /// Returns a copy of the payload with a client order ID set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the client order ID is empty or non-ASCII.
+    pub fn with_client_order_id(mut self, client_order_id: impl Into<String>) -> Result<Self> {
+        let client_order_id = client_order_id.into();
+        if client_order_id.trim().is_empty() {
+            return Err(validation("client_order_id must not be empty"));
+        }
+        if !client_order_id.is_ascii() {
+            return Err(validation("client_order_id must be ASCII"));
+        }
+        self.client_order_id = Some(client_order_id);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Validates this payload without submitting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload is malformed.
+    pub fn validate(&self) -> Result<()> {
+        if self.symbol.trim().is_empty() {
+            return Err(validation("symbol must not be empty"));
+        }
+        parse_positive_u64(&self.qty, "qty")?;
+        if self.side != self.position_intent.side() {
+            return Err(validation(
+                "side must match the side implied by position_intent",
+            ));
+        }
+        if self.order_class != "simple" {
+            return Err(validation("order_class must be simple"));
+        }
+        if self.order_type != "limit" {
+            return Err(validation("only limit simple option orders are supported"));
+        }
+        if self.time_in_force != "day" {
+            return Err(validation("options simple time_in_force must be day"));
+        }
+        let limit_price = self
+            .limit_price
+            .as_ref()
+            .ok_or_else(|| validation("limit_price is required"))?
+            .parse::<f64>()
+            .map_err(|_| validation("limit_price must be numeric"))?;
+        if limit_price <= 0.0 {
+            return Err(validation("limit_price must be positive"));
+        }
+        if let Some(client_order_id) = &self.client_order_id {
+            if client_order_id.trim().is_empty() {
+                return Err(validation("client_order_id must not be empty"));
+            }
+            if !client_order_id.is_ascii() {
+                return Err(validation("client_order_id must be ASCII"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Alpaca multi-leg order payload.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct MlegOrderPayload {
@@ -621,6 +737,40 @@ fn validation(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simple_option_open_payload_uses_sell_to_open() {
+        let payload = SimpleOrderPayload::new_option_limit(
+            "SPY260512P00708000",
+            1,
+            AlpacaPositionIntent::SellToOpen,
+            0.55,
+        )
+        .unwrap()
+        .with_client_order_id("naked-put-1")
+        .unwrap();
+
+        assert_eq!(payload.symbol, "SPY260512P00708000");
+        assert_eq!(payload.side, AlpacaOrderSide::Sell);
+        assert_eq!(payload.position_intent, AlpacaPositionIntent::SellToOpen);
+        assert_eq!(payload.limit_price.as_deref(), Some("0.55"));
+        assert_eq!(payload.order_class, "simple");
+    }
+
+    #[test]
+    fn simple_option_close_payload_uses_buy_to_close() {
+        let payload = SimpleOrderPayload::new_option_limit(
+            "SPY260512P00708000",
+            1,
+            AlpacaPositionIntent::BuyToClose,
+            0.20,
+        )
+        .unwrap();
+
+        assert_eq!(payload.side, AlpacaOrderSide::Buy);
+        assert_eq!(payload.position_intent, AlpacaPositionIntent::BuyToClose);
+        assert_eq!(payload.limit_price.as_deref(), Some("0.20"));
+    }
 
     #[test]
     fn credit_spread_close_payload_uses_buy_to_close_and_positive_debit() {

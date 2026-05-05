@@ -76,7 +76,7 @@ use crate::{
 use crate::{
     config::AlpacaExecClientConfig,
     http::models::{AlpacaActivity, ListActivitiesRequest, ReplaceOrderRequest},
-    orders::{AlpacaPositionIntent, MlegOrderLeg, MlegOrderPayload},
+    orders::{AlpacaPositionIntent, MlegOrderLeg, MlegOrderPayload, SimpleOrderPayload},
     orders::{NetPremiumKind, TradeIntent, signed_net_limit_price},
     runtime::emit_operator_event,
     websocket::{
@@ -131,7 +131,7 @@ pub fn check_put_credit_entry_admission(
     )
 }
 
-/// Checks account, position, and open-order state before opening an option spread.
+/// Checks account, position, and open-order state before opening option exposure.
 #[must_use]
 pub fn check_option_spread_entry_admission(
     account: &AlpacaAccount,
@@ -151,11 +151,11 @@ pub fn check_option_spread_entry_admission(
         .next()
         .cloned()
         .unwrap_or_default();
-    if candidate_symbols.len() < 2
+    if candidate_symbols.is_empty()
         || candidate_underlying.is_empty()
         || candidate_underlyings.len() != 1
     {
-        reasons.push("candidate legs must resolve to the same option underlying".to_string());
+        reasons.push("candidate option symbols must resolve to one underlying".to_string());
     }
 
     let candidate_symbols = candidate_symbols
@@ -1372,10 +1372,46 @@ impl ExecutionClient for AlpacaExecutionClient {
             return Ok(());
         }
 
-        self.emitter.emit_order_denied(
-            &order,
-            "Alpaca execution client submits option spreads through SubmitOrderList; single-order submit is not supported",
-        );
+        let payload = build_simple_payload_from_order(&order)?;
+        self.emitter.emit_order_submitted(&order);
+
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+        self.spawn_task("submit_simple_order", async move {
+            match http_client.submit_simple_order(&payload).await {
+                Ok(submitted) => {
+                    let ts_event = clock.get_time_ns();
+                    match submitted.id.as_deref() {
+                        Some(venue_order_id) => {
+                            emitter.emit_order_accepted(
+                                &order,
+                                VenueOrderId::from(venue_order_id),
+                                ts_event,
+                            );
+                        }
+                        None => {
+                            emitter.emit_order_rejected(
+                                &order,
+                                "submit-order-error: Alpaca accepted simple order but returned no venue order id",
+                                ts_event,
+                                false,
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    let ts_event = clock.get_time_ns();
+                    emitter.emit_order_rejected(
+                        &order,
+                        &format!("submit-order-rejected: {e}"),
+                        ts_event,
+                        false,
+                    );
+                }
+            }
+            Ok(())
+        });
         Ok(())
     }
 
@@ -1836,6 +1872,36 @@ fn emit_trade_update_reports(
 }
 
 #[cfg(feature = "live")]
+fn build_simple_payload_from_order(order: &OrderAny) -> anyhow::Result<SimpleOrderPayload> {
+    validate_simple_option_order(order)?;
+    let quantity = positive_integer_quantity(order.quantity(), order.client_order_id())?;
+    let price = order
+        .price()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Alpaca simple order {} missing limit price",
+                order.client_order_id()
+            )
+        })?
+        .as_f64();
+    if price <= 0.0 {
+        anyhow::bail!(
+            "Alpaca simple order {} price must be positive, was {price}",
+            order.client_order_id()
+        );
+    }
+    let position_intent = alpaca_position_intent(order.order_side(), order.is_reduce_only())?;
+    SimpleOrderPayload::new_option_limit(
+        order.instrument_id().symbol.as_str(),
+        quantity,
+        position_intent,
+        price,
+    )
+    .and_then(|payload| payload.with_client_order_id(order.client_order_id().to_string()))
+    .map_err(|e| anyhow::anyhow!("invalid Alpaca simple payload: {e}"))
+}
+
+#[cfg(feature = "live")]
 fn build_mleg_payload_from_order_list(
     cmd: &SubmitOrderList,
     orders: &[OrderAny],
@@ -1956,6 +2022,44 @@ fn replace_order_request_from_modify_order(
         limit_price,
         ..Default::default()
     })
+}
+
+#[cfg(feature = "live")]
+fn validate_simple_option_order(order: &OrderAny) -> anyhow::Result<()> {
+    if order.instrument_id().venue != Venue::new(ALPACA_VENUE) {
+        anyhow::bail!(
+            "Alpaca simple order {} has non-Alpaca instrument {}",
+            order.client_order_id(),
+            order.instrument_id()
+        );
+    }
+    if order.order_type() != OrderType::Limit {
+        anyhow::bail!(
+            "Alpaca simple order {} must be a limit order, was {:?}",
+            order.client_order_id(),
+            order.order_type()
+        );
+    }
+    if order.time_in_force() != TimeInForce::Day {
+        anyhow::bail!(
+            "Alpaca simple order {} must use DAY time in force, was {:?}",
+            order.client_order_id(),
+            order.time_in_force()
+        );
+    }
+    if order.is_quote_quantity() {
+        anyhow::bail!(
+            "Alpaca simple order {} cannot use quote quantity",
+            order.client_order_id()
+        );
+    }
+    if matches!(order.order_side(), OrderSide::NoOrderSide) {
+        anyhow::bail!(
+            "Alpaca simple order {} missing order side",
+            order.client_order_id()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(feature = "live")]
@@ -2649,6 +2753,20 @@ mod tests {
             reports[0].avg_px_open,
             Some(Decimal::from_str("0.72").unwrap())
         );
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn build_simple_payload_from_order_uses_position_intent() {
+        let order = mleg_limit_order("O-1", "SPY260508P00500000", OrderSide::Sell, 0.75, false);
+
+        let payload = build_simple_payload_from_order(&order).unwrap();
+
+        assert_eq!(payload.symbol, "SPY260508P00500000");
+        assert_eq!(payload.side, crate::orders::AlpacaOrderSide::Sell);
+        assert_eq!(payload.position_intent, AlpacaPositionIntent::SellToOpen);
+        assert_eq!(payload.limit_price.as_deref(), Some("0.75"));
+        assert_eq!(payload.client_order_id.as_deref(), Some("O-1"));
     }
 
     #[cfg(feature = "live")]

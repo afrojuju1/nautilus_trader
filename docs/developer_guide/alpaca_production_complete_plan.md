@@ -456,7 +456,9 @@ Migration order:
 5. Iron condors (native scanner, 4-leg open/close payload primitives, account-engine dry-run
    hosting, SPY dry-run proof complete, and strategy-level dry-run gating available while put/call
    credit spreads remain live; still needs paper submit/close proof)
-6. Straddles/strangles after long-premium management rules are proven
+6. Naked calls / naked puts for the undefined-risk paper account (native scanner, simple open/close
+   order payloads, fleet permission gates, and state plumbing complete; paper proof pending)
+7. Straddles/strangles after long-premium management rules are proven
 
 Each strategy must have native open, management, close, reconciliation, paper validation, and
 operator visibility before live enablement.
@@ -510,6 +512,10 @@ Phase 7 blockers:
   selected an SPY iron condor with submission disabled and the follow-up broker check showed zero
   positions and zero open orders. They still need management-rule review, submit-with-cancel paper
   proof, and full open/close paper proof before live enablement.
+- Naked calls and naked puts now have native single-leg candidate scanning, Alpaca simple order open
+  and close payloads, persisted single-leg state, fleet permission enforcement, and undefined-risk
+  account config support. They still need real market-hours paper proof, assignment-risk review,
+  buying-power/Greek budget enforcement beyond static fleet metadata, and emergency flatten proof.
 - Straddles/strangles should wait until long-premium management and max-loss behavior are specified.
 
 Parked next steps for earnings debit:
@@ -561,7 +567,5 @@ Current status:
 
 ## Immediate Next Milestone
 
-Paper-prove the new fleet permission gates and hosted debit-spread path on `paper-directional` after
-the existing call-credit exposure is flat or intentionally closed. Keep `paper-undefined-risk`
-disabled until naked/undefined-risk buying-power, Greek, assignment, and emergency flatten controls
-are implemented.
+Paper-prove the undefined-risk paper account with strict caps, then verify one naked-option
+open/management/close lifecycle before expanding the undefined-risk symbol list or sizing.

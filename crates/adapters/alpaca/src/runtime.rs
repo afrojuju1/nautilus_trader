@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::strategy::{
-    CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, IronCondorCandidate, SpreadCandidate,
+    CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, IronCondorCandidate,
+    NakedOptionCandidate, NakedOptionKind, SpreadCandidate,
 };
 
 /// Persisted state for the Alpaca index credit runner.
@@ -161,6 +162,44 @@ impl StrategyState {
             closed_at_utc: None,
         });
     }
+
+    /// Appends one submitted naked short option entry to the state.
+    pub fn record_naked_option_submission(
+        &mut self,
+        trade_date: String,
+        underlying: String,
+        kind: NakedOptionKind,
+        quantity: u64,
+        order_list_id: String,
+        candidate: &NakedOptionCandidate,
+        parent_order_id: Option<String>,
+    ) {
+        self.entries.push(StrategyStateEntry {
+            trade_date,
+            underlying,
+            strategy: naked_option_strategy_name(kind).to_string(),
+            order_list_id,
+            short_symbol: candidate.short.symbol.clone(),
+            long_symbol: String::new(),
+            short_call_symbol: None,
+            long_call_symbol: None,
+            quantity,
+            credit: candidate.credit,
+            debit: None,
+            score: candidate.score,
+            parent_order_id,
+            close_order_list_id: None,
+            close_parent_order_id: None,
+            close_reason: None,
+            close_attempts: 0,
+            last_close_submitted_at_utc: None,
+            submitted: true,
+            canceled: false,
+            closed: false,
+            recorded_at_utc: Utc::now().to_rfc3339(),
+            closed_at_utc: None,
+        });
+    }
 }
 
 /// Persisted state for one broker-native spread entry.
@@ -246,10 +285,19 @@ impl StrategyStateEntry {
         self.debit.is_some() || self.strategy.contains("_debit_")
     }
 
+    /// Returns `true` when this entry stores one naked short option.
+    #[must_use]
+    pub fn is_naked_option(&self) -> bool {
+        self.strategy.contains("_naked_") || self.long_symbol.is_empty()
+    }
+
     /// Returns all option symbols tracked by this entry.
     #[must_use]
     pub fn symbols(&self) -> Vec<&str> {
-        let mut symbols = vec![self.short_symbol.as_str(), self.long_symbol.as_str()];
+        let mut symbols = vec![self.short_symbol.as_str()];
+        if !self.long_symbol.is_empty() {
+            symbols.push(self.long_symbol.as_str());
+        }
         if let Some(symbol) = self.short_call_symbol.as_deref() {
             symbols.push(symbol);
         }
@@ -308,6 +356,15 @@ pub fn debit_spread_strategy_name(kind: DebitSpreadKind) -> &'static str {
     match kind {
         DebitSpreadKind::Call => "index_call_debit_entry",
         DebitSpreadKind::Put => "index_put_debit_entry",
+    }
+}
+
+/// Returns the strategy name for a naked short option kind.
+#[must_use]
+pub fn naked_option_strategy_name(kind: NakedOptionKind) -> &'static str {
+    match kind {
+        NakedOptionKind::Call => "index_naked_call_entry",
+        NakedOptionKind::Put => "index_naked_put_entry",
     }
 }
 
@@ -480,6 +537,36 @@ mod tests {
         );
         assert!(entry.closed_at_utc.is_some());
         assert!(!state.has_submitted_underlying("2026-05-04", "SPY"));
+    }
+
+    #[test]
+    fn naked_option_state_tracks_single_short_leg() {
+        let mut state = StrategyState::default();
+        let candidate = crate::strategy::NakedOptionCandidate {
+            short: scored_contract("SPY260508P00710000", 710.0),
+            credit: 0.72,
+            score: 75.0,
+        };
+        state.record_naked_option_submission(
+            "2026-05-04".to_string(),
+            "SPY".to_string(),
+            NakedOptionKind::Put,
+            1,
+            "open-list-1".to_string(),
+            &candidate,
+            Some("open-parent-1".to_string()),
+        );
+
+        let entry = state.entries.first().unwrap();
+        assert!(entry.is_active());
+        assert!(entry.is_naked_option());
+        assert_eq!(
+            entry.strategy,
+            naked_option_strategy_name(NakedOptionKind::Put)
+        );
+        assert_eq!(entry.symbols(), vec!["SPY260508P00710000"]);
+        assert_eq!(entry.credit, 0.72);
+        assert!(entry.long_symbol.is_empty());
     }
 
     fn iron_condor_candidate() -> IronCondorCandidate {

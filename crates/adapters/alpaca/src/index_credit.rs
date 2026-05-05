@@ -34,13 +34,16 @@ use crate::{
     http::{client::AlpacaHttpClient, models::ListOrdersRequest},
     management::CreditSpreadManagementConfig,
     runtime::{
-        StrategyState, credit_spread_strategy_name, debit_spread_strategy_name, emit_operator_event,
+        StrategyState, credit_spread_strategy_name, debit_spread_strategy_name,
+        emit_operator_event, naked_option_strategy_name,
     },
     strategy::{
         CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, DebitSpreadScannerConfig,
-        IronCondorCandidate, IronCondorScannerConfig, PutCreditScannerConfig, SpreadCandidate,
+        IronCondorCandidate, IronCondorScannerConfig, NakedOptionCandidate, NakedOptionKind,
+        NakedOptionScannerConfig, PutCreditScannerConfig, SpreadCandidate,
         scan_call_credit_underlying, scan_call_debit_underlying, scan_iron_condor_underlying,
-        scan_put_credit_underlying, scan_put_debit_underlying,
+        scan_naked_call_underlying, scan_naked_put_underlying, scan_put_credit_underlying,
+        scan_put_debit_underlying,
     },
 };
 
@@ -55,12 +58,16 @@ pub struct IndexCreditConfig {
     pub iron_condor_enabled: bool,
     /// Enabled long-premium debit spread kinds.
     pub debit_kinds: Vec<DebitSpreadKind>,
+    /// Enabled naked short option kinds.
+    pub naked_kinds: Vec<NakedOptionKind>,
     /// Credit spread kinds which scan but never submit.
     pub dry_run_spread_kinds: Vec<CreditSpreadKind>,
     /// Whether iron-condor candidates scan but never submit.
     pub iron_condor_dry_run: bool,
     /// Debit spread kinds which scan but never submit.
     pub dry_run_debit_kinds: Vec<DebitSpreadKind>,
+    /// Naked option kinds which scan but never submit.
+    pub dry_run_naked_kinds: Vec<NakedOptionKind>,
     /// Maximum active strategy entries. `None` means unlimited.
     pub max_active_entries: Option<usize>,
     /// Maximum accepted strategy submissions for one trade date. `None` means unlimited.
@@ -131,6 +138,8 @@ pub struct IndexCreditConfig {
     pub iron_condor_scanner: IronCondorScannerConfig,
     /// Debit-spread scanner config.
     pub debit_scanner: DebitSpreadScannerConfig,
+    /// Naked-option scanner config.
+    pub naked_scanner: NakedOptionScannerConfig,
     /// Loaded fleet registry, if configured.
     pub fleet: Option<ResolvedFleetConfig>,
     /// Current fleet account ID, if this runtime matched one.
@@ -192,6 +201,11 @@ impl IndexCreditConfig {
                 .iter()
                 .map(|kind| debit_spread_strategy_name(*kind)),
         );
+        names.extend(
+            self.naked_kinds
+                .iter()
+                .map(|kind| naked_option_strategy_name(*kind)),
+        );
         names
     }
 
@@ -210,6 +224,11 @@ impl IndexCreditConfig {
             self.dry_run_debit_kinds
                 .iter()
                 .map(|kind| debit_spread_strategy_name(*kind)),
+        );
+        names.extend(
+            self.dry_run_naked_kinds
+                .iter()
+                .map(|kind| naked_option_strategy_name(*kind)),
         );
         names
     }
@@ -230,6 +249,12 @@ impl IndexCreditConfig {
     #[must_use]
     pub fn debit_submit_enabled(&self, kind: DebitSpreadKind) -> bool {
         self.submit_enabled && !self.dry_run_debit_kinds.contains(&kind)
+    }
+
+    /// Returns whether a selected naked-option kind may submit live orders.
+    #[must_use]
+    pub fn naked_submit_enabled(&self, kind: NakedOptionKind) -> bool {
+        self.submit_enabled && !self.dry_run_naked_kinds.contains(&kind)
     }
 
     /// Returns the configured sector/correlation group for an underlying.
@@ -272,6 +297,17 @@ pub struct SelectedDebitEntry {
     pub candidate: DebitSpreadCandidate,
 }
 
+/// Selected naked short option candidate.
+#[derive(Clone, Debug)]
+pub struct SelectedNakedOptionEntry {
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Naked option kind.
+    pub kind: NakedOptionKind,
+    /// Scored naked-option candidate.
+    pub candidate: NakedOptionCandidate,
+}
+
 /// Selected index strategy candidate.
 #[derive(Clone, Debug)]
 pub enum SelectedIndexEntry {
@@ -281,6 +317,8 @@ pub enum SelectedIndexEntry {
     IronCondor(SelectedIronCondorEntry),
     /// Two-leg debit spread.
     Debit(SelectedDebitEntry),
+    /// Single-leg naked short option.
+    NakedOption(SelectedNakedOptionEntry),
 }
 
 impl SelectedIndexEntry {
@@ -291,6 +329,7 @@ impl SelectedIndexEntry {
             Self::Credit(entry) => entry.candidate.score,
             Self::IronCondor(entry) => entry.candidate.score,
             Self::Debit(entry) => entry.candidate.score,
+            Self::NakedOption(entry) => entry.candidate.score,
         }
     }
 }
@@ -314,6 +353,7 @@ pub async fn select_index_credit_entry(
                 SelectedIndexEntry::Credit(entry) => Some(entry),
                 SelectedIndexEntry::IronCondor(_) => None,
                 SelectedIndexEntry::Debit(_) => None,
+                SelectedIndexEntry::NakedOption(_) => None,
             }),
     )
 }
@@ -770,6 +810,115 @@ pub async fn select_index_strategy_entry(
                 }));
             }
         }
+
+        for kind in &config.naked_kinds {
+            let result = match kind {
+                NakedOptionKind::Call => {
+                    scan_naked_call_underlying(
+                        client,
+                        data_config,
+                        &config.naked_scanner,
+                        underlying,
+                    )
+                    .await?
+                }
+                NakedOptionKind::Put => {
+                    scan_naked_put_underlying(
+                        client,
+                        data_config,
+                        &config.naked_scanner,
+                        underlying,
+                    )
+                    .await?
+                }
+            };
+            let Some(best) = result.candidates.first() else {
+                let reason = no_candidate_reason(
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                );
+                println!(
+                    "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={}",
+                    naked_option_strategy_name(*kind),
+                    reason,
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                );
+                emit_operator_event(
+                    "scanner_diagnostic",
+                    json!({
+                        "underlying": underlying,
+                        "strategy": naked_option_strategy_name(*kind),
+                        "result": "no_candidate",
+                        "reason": reason,
+                        "contracts": result.contract_count,
+                        "snapshots": result.snapshot_count,
+                        "scoreable": result.scoreable_count,
+                    }),
+                );
+                continue;
+            };
+
+            let admission = check_option_spread_entry_admission(
+                &account,
+                &positions,
+                &open_orders,
+                &[&best.short.symbol],
+            );
+            if !admission.allowed {
+                println!(
+                    "{underlying}: admission_rejected strategy={} short={} reasons={}",
+                    naked_option_strategy_name(*kind),
+                    best.short.symbol,
+                    admission.reasons.join(" | "),
+                );
+                emit_operator_event(
+                    "scanner_diagnostic",
+                    json!({
+                        "underlying": underlying,
+                        "strategy": naked_option_strategy_name(*kind),
+                        "result": "admission_rejected",
+                        "short_symbol": &best.short.symbol,
+                        "reasons": admission.reasons,
+                    }),
+                );
+                continue;
+            }
+
+            println!(
+                "{underlying}: candidate strategy={} short={} credit={:.2} delta={:.2} score={:.1}",
+                naked_option_strategy_name(*kind),
+                best.short.symbol,
+                best.credit,
+                best.short.delta_abs,
+                best.score,
+            );
+            emit_operator_event(
+                "scanner_diagnostic",
+                json!({
+                    "underlying": underlying,
+                    "strategy": naked_option_strategy_name(*kind),
+                    "result": "candidate",
+                    "short_symbol": &best.short.symbol,
+                    "credit": best.credit,
+                    "delta_abs": best.short.delta_abs,
+                    "score": best.score,
+                }),
+            );
+
+            if selected
+                .as_ref()
+                .is_none_or(|current| best.score > current.score())
+            {
+                selected = Some(SelectedIndexEntry::NakedOption(SelectedNakedOptionEntry {
+                    underlying: underlying.clone(),
+                    kind: *kind,
+                    candidate: best.clone(),
+                }));
+            }
+        }
     }
 
     Ok(selected)
@@ -780,6 +929,7 @@ struct StrategyConfig {
     credit_kinds: Vec<CreditSpreadKind>,
     iron_condor_enabled: bool,
     debit_kinds: Vec<DebitSpreadKind>,
+    naked_kinds: Vec<NakedOptionKind>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -790,6 +940,7 @@ struct RuntimeConfigFile {
     scanner: ScannerSection,
     iron_condor: IronCondorSection,
     debit_scanner: DebitScannerSection,
+    naked_scanner: NakedScannerSection,
     management: ManagementSection,
     risk: RiskSection,
 }
@@ -860,6 +1011,18 @@ struct DebitScannerSection {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+struct NakedScannerSection {
+    min_dte: Option<i64>,
+    max_dte: Option<i64>,
+    short_delta_min: Option<f64>,
+    short_delta_max: Option<f64>,
+    min_open_interest: Option<u64>,
+    max_spread_pct: Option<f64>,
+    min_credit: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct ManagementSection {
     stale_entry_secs: Option<u64>,
     stale_close_secs: Option<u64>,
@@ -891,6 +1054,9 @@ fn load_runtime_config_file_from_env() -> anyhow::Result<RuntimeConfigFile> {
         let path = PathBuf::from(path);
         return load_runtime_config_file(&path, true);
     }
+    if let Some(path) = current_fleet_account_config_path()? {
+        return load_runtime_config_file(&path, true);
+    }
 
     let path = default_config_path();
     if path.exists() {
@@ -898,6 +1064,15 @@ fn load_runtime_config_file_from_env() -> anyhow::Result<RuntimeConfigFile> {
     } else {
         Ok(RuntimeConfigFile::default())
     }
+}
+
+fn current_fleet_account_config_path() -> anyhow::Result<Option<PathBuf>> {
+    let Some(fleet) = load_fleet_config_from_env()? else {
+        return Ok(None);
+    };
+    Ok(fleet
+        .current_account()
+        .and_then(|account| fleet.config_file(account)))
 }
 
 fn load_runtime_config_file(path: &Path, explicit: bool) -> anyhow::Result<RuntimeConfigFile> {
@@ -949,9 +1124,11 @@ fn build_index_credit_config(
         spread_kinds: strategy_config.credit_kinds,
         iron_condor_enabled: strategy_config.iron_condor_enabled,
         debit_kinds: strategy_config.debit_kinds,
+        naked_kinds: strategy_config.naked_kinds,
         dry_run_spread_kinds: dry_run_strategy_config.credit_kinds,
         iron_condor_dry_run: dry_run_strategy_config.iron_condor_enabled,
         dry_run_debit_kinds: dry_run_strategy_config.debit_kinds,
+        dry_run_naked_kinds: dry_run_strategy_config.naked_kinds,
         max_active_entries: env_parse("ALPACA_MAX_ACTIVE_ENTRIES").or(file.risk.max_active_entries),
         max_daily_submits: env_parse("ALPACA_MAX_DAILY_SUBMITS").or(file.risk.max_daily_submits),
         max_open_orders: env_parse("ALPACA_MAX_OPEN_ORDERS").or(file.risk.max_open_orders),
@@ -1024,6 +1201,7 @@ fn build_index_credit_config(
             .unwrap_or_else(default_state_path),
         iron_condor_scanner: iron_condor_scanner_config_from_file(&scanner, &file.iron_condor),
         debit_scanner: debit_scanner_config_from_file(&file.debit_scanner),
+        naked_scanner: naked_scanner_config_from_file(&file.naked_scanner),
         scanner,
         fleet,
         fleet_account_id: None,
@@ -1037,6 +1215,7 @@ fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyCo
     let mut kinds = Vec::new();
     let mut iron_condor_enabled = false;
     let mut debit_kinds = Vec::new();
+    let mut naked_kinds = Vec::new();
     for raw in values
         .into_iter()
         .flat_map(|value| split_strings([value]))
@@ -1071,10 +1250,21 @@ fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyCo
                 debit_kinds.push(DebitSpreadKind::Call);
                 debit_kinds.push(DebitSpreadKind::Put);
             }
+            "naked_call" | "short_call" | "index_naked_call_entry" => {
+                naked_kinds.push(NakedOptionKind::Call);
+            }
+            "naked_put" | "short_put" | "index_naked_put_entry" => {
+                naked_kinds.push(NakedOptionKind::Put);
+            }
+            "naked" | "undefined_risk" | "short_premium_undefined" => {
+                naked_kinds.push(NakedOptionKind::Call);
+                naked_kinds.push(NakedOptionKind::Put);
+            }
             other => anyhow::bail!("unsupported Alpaca strategy value {other}"),
         }
     }
-    if kinds.is_empty() && !iron_condor_enabled && debit_kinds.is_empty() {
+    if kinds.is_empty() && !iron_condor_enabled && debit_kinds.is_empty() && naked_kinds.is_empty()
+    {
         kinds.push(CreditSpreadKind::Put);
     }
     kinds.sort_by_key(|kind| match kind {
@@ -1087,10 +1277,16 @@ fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyCo
         DebitSpreadKind::Put => 1,
     });
     debit_kinds.dedup();
+    naked_kinds.sort_by_key(|kind| match kind {
+        NakedOptionKind::Call => 0,
+        NakedOptionKind::Put => 1,
+    });
+    naked_kinds.dedup();
     Ok(StrategyConfig {
         credit_kinds: kinds,
         iron_condor_enabled,
         debit_kinds,
+        naked_kinds,
     })
 }
 
@@ -1100,6 +1296,7 @@ fn dry_run_strategy_config_from_values(values: Vec<String>) -> anyhow::Result<St
             credit_kinds: Vec::new(),
             iron_condor_enabled: false,
             debit_kinds: Vec::new(),
+            naked_kinds: Vec::new(),
         });
     }
     strategy_config_from_values(values)
@@ -1128,6 +1325,24 @@ fn apply_fleet_policy(config: &mut IndexCreditConfig) {
                 account.id
             ));
         }
+        if has_undefined_risk_strategies(config) && !account.permissions.undefined_risk {
+            config.fleet_policy_blocks.push(format!(
+                "fleet_permission_undefined_risk_required:{}",
+                account.id
+            ));
+        }
+        if config.naked_kinds.contains(&NakedOptionKind::Call) && !account.permissions.naked_calls {
+            config.fleet_policy_blocks.push(format!(
+                "fleet_permission_naked_calls_required:{}",
+                account.id
+            ));
+        }
+        if config.naked_kinds.contains(&NakedOptionKind::Put) && !account.permissions.naked_puts {
+            config.fleet_policy_blocks.push(format!(
+                "fleet_permission_naked_puts_required:{}",
+                account.id
+            ));
+        }
         if let Some(limit) = account.risk_budget.max_active_entries {
             config.max_active_entries = Some(min_limit(config.max_active_entries, limit));
         }
@@ -1150,6 +1365,10 @@ fn apply_fleet_policy(config: &mut IndexCreditConfig) {
 
 fn has_defined_risk_strategies(config: &IndexCreditConfig) -> bool {
     !config.spread_kinds.is_empty() || config.iron_condor_enabled
+}
+
+fn has_undefined_risk_strategies(config: &IndexCreditConfig) -> bool {
+    !config.naked_kinds.is_empty()
 }
 
 fn min_limit(current: Option<usize>, fleet_limit: usize) -> usize {
@@ -1349,6 +1568,18 @@ fn debit_scanner_config_from_file(config: &DebitScannerSection) -> DebitSpreadSc
     }
 }
 
+fn naked_scanner_config_from_file(config: &NakedScannerSection) -> NakedOptionScannerConfig {
+    NakedOptionScannerConfig {
+        min_dte: config.min_dte.unwrap_or(7),
+        max_dte: config.max_dte.unwrap_or(21),
+        short_delta_min: config.short_delta_min.unwrap_or(0.10),
+        short_delta_max: config.short_delta_max.unwrap_or(0.20),
+        min_open_interest: config.min_open_interest.unwrap_or(500),
+        max_spread_pct: config.max_spread_pct.unwrap_or(0.12),
+        min_credit: config.min_credit.unwrap_or(0.25),
+    }
+}
+
 fn parse_time_value(value: Option<&str>, default: &str) -> anyhow::Result<NaiveTime> {
     Ok(NaiveTime::parse_from_str(
         value.unwrap_or(default),
@@ -1472,6 +1703,15 @@ max_debit_to_width = 0.50
 min_debit_to_width = 0.25
 min_reward_to_risk = 0.80
 
+[naked_scanner]
+min_dte = 7
+max_dte = 21
+short_delta_min = 0.10
+short_delta_max = 0.20
+min_open_interest = 500
+max_spread_pct = 0.12
+min_credit = 0.25
+
 [risk]
 max_active_entries = 1
 max_daily_submits = 1
@@ -1508,6 +1748,9 @@ expiration_exit_days = 2
         assert_eq!(config.iron_condor.min_return_on_risk, Some(0.20));
         assert_eq!(config.debit_scanner.widths, Some(vec![3.0, 5.0]));
         assert_eq!(config.debit_scanner.min_debit_to_width, Some(0.25));
+        assert_eq!(config.naked_scanner.min_dte, Some(7));
+        assert_eq!(config.naked_scanner.max_spread_pct, Some(0.12));
+        assert_eq!(config.naked_scanner.min_credit, Some(0.25));
         assert_eq!(config.risk.max_active_entries, Some(1));
         assert_eq!(config.risk.max_daily_submits, Some(1));
         assert_eq!(config.risk.max_open_orders, Some(1));
@@ -1537,6 +1780,7 @@ expiration_exit_days = 2
         );
         assert!(config.iron_condor_enabled);
         assert!(config.debit_kinds.is_empty());
+        assert!(config.naked_kinds.is_empty());
     }
 
     #[test]
@@ -1549,6 +1793,20 @@ expiration_exit_days = 2
             config.debit_kinds,
             vec![DebitSpreadKind::Call, DebitSpreadKind::Put],
         );
+        assert!(config.naked_kinds.is_empty());
+    }
+
+    #[test]
+    fn strategy_config_accepts_naked_strategies() {
+        let config = strategy_config_from_values(vec!["naked_call,naked_put".to_string()]).unwrap();
+
+        assert!(config.credit_kinds.is_empty());
+        assert!(!config.iron_condor_enabled);
+        assert!(config.debit_kinds.is_empty());
+        assert_eq!(
+            config.naked_kinds,
+            vec![NakedOptionKind::Call, NakedOptionKind::Put],
+        );
     }
 
     #[test]
@@ -1558,10 +1816,12 @@ expiration_exit_days = 2
         assert!(config.credit_kinds.is_empty());
         assert!(!config.iron_condor_enabled);
         assert!(config.debit_kinds.is_empty());
+        assert!(config.naked_kinds.is_empty());
 
         let config = dry_run_strategy_config_from_values(vec!["put".to_string()]).unwrap();
         assert_eq!(config.credit_kinds, vec![CreditSpreadKind::Put]);
         assert!(!config.iron_condor_enabled);
         assert!(config.debit_kinds.is_empty());
+        assert!(config.naked_kinds.is_empty());
     }
 }

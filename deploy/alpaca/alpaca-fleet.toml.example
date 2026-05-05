@@ -83,7 +83,7 @@ state_path = "/home/ade/.local/state/nautilus_trader/alpaca/paper-undefined-risk
 defined_risk = false
 long_premium = false
 undefined_risk = true
-naked_calls = false
+naked_calls = true
 naked_puts = true
 
 [accounts.risk_budget]

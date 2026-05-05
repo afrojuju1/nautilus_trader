@@ -177,6 +177,9 @@ role and strategy set.
 - TOML `[scanner] min_credit_to_width` and `[debit_scanner] min_debit_to_width` reject underpaid
   spread candidates before ranking. Candidate ranking also favors centered DTE and stronger
   minimum-leg open interest.
+- TOML `[naked_scanner]` controls undefined-risk single-leg short option candidates. It filters by
+  DTE, absolute delta, open interest, bid/ask spread, and minimum credit before the account-level
+  fleet permission gate can allow any naked-call or naked-put submission.
 - TOML `[risk] max_active_entries`, `max_daily_submits`, and `max_open_orders` cap account-level
   exposure before any hosted strategy can submit. Env overrides are available as
   `ALPACA_MAX_ACTIVE_ENTRIES`, `ALPACA_MAX_DAILY_SUBMITS`, and `ALPACA_MAX_OPEN_ORDERS`.

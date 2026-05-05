@@ -50,6 +50,15 @@ max_debit_to_width = 0.55
 min_debit_to_width = 0.20
 min_reward_to_risk = 0.75
 
+[naked_scanner]
+min_dte = 7
+max_dte = 21
+short_delta_min = 0.10
+short_delta_max = 0.20
+min_open_interest = 500
+max_spread_pct = 0.12
+min_credit = 0.25
+
 [risk]
 # Account-level caps checked before any hosted strategy can submit a new entry.
 # Omit a field or set it through env only when the cap should be unlimited.
