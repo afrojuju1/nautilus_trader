@@ -55,8 +55,8 @@ Known gaps:
 - Websocket disconnect/reconnect and reconciliation events are wired, but they still need paper
   observation during an actual reconnect or broker event-loss scenario.
 - Multi-account support currently has an operator/deployment foundation only. It still needs account
-  admission policy, allocation rules, per-role strategy configs, and paper proof before any secondary
-  account is allowed to submit.
+  admission policy, allocation rules, per-role strategy configs, and paper proof before undefined
+  risk is allowed to submit.
 
 ## Phase 1: Foundation Lock
 
@@ -435,8 +435,10 @@ Exit criteria:
 - The architecture preserves role separation for defined-risk short premium, long-premium
   directional, and future undefined-risk/naked-call/naked-put accounts.
 
-Status: implementation in progress. This phase is infrastructure only; no allocator and no
-secondary-account submission.
+Status: initial implementation complete. The account engine reads the fleet registry on startup,
+forces `submit=false` plus kill-switch when permissions do not match configured strategies, honors a
+fleet-wide kill switch, applies fleet active-entry caps from account state paths, and surfaces fleet
+policy blocks in operator status. This is not yet a full allocator.
 
 ## Phase 7: Strategy Migration
 
@@ -444,10 +446,11 @@ Migration order:
 
 1. `index_put_credit_entry` (initial native runner complete)
 2. `index_call_credit_entry` (Phase 7A scanner path complete through `ALPACA_STRATEGIES=call|both`)
-3. `earnings_call_debit_entry` (debit-spread Alpaca MLeg order payload builders complete; explicit
-   earnings-event CSV input policy complete; initial call-debit scanner primitives complete)
-4. `earnings_put_debit_entry` (debit-spread Alpaca MLeg order payload builders complete; explicit
-   earnings-event CSV input policy complete; initial put-debit scanner primitives complete)
+3. `index_call_debit_entry` / `index_put_debit_entry` for the directional paper account (hosted
+   scanner, submit, state, and debit-spread close-management path complete; paper proof pending)
+4. `earnings_call_debit_entry` / `earnings_put_debit_entry` (debit-spread Alpaca MLeg order payload
+   builders complete; explicit earnings-event CSV input policy complete; earnings-event selection
+   remains parked)
 5. Iron condors (native scanner, 4-leg open/close payload primitives, account-engine dry-run
    hosting, SPY dry-run proof complete, and strategy-level dry-run gating available while put/call
    credit spreads remain live; still needs paper submit/close proof)
@@ -492,8 +495,11 @@ Phase 7 blockers:
   9. Park earnings debit until explicitly resumed.
 - Secondary Alpaca accounts should remain disabled until Phase 6.7 is installed, the user provides
   paper credentials, and each account receives a role-specific config and risk budget.
-- Earnings debit strategies still need account-engine integration, management rules, paper proof,
-  and source-quality review of the Alpha Vantage feed before live use. Earnings work is intentionally
+- Directional debit strategies now have account-engine hosting and management plumbing, but still
+  need market-hours paper proof on `paper-directional` after current defined-risk exposure is flat or
+  intentionally closed.
+- Earnings debit strategies still need earnings-event selection policy integration, paper proof, and
+  source-quality review of the Alpha Vantage feed before live use. Earnings work is intentionally
   skipped for the current scanner expansion.
 - Iron condors now have native candidate construction, four-leg Alpaca MLeg open/close payload
   builders, hosted account-engine selection, dry-run decision emission, persisted four-leg state,
@@ -551,7 +557,7 @@ Current status:
 
 ## Immediate Next Milestone
 
-Finish and install the Phase 6.7 multi-account foundation, then run fleet status against the current
-paper account. After the secondary paper credentials are provided, create account-scoped env/config
-files with submission gates disabled, verify read-only fleet/operator status, and only then decide
-which account gets the next paper strategy proof.
+Paper-prove the new fleet permission gates and hosted debit-spread path on `paper-directional` after
+the existing call-credit exposure is flat or intentionally closed. Keep `paper-undefined-risk`
+disabled until naked/undefined-risk buying-power, Greek, assignment, and emergency flatten controls
+are implemented.

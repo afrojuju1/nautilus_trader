@@ -5,6 +5,22 @@
 
 [fleet]
 operator_bin = "/home/ade/.local/bin/alpaca-operator-status"
+kill_switch = false
+max_active_entries = 12
+max_active_entries_per_underlying = 1
+max_active_entries_per_sector = 4
+
+[fleet.sectors]
+SPY = "broad_index"
+QQQ = "broad_index"
+IWM = "broad_index"
+DIA = "broad_index"
+GLD = "metals"
+TLT = "rates"
+XLE = "energy"
+XLF = "financials"
+XLK = "technology"
+XLV = "healthcare"
 
 [[accounts]]
 id = "paper-main"
@@ -15,6 +31,7 @@ env_file = "/home/ade/.config/nautilus-trader/alpaca/index-credit.env"
 config_file = "/home/ade/.config/nautilus-trader/alpaca/index-credit.toml"
 log_dir = "/home/ade/.local/state/nautilus_trader/logs"
 lock_dir = "/home/ade/.local/state/nautilus_trader/locks"
+state_path = "/home/ade/.local/state/nautilus_trader/alpaca_index_credit_state.json"
 
 [accounts.permissions]
 defined_risk = true
@@ -37,6 +54,7 @@ env_file = "/home/ade/.config/nautilus-trader/alpaca/accounts/paper-directional.
 config_file = "/home/ade/.config/nautilus-trader/alpaca/configs/paper-directional-index-credit.toml"
 log_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-directional/logs"
 lock_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-directional/locks"
+state_path = "/home/ade/.local/state/nautilus_trader/alpaca/paper-directional/strategy_state.json"
 
 [accounts.permissions]
 defined_risk = false
@@ -59,6 +77,7 @@ env_file = "/home/ade/.config/nautilus-trader/alpaca/accounts/paper-undefined-ri
 config_file = "/home/ade/.config/nautilus-trader/alpaca/configs/paper-undefined-risk-index-credit.toml"
 log_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-undefined-risk/logs"
 lock_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-undefined-risk/locks"
+state_path = "/home/ade/.local/state/nautilus_trader/alpaca/paper-undefined-risk/strategy_state.json"
 
 [accounts.permissions]
 defined_risk = false

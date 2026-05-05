@@ -55,6 +55,8 @@ struct OperatorConfig {
     max_active_entries_per_underlying: Option<usize>,
     max_active_entries_per_sector: Option<usize>,
     sectors: BTreeMap<String, String>,
+    fleet_account_id: Option<String>,
+    fleet_policy_blocks: Vec<String>,
     json_output: bool,
 }
 
@@ -89,6 +91,7 @@ enum EngineState {
 #[derive(Debug, Serialize)]
 struct ServiceStatus {
     name: String,
+    fleet_account_id: Option<String>,
     active: Option<bool>,
     active_state: Option<String>,
     lock_file: String,
@@ -122,6 +125,8 @@ struct OrdersStatus {
     open_mleg: usize,
     nested_legs: usize,
     stale_working: usize,
+    partial_filled: usize,
+    accepted_not_filled: usize,
     recent_rejected: usize,
 }
 
@@ -165,6 +170,8 @@ struct ActiveEntryStatus {
     strategy: String,
     symbols: Vec<String>,
     credit: f64,
+    debit: Option<f64>,
+    net_premium_kind: String,
     score: f64,
     close_reason: Option<String>,
     close_order_list_id: Option<String>,
@@ -270,6 +277,8 @@ impl OperatorConfig {
             max_active_entries_per_underlying: strategy_config.max_active_entries_per_underlying,
             max_active_entries_per_sector: strategy_config.max_active_entries_per_sector,
             sectors: strategy_config.sectors,
+            fleet_account_id: strategy_config.fleet_account_id,
+            fleet_policy_blocks: strategy_config.fleet_policy_blocks,
             json_output: env::args().any(|arg| arg == "--json"),
         })
     }
@@ -303,6 +312,17 @@ fn build_status(
     let recent_rejected = recent_orders
         .iter()
         .filter(|order| order.status.as_deref() == Some("rejected"))
+        .count();
+    let partial_filled = open_orders
+        .iter()
+        .filter(|order| order_filled_qty(order) > 0.0 && order.is_working())
+        .count();
+    let accepted_not_filled = open_orders
+        .iter()
+        .filter(|order| {
+            matches!(order.status.as_deref(), Some("accepted" | "new"))
+                && order_filled_qty(order) == 0.0
+        })
         .count();
 
     let account_status = AccountStatus {
@@ -347,6 +367,8 @@ fn build_status(
             .map(|order| order.legs.as_ref().map_or(0, Vec::len))
             .sum(),
         stale_working: stale_working_orders,
+        partial_filled,
+        accepted_not_filled,
         recent_rejected,
     };
 
@@ -403,6 +425,7 @@ fn build_status(
 
     let service = ServiceStatus {
         name: config.service_name.clone(),
+        fleet_account_id: config.fleet_account_id.clone(),
         active: service_active(&config.service_name),
         active_state: service_active_state(&config.service_name),
         lock_file: config.lock_path.display().to_string(),
@@ -516,6 +539,13 @@ fn build_alerts(
             "entry submission is disabled".to_string(),
         ));
     }
+    for block in &config.fleet_policy_blocks {
+        alerts.push(alert(
+            AlertSeverity::Critical,
+            "fleet_policy_block",
+            format!("fleet policy is blocking new entries: {block}"),
+        ));
+    }
     if orders.recent_rejected > 0 {
         alerts.push(alert(
             AlertSeverity::Warning,
@@ -533,6 +563,23 @@ fn build_alerts(
             format!(
                 "{} open orders are older than {} seconds",
                 orders.stale_working, config.stale_order_secs
+            ),
+        ));
+    }
+    if orders.partial_filled > 0 {
+        alerts.push(alert(
+            AlertSeverity::Warning,
+            "partial_filled_orders",
+            format!("{} open orders have partial fills", orders.partial_filled),
+        ));
+    }
+    if orders.accepted_not_filled > 0 {
+        alerts.push(alert(
+            AlertSeverity::Info,
+            "accepted_not_filled_orders",
+            format!(
+                "{} open orders are accepted/new with no fill yet",
+                orders.accepted_not_filled
             ),
         ));
     }
@@ -737,11 +784,13 @@ fn print_human_status(status: &OperatorStatus) {
         status.account.cash,
     );
     println!(
-        "orders: open={} mleg={} nested_legs={} stale_working={} recent_rejected={}",
+        "orders: open={} mleg={} nested_legs={} stale_working={} partial_filled={} accepted_not_filled={} recent_rejected={}",
         status.orders.open,
         status.orders.open_mleg,
         status.orders.nested_legs,
         status.orders.stale_working,
+        status.orders.partial_filled,
+        status.orders.accepted_not_filled,
         status.orders.recent_rejected,
     );
     println!(
@@ -762,11 +811,15 @@ fn print_human_status(status: &OperatorStatus) {
     );
     for entry in &status.active_entries {
         println!(
-            "active_entry: underlying={} strategy={} symbols={} credit={:.2} close_attempts={} close_reason={} close_order_list_id={} last_close_submitted_at={}",
+            "active_entry: underlying={} strategy={} symbols={} net_premium_kind={} credit={:.2} debit={} close_attempts={} close_reason={} close_order_list_id={} last_close_submitted_at={}",
             entry.underlying,
             entry.strategy,
             entry.symbols.join(","),
+            entry.net_premium_kind,
             entry.credit,
+            entry
+                .debit
+                .map_or_else(|| "none".to_string(), |debit| format!("{debit:.2}")),
             entry.close_attempts,
             entry.close_reason.as_deref().unwrap_or("none"),
             entry.close_order_list_id.as_deref().unwrap_or("none"),
@@ -970,6 +1023,12 @@ fn active_entry_statuses(state: &StrategyState) -> Vec<ActiveEntryStatus> {
                 .map(ToString::to_string)
                 .collect(),
             credit: entry.credit,
+            debit: entry.debit,
+            net_premium_kind: if entry.is_debit_spread() {
+                "debit".to_string()
+            } else {
+                "credit".to_string()
+            },
             score: entry.score,
             close_reason: entry.close_reason.clone(),
             close_order_list_id: entry.close_order_list_id.clone(),
@@ -991,6 +1050,19 @@ fn order_is_stale(order: &AlpacaOrder, now: DateTime<Utc>, stale_order_secs: i64
         .and_then(parse_utc);
     submitted_at
         .is_some_and(|ts| now.signed_duration_since(ts) > Duration::seconds(stale_order_secs))
+}
+
+fn order_filled_qty(order: &AlpacaOrder) -> f64 {
+    let own_qty = order
+        .filled_qty
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let leg_qty = order
+        .legs
+        .as_ref()
+        .map_or(0.0, |legs| legs.iter().map(order_filled_qty).sum::<f64>());
+    own_qty + leg_qty
 }
 
 fn parse_utc(value: &str) -> Option<DateTime<Utc>> {

@@ -171,6 +171,7 @@ mod tests {
             long_call_symbol: None,
             quantity: 1,
             credit: 0.50,
+            debit: None,
             score: 60.0,
             parent_order_id: Some("parent-1".to_string()),
             close_order_list_id: None,

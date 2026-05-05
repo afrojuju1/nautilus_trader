@@ -30,13 +30,17 @@ use serde_json::json;
 use crate::{
     config::AlpacaDataClientConfig,
     execution::check_option_spread_entry_admission,
+    fleet::{ResolvedFleetConfig, load_fleet_config_from_env},
     http::{client::AlpacaHttpClient, models::ListOrdersRequest},
     management::CreditSpreadManagementConfig,
-    runtime::{StrategyState, credit_spread_strategy_name, emit_operator_event},
+    runtime::{
+        StrategyState, credit_spread_strategy_name, debit_spread_strategy_name, emit_operator_event,
+    },
     strategy::{
-        CreditSpreadKind, IronCondorCandidate, IronCondorScannerConfig, PutCreditScannerConfig,
-        SpreadCandidate, scan_call_credit_underlying, scan_iron_condor_underlying,
-        scan_put_credit_underlying,
+        CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, DebitSpreadScannerConfig,
+        IronCondorCandidate, IronCondorScannerConfig, PutCreditScannerConfig, SpreadCandidate,
+        scan_call_credit_underlying, scan_call_debit_underlying, scan_iron_condor_underlying,
+        scan_put_credit_underlying, scan_put_debit_underlying,
     },
 };
 
@@ -49,10 +53,14 @@ pub struct IndexCreditConfig {
     pub spread_kinds: Vec<CreditSpreadKind>,
     /// Whether the index iron-condor strategy is enabled.
     pub iron_condor_enabled: bool,
+    /// Enabled long-premium debit spread kinds.
+    pub debit_kinds: Vec<DebitSpreadKind>,
     /// Credit spread kinds which scan but never submit.
     pub dry_run_spread_kinds: Vec<CreditSpreadKind>,
     /// Whether iron-condor candidates scan but never submit.
     pub iron_condor_dry_run: bool,
+    /// Debit spread kinds which scan but never submit.
+    pub dry_run_debit_kinds: Vec<DebitSpreadKind>,
     /// Maximum active strategy entries. `None` means unlimited.
     pub max_active_entries: Option<usize>,
     /// Maximum accepted strategy submissions for one trade date. `None` means unlimited.
@@ -121,6 +129,14 @@ pub struct IndexCreditConfig {
     pub scanner: PutCreditScannerConfig,
     /// Iron-condor scanner config.
     pub iron_condor_scanner: IronCondorScannerConfig,
+    /// Debit-spread scanner config.
+    pub debit_scanner: DebitSpreadScannerConfig,
+    /// Loaded fleet registry, if configured.
+    pub fleet: Option<ResolvedFleetConfig>,
+    /// Current fleet account ID, if this runtime matched one.
+    pub fleet_account_id: Option<String>,
+    /// Fleet policy blocks applied to this runtime.
+    pub fleet_policy_blocks: Vec<String>,
 }
 
 impl IndexCreditConfig {
@@ -171,6 +187,11 @@ impl IndexCreditConfig {
         if self.iron_condor_enabled {
             names.push("index_iron_condor_entry");
         }
+        names.extend(
+            self.debit_kinds
+                .iter()
+                .map(|kind| debit_spread_strategy_name(*kind)),
+        );
         names
     }
 
@@ -185,6 +206,11 @@ impl IndexCreditConfig {
         if self.iron_condor_dry_run {
             names.push("index_iron_condor_entry");
         }
+        names.extend(
+            self.dry_run_debit_kinds
+                .iter()
+                .map(|kind| debit_spread_strategy_name(*kind)),
+        );
         names
     }
 
@@ -198,6 +224,12 @@ impl IndexCreditConfig {
     #[must_use]
     pub fn iron_condor_submit_enabled(&self) -> bool {
         self.submit_enabled && !self.iron_condor_dry_run
+    }
+
+    /// Returns whether a selected debit-spread kind may submit live orders.
+    #[must_use]
+    pub fn debit_submit_enabled(&self, kind: DebitSpreadKind) -> bool {
+        self.submit_enabled && !self.dry_run_debit_kinds.contains(&kind)
     }
 
     /// Returns the configured sector/correlation group for an underlying.
@@ -229,6 +261,17 @@ pub struct SelectedIronCondorEntry {
     pub candidate: IronCondorCandidate,
 }
 
+/// Selected long-premium debit-spread candidate.
+#[derive(Clone, Debug)]
+pub struct SelectedDebitEntry {
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Debit-spread kind.
+    pub kind: DebitSpreadKind,
+    /// Scored debit-spread candidate.
+    pub candidate: DebitSpreadCandidate,
+}
+
 /// Selected index strategy candidate.
 #[derive(Clone, Debug)]
 pub enum SelectedIndexEntry {
@@ -236,6 +279,8 @@ pub enum SelectedIndexEntry {
     Credit(SelectedEntry),
     /// Four-leg iron condor.
     IronCondor(SelectedIronCondorEntry),
+    /// Two-leg debit spread.
+    Debit(SelectedDebitEntry),
 }
 
 impl SelectedIndexEntry {
@@ -245,6 +290,7 @@ impl SelectedIndexEntry {
         match self {
             Self::Credit(entry) => entry.candidate.score,
             Self::IronCondor(entry) => entry.candidate.score,
+            Self::Debit(entry) => entry.candidate.score,
         }
     }
 }
@@ -267,6 +313,7 @@ pub async fn select_index_credit_entry(
             .and_then(|entry| match entry {
                 SelectedIndexEntry::Credit(entry) => Some(entry),
                 SelectedIndexEntry::IronCondor(_) => None,
+                SelectedIndexEntry::Debit(_) => None,
             }),
     )
 }
@@ -332,6 +379,50 @@ pub async fn select_index_strategy_entry(
                 continue;
             }
         }
+        if let Some(limit) = config
+            .fleet
+            .as_ref()
+            .and_then(|fleet| fleet.config.fleet.max_active_entries_per_underlying)
+        {
+            let current = fleet_active_underlying_count(config, underlying);
+            if current >= limit {
+                println!(
+                    "{underlying}: admission_rejected reason=fleet_max_active_entries_per_underlying current={} limit={}",
+                    current, limit,
+                );
+                emit_operator_event(
+                    "scanner_diagnostic",
+                    json!({
+                        "underlying": underlying,
+                        "result": "admission_rejected",
+                        "reason": "fleet_max_active_entries_per_underlying",
+                        "current": current,
+                        "limit": limit,
+                    }),
+                );
+                continue;
+            }
+        }
+        if let Some((sector, current, limit)) = fleet_sector_limit_state(config, underlying)
+            && current >= limit
+        {
+            println!(
+                "{underlying}: admission_rejected reason=fleet_max_active_entries_per_sector sector={} current={} limit={}",
+                sector, current, limit,
+            );
+            emit_operator_event(
+                "scanner_diagnostic",
+                json!({
+                    "underlying": underlying,
+                    "result": "admission_rejected",
+                    "reason": "fleet_max_active_entries_per_sector",
+                    "sector": sector,
+                    "current": current,
+                    "limit": limit,
+                }),
+            );
+            continue;
+        }
 
         if state.has_submitted_underlying(trade_date, underlying) {
             println!("{underlying}: admission_rejected reason=daily_duplicate_state");
@@ -340,6 +431,19 @@ pub async fn select_index_strategy_entry(
                 json!({
                     "underlying": underlying,
                     "reason": "daily_duplicate_state",
+                }),
+            );
+            continue;
+        }
+
+        if fleet_has_active_underlying_elsewhere(config, underlying) {
+            println!("{underlying}: admission_rejected reason=fleet_duplicate_underlying");
+            emit_operator_event(
+                "scanner_diagnostic",
+                json!({
+                    "underlying": underlying,
+                    "result": "admission_rejected",
+                    "reason": "fleet_duplicate_underlying",
                 }),
             );
             continue;
@@ -553,6 +657,119 @@ pub async fn select_index_strategy_entry(
                 }));
             }
         }
+
+        for kind in &config.debit_kinds {
+            let result = match kind {
+                DebitSpreadKind::Call => {
+                    scan_call_debit_underlying(
+                        client,
+                        data_config,
+                        &config.debit_scanner,
+                        underlying,
+                    )
+                    .await?
+                }
+                DebitSpreadKind::Put => {
+                    scan_put_debit_underlying(
+                        client,
+                        data_config,
+                        &config.debit_scanner,
+                        underlying,
+                    )
+                    .await?
+                }
+            };
+            let Some(best) = result.candidates.first() else {
+                let reason = no_candidate_reason(
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                );
+                println!(
+                    "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={}",
+                    debit_spread_strategy_name(*kind),
+                    reason,
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                );
+                emit_operator_event(
+                    "scanner_diagnostic",
+                    json!({
+                        "underlying": underlying,
+                        "strategy": debit_spread_strategy_name(*kind),
+                        "result": "no_candidate",
+                        "reason": reason,
+                        "contracts": result.contract_count,
+                        "snapshots": result.snapshot_count,
+                        "scoreable": result.scoreable_count,
+                    }),
+                );
+                continue;
+            };
+
+            let admission = check_option_spread_entry_admission(
+                &account,
+                &positions,
+                &open_orders,
+                &[&best.long.symbol, &best.short.symbol],
+            );
+            if !admission.allowed {
+                println!(
+                    "{underlying}: admission_rejected strategy={} long={} short={} reasons={}",
+                    debit_spread_strategy_name(*kind),
+                    best.long.symbol,
+                    best.short.symbol,
+                    admission.reasons.join(" | "),
+                );
+                emit_operator_event(
+                    "scanner_diagnostic",
+                    json!({
+                        "underlying": underlying,
+                        "strategy": debit_spread_strategy_name(*kind),
+                        "result": "admission_rejected",
+                        "long_symbol": &best.long.symbol,
+                        "short_symbol": &best.short.symbol,
+                        "reasons": admission.reasons,
+                    }),
+                );
+                continue;
+            }
+
+            println!(
+                "{underlying}: candidate strategy={} long={} short={} debit={:.2} rtr={:.1}% score={:.1}",
+                debit_spread_strategy_name(*kind),
+                best.long.symbol,
+                best.short.symbol,
+                best.debit,
+                best.reward_to_risk * 100.0,
+                best.score,
+            );
+            emit_operator_event(
+                "scanner_diagnostic",
+                json!({
+                    "underlying": underlying,
+                    "strategy": debit_spread_strategy_name(*kind),
+                    "result": "candidate",
+                    "long_symbol": &best.long.symbol,
+                    "short_symbol": &best.short.symbol,
+                    "debit": best.debit,
+                    "reward_to_risk": best.reward_to_risk,
+                    "score": best.score,
+                }),
+            );
+
+            if selected
+                .as_ref()
+                .is_none_or(|current| best.score > current.score())
+            {
+                selected = Some(SelectedIndexEntry::Debit(SelectedDebitEntry {
+                    underlying: underlying.clone(),
+                    kind: *kind,
+                    candidate: best.clone(),
+                }));
+            }
+        }
     }
 
     Ok(selected)
@@ -562,6 +779,7 @@ pub async fn select_index_strategy_entry(
 struct StrategyConfig {
     credit_kinds: Vec<CreditSpreadKind>,
     iron_condor_enabled: bool,
+    debit_kinds: Vec<DebitSpreadKind>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -571,6 +789,7 @@ struct RuntimeConfigFile {
     index: IndexSection,
     scanner: ScannerSection,
     iron_condor: IronCondorSection,
+    debit_scanner: DebitScannerSection,
     management: ManagementSection,
     risk: RiskSection,
 }
@@ -621,6 +840,20 @@ struct IronCondorSection {
     min_return_on_risk: Option<f64>,
     wing_min_return_on_risk: Option<f64>,
     require_equal_widths: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct DebitScannerSection {
+    min_dte: Option<i64>,
+    max_dte: Option<i64>,
+    long_delta_min: Option<f64>,
+    long_delta_max: Option<f64>,
+    widths: Option<Vec<f64>>,
+    min_open_interest: Option<u64>,
+    max_leg_spread_pct: Option<f64>,
+    max_debit_to_width: Option<f64>,
+    min_reward_to_risk: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -708,12 +941,15 @@ fn build_index_credit_config(
     let dry_run_strategy_config = dry_run_strategy_config_from_values(dry_run_strategy_values)?;
     let scanner = scanner_config_from_file(&file.scanner);
     let stale_entry_secs = file.management.stale_entry_secs.unwrap_or(900);
-    Ok(IndexCreditConfig {
+    let fleet = load_fleet_config_from_env()?;
+    let mut config = IndexCreditConfig {
         underlyings: underlyings_from_sources(cli_underlyings, &file.index),
         spread_kinds: strategy_config.credit_kinds,
         iron_condor_enabled: strategy_config.iron_condor_enabled,
+        debit_kinds: strategy_config.debit_kinds,
         dry_run_spread_kinds: dry_run_strategy_config.credit_kinds,
         iron_condor_dry_run: dry_run_strategy_config.iron_condor_enabled,
+        dry_run_debit_kinds: dry_run_strategy_config.debit_kinds,
         max_active_entries: env_parse("ALPACA_MAX_ACTIVE_ENTRIES").or(file.risk.max_active_entries),
         max_daily_submits: env_parse("ALPACA_MAX_DAILY_SUBMITS").or(file.risk.max_daily_submits),
         max_open_orders: env_parse("ALPACA_MAX_OPEN_ORDERS").or(file.risk.max_open_orders),
@@ -785,13 +1021,20 @@ fn build_index_credit_config(
             .or(file.runtime.state_path)
             .unwrap_or_else(default_state_path),
         iron_condor_scanner: iron_condor_scanner_config_from_file(&scanner, &file.iron_condor),
+        debit_scanner: debit_scanner_config_from_file(&file.debit_scanner),
         scanner,
-    })
+        fleet,
+        fleet_account_id: None,
+        fleet_policy_blocks: Vec::new(),
+    };
+    apply_fleet_policy(&mut config);
+    Ok(config)
 }
 
 fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyConfig> {
     let mut kinds = Vec::new();
     let mut iron_condor_enabled = false;
+    let mut debit_kinds = Vec::new();
     for raw in values
         .into_iter()
         .flat_map(|value| split_strings([value]))
@@ -816,10 +1059,20 @@ fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyCo
             "iron_condor" | "condor" | "index_iron_condor_entry" => {
                 iron_condor_enabled = true;
             }
+            "call_debit" | "index_call_debit_entry" | "earnings_call_debit_entry" => {
+                debit_kinds.push(DebitSpreadKind::Call);
+            }
+            "put_debit" | "index_put_debit_entry" | "earnings_put_debit_entry" => {
+                debit_kinds.push(DebitSpreadKind::Put);
+            }
+            "debit" | "long_premium" | "directional" => {
+                debit_kinds.push(DebitSpreadKind::Call);
+                debit_kinds.push(DebitSpreadKind::Put);
+            }
             other => anyhow::bail!("unsupported Alpaca strategy value {other}"),
         }
     }
-    if kinds.is_empty() && !iron_condor_enabled {
+    if kinds.is_empty() && !iron_condor_enabled && debit_kinds.is_empty() {
         kinds.push(CreditSpreadKind::Put);
     }
     kinds.sort_by_key(|kind| match kind {
@@ -827,9 +1080,15 @@ fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyCo
         CreditSpreadKind::Call => 1,
     });
     kinds.dedup();
+    debit_kinds.sort_by_key(|kind| match kind {
+        DebitSpreadKind::Call => 0,
+        DebitSpreadKind::Put => 1,
+    });
+    debit_kinds.dedup();
     Ok(StrategyConfig {
         credit_kinds: kinds,
         iron_condor_enabled,
+        debit_kinds,
     })
 }
 
@@ -838,9 +1097,61 @@ fn dry_run_strategy_config_from_values(values: Vec<String>) -> anyhow::Result<St
         return Ok(StrategyConfig {
             credit_kinds: Vec::new(),
             iron_condor_enabled: false,
+            debit_kinds: Vec::new(),
         });
     }
     strategy_config_from_values(values)
+}
+
+fn apply_fleet_policy(config: &mut IndexCreditConfig) {
+    let Some(fleet) = &config.fleet else {
+        return;
+    };
+    if let Some(account) = fleet.current_account() {
+        config.fleet_account_id = Some(account.id.clone());
+        if !account.enabled {
+            config
+                .fleet_policy_blocks
+                .push(format!("fleet_account_disabled:{}", account.id));
+        }
+        if has_defined_risk_strategies(config) && !account.permissions.defined_risk {
+            config.fleet_policy_blocks.push(format!(
+                "fleet_permission_defined_risk_required:{}",
+                account.id
+            ));
+        }
+        if !config.debit_kinds.is_empty() && !account.permissions.long_premium {
+            config.fleet_policy_blocks.push(format!(
+                "fleet_permission_long_premium_required:{}",
+                account.id
+            ));
+        }
+        if let Some(limit) = account.risk_budget.max_active_entries {
+            config.max_active_entries = Some(min_limit(config.max_active_entries, limit));
+        }
+    } else {
+        config
+            .fleet_policy_blocks
+            .push("fleet_account_unmatched".to_string());
+    }
+
+    if fleet.config.fleet.kill_switch {
+        config
+            .fleet_policy_blocks
+            .push("fleet_kill_switch_enabled".to_string());
+    }
+    if !config.fleet_policy_blocks.is_empty() {
+        config.kill_switch = true;
+        config.submit_enabled = false;
+    }
+}
+
+fn has_defined_risk_strategies(config: &IndexCreditConfig) -> bool {
+    !config.spread_kinds.is_empty() || config.iron_condor_enabled
+}
+
+fn min_limit(current: Option<usize>, fleet_limit: usize) -> usize {
+    current.map_or(fleet_limit, |current| current.min(fleet_limit))
 }
 
 fn underlyings_from_sources(cli_underlyings: Vec<String>, config: &IndexSection) -> Vec<String> {
@@ -910,6 +1221,54 @@ fn active_sector_count(
         .count()
 }
 
+fn fleet_has_active_underlying_elsewhere(config: &IndexCreditConfig, underlying: &str) -> bool {
+    let Some(fleet) = &config.fleet else {
+        return false;
+    };
+    let Some(account_id) = config.fleet_account_id.as_deref() else {
+        return false;
+    };
+    fleet
+        .active_underlyings_excluding(account_id)
+        .contains(&underlying.to_ascii_uppercase())
+}
+
+fn fleet_active_underlying_count(config: &IndexCreditConfig, underlying: &str) -> usize {
+    config
+        .fleet
+        .as_ref()
+        .map(|fleet| {
+            fleet
+                .exposure()
+                .active_entries_by_underlying
+                .get(&underlying.to_ascii_uppercase())
+                .copied()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
+fn fleet_sector_limit_state(
+    config: &IndexCreditConfig,
+    underlying: &str,
+) -> Option<(String, usize, usize)> {
+    let fleet = config.fleet.as_ref()?;
+    let limit = fleet.config.fleet.max_active_entries_per_sector?;
+    let sector = fleet
+        .config
+        .fleet
+        .sectors
+        .get(&underlying.to_ascii_uppercase())?
+        .clone();
+    let current = fleet
+        .exposure()
+        .active_entries_by_sector
+        .get(&sector)
+        .copied()
+        .unwrap_or(0);
+    Some((sector, current, limit))
+}
+
 fn default_underlyings() -> Vec<String> {
     ["SPY", "QQQ", "IWM", "DIA", "GLD"]
         .into_iter()
@@ -969,6 +1328,20 @@ fn iron_condor_scanner_config_from_file(
         credit,
         min_return_on_risk: config.min_return_on_risk.unwrap_or(0.18),
         require_equal_widths: config.require_equal_widths.unwrap_or(true),
+    }
+}
+
+fn debit_scanner_config_from_file(config: &DebitScannerSection) -> DebitSpreadScannerConfig {
+    DebitSpreadScannerConfig {
+        min_dte: config.min_dte.unwrap_or(5),
+        max_dte: config.max_dte.unwrap_or(45),
+        long_delta_min: config.long_delta_min.unwrap_or(0.45),
+        long_delta_max: config.long_delta_max.unwrap_or(0.65),
+        widths: config.widths.clone().unwrap_or_else(|| vec![2.0, 3.0, 5.0]),
+        min_open_interest: config.min_open_interest.unwrap_or(200),
+        max_leg_spread_pct: config.max_leg_spread_pct.unwrap_or(0.15),
+        max_debit_to_width: config.max_debit_to_width.unwrap_or(0.55),
+        min_reward_to_risk: config.min_reward_to_risk.unwrap_or(0.75),
     }
 }
 
@@ -1143,6 +1516,19 @@ expiration_exit_days = 2
             vec![CreditSpreadKind::Put, CreditSpreadKind::Call],
         );
         assert!(config.iron_condor_enabled);
+        assert!(config.debit_kinds.is_empty());
+    }
+
+    #[test]
+    fn strategy_config_accepts_debit_strategies() {
+        let config = strategy_config_from_values(vec!["call_debit,put_debit".to_string()]).unwrap();
+
+        assert!(config.credit_kinds.is_empty());
+        assert!(!config.iron_condor_enabled);
+        assert_eq!(
+            config.debit_kinds,
+            vec![DebitSpreadKind::Call, DebitSpreadKind::Put],
+        );
     }
 
     #[test]
@@ -1151,9 +1537,11 @@ expiration_exit_days = 2
 
         assert!(config.credit_kinds.is_empty());
         assert!(!config.iron_condor_enabled);
+        assert!(config.debit_kinds.is_empty());
 
         let config = dry_run_strategy_config_from_values(vec!["put".to_string()]).unwrap();
         assert_eq!(config.credit_kinds, vec![CreditSpreadKind::Put]);
         assert!(!config.iron_condor_enabled);
+        assert!(config.debit_kinds.is_empty());
     }
 }

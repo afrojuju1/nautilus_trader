@@ -99,14 +99,29 @@ The existing paper account remains `alpaca-index-credit.service` and continues t
 - Config: `~/.config/nautilus-trader/alpaca/index-credit.toml`
 
 Additional accounts are represented in `~/.config/nautilus-trader/alpaca/fleet.toml` with explicit
-roles, permissions, risk budgets, service names, env files, config files, log directories, and lock
-directories. This is an operator registry only; it does not allocate trades across accounts and it
-does not enable submission for a new account by itself.
+roles, permissions, risk budgets, service names, env files, config files, state files, log
+directories, and lock directories. The account engine reads this registry on startup to enforce
+account permissions, the fleet kill switch, and fleet-level active-entry caps before submitting new
+entries.
 
 For account-instance services, the systemd template owns account identity, service name, config
 path, log path, and lock path. The account env file should stay focused on credentials, endpoints,
 and explicit safety gates. Fleet status creates a hermetic operator-status child process for each
 account instead of inheriting any `ALPACA_*` or `NAUTILUS_ALPACA_*` values from the parent shell.
+
+The hosted strategy names are:
+
+- `put`, `put_credit`, `index_put_credit_entry`: put-credit verticals.
+- `call`, `call_credit`, `index_call_credit_entry`: call-credit verticals.
+- `iron_condor`, `condor`, `index_iron_condor_entry`: four-leg iron condors.
+- `call_debit`, `index_call_debit_entry`: long call-debit verticals.
+- `put_debit`, `index_put_debit_entry`: long put-debit verticals.
+- `debit`, `long_premium`, `directional`: both call-debit and put-debit verticals.
+
+Accounts with credit verticals or iron condors require `defined_risk = true` in the fleet registry.
+Accounts with debit verticals require `long_premium = true`. A mismatch forces
+`submit_enabled=false` and `kill_switch=true` for that runtime while leaving management/close gates
+available for existing tracked exposure.
 
 Future account env files should live under:
 
@@ -164,6 +179,11 @@ role and strategy set.
   `[risk.sectors]` cap concentration by symbol and configured correlation group. Env overrides are
   available for the two numeric caps as `ALPACA_MAX_ACTIVE_ENTRIES_PER_UNDERLYING` and
   `ALPACA_MAX_ACTIVE_ENTRIES_PER_SECTOR`.
+- Fleet `[fleet] kill_switch = true` blocks new entries for every account runtime that reads the
+  registry.
+- Fleet `[fleet] max_active_entries`, `max_active_entries_per_underlying`, and
+  `max_active_entries_per_sector` cap exposure across enabled accounts using the account
+  `state_path` values in the registry.
 
 Paper/live endpoint selection is controlled by `ALPACA_TRADING_BASE_URL` and
 `ALPACA_TRADE_UPDATES_WS_URL`. Keep paper URLs in place until the rollout plan explicitly moves to a
@@ -179,6 +199,10 @@ output.
 `alpaca-index-credit-control.sh fleet` runs `alpaca-fleet-status`, reads the fleet registry, and
 executes per-account operator status with each account's env file. It is a read-only fleet summary;
 it does not start services, submit orders, or change account state.
+
+Operator status reports fleet policy blocks as critical `fleet_policy_block` alerts. It also reports
+partial fills and accepted/new orders that have not filled yet so stale order handling can be
+separated from ordinary working-order latency.
 
 The command reports one engine state:
 

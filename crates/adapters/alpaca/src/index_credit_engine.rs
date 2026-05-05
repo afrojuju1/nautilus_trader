@@ -34,15 +34,15 @@ use crate::{
         models::{AlpacaOrder, AlpacaPosition, ListOrdersRequest, OptionSnapshotsRequest},
     },
     index_credit::{
-        IndexCreditConfig, SelectedEntry, SelectedIndexEntry, SelectedIronCondorEntry,
-        select_index_strategy_entry,
+        IndexCreditConfig, SelectedDebitEntry, SelectedEntry, SelectedIndexEntry,
+        SelectedIronCondorEntry, select_index_strategy_entry,
     },
     management::credit_spread_close_reason,
     runtime::{
-        StrategyState, StrategyStateEntry, credit_spread_strategy_name, emit_operator_event,
-        load_strategy_state, save_strategy_state_atomic,
+        StrategyState, StrategyStateEntry, credit_spread_strategy_name, debit_spread_strategy_name,
+        emit_operator_event, load_strategy_state, save_strategy_state_atomic,
     },
-    strategy::{CreditSpreadKind, IronCondorCandidate},
+    strategy::{CreditSpreadKind, DebitSpreadCandidate, IronCondorCandidate},
     submit::{MlegSubmitLeg, MlegSubmitOrderListRequest, build_mleg_submit_order_list},
 };
 use chrono::{DateTime, Utc};
@@ -107,6 +107,11 @@ pub enum StrategyDecision {
         /// Selected iron-condor candidate.
         entry: SelectedIronCondorEntry,
     },
+    /// Debit-spread candidate was found, but submission is disabled.
+    DryRunDebit {
+        /// Selected debit-spread candidate.
+        entry: SelectedDebitEntry,
+    },
     /// Submit an opening broker-native MLeg order list.
     SubmitOpen {
         /// Selected entry candidate.
@@ -116,6 +121,11 @@ pub enum StrategyDecision {
     SubmitIronCondorOpen {
         /// Selected iron-condor candidate.
         entry: SelectedIronCondorEntry,
+    },
+    /// Submit an opening long-premium debit spread broker-native MLeg order list.
+    SubmitDebitOpen {
+        /// Selected debit-spread candidate.
+        entry: SelectedDebitEntry,
     },
 }
 
@@ -220,6 +230,13 @@ impl StrategyRuntime for IndexCreditStrategy {
                         limit,
                     });
                 }
+                RiskGateDecision::FleetMaxActiveEntries { current, limit } => {
+                    return Ok(StrategyDecision::RiskBlocked {
+                        reason: "fleet_max_active_entries",
+                        current,
+                        limit,
+                    });
+                }
             }
 
             let selected = select_index_strategy_entry(
@@ -245,6 +262,12 @@ impl StrategyRuntime for IndexCreditStrategy {
                 Some(SelectedIndexEntry::IronCondor(entry)) => {
                     StrategyDecision::DryRunIronCondor { entry }
                 }
+                Some(SelectedIndexEntry::Debit(entry))
+                    if context.config.debit_submit_enabled(entry.kind) =>
+                {
+                    StrategyDecision::SubmitDebitOpen { entry }
+                }
+                Some(SelectedIndexEntry::Debit(entry)) => StrategyDecision::DryRunDebit { entry },
                 None => StrategyDecision::NoEntry,
             })
         })
@@ -264,6 +287,7 @@ enum RiskGateDecision {
     MaxActiveEntries { current: usize, limit: usize },
     MaxDailySubmits { current: usize, limit: usize },
     MaxOpenOrders { current: usize, limit: usize },
+    FleetMaxActiveEntries { current: usize, limit: usize },
 }
 
 /// Runs the Alpaca index-credit account engine until configured shutdown.
@@ -305,6 +329,8 @@ pub async fn run_index_credit_engine() -> anyhow::Result<()> {
             "max_active_entries_per_underlying": config.max_active_entries_per_underlying,
             "max_active_entries_per_sector": config.max_active_entries_per_sector,
             "sectors": &config.sectors,
+            "fleet_account_id": &config.fleet_account_id,
+            "fleet_policy_blocks": &config.fleet_policy_blocks,
             "stale_close_secs": config.stale_close_secs,
             "close_regular_hours_only": config.close_regular_hours_only,
             "close_start": config.close_start.to_string(),
@@ -533,6 +559,60 @@ async fn apply_strategy_decision(
             );
             Ok(outcome.accepted > 0)
         }
+        StrategyDecision::SubmitDebitOpen { entry } => {
+            let order_list_id = order_list_id(trade_date, &entry.underlying);
+            println!(
+                "decision: submit underlying={} long={} short={} debit={:.2} rtr={:.1}% score={:.1} order_list_id={}",
+                entry.underlying,
+                entry.candidate.long.symbol,
+                entry.candidate.short.symbol,
+                entry.candidate.debit,
+                entry.candidate.reward_to_risk * 100.0,
+                entry.candidate.score,
+                order_list_id,
+            );
+            emit_operator_event(
+                "decision",
+                json!({
+                    "action": "submit",
+                    "underlying": &entry.underlying,
+                    "strategy": debit_spread_strategy_name(entry.kind),
+                    "long_symbol": &entry.candidate.long.symbol,
+                    "short_symbol": &entry.candidate.short.symbol,
+                    "debit": entry.candidate.debit,
+                    "reward_to_risk": entry.candidate.reward_to_risk,
+                    "score": entry.candidate.score,
+                    "order_list_id": &order_list_id,
+                    "trade_date": trade_date,
+                }),
+            );
+            let outcome =
+                submit_debit_entry(&entry, &order_list_id, config.quantity, config).await?;
+            if outcome.accepted > 0 {
+                state.record_debit_submission(
+                    trade_date.to_string(),
+                    entry.underlying,
+                    entry.kind,
+                    config.quantity,
+                    order_list_id,
+                    &entry.candidate,
+                    outcome.parent_order_id.clone(),
+                );
+            }
+            println!(
+                "submit_result: accepted={} rejected={}",
+                outcome.accepted, outcome.rejected
+            );
+            emit_operator_event(
+                "submit_result",
+                json!({
+                    "accepted": outcome.accepted,
+                    "rejected": outcome.rejected,
+                    "parent_order_id": outcome.parent_order_id,
+                }),
+            );
+            Ok(outcome.accepted > 0)
+        }
         StrategyDecision::DryRun { entry } => {
             println!(
                 "decision: dry_run underlying={} short={} long={} credit={:.2} ror={:.1}% score={:.1} reason=submission_disabled",
@@ -591,6 +671,33 @@ async fn apply_strategy_decision(
             );
             Ok(false)
         }
+        StrategyDecision::DryRunDebit { entry } => {
+            println!(
+                "decision: dry_run underlying={} long={} short={} debit={:.2} rtr={:.1}% score={:.1} reason=submission_disabled",
+                entry.underlying,
+                entry.candidate.long.symbol,
+                entry.candidate.short.symbol,
+                entry.candidate.debit,
+                entry.candidate.reward_to_risk * 100.0,
+                entry.candidate.score,
+            );
+            emit_operator_event(
+                "decision",
+                json!({
+                    "action": "dry_run",
+                    "reason": "submission_disabled",
+                    "underlying": &entry.underlying,
+                    "strategy": debit_spread_strategy_name(entry.kind),
+                    "long_symbol": &entry.candidate.long.symbol,
+                    "short_symbol": &entry.candidate.short.symbol,
+                    "debit": entry.candidate.debit,
+                    "reward_to_risk": entry.candidate.reward_to_risk,
+                    "score": entry.candidate.score,
+                    "trade_date": trade_date,
+                }),
+            );
+            Ok(false)
+        }
         StrategyDecision::NoEntry => {
             println!("decision: no_entry");
             emit_operator_event(
@@ -640,6 +747,15 @@ async fn risk_gate_decision(
             .len();
         if current >= limit {
             return Ok(RiskGateDecision::MaxOpenOrders { current, limit });
+        }
+    }
+
+    if let Some(fleet) = context.config.fleet.as_ref()
+        && let Some(limit) = fleet.config.fleet.max_active_entries
+    {
+        let current = fleet.exposure().active_entries;
+        if current >= limit {
+            return Ok(RiskGateDecision::FleetMaxActiveEntries { current, limit });
         }
     }
 
@@ -912,14 +1028,25 @@ async fn manage_existing_entries(
             continue;
         };
         let close_reason = close_reason(config, entry, close_quote.debit);
-        println!(
-            "manage: position underlying={} strategy={} close_debit={:.2} entry_credit={:.2} reason={}",
-            entry.underlying,
-            entry.strategy,
-            close_quote.debit,
-            entry.credit,
-            close_reason.as_deref().unwrap_or("none"),
-        );
+        if entry.is_debit_spread() {
+            println!(
+                "manage: position underlying={} strategy={} close_credit={:.2} entry_debit={:.2} reason={}",
+                entry.underlying,
+                entry.strategy,
+                -close_quote.debit,
+                entry.debit.unwrap_or_default(),
+                close_reason.as_deref().unwrap_or("none"),
+            );
+        } else {
+            println!(
+                "manage: position underlying={} strategy={} close_debit={:.2} entry_credit={:.2} reason={}",
+                entry.underlying,
+                entry.strategy,
+                close_quote.debit,
+                entry.credit,
+                close_reason.as_deref().unwrap_or("none"),
+            );
+        }
 
         let Some(close_reason) = close_reason else {
             continue;
@@ -991,10 +1118,23 @@ async fn manage_existing_entries(
         let close_order_list_id = close_order_list_id(entry);
         let submit_quote = close_quote.with_price_cushion(config.close_price_cushion);
         if config.close_price_cushion > 0.0 {
-            println!(
-                "manage: close_limit underlying={} raw_debit={:.2} cushion={:.2} limit_debit={:.2}",
-                entry.underlying, close_quote.debit, config.close_price_cushion, submit_quote.debit,
-            );
+            if entry.is_debit_spread() {
+                println!(
+                    "manage: close_limit underlying={} raw_credit={:.2} cushion={:.2} limit_credit={:.2}",
+                    entry.underlying,
+                    -close_quote.debit,
+                    config.close_price_cushion,
+                    -submit_quote.debit,
+                );
+            } else {
+                println!(
+                    "manage: close_limit underlying={} raw_debit={:.2} cushion={:.2} limit_debit={:.2}",
+                    entry.underlying,
+                    close_quote.debit,
+                    config.close_price_cushion,
+                    submit_quote.debit,
+                );
+            }
         }
         let outcome =
             submit_close_entry(entry, &submit_quote, &close_order_list_id, config).await?;
@@ -1064,7 +1204,15 @@ async fn close_quote(
     ) else {
         return Ok(None);
     };
-    let mut debit = short_ask - long_bid;
+    let mut debit = if entry.is_debit_spread() {
+        let credit = long_bid - short_ask;
+        if credit <= 0.0 {
+            return Ok(None);
+        }
+        -credit
+    } else {
+        short_ask - long_bid
+    };
     let mut short_call_ask = None;
     let mut long_call_bid = None;
     if let (Some(short_call_symbol), Some(long_call_symbol)) = (
@@ -1087,7 +1235,7 @@ async fn close_quote(
         short_call_ask = Some(call_short_ask);
         long_call_bid = Some(call_long_bid);
     }
-    if debit <= 0.0 {
+    if !entry.is_debit_spread() && debit <= 0.0 {
         return Ok(None);
     }
     Ok(Some(CloseQuote {
@@ -1104,8 +1252,44 @@ fn close_reason(
     entry: &StrategyStateEntry,
     close_debit: f64,
 ) -> Option<String> {
-    credit_spread_close_reason(&config.management_config(), entry, close_debit)
-        .map(ToString::to_string)
+    if entry.is_debit_spread() {
+        debit_spread_close_reason(config, entry, -close_debit)
+    } else {
+        credit_spread_close_reason(&config.management_config(), entry, close_debit)
+            .map(ToString::to_string)
+    }
+}
+
+fn debit_spread_close_reason(
+    config: &IndexCreditConfig,
+    entry: &StrategyStateEntry,
+    close_credit: f64,
+) -> Option<String> {
+    if config.force_flatten {
+        return Some("force_flatten".to_string());
+    }
+    let entry_debit = entry.debit?;
+    if close_credit >= entry_debit * (1.0 + config.profit_target_close_fraction.max(0.0)) {
+        return Some("profit_target".to_string());
+    }
+    if config.stop_loss_close_multiple > 0.0
+        && close_credit <= entry_debit / config.stop_loss_close_multiple
+    {
+        return Some("stop_loss".to_string());
+    }
+    if config.max_hold_secs > 0
+        && DateTime::parse_from_rfc3339(&entry.recorded_at_utc)
+            .map(|recorded| {
+                Utc::now()
+                    .signed_duration_since(recorded.with_timezone(&Utc))
+                    .num_seconds()
+                    >= config.max_hold_secs as i64
+            })
+            .unwrap_or(false)
+    {
+        return Some("max_hold".to_string());
+    }
+    None
 }
 
 async fn submit_entry(
@@ -1203,6 +1387,61 @@ async fn submit_iron_condor_entry(
     client.submit_order_list(cmd)?;
 
     let (accepted, rejected) = collect_execution_events(&mut rx, 4).await;
+    let parent_order_id = lookup_parent_order(&exec_config, order_list_id).await?;
+    if config.cancel_after_accept && accepted > 0 {
+        cancel_parent_order(&exec_config, parent_order_id.as_deref()).await?;
+    }
+
+    client.disconnect().await?;
+    client.stop()?;
+
+    Ok(SubmitOutcome {
+        accepted,
+        rejected,
+        parent_order_id,
+    })
+}
+
+async fn submit_debit_entry(
+    entry: &SelectedDebitEntry,
+    order_list_id: &str,
+    quantity: u64,
+    config: &IndexCreditConfig,
+) -> anyhow::Result<SubmitOutcome> {
+    let exec_config = exec_config_from_env();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    replace_exec_event_sender(tx);
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let trader_id = TraderId::from("TRADER-001");
+    let client_id = ClientId::from(ALPACA_CLIENT_ID);
+    let account_id = AccountId::from("ALPACA-001");
+    let strategy_id = StrategyId::from(STRATEGY_FAMILY);
+    let core = ExecutionClientCore::new(
+        trader_id,
+        client_id,
+        Venue::new(ALPACA_VENUE),
+        OmsType::Netting,
+        account_id,
+        AccountType::Margin,
+        None,
+        cache,
+    );
+    let mut client = AlpacaExecutionClient::new(core, exec_config.clone())?;
+    client.start()?;
+    client.connect().await?;
+
+    let cmd = build_debit_submit_order_list(
+        &entry.candidate,
+        order_list_id,
+        quantity,
+        trader_id,
+        Some(client_id),
+        strategy_id,
+    )?;
+    client.submit_order_list(cmd)?;
+
+    let (accepted, rejected) = collect_execution_events(&mut rx, 2).await;
     let parent_order_id = lookup_parent_order(&exec_config, order_list_id).await?;
     if config.cancel_after_accept && accepted > 0 {
         cancel_parent_order(&exec_config, parent_order_id.as_deref()).await?;
@@ -1365,6 +1604,47 @@ fn build_iron_condor_submit_order_list(
                 order_side: OrderSide::Buy,
                 quantity,
                 limit_price: Price::new(candidate.call.long.ask, 2),
+                reduce_only: false,
+            },
+        ],
+        ts_init: get_atomic_clock_realtime().get_time_ns(),
+    })
+}
+
+fn build_debit_submit_order_list(
+    candidate: &DebitSpreadCandidate,
+    order_list_id: &str,
+    quantity: u64,
+    trader_id: TraderId,
+    client_id: Option<ClientId>,
+    strategy_id: StrategyId,
+) -> anyhow::Result<SubmitOrderList> {
+    if quantity == 0 {
+        anyhow::bail!("quantity must be positive");
+    }
+
+    let order_list_id = OrderListId::from(order_list_id);
+    let quantity = Quantity::new(quantity as f64, 0);
+    build_mleg_submit_order_list(MlegSubmitOrderListRequest {
+        trader_id,
+        client_id,
+        strategy_id,
+        order_list_id,
+        legs: vec![
+            MlegSubmitLeg {
+                client_order_id: ClientOrderId::from(format!("{order_list_id}-long").as_str()),
+                instrument_id: alpaca_instrument_id(&candidate.long.symbol)?,
+                order_side: OrderSide::Buy,
+                quantity,
+                limit_price: Price::new(candidate.long.ask, 2),
+                reduce_only: false,
+            },
+            MlegSubmitLeg {
+                client_order_id: ClientOrderId::from(format!("{order_list_id}-short").as_str()),
+                instrument_id: alpaca_instrument_id(&candidate.short.symbol)?,
+                order_side: OrderSide::Sell,
+                quantity,
+                limit_price: Price::new(candidate.short.bid, 2),
                 reduce_only: false,
             },
         ],
@@ -1680,15 +1960,19 @@ mod tests {
     use chrono::NaiveTime;
 
     use super::*;
-    use crate::strategy::{IronCondorScannerConfig, PutCreditScannerConfig};
+    use crate::strategy::{
+        DebitSpreadScannerConfig, IronCondorScannerConfig, PutCreditScannerConfig,
+    };
 
     fn config_for_gate_tests() -> IndexCreditConfig {
         IndexCreditConfig {
             underlyings: vec!["SPY".to_string()],
             spread_kinds: vec![CreditSpreadKind::Put],
             iron_condor_enabled: false,
+            debit_kinds: Vec::new(),
             dry_run_spread_kinds: Vec::new(),
             iron_condor_dry_run: false,
+            dry_run_debit_kinds: Vec::new(),
             max_active_entries: None,
             max_daily_submits: None,
             max_open_orders: None,
@@ -1723,6 +2007,10 @@ mod tests {
             state_path: PathBuf::from("state.json"),
             scanner: PutCreditScannerConfig::default(),
             iron_condor_scanner: IronCondorScannerConfig::default(),
+            debit_scanner: DebitSpreadScannerConfig::default(),
+            fleet: None,
+            fleet_account_id: None,
+            fleet_policy_blocks: Vec::new(),
         }
     }
 
@@ -1888,6 +2176,7 @@ mod tests {
             long_call_symbol: None,
             quantity: 1,
             credit: 0.50,
+            debit: None,
             score: 60.0,
             parent_order_id: Some("open-parent-1".to_string()),
             close_order_list_id: None,

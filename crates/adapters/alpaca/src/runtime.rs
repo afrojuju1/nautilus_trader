@@ -24,7 +24,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::strategy::{CreditSpreadKind, IronCondorCandidate, SpreadCandidate};
+use crate::strategy::{
+    CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, IronCondorCandidate, SpreadCandidate,
+};
 
 /// Persisted state for the Alpaca index credit runner.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -69,6 +71,7 @@ impl StrategyState {
             long_call_symbol: None,
             quantity,
             credit: candidate.credit,
+            debit: None,
             score: candidate.score,
             parent_order_id,
             close_order_list_id: None,
@@ -105,6 +108,45 @@ impl StrategyState {
             long_call_symbol: Some(candidate.call.long.symbol.clone()),
             quantity,
             credit: candidate.credit,
+            debit: None,
+            score: candidate.score,
+            parent_order_id,
+            close_order_list_id: None,
+            close_parent_order_id: None,
+            close_reason: None,
+            close_attempts: 0,
+            last_close_submitted_at_utc: None,
+            submitted: true,
+            canceled: false,
+            closed: false,
+            recorded_at_utc: Utc::now().to_rfc3339(),
+            closed_at_utc: None,
+        });
+    }
+
+    /// Appends one submitted long-premium debit spread entry to the state.
+    pub fn record_debit_submission(
+        &mut self,
+        trade_date: String,
+        underlying: String,
+        kind: DebitSpreadKind,
+        quantity: u64,
+        order_list_id: String,
+        candidate: &DebitSpreadCandidate,
+        parent_order_id: Option<String>,
+    ) {
+        self.entries.push(StrategyStateEntry {
+            trade_date,
+            underlying,
+            strategy: debit_spread_strategy_name(kind).to_string(),
+            order_list_id,
+            short_symbol: candidate.short.symbol.clone(),
+            long_symbol: candidate.long.symbol.clone(),
+            short_call_symbol: None,
+            long_call_symbol: None,
+            quantity,
+            credit: -candidate.debit,
+            debit: Some(candidate.debit),
             score: candidate.score,
             parent_order_id,
             close_order_list_id: None,
@@ -148,6 +190,9 @@ pub struct StrategyStateEntry {
     pub quantity: u64,
     /// Entry credit.
     pub credit: f64,
+    /// Entry debit for long-premium spreads.
+    #[serde(default)]
+    pub debit: Option<f64>,
     /// Scanner score at entry.
     pub score: f64,
     /// Alpaca parent order ID for the entry.
@@ -193,6 +238,12 @@ impl StrategyStateEntry {
     #[must_use]
     pub fn is_iron_condor(&self) -> bool {
         self.short_call_symbol.is_some() && self.long_call_symbol.is_some()
+    }
+
+    /// Returns `true` when this entry stores a long-premium debit spread.
+    #[must_use]
+    pub fn is_debit_spread(&self) -> bool {
+        self.debit.is_some() || self.strategy.contains("_debit_")
     }
 
     /// Returns all option symbols tracked by this entry.
@@ -248,6 +299,15 @@ pub fn credit_spread_strategy_name(kind: CreditSpreadKind) -> &'static str {
     match kind {
         CreditSpreadKind::Put => "index_put_credit_entry",
         CreditSpreadKind::Call => "index_call_credit_entry",
+    }
+}
+
+/// Returns the strategy name for a debit-spread kind.
+#[must_use]
+pub fn debit_spread_strategy_name(kind: DebitSpreadKind) -> &'static str {
+    match kind {
+        DebitSpreadKind::Call => "index_call_debit_entry",
+        DebitSpreadKind::Put => "index_put_debit_entry",
     }
 }
 
@@ -346,6 +406,7 @@ mod tests {
             long_call_symbol: None,
             quantity: 1,
             credit: 0.46,
+            debit: None,
             score: 61.9,
             parent_order_id: Some("parent-1".to_string()),
             close_order_list_id: None,

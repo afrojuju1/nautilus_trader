@@ -16,90 +16,21 @@
 //! Fleet status command for account-scoped Alpaca runtimes.
 
 use std::{
-    env, fs,
+    env,
     path::{Path, PathBuf},
     process::Command,
 };
 
 use chrono::Utc;
-use nautilus_alpaca::runtime_env::configure_account_command_env;
-use serde::{Deserialize, Serialize};
+use nautilus_alpaca::{
+    fleet::{
+        AccountConfig, AccountPermissions, FleetConfig, ResolvedFleetConfig, RiskBudget,
+        default_registry_path, load_fleet_config,
+    },
+    runtime_env::configure_account_command_env,
+};
+use serde::Serialize;
 use serde_json::Value;
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct FleetConfig {
-    fleet: FleetSection,
-    accounts: Vec<AccountConfig>,
-}
-
-impl Default for FleetConfig {
-    fn default() -> Self {
-        Self {
-            fleet: FleetSection::default(),
-            accounts: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct FleetSection {
-    operator_bin: Option<PathBuf>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
-struct AccountConfig {
-    id: String,
-    role: String,
-    enabled: bool,
-    service: String,
-    env_file: PathBuf,
-    config_file: Option<PathBuf>,
-    log_dir: Option<PathBuf>,
-    lock_dir: Option<PathBuf>,
-    permissions: AccountPermissions,
-    risk_budget: RiskBudget,
-}
-
-impl Default for AccountConfig {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            role: "unspecified".to_string(),
-            enabled: true,
-            service: String::new(),
-            env_file: PathBuf::new(),
-            config_file: None,
-            log_dir: None,
-            lock_dir: None,
-            permissions: AccountPermissions::default(),
-            risk_budget: RiskBudget::default(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
-struct AccountPermissions {
-    defined_risk: bool,
-    long_premium: bool,
-    undefined_risk: bool,
-    naked_calls: bool,
-    naked_puts: bool,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
-struct RiskBudget {
-    max_active_entries: Option<usize>,
-    max_buying_power_pct: Option<f64>,
-    max_notional_risk: Option<f64>,
-    max_delta_abs: Option<f64>,
-    max_gamma_abs: Option<f64>,
-    max_vega_abs: Option<f64>,
-}
 
 #[derive(Debug, Serialize)]
 struct FleetStatus {
@@ -136,6 +67,7 @@ struct AccountFleetStatus {
     config_file: Option<String>,
     log_dir: Option<String>,
     lock_dir: Option<String>,
+    state_path: Option<String>,
     permissions: AccountPermissions,
     risk_budget: RiskBudget,
     status: AccountStatusKind,
@@ -162,27 +94,18 @@ enum AccountStatusKind {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
     let registry_path = args.registry_path();
-    let registry_dir = registry_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let config = load_fleet_config(&registry_path)?;
-    let operator_bin = config
-        .fleet
-        .operator_bin
-        .as_deref()
-        .map(|path| resolve_path(path, &registry_dir))
-        .unwrap_or_else(default_operator_bin);
+    let fleet = load_fleet_config(&registry_path)?;
+    let operator_bin = fleet.operator_bin().unwrap_or_else(default_operator_bin);
 
     let mut accounts = Vec::new();
-    for account in &config.accounts {
+    for account in &fleet.config.accounts {
         if !account.enabled && !args.include_disabled {
             continue;
         }
-        accounts.push(check_account(account, &operator_bin, &registry_dir));
+        accounts.push(check_account(account, &operator_bin, &fleet));
     }
 
-    let summary = summarize(&config, &accounts);
+    let summary = summarize(&fleet.config, &accounts);
     let failed = summary.missing_env > 0 || summary.operator_errors > 0 || summary.broken > 0;
     let status = FleetStatus {
         checked_at_utc: Utc::now().to_rfc3339(),
@@ -251,49 +174,16 @@ impl Args {
     }
 }
 
-fn load_fleet_config(path: &Path) -> anyhow::Result<FleetConfig> {
-    let raw = fs::read_to_string(path).map_err(|error| {
-        anyhow::anyhow!("failed to read fleet config {}: {error}", path.display())
-    })?;
-    let config: FleetConfig = toml::from_str(&raw)
-        .map_err(|error| anyhow::anyhow!("invalid fleet config {}: {error}", path.display()))?;
-    validate_config(&config)?;
-    Ok(config)
-}
-
-fn validate_config(config: &FleetConfig) -> anyhow::Result<()> {
-    for account in &config.accounts {
-        if account.id.trim().is_empty() {
-            anyhow::bail!("fleet account id cannot be empty");
-        }
-        if account.service.trim().is_empty() {
-            anyhow::bail!("fleet account {} service cannot be empty", account.id);
-        }
-        if account.env_file.as_os_str().is_empty() {
-            anyhow::bail!("fleet account {} env_file cannot be empty", account.id);
-        }
-    }
-    Ok(())
-}
-
 fn check_account(
     account: &AccountConfig,
-    operator_bin: &Path,
-    registry_dir: &Path,
+    operator_bin: &std::path::Path,
+    fleet: &ResolvedFleetConfig,
 ) -> AccountFleetStatus {
-    let env_file = resolve_path(&account.env_file, registry_dir);
-    let config_file = account
-        .config_file
-        .as_deref()
-        .map(|path| resolve_path(path, registry_dir));
-    let log_dir = account
-        .log_dir
-        .as_deref()
-        .map(|path| resolve_path(path, registry_dir));
-    let lock_dir = account
-        .lock_dir
-        .as_deref()
-        .map(|path| resolve_path(path, registry_dir));
+    let env_file = fleet.env_file(account);
+    let config_file = fleet.config_file(account);
+    let log_dir = fleet.log_dir(account);
+    let lock_dir = fleet.lock_dir(account);
+    let state_path = fleet.state_path(account);
 
     if !account.enabled {
         return account_status(
@@ -302,6 +192,7 @@ fn check_account(
             config_file.as_deref(),
             log_dir.as_deref(),
             lock_dir.as_deref(),
+            state_path.as_deref(),
             AccountStatusKind::Disabled,
             None,
             Some("account disabled in fleet registry".to_string()),
@@ -314,6 +205,7 @@ fn check_account(
             config_file.as_deref(),
             log_dir.as_deref(),
             lock_dir.as_deref(),
+            state_path.as_deref(),
             AccountStatusKind::MissingEnv,
             None,
             Some(format!("missing env file {}", env_file.display())),
@@ -328,6 +220,7 @@ fn check_account(
             config_file.as_deref(),
             log_dir.as_deref(),
             lock_dir.as_deref(),
+            state_path.as_deref(),
             AccountStatusKind::OperatorError,
             None,
             Some(format!("failed to prepare account env: {error}")),
@@ -345,6 +238,9 @@ fn check_account(
     if let Some(lock_dir) = &lock_dir {
         command.env("NAUTILUS_ALPACA_LOCK_DIR", lock_dir);
     }
+    if let Some(state_path) = &state_path {
+        command.env("ALPACA_STATE_PATH", state_path);
+    }
 
     let output = match command.output() {
         Ok(output) => output,
@@ -355,6 +251,7 @@ fn check_account(
                 config_file.as_deref(),
                 log_dir.as_deref(),
                 lock_dir.as_deref(),
+                state_path.as_deref(),
                 AccountStatusKind::OperatorError,
                 None,
                 Some(format!(
@@ -383,6 +280,7 @@ fn check_account(
                 config_file.as_deref(),
                 log_dir.as_deref(),
                 lock_dir.as_deref(),
+                state_path.as_deref(),
                 status,
                 Some(value),
                 (!output.status.success()).then(|| {
@@ -401,6 +299,7 @@ fn check_account(
             config_file.as_deref(),
             log_dir.as_deref(),
             lock_dir.as_deref(),
+            state_path.as_deref(),
             AccountStatusKind::OperatorError,
             None,
             Some(format!(
@@ -418,6 +317,7 @@ fn account_status(
     config_file: Option<&Path>,
     log_dir: Option<&Path>,
     lock_dir: Option<&Path>,
+    state_path: Option<&Path>,
     status: AccountStatusKind,
     operator_status: Option<Value>,
     error: Option<String>,
@@ -449,6 +349,7 @@ fn account_status(
         config_file: config_file.map(|path| path.display().to_string()),
         log_dir: log_dir.map(|path| path.display().to_string()),
         lock_dir: lock_dir.map(|path| path.display().to_string()),
+        state_path: state_path.map(|path| path.display().to_string()),
         permissions: account.permissions.clone(),
         risk_budget: account.risk_budget.clone(),
         status,
@@ -550,33 +451,6 @@ fn nested_usize(value: Option<&Value>, path: &[&str]) -> Option<usize> {
         .and_then(|value| usize::try_from(value).ok())
 }
 
-fn resolve_path(path: &Path, base_dir: &Path) -> PathBuf {
-    let expanded = expand_home(path);
-    if expanded.is_absolute() {
-        expanded
-    } else {
-        base_dir.join(expanded)
-    }
-}
-
-fn expand_home(path: &Path) -> PathBuf {
-    let raw = path.to_string_lossy();
-    if raw == "~" {
-        return home_dir();
-    }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        return home_dir().join(rest);
-    }
-    path.to_path_buf()
-}
-
-fn default_registry_path() -> PathBuf {
-    default_config_home()
-        .join("nautilus-trader")
-        .join("alpaca")
-        .join("fleet.toml")
-}
-
 fn default_operator_bin() -> PathBuf {
     env::current_exe()
         .ok()
@@ -586,10 +460,6 @@ fn default_operator_bin() -> PathBuf {
         })
         .filter(|path| path.exists())
         .unwrap_or_else(|| home_dir().join(".local/bin/alpaca-operator-status"))
-}
-
-fn default_config_home() -> PathBuf {
-    env::var_os("XDG_CONFIG_HOME").map_or_else(|| home_dir().join(".config"), PathBuf::from)
 }
 
 fn home_dir() -> PathBuf {

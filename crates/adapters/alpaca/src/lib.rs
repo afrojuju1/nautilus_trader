@@ -41,6 +41,8 @@ pub mod earnings;
 pub mod execution;
 #[cfg(feature = "live")]
 pub mod factories;
+#[cfg(feature = "live")]
+pub mod fleet;
 pub mod http;
 #[cfg(feature = "live")]
 pub mod index_credit;

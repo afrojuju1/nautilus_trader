@@ -37,6 +37,17 @@ min_return_on_risk = 0.18
 wing_min_return_on_risk = 0.10
 require_equal_widths = true
 
+[debit_scanner]
+min_dte = 5
+max_dte = 45
+long_delta_min = 0.45
+long_delta_max = 0.65
+widths = [2.0, 3.0, 5.0]
+min_open_interest = 200
+max_leg_spread_pct = 0.15
+max_debit_to_width = 0.55
+min_reward_to_risk = 0.75
+
 [risk]
 # Account-level caps checked before any hosted strategy can submit a new entry.
 # Omit a field or set it through env only when the cap should be unlimited.
