@@ -1,19 +1,24 @@
 # Alpaca NUC Deployment
 
-This deployment runs the Rust Alpaca index credit runner as one supervised user service. It keeps
-secrets outside the repo, writes logs under the user's state directory, and uses a file lock so only
-one runner can own the Alpaca account workflow.
+This deployment runs the Rust Alpaca index credit runner as one supervised user service for the
+active account. It keeps secrets outside the repo, writes logs under the user's state directory, and
+uses a file lock so only one runner can own a given Alpaca account workflow.
 
 ## Files
 
 - `deploy/alpaca/alpaca-index-credit.env.example`: credentials, endpoints, service paths, and
   emergency override template.
+- `deploy/alpaca/alpaca-index-credit.account.env.example`: account-scoped env template for future
+  supervised account instances.
 - `deploy/alpaca/alpaca-index-credit.toml.example`: strategy/scanner/management config template.
+- `deploy/alpaca/alpaca-fleet.toml.example`: read-only fleet registry template.
 - `deploy/alpaca/alpaca-index-credit-install.sh`: builds release binaries and installs user files.
 - `deploy/alpaca/alpaca-index-credit-runner.sh`: `flock`-guarded runner wrapper.
 - `deploy/alpaca/alpaca-index-credit.service`: user systemd service.
+- `deploy/alpaca/alpaca-index-credit@.service`: disabled-by-default account-instance service
+  template.
 - `deploy/alpaca/alpaca-index-credit-control.sh`: operator status, health, start, stop, restart,
-  logs.
+  fleet status, logs.
 - `deploy/alpaca/alpaca-index-credit.logrotate`: optional logrotate policy.
 
 ## Install
@@ -36,6 +41,9 @@ Edit `~/.config/nautilus-trader/alpaca/index-credit.toml` for strategy/scanner/m
 TOML `runtime.max_iterations = 0` is continuous service mode. Set `ALPACA_MAX_ITERATIONS=1` only
 for a manual one-shot smoke test override.
 
+The installer also creates `~/.config/nautilus-trader/alpaca/fleet.toml` if missing. The fleet
+registry is read-only operator metadata; credentials remain in each account env file.
+
 ## Commands
 
 ```bash
@@ -45,8 +53,11 @@ systemctl --user stop alpaca-index-credit.service
 systemctl --user status alpaca-index-credit.service --no-pager
 deploy/alpaca/alpaca-index-credit-control.sh operator
 deploy/alpaca/alpaca-index-credit-control.sh operator --json
+deploy/alpaca/alpaca-index-credit-control.sh fleet
+deploy/alpaca/alpaca-index-credit-control.sh fleet --json
 deploy/alpaca/alpaca-index-credit-control.sh health
 deploy/alpaca/alpaca-index-credit-control.sh logs
+alpaca-fleet-status --json
 ```
 
 To enable start on user login:
@@ -71,8 +82,62 @@ The service runs installed release binaries by default:
 
 - Runner: `~/.local/bin/alpaca-index-credit-engine`
 - Operator status: `~/.local/bin/alpaca-operator-status`
+- Fleet status: `~/.local/bin/alpaca-fleet-status`
 
 Override with `NAUTILUS_ALPACA_RUNNER_BIN` or `NAUTILUS_ALPACA_OPERATOR_BIN` only for diagnostics.
+
+Account-scoped services use template-owned log and lock directories, for example
+`~/.local/state/nautilus_trader/alpaca/<account-id>/logs` and
+`~/.local/state/nautilus_trader/alpaca/<account-id>/locks`. Keep each account's strategy state path
+inside its account config so one account cannot read or write another account's runtime state.
+
+## Multi-Account Foundation
+
+The existing paper account remains `alpaca-index-credit.service` and continues to use:
+
+- Env: `~/.config/nautilus-trader/alpaca/index-credit.env`
+- Config: `~/.config/nautilus-trader/alpaca/index-credit.toml`
+
+Additional accounts are represented in `~/.config/nautilus-trader/alpaca/fleet.toml` with explicit
+roles, permissions, risk budgets, service names, env files, config files, log directories, and lock
+directories. This is an operator registry only; it does not allocate trades across accounts and it
+does not enable submission for a new account by itself.
+
+For account-instance services, the systemd template owns account identity, service name, config
+path, log path, and lock path. The account env file should stay focused on credentials, endpoints,
+and explicit safety gates. Fleet status creates a hermetic operator-status child process for each
+account instead of inheriting any `ALPACA_*` or `NAUTILUS_ALPACA_*` values from the parent shell.
+
+Future account env files should live under:
+
+```text
+~/.config/nautilus-trader/alpaca/accounts/<account-id>.env
+```
+
+Future account configs should live under:
+
+```text
+~/.config/nautilus-trader/alpaca/configs/<account-id>-index-credit.toml
+```
+
+Keep extra accounts disabled in the fleet registry and keep their env gates inert until credentials,
+permissions, strategy config, and risk budget are reviewed:
+
+```bash
+ALPACA_SUBMIT=false
+ALPACA_MANAGE=false
+ALPACA_CLOSE=false
+ALPACA_KILL_SWITCH=true
+```
+
+After an account env/config pair is reviewed, the account can be enabled explicitly:
+
+```bash
+systemctl --user start alpaca-index-credit@paper-directional.service
+```
+
+Do not enable account-instance services on login until paper proof is complete for that account's
+role and strategy set.
 
 ## Safety Gates
 
@@ -106,10 +171,14 @@ tiny live canary.
 
 ## Operator Status
 
-`alpaca-index-credit-control.sh operator` runs the `alpaca-operator-status` binary from the repo and
-summarizes service state, account status, open orders, positions, strategy state, the last structured
+`alpaca-index-credit-control.sh operator` runs the `alpaca-operator-status` binary and summarizes
+service state, account status, open orders, positions, strategy state, the last structured
 scan/decision event, the latest broker event, and operator alerts. Use `--json` for machine-readable
 output.
+
+`alpaca-index-credit-control.sh fleet` runs `alpaca-fleet-status`, reads the fleet registry, and
+executes per-account operator status with each account's env file. It is a read-only fleet summary;
+it does not start services, submit orders, or change account state.
 
 The command reports one engine state:
 
@@ -124,6 +193,7 @@ Normal overnight monitoring:
 
 ```bash
 alpaca-operator-status --json
+alpaca-fleet-status --json
 cargo run -p nautilus-alpaca --features live --bin alpaca-check-account-orders
 ```
 

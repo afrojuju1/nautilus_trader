@@ -15,12 +15,39 @@
 
 //! Runtime environment loading for deployed Alpaca account-engine utilities.
 
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+const ACCOUNT_COMMAND_PASSTHROUGH_ENV: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "XDG_CONFIG_HOME",
+    "XDG_RUNTIME_DIR",
+    "XDG_STATE_HOME",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "RUST_LOG",
+];
 
 /// Loads the deployed Alpaca index-credit environment file when present.
 ///
-/// Existing process environment variables win over file values, so callers can still override
-/// individual settings explicitly.
+/// The default env file preserves existing process environment values for manual operator
+/// overrides. An explicit `NAUTILUS_ALPACA_ENV_FILE` is treated as an account boundary, so that
+/// file's values override inherited values for keys it declares.
 ///
 /// # Errors
 ///
@@ -33,7 +60,12 @@ pub fn load_index_credit_env_file() -> anyhow::Result<Option<PathBuf>> {
 
     match path.try_exists() {
         Ok(true) => {
-            dotenvy::from_path(&path).map_err(|error| {
+            let result = if explicit {
+                dotenvy::from_path_override(&path)
+            } else {
+                dotenvy::from_path(&path)
+            };
+            result.map_err(|error| {
                 anyhow::anyhow!("failed to load Alpaca env file {}: {error}", path.display())
             })?;
             Ok(Some(path))
@@ -47,6 +79,39 @@ pub fn load_index_credit_env_file() -> anyhow::Result<Option<PathBuf>> {
             path.display()
         ),
     }
+}
+
+/// Configures a child process to run with one account's env file as its runtime boundary.
+///
+/// This intentionally avoids inheriting `ALPACA_*` and `NAUTILUS_ALPACA_*` values from the parent
+/// shell or process manager. The child receives only a small set of OS/session variables required
+/// for path expansion, TLS/proxy handling, and `systemctl --user`, then the account env file values.
+///
+/// # Errors
+///
+/// Returns an error if the account env file cannot be read or parsed.
+pub fn configure_account_command_env(command: &mut Command, env_file: &Path) -> anyhow::Result<()> {
+    command.env_clear();
+    for key in ACCOUNT_COMMAND_PASSTHROUGH_ENV {
+        if let Some(value) = env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command.env("NAUTILUS_ALPACA_ENV_FILE", env_file);
+
+    let iter = dotenvy::from_path_iter(env_file).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to read Alpaca env file {}: {error}",
+            env_file.display()
+        )
+    })?;
+    for item in iter {
+        let (key, value) = item.map_err(|error| {
+            anyhow::anyhow!("invalid Alpaca env file {}: {error}", env_file.display())
+        })?;
+        command.env(key, value);
+    }
+    Ok(())
 }
 
 fn default_index_credit_env_path() -> PathBuf {

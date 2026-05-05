@@ -4,10 +4,11 @@ set -euo pipefail
 SERVICE="${NAUTILUS_ALPACA_SERVICE:-alpaca-index-credit.service}"
 ENV_FILE="${NAUTILUS_ALPACA_ENV_FILE:-$HOME/.config/nautilus-trader/alpaca/index-credit.env}"
 OPERATOR_BIN="${NAUTILUS_ALPACA_OPERATOR_BIN:-$HOME/.local/bin/alpaca-operator-status}"
+FLEET_BIN="${NAUTILUS_ALPACA_FLEET_BIN:-$HOME/.local/bin/alpaca-fleet-status}"
 
 usage() {
   cat <<EOF
-usage: $(basename "$0") <status|operator|health|start|stop|restart|logs>
+usage: $(basename "$0") <status|operator|fleet|health|start|stop|restart|logs>
 
 Controls the user systemd service: $SERVICE
 EOF
@@ -39,6 +40,14 @@ case "${1:-}" in
   operator)
     shift
     run_operator_status "$@"
+    ;;
+  fleet)
+    shift
+    if [[ ! -x "$FLEET_BIN" ]]; then
+      echo "missing executable fleet status binary: $FLEET_BIN" >&2
+      exit 127
+    fi
+    "$FLEET_BIN" "$@"
     ;;
   health)
     require_env_file

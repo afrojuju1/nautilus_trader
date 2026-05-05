@@ -1,0 +1,76 @@
+# Copy to ~/.config/nautilus-trader/alpaca/fleet.toml.
+#
+# This registry is operator/control-plane metadata only. Account credentials remain in each
+# account env file and are never stored here.
+
+[fleet]
+operator_bin = "/home/ade/.local/bin/alpaca-operator-status"
+
+[[accounts]]
+id = "paper-main"
+role = "defined_risk_short_premium"
+enabled = true
+service = "alpaca-index-credit.service"
+env_file = "/home/ade/.config/nautilus-trader/alpaca/index-credit.env"
+config_file = "/home/ade/.config/nautilus-trader/alpaca/index-credit.toml"
+log_dir = "/home/ade/.local/state/nautilus_trader/logs"
+lock_dir = "/home/ade/.local/state/nautilus_trader/locks"
+
+[accounts.permissions]
+defined_risk = true
+long_premium = false
+undefined_risk = false
+naked_calls = false
+naked_puts = false
+
+[accounts.risk_budget]
+max_active_entries = 10
+max_buying_power_pct = 0.10
+max_notional_risk = 5000.0
+
+[[accounts]]
+id = "paper-directional"
+role = "long_premium_directional"
+enabled = false
+service = "alpaca-index-credit@paper-directional.service"
+env_file = "/home/ade/.config/nautilus-trader/alpaca/accounts/paper-directional.env"
+config_file = "/home/ade/.config/nautilus-trader/alpaca/configs/paper-directional-index-credit.toml"
+log_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-directional/logs"
+lock_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-directional/locks"
+
+[accounts.permissions]
+defined_risk = false
+long_premium = true
+undefined_risk = false
+naked_calls = false
+naked_puts = false
+
+[accounts.risk_budget]
+max_active_entries = 5
+max_buying_power_pct = 0.05
+max_notional_risk = 2500.0
+
+[[accounts]]
+id = "paper-undefined-risk"
+role = "undefined_risk_short_premium"
+enabled = false
+service = "alpaca-index-credit@paper-undefined-risk.service"
+env_file = "/home/ade/.config/nautilus-trader/alpaca/accounts/paper-undefined-risk.env"
+config_file = "/home/ade/.config/nautilus-trader/alpaca/configs/paper-undefined-risk-index-credit.toml"
+log_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-undefined-risk/logs"
+lock_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-undefined-risk/locks"
+
+[accounts.permissions]
+defined_risk = false
+long_premium = false
+undefined_risk = true
+naked_calls = false
+naked_puts = true
+
+[accounts.risk_budget]
+max_active_entries = 3
+max_buying_power_pct = 0.03
+max_notional_risk = 1500.0
+max_delta_abs = 50.0
+max_gamma_abs = 20.0
+max_vega_abs = 100.0

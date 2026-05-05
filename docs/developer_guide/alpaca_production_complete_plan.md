@@ -8,11 +8,14 @@ Alpaca option-spread workflow. The target state is Nautilus-native execution and
 
 - Nautilus owns live strategy runtime, Alpaca market data access, Alpaca execution, order events,
   reconciliation, position lifecycle, and operator controls.
-- The NUC (`ade-nucbox-k8-plus`) runs one supervised Nautilus paper/live process for the active
+- The NUC (`ade-nucbox-k8-plus`) runs one supervised Nautilus paper/live process for each enabled
   Alpaca account.
-- That process is the single Alpaca account engine: it owns broker connectivity and account-level
+- Each process is a single Alpaca account engine: it owns broker connectivity and account-level
   risk, while hosting multiple enabled strategies from config. Add separate supervised services only
-  for separate ownership domains such as paper vs live accounts or non-trading diagnostics.
+  for separate broker accounts or non-trading diagnostics.
+- A read-only fleet registry tracks account role, permissions, risk budget, env file, config file,
+  and service name. It does not allocate trades across accounts until a deliberate allocator is
+  designed.
 - Strategies are implemented as Nautilus-native strategies or Rust/Python components in this repo.
 - Alpaca option spreads are submitted through Nautilus `SubmitOrderList` and reconciled through
   trade updates plus REST repair paths.
@@ -51,6 +54,9 @@ Known gaps:
 - Multi-day paper proof with real management closes is still outstanding.
 - Websocket disconnect/reconnect and reconciliation events are wired, but they still need paper
   observation during an actual reconnect or broker event-loss scenario.
+- Multi-account support currently has an operator/deployment foundation only. It still needs account
+  admission policy, allocation rules, per-role strategy configs, and paper proof before any secondary
+  account is allowed to submit.
 
 ## Phase 1: Foundation Lock
 
@@ -401,6 +407,37 @@ Current status:
 Status: engineering complete for index-credit account-engine hosting; market-hours paper proof
 remains.
 
+## Phase 6.7: Multi-Account Foundation
+
+Goal: prepare the deployment for multiple Alpaca paper accounts without letting secondary accounts
+trade before credentials, roles, permissions, and gates are reviewed.
+
+Work:
+
+- Add a read-only fleet registry with account ID, role, enabled flag, service name, env file, config
+  file, log directory, lock directory, permissions, and risk budget.
+- Add an account-scoped systemd service template so future accounts can run as separate supervised
+  account engines with their own env, config, logs, locks, and strategy state.
+- Add an account env template that defaults extra accounts to `ALPACA_KILL_SWITCH=true`,
+  `ALPACA_SUBMIT=false`, `ALPACA_MANAGE=false`, and `ALPACA_CLOSE=false`.
+- Add a fleet status command that checks enabled accounts by running the existing operator status
+  command inside a hermetic child process built from each account's env file plus registry service
+  and config metadata.
+- Keep the current account as `paper-main` on `alpaca-index-credit.service`; keep future accounts
+  disabled until credentials are provided and reviewed.
+
+Exit criteria:
+
+- The installed tooling can report the current account through fleet status.
+- Disabled future account entries are visible in the registry but never started by install/control
+  scripts.
+- Account-scoped services do not share logs, locks, strategy state, or credentials.
+- The architecture preserves role separation for defined-risk short premium, long-premium
+  directional, and future undefined-risk/naked-call/naked-put accounts.
+
+Status: implementation in progress. This phase is infrastructure only; no allocator and no
+secondary-account submission.
+
 ## Phase 7: Strategy Migration
 
 Migration order:
@@ -453,6 +490,8 @@ Phase 7 blockers:
      enabled under one-entry caps.)
   8. Enable iron condor scanning as dry-run only while put/call credit spreads remain live.
   9. Park earnings debit until explicitly resumed.
+- Secondary Alpaca accounts should remain disabled until Phase 6.7 is installed, the user provides
+  paper credentials, and each account receives a role-specific config and risk budget.
 - Earnings debit strategies still need account-engine integration, management rules, paper proof,
   and source-quality review of the Alpha Vantage feed before live use. Earnings work is intentionally
   skipped for the current scanner expansion.
@@ -512,6 +551,7 @@ Current status:
 
 ## Immediate Next Milestone
 
-Run the market-hours paper workflow for the hosted account engine: dry-run scan,
-submit-with-cancel smoke, paper open with real management close, and multi-day paper soak. In
-parallel, build the Phase 7 earnings-debit scanner against the explicit local earnings CSV policy.
+Finish and install the Phase 6.7 multi-account foundation, then run fleet status against the current
+paper account. After the secondary paper credentials are provided, create account-scoped env/config
+files with submission gates disabled, verify read-only fleet/operator status, and only then decide
+which account gets the next paper strategy proof.
