@@ -479,11 +479,14 @@ impl LiveNode {
     ///
     /// The config type determines which built-in strategy is constructed.
     /// All execution happens in Rust; Python is the configuration layer.
+    ///
+    /// Custom native Rust strategies require the native strategy plugin API.
     #[cfg(feature = "examples")]
     #[pyo3(name = "add_native_strategy")]
     fn py_add_native_strategy(&mut self, config: &Bound<'_, PyAny>) -> PyResult<()> {
         use nautilus_trading::examples::strategies::{
-            DeltaNeutralVol, DeltaNeutralVolConfig, EmaCross, EmaCrossConfig, GridMarketMaker,
+            CompositeMarketMaker, CompositeMarketMakerConfig, DeltaNeutralVol,
+            DeltaNeutralVolConfig, EmaCross, EmaCrossConfig, GridMarketMaker,
             GridMarketMakerConfig, HurstVpinDirectional, HurstVpinDirectionalConfig,
         };
 
@@ -492,6 +495,9 @@ impl LiveNode {
                 .map_err(to_pyruntime_err)
         } else if let Ok(config) = config.extract::<GridMarketMakerConfig>() {
             self.add_strategy(GridMarketMaker::new(config))
+                .map_err(to_pyruntime_err)
+        } else if let Ok(config) = config.extract::<CompositeMarketMakerConfig>() {
+            self.add_strategy(CompositeMarketMaker::new(config))
                 .map_err(to_pyruntime_err)
         } else if let Ok(config) = config.extract::<DeltaNeutralVolConfig>() {
             self.add_strategy(DeltaNeutralVol::new(config))
