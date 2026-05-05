@@ -19,8 +19,8 @@ uses a file lock so only one runner can own a given Alpaca account workflow.
 - `deploy/alpaca/alpaca-index-credit.service`: user systemd service.
 - `deploy/alpaca/alpaca-index-credit@.service`: disabled-by-default account-instance service
   template.
-- `deploy/alpaca/alpaca-index-credit-control.sh`: operator status, health, start, stop, restart,
-  fleet status, logs.
+- `deploy/alpaca/alpaca-index-credit-control.sh`: account-aware operator status, config checks,
+  candidate scans, ledger tails, health, service control, fleet status, and logs.
 - `deploy/alpaca/alpaca-index-credit.logrotate`: optional logrotate policy.
 
 ## Install
@@ -45,24 +45,36 @@ base, then override only strategy identity, state path, risk caps, or account-sp
 limits. TOML `runtime.max_iterations = 0` is continuous service mode. Set
 `ALPACA_MAX_ITERATIONS=1` only for a manual one-shot smoke test override.
 
+Candidate-ledger evidence is enabled by default with `runtime.candidate_ledger_enabled = true`.
+When `runtime.candidate_ledger_dir` is omitted, each account writes JSONL records under
+`~/.local/state/nautilus_trader/alpaca/<account-id>/candidate-ledger/<trade-date>.jsonl`.
+`runtime.candidate_ledger_max_candidates` controls how many ranked candidates per scanner result
+are persisted; `0` records all ranked candidates.
+
 The installer also creates `~/.config/nautilus-trader/alpaca/fleet.toml` if missing. The fleet
 registry is read-only operator metadata; credentials remain in each account env file.
 
 ## Commands
 
 ```bash
-alpaca-index-credit-engine --check-config
-systemctl --user start alpaca-index-credit.service
-systemctl --user stop alpaca-index-credit.service
-systemctl --user status alpaca-index-credit.service --no-pager
-deploy/alpaca/alpaca-index-credit-control.sh operator
-deploy/alpaca/alpaca-index-credit-control.sh operator --json
-deploy/alpaca/alpaca-index-credit-control.sh fleet
-deploy/alpaca/alpaca-index-credit-control.sh fleet --json
-deploy/alpaca/alpaca-index-credit-control.sh health
-deploy/alpaca/alpaca-index-credit-control.sh logs
+alpaca-index-credit-control accounts
+alpaca-index-credit-control --account paper-main status
+alpaca-index-credit-control --account paper-directional status
+alpaca-index-credit-control --account paper-undefined-risk status
+alpaca-index-credit-control --account paper-undefined-risk check-config
+alpaca-index-credit-control --account paper-undefined-risk scan naked GDX,SLV
+alpaca-index-credit-control --account paper-directional scan directional XLF,XLK
+alpaca-index-credit-control --account paper-main ledger --lines 20
+alpaca-index-credit-control fleet --json
+alpaca-index-credit-control health
+alpaca-index-credit-control logs
 alpaca-fleet-status --json
 ```
+
+`scan` is a one-shot diagnostic candidate scan. It auto-loads the selected account env/config,
+forces dry-run entry decisions, disables submit/manage/close, ignores the entry window by default,
+and raises local account caps so daily submit limits do not hide candidates. Use `run-once` when the
+goal is to execute one normal engine iteration with the account's configured runtime gates.
 
 To enable start on user login:
 
@@ -78,6 +90,7 @@ Default state files from the env template:
 - Logs: `~/.local/state/nautilus_trader/logs/alpaca-index-credit.log`
 - Lock: `~/.local/state/nautilus_trader/locks/alpaca-index-credit.lock`
 - Strategy state: `~/.local/state/nautilus_trader/alpaca_index_credit_state.json`
+- Candidate ledger: `~/.local/state/nautilus_trader/alpaca/<account-id>/candidate-ledger/*.jsonl`
 
 The runner wrapper takes an exclusive non-blocking lock. If another process already owns the lock,
 the service exits without starting another Alpaca account owner.

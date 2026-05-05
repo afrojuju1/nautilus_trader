@@ -25,9 +25,10 @@ use std::{
 use chrono::NaiveTime;
 use chrono_tz::Tz;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{
+    candidate_ledger::{append_candidate_ledger_record, default_candidate_ledger_dir},
     config::AlpacaDataClientConfig,
     execution::check_option_spread_entry_admission,
     fleet::{ResolvedFleetConfig, load_fleet_config_from_env},
@@ -41,10 +42,10 @@ use crate::{
         CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, DebitSpreadScannerConfig,
         IronCondorCandidate, IronCondorScannerConfig, NakedOptionCandidate,
         NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig,
-        PutCreditScannerConfig, SpreadCandidate, annualized_premium_yield,
-        scan_call_credit_underlying, scan_call_debit_underlying, scan_iron_condor_underlying,
-        scan_naked_option_underlying_with_capital, scan_put_credit_underlying,
-        scan_put_debit_underlying,
+        OptionCandidateMetrics, PutCreditScannerConfig, ScoredContract, SpreadCandidate,
+        annualized_premium_yield, scan_call_credit_underlying, scan_call_debit_underlying,
+        scan_iron_condor_underlying, scan_naked_option_underlying_with_capital,
+        scan_put_credit_underlying, scan_put_debit_underlying,
     },
 };
 
@@ -133,6 +134,12 @@ pub struct IndexCreditConfig {
     pub entry_timezone: Tz,
     /// Local strategy state path.
     pub state_path: PathBuf,
+    /// Whether scanner evidence should be written to the candidate ledger.
+    pub candidate_ledger_enabled: bool,
+    /// Directory for append-only candidate-ledger JSONL files.
+    pub candidate_ledger_dir: PathBuf,
+    /// Maximum ranked candidates to write per scanner result. `0` means all candidates.
+    pub candidate_ledger_max_candidates: usize,
     /// Credit scanner config.
     pub scanner: PutCreditScannerConfig,
     /// Iron-condor scanner config.
@@ -185,6 +192,39 @@ impl IndexCreditConfig {
             stop_loss_close_multiple: self.stop_loss_close_multiple,
             max_hold_secs: self.max_hold_secs,
             expiration_exit_days: self.expiration_exit_days,
+        }
+    }
+
+    /// Appends one analytical record to the candidate ledger when enabled.
+    pub fn record_candidate_ledger(&self, trade_date: &str, record_type: &str, payload: Value) {
+        if !self.candidate_ledger_enabled {
+            return;
+        }
+        if let Err(error) = append_candidate_ledger_record(
+            &self.candidate_ledger_dir,
+            trade_date,
+            self.fleet_account_id.as_deref(),
+            record_type,
+            payload,
+        ) {
+            emit_operator_event(
+                "candidate_ledger_error",
+                json!({
+                    "reason": "append_failed",
+                    "record_type": record_type,
+                    "trade_date": trade_date,
+                    "ledger_dir": self.candidate_ledger_dir.display().to_string(),
+                    "error": error.to_string(),
+                }),
+            );
+        }
+    }
+
+    fn candidate_ledger_candidate_limit(&self, candidate_count: usize) -> usize {
+        if self.candidate_ledger_max_candidates == 0 {
+            candidate_count
+        } else {
+            candidate_count.min(self.candidate_ledger_max_candidates)
         }
     }
 
@@ -397,6 +437,17 @@ pub async fn select_index_strategy_entry(
                     "{underlying}: admission_rejected reason=risk_max_active_entries_per_underlying current={} limit={}",
                     current, limit,
                 );
+                record_scanner_ledger_result(
+                    config,
+                    trade_date,
+                    json!({
+                        "underlying": underlying,
+                        "result": "admission_rejected",
+                        "reason": "risk_max_active_entries_per_underlying",
+                        "current": current,
+                        "limit": limit,
+                    }),
+                );
                 emit_operator_event(
                     "scanner_diagnostic",
                     json!({
@@ -418,6 +469,18 @@ pub async fn select_index_strategy_entry(
                 println!(
                     "{underlying}: admission_rejected reason=risk_max_active_entries_per_sector sector={} current={} limit={}",
                     sector, current, limit,
+                );
+                record_scanner_ledger_result(
+                    config,
+                    trade_date,
+                    json!({
+                        "underlying": underlying,
+                        "result": "admission_rejected",
+                        "reason": "risk_max_active_entries_per_sector",
+                        "sector": sector,
+                        "current": current,
+                        "limit": limit,
+                    }),
                 );
                 emit_operator_event(
                     "scanner_diagnostic",
@@ -444,6 +507,17 @@ pub async fn select_index_strategy_entry(
                     "{underlying}: admission_rejected reason=fleet_max_active_entries_per_underlying current={} limit={}",
                     current, limit,
                 );
+                record_scanner_ledger_result(
+                    config,
+                    trade_date,
+                    json!({
+                        "underlying": underlying,
+                        "result": "admission_rejected",
+                        "reason": "fleet_max_active_entries_per_underlying",
+                        "current": current,
+                        "limit": limit,
+                    }),
+                );
                 emit_operator_event(
                     "scanner_diagnostic",
                     json!({
@@ -464,6 +538,18 @@ pub async fn select_index_strategy_entry(
                 "{underlying}: admission_rejected reason=fleet_max_active_entries_per_sector sector={} current={} limit={}",
                 sector, current, limit,
             );
+            record_scanner_ledger_result(
+                config,
+                trade_date,
+                json!({
+                    "underlying": underlying,
+                    "result": "admission_rejected",
+                    "reason": "fleet_max_active_entries_per_sector",
+                    "sector": sector,
+                    "current": current,
+                    "limit": limit,
+                }),
+            );
             emit_operator_event(
                 "scanner_diagnostic",
                 json!({
@@ -480,6 +566,15 @@ pub async fn select_index_strategy_entry(
 
         if state.has_submitted_underlying(trade_date, underlying) {
             println!("{underlying}: admission_rejected reason=daily_duplicate_state");
+            record_scanner_ledger_result(
+                config,
+                trade_date,
+                json!({
+                    "underlying": underlying,
+                    "result": "admission_rejected",
+                    "reason": "daily_duplicate_state",
+                }),
+            );
             emit_operator_event(
                 "scanner_diagnostic",
                 json!({
@@ -492,6 +587,15 @@ pub async fn select_index_strategy_entry(
 
         if fleet_has_active_underlying_elsewhere(config, underlying) {
             println!("{underlying}: admission_rejected reason=fleet_duplicate_underlying");
+            record_scanner_ledger_result(
+                config,
+                trade_date,
+                json!({
+                    "underlying": underlying,
+                    "result": "admission_rejected",
+                    "reason": "fleet_duplicate_underlying",
+                }),
+            );
             emit_operator_event(
                 "scanner_diagnostic",
                 json!({
@@ -514,6 +618,35 @@ pub async fn select_index_strategy_entry(
                         .await?
                 }
             };
+            let strategy_name = credit_spread_strategy_name(*kind);
+            let scanner_reason = result.candidates.is_empty().then(|| {
+                no_candidate_reason(
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                )
+            });
+            record_scanner_ledger_result(
+                config,
+                trade_date,
+                json!({
+                    "underlying": underlying,
+                    "strategy": strategy_name,
+                    "result": if result.candidates.is_empty() { "no_candidate" } else { "candidate" },
+                    "reason": scanner_reason,
+                    "contracts": result.contract_count,
+                    "snapshots": result.snapshot_count,
+                    "scoreable": result.scoreable_count,
+                    "rejections": &result.rejection_counts,
+                }),
+            );
+            record_credit_candidate_ledger(
+                config,
+                trade_date,
+                underlying,
+                strategy_name,
+                &result.candidates,
+            );
             let Some(best) = result.candidates.first() else {
                 let reason = no_candidate_reason(
                     result.contract_count,
@@ -558,6 +691,18 @@ pub async fn select_index_strategy_entry(
                     best.short.symbol,
                     best.long.symbol,
                     admission.reasons.join(" | "),
+                );
+                record_scanner_ledger_result(
+                    config,
+                    trade_date,
+                    json!({
+                        "underlying": underlying,
+                        "strategy": credit_spread_strategy_name(*kind),
+                        "result": "admission_rejected",
+                        "short_symbol": &best.short.symbol,
+                        "long_symbol": &best.long.symbol,
+                        "reasons": &admission.reasons,
+                    }),
                 );
                 emit_operator_event(
                     "scanner_diagnostic",
@@ -617,6 +762,28 @@ pub async fn select_index_strategy_entry(
                 underlying,
             )
             .await?;
+            let scanner_reason = result.candidates.is_empty().then(|| {
+                no_candidate_reason(
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                )
+            });
+            record_scanner_ledger_result(
+                config,
+                trade_date,
+                json!({
+                    "underlying": underlying,
+                    "strategy": "index_iron_condor_entry",
+                    "result": if result.candidates.is_empty() { "no_candidate" } else { "candidate" },
+                    "reason": scanner_reason,
+                    "contracts": result.contract_count,
+                    "snapshots": result.snapshot_count,
+                    "scoreable": result.scoreable_count,
+                    "rejections": &result.rejection_counts,
+                }),
+            );
+            record_iron_condor_candidate_ledger(config, trade_date, underlying, &result.candidates);
             let Some(best) = result.candidates.first() else {
                 let reason = no_candidate_reason(
                     result.contract_count,
@@ -666,6 +833,20 @@ pub async fn select_index_strategy_entry(
                     best.call.short.symbol,
                     best.call.long.symbol,
                     admission.reasons.join(" | "),
+                );
+                record_scanner_ledger_result(
+                    config,
+                    trade_date,
+                    json!({
+                        "underlying": underlying,
+                        "strategy": "index_iron_condor_entry",
+                        "result": "admission_rejected",
+                        "short_put_symbol": &best.put.short.symbol,
+                        "long_put_symbol": &best.put.long.symbol,
+                        "short_call_symbol": &best.call.short.symbol,
+                        "long_call_symbol": &best.call.long.symbol,
+                        "reasons": &admission.reasons,
+                    }),
                 );
                 emit_operator_event(
                     "scanner_diagnostic",
@@ -742,6 +923,35 @@ pub async fn select_index_strategy_entry(
                     .await?
                 }
             };
+            let strategy_name = debit_spread_strategy_name(*kind);
+            let scanner_reason = result.candidates.is_empty().then(|| {
+                no_candidate_reason(
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                )
+            });
+            record_scanner_ledger_result(
+                config,
+                trade_date,
+                json!({
+                    "underlying": underlying,
+                    "strategy": strategy_name,
+                    "result": if result.candidates.is_empty() { "no_candidate" } else { "candidate" },
+                    "reason": scanner_reason,
+                    "contracts": result.contract_count,
+                    "snapshots": result.snapshot_count,
+                    "scoreable": result.scoreable_count,
+                    "rejections": &result.rejection_counts,
+                }),
+            );
+            record_debit_candidate_ledger(
+                config,
+                trade_date,
+                underlying,
+                strategy_name,
+                &result.candidates,
+            );
             let Some(best) = result.candidates.first() else {
                 let reason = no_candidate_reason(
                     result.contract_count,
@@ -786,6 +996,18 @@ pub async fn select_index_strategy_entry(
                     best.long.symbol,
                     best.short.symbol,
                     admission.reasons.join(" | "),
+                );
+                record_scanner_ledger_result(
+                    config,
+                    trade_date,
+                    json!({
+                        "underlying": underlying,
+                        "strategy": debit_spread_strategy_name(*kind),
+                        "result": "admission_rejected",
+                        "long_symbol": &best.long.symbol,
+                        "short_symbol": &best.short.symbol,
+                        "reasons": &admission.reasons,
+                    }),
                 );
                 emit_operator_event(
                     "scanner_diagnostic",
@@ -850,6 +1072,36 @@ pub async fn select_index_strategy_entry(
                 }),
             )
             .await?;
+            let strategy_name = naked_option_strategy_name(*kind);
+            let scanner_reason = result.candidates.is_empty().then(|| {
+                no_candidate_reason(
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                )
+            });
+            record_scanner_ledger_result(
+                config,
+                trade_date,
+                json!({
+                    "underlying": underlying,
+                    "strategy": strategy_name,
+                    "result": if result.candidates.is_empty() { "no_candidate" } else { "candidate" },
+                    "reason": scanner_reason,
+                    "contracts": result.contract_count,
+                    "snapshots": result.snapshot_count,
+                    "scoreable": result.scoreable_count,
+                    "rejections": &result.rejection_counts,
+                }),
+            );
+            record_naked_candidate_ledger(
+                config,
+                trade_date,
+                underlying,
+                strategy_name,
+                options_buying_power,
+                &result.candidates,
+            );
             let Some(best) = result.candidates.first() else {
                 let reason = no_candidate_reason(
                     result.contract_count,
@@ -893,6 +1145,17 @@ pub async fn select_index_strategy_entry(
                     naked_option_strategy_name(*kind),
                     best.short.symbol,
                     admission.reasons.join(" | "),
+                );
+                record_scanner_ledger_result(
+                    config,
+                    trade_date,
+                    json!({
+                        "underlying": underlying,
+                        "strategy": naked_option_strategy_name(*kind),
+                        "result": "admission_rejected",
+                        "short_symbol": &best.short.symbol,
+                        "reasons": &admission.reasons,
+                    }),
                 );
                 emit_operator_event(
                     "scanner_diagnostic",
@@ -1057,6 +1320,9 @@ struct RuntimeSection {
     cancel_after_accept: Option<bool>,
     ignore_entry_window: Option<bool>,
     state_path: Option<PathBuf>,
+    candidate_ledger_enabled: Option<bool>,
+    candidate_ledger_dir: Option<PathBuf>,
+    candidate_ledger_max_candidates: Option<usize>,
 }
 
 impl RuntimeSection {
@@ -1074,6 +1340,13 @@ impl RuntimeSection {
             cancel_after_accept: self.cancel_after_accept.or(parent.cancel_after_accept),
             ignore_entry_window: self.ignore_entry_window.or(parent.ignore_entry_window),
             state_path: self.state_path.or(parent.state_path),
+            candidate_ledger_enabled: self
+                .candidate_ledger_enabled
+                .or(parent.candidate_ledger_enabled),
+            candidate_ledger_dir: self.candidate_ledger_dir.or(parent.candidate_ledger_dir),
+            candidate_ledger_max_candidates: self
+                .candidate_ledger_max_candidates
+                .or(parent.candidate_ledger_max_candidates),
         }
     }
 }
@@ -1514,6 +1787,9 @@ fn build_index_credit_config(
             .ok()
             .or(file.runtime.state_path)
             .unwrap_or_else(default_state_path),
+        candidate_ledger_enabled: file.runtime.candidate_ledger_enabled.unwrap_or(true),
+        candidate_ledger_dir: file.runtime.candidate_ledger_dir.unwrap_or_default(),
+        candidate_ledger_max_candidates: file.runtime.candidate_ledger_max_candidates.unwrap_or(10),
         iron_condor_scanner: iron_condor_scanner_config_from_file(&scanner, &file.iron_condor),
         debit_scanner: debit_scanner_config_from_file(&file.debit_scanner),
         naked_scanner: naked_scanner_config_from_file(&file.naked_scanner),
@@ -1524,6 +1800,10 @@ fn build_index_credit_config(
         fleet_policy_blocks: Vec::new(),
     };
     apply_fleet_policy(&mut config);
+    if config.candidate_ledger_dir.as_os_str().is_empty() {
+        config.candidate_ledger_dir =
+            default_candidate_ledger_dir(&config.state_path, config.fleet_account_id.as_deref());
+    }
     Ok(config)
 }
 
@@ -1736,6 +2016,209 @@ fn split_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+fn record_scanner_ledger_result(config: &IndexCreditConfig, trade_date: &str, payload: Value) {
+    config.record_candidate_ledger(trade_date, "scanner_result", payload);
+}
+
+fn record_credit_candidate_ledger(
+    config: &IndexCreditConfig,
+    trade_date: &str,
+    underlying: &str,
+    strategy: &str,
+    candidates: &[SpreadCandidate],
+) {
+    for (index, candidate) in candidates
+        .iter()
+        .take(config.candidate_ledger_candidate_limit(candidates.len()))
+        .enumerate()
+    {
+        config.record_candidate_ledger(
+            trade_date,
+            "candidate",
+            json!({
+                "underlying": underlying,
+                "strategy": strategy,
+                "candidate_type": "credit_spread",
+                "rank": index + 1,
+                "short_symbol": &candidate.short.symbol,
+                "long_symbol": &candidate.long.symbol,
+                "width": candidate.width,
+                "credit": candidate.credit,
+                "max_loss": candidate.max_loss,
+                "return_on_risk": candidate.return_on_risk,
+                "score": candidate.score,
+                "short": scored_contract_ledger_payload(&candidate.short),
+                "long": scored_contract_ledger_payload(&candidate.long),
+            }),
+        );
+    }
+}
+
+fn record_debit_candidate_ledger(
+    config: &IndexCreditConfig,
+    trade_date: &str,
+    underlying: &str,
+    strategy: &str,
+    candidates: &[DebitSpreadCandidate],
+) {
+    for (index, candidate) in candidates
+        .iter()
+        .take(config.candidate_ledger_candidate_limit(candidates.len()))
+        .enumerate()
+    {
+        config.record_candidate_ledger(
+            trade_date,
+            "candidate",
+            json!({
+                "underlying": underlying,
+                "strategy": strategy,
+                "candidate_type": "debit_spread",
+                "rank": index + 1,
+                "long_symbol": &candidate.long.symbol,
+                "short_symbol": &candidate.short.symbol,
+                "width": candidate.width,
+                "debit": candidate.debit,
+                "max_profit": candidate.max_profit,
+                "max_loss": candidate.max_loss,
+                "reward_to_risk": candidate.reward_to_risk,
+                "score": candidate.score,
+                "long": scored_contract_ledger_payload(&candidate.long),
+                "short": scored_contract_ledger_payload(&candidate.short),
+            }),
+        );
+    }
+}
+
+fn record_iron_condor_candidate_ledger(
+    config: &IndexCreditConfig,
+    trade_date: &str,
+    underlying: &str,
+    candidates: &[IronCondorCandidate],
+) {
+    for (index, candidate) in candidates
+        .iter()
+        .take(config.candidate_ledger_candidate_limit(candidates.len()))
+        .enumerate()
+    {
+        config.record_candidate_ledger(
+            trade_date,
+            "candidate",
+            json!({
+                "underlying": underlying,
+                "strategy": "index_iron_condor_entry",
+                "candidate_type": "iron_condor",
+                "rank": index + 1,
+                "short_put_symbol": &candidate.put.short.symbol,
+                "long_put_symbol": &candidate.put.long.symbol,
+                "short_call_symbol": &candidate.call.short.symbol,
+                "long_call_symbol": &candidate.call.long.symbol,
+                "credit": candidate.credit,
+                "max_loss": candidate.max_loss,
+                "return_on_risk": candidate.return_on_risk,
+                "score": candidate.score,
+                "put": spread_candidate_ledger_payload(&candidate.put),
+                "call": spread_candidate_ledger_payload(&candidate.call),
+            }),
+        );
+    }
+}
+
+fn record_naked_candidate_ledger(
+    config: &IndexCreditConfig,
+    trade_date: &str,
+    underlying: &str,
+    strategy: &str,
+    options_buying_power: Option<f64>,
+    candidates: &[NakedOptionCandidate],
+) {
+    for (index, candidate) in candidates
+        .iter()
+        .take(config.candidate_ledger_candidate_limit(candidates.len()))
+        .enumerate()
+    {
+        config.record_candidate_ledger(
+            trade_date,
+            "candidate",
+            json!({
+                "underlying": underlying,
+                "strategy": strategy,
+                "candidate_type": "naked_option",
+                "rank": index + 1,
+                "short_symbol": &candidate.short.symbol,
+                "credit": candidate.credit,
+                "account_options_buying_power": options_buying_power,
+                "capital_requirement_model": candidate.capital_requirement_model.as_str(),
+                "estimated_buying_power_requirement": candidate.estimated_buying_power_requirement,
+                "buying_power_usage_pct": candidate.buying_power_usage_pct,
+                "return_on_buying_power": candidate.return_on_buying_power,
+                "annualized_premium_yield": annualized_premium_yield(
+                    candidate.credit,
+                    candidate.short.strike,
+                    candidate.short.dte,
+                ),
+                "score": candidate.score,
+                "short": scored_contract_ledger_payload(&candidate.short),
+            }),
+        );
+    }
+}
+
+fn spread_candidate_ledger_payload(candidate: &SpreadCandidate) -> Value {
+    json!({
+        "short_symbol": &candidate.short.symbol,
+        "long_symbol": &candidate.long.symbol,
+        "width": candidate.width,
+        "credit": candidate.credit,
+        "max_loss": candidate.max_loss,
+        "return_on_risk": candidate.return_on_risk,
+        "score": candidate.score,
+        "short": scored_contract_ledger_payload(&candidate.short),
+        "long": scored_contract_ledger_payload(&candidate.long),
+    })
+}
+
+fn scored_contract_ledger_payload(contract: &ScoredContract) -> Value {
+    json!({
+        "symbol": &contract.symbol,
+        "expiration_date": &contract.expiration_date,
+        "dte": contract.dte,
+        "strike": contract.strike,
+        "bid": contract.bid,
+        "ask": contract.ask,
+        "delta_abs": contract.delta_abs,
+        "spread_pct": contract.spread_pct,
+        "bid_size": contract.bid_size,
+        "ask_size": contract.ask_size,
+        "volume": contract.volume,
+        "open_interest": contract.open_interest,
+        "implied_volatility": contract.implied_volatility,
+        "metrics": contract.metrics.as_ref().map(option_metrics_ledger_payload),
+    })
+}
+
+fn option_metrics_ledger_payload(metrics: &OptionCandidateMetrics) -> Value {
+    json!({
+        "underlying_price": metrics.underlying_price,
+        "breakeven": metrics.breakeven,
+        "strike_itm_probability": metrics.strike_itm_probability,
+        "delta_pop_proxy": metrics.delta_pop_proxy,
+        "breakeven_pop": metrics.breakeven_pop,
+        "probability_of_touch_est": metrics.probability_of_touch_est,
+        "expected_move": metrics.expected_move,
+        "expected_move_pct": metrics.expected_move_pct,
+        "distance_to_strike_pct": metrics.distance_to_strike_pct,
+        "distance_to_breakeven_pct": metrics.distance_to_breakeven_pct,
+        "expected_move_coverage": metrics.expected_move_coverage,
+        "capital_requirement_model": metrics.capital_requirement_model.as_str(),
+        "estimated_buying_power_requirement": metrics.estimated_buying_power_requirement,
+        "return_on_buying_power": metrics.return_on_buying_power,
+        "model_delta_abs": metrics.model_delta_abs,
+        "model_gamma": metrics.model_gamma,
+        "model_theta": metrics.model_theta,
+        "model_vega": metrics.model_vega,
+    })
 }
 
 fn merge_vec<T>(child: Vec<T>, parent: Vec<T>) -> Vec<T> {
@@ -2107,6 +2590,8 @@ mod tests {
             r#"
 [runtime]
 max_iterations = 0
+candidate_ledger_enabled = true
+candidate_ledger_max_candidates = 5
 
 [index]
 underlyings = ["SPY", "GLD"]
@@ -2131,6 +2616,7 @@ extends = "base.toml"
 
 [runtime]
 strategies = ["naked_put"]
+candidate_ledger_max_candidates = 20
 
 [naked_scanner]
 max_buying_power_usage_pct = 0.03
@@ -2149,6 +2635,8 @@ GDX = "metals"
         assert!(merged.extends.is_none());
         assert_eq!(merged.runtime.strategies, vec!["naked_put"]);
         assert_eq!(merged.runtime.max_iterations, Some(0));
+        assert_eq!(merged.runtime.candidate_ledger_enabled, Some(true));
+        assert_eq!(merged.runtime.candidate_ledger_max_candidates, Some(20));
         assert_eq!(merged.index.underlyings, vec!["SPY", "GLD"]);
         assert_eq!(merged.index.quantity, Some(1));
         assert_eq!(merged.naked_scanner.max_buying_power_usage_pct, Some(0.03),);
@@ -2178,6 +2666,9 @@ manage = true
 close = true
 kill_switch = true
 state_path = "/tmp/alpaca-state.json"
+candidate_ledger_enabled = true
+candidate_ledger_dir = "/tmp/candidate-ledger"
+candidate_ledger_max_candidates = 7
 
 [index]
 underlyings = ["SPY", "QQQ"]
@@ -2288,6 +2779,12 @@ expiration_exit_days = 2
 
         assert_eq!(config.runtime.strategies, vec!["put", "iron_condor"]);
         assert_eq!(config.runtime.dry_run_strategies, vec!["iron_condor"]);
+        assert_eq!(config.runtime.candidate_ledger_enabled, Some(true));
+        assert_eq!(
+            config.runtime.candidate_ledger_dir,
+            Some(PathBuf::from("/tmp/candidate-ledger")),
+        );
+        assert_eq!(config.runtime.candidate_ledger_max_candidates, Some(7));
         assert_eq!(config.index.underlyings, vec!["SPY", "QQQ"]);
         assert_eq!(config.scanner.widths, Some(vec![2.0, 5.0]));
         assert_eq!(config.scanner.min_credit_to_width, Some(0.09));

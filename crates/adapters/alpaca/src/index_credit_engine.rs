@@ -364,6 +364,9 @@ pub async fn run_index_credit_engine() -> anyhow::Result<()> {
             "max_close_attempts": config.max_close_attempts,
             "close_reprice_cooldown_secs": config.close_reprice_cooldown_secs,
             "state_path": config.state_path.display().to_string(),
+            "candidate_ledger_enabled": config.candidate_ledger_enabled,
+            "candidate_ledger_dir": config.candidate_ledger_dir.display().to_string(),
+            "candidate_ledger_max_candidates": config.candidate_ledger_max_candidates,
             "hosted_strategy": strategy.name(),
         }),
     );
@@ -388,6 +391,7 @@ pub async fn run_index_credit_engine() -> anyhow::Result<()> {
                 "trade_date": trade_date,
             }),
         );
+        record_scan_started(&config, &trade_date, iteration, strategy.name());
 
         if manage_existing_entries(&http_client, &data_config, &config, &mut state).await? {
             save_strategy_state_atomic(&config.state_path, &state)?;
@@ -417,6 +421,127 @@ pub async fn run_index_credit_engine() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn record_scan_started(
+    config: &IndexCreditConfig,
+    trade_date: &str,
+    iteration: u64,
+    hosted_strategy: &str,
+) {
+    config.record_candidate_ledger(
+        trade_date,
+        "scan_started",
+        json!({
+            "iteration": iteration,
+            "hosted_strategy": hosted_strategy,
+            "underlyings": &config.underlyings,
+            "strategies": config.enabled_strategy_names(),
+            "dry_run_strategies": config.dry_run_strategy_names(),
+            "entry_window": {
+                "start": config.entry_start.to_string(),
+                "end": config.entry_end.to_string(),
+                "timezone": config.entry_timezone.to_string(),
+                "ignore": config.ignore_entry_window,
+            },
+        }),
+    );
+    config.record_candidate_ledger(
+        trade_date,
+        "threshold_snapshot",
+        candidate_ledger_threshold_snapshot(config),
+    );
+}
+
+fn candidate_ledger_threshold_snapshot(config: &IndexCreditConfig) -> serde_json::Value {
+    json!({
+        "underlyings": &config.underlyings,
+        "strategies": config.enabled_strategy_names(),
+        "dry_run_strategies": config.dry_run_strategy_names(),
+        "quantity": config.quantity,
+        "submit_enabled": config.submit_enabled,
+        "manage_enabled": config.manage_enabled,
+        "close_enabled": config.close_enabled,
+        "kill_switch": config.kill_switch,
+        "risk": {
+            "max_active_entries": config.max_active_entries,
+            "max_daily_submits": config.max_daily_submits,
+            "max_open_orders": config.max_open_orders,
+            "max_active_entries_per_underlying": config.max_active_entries_per_underlying,
+            "max_active_entries_per_sector": config.max_active_entries_per_sector,
+            "sectors": &config.sectors,
+        },
+        "credit_scanner": {
+            "min_dte": config.scanner.min_dte,
+            "max_dte": config.scanner.max_dte,
+            "short_delta_min": config.scanner.short_delta_min,
+            "short_delta_max": config.scanner.short_delta_max,
+            "widths": &config.scanner.widths,
+            "min_open_interest": config.scanner.min_open_interest,
+            "max_leg_spread_pct": config.scanner.max_leg_spread_pct,
+            "min_return_on_risk": config.scanner.min_return_on_risk,
+            "min_credit_to_width": config.scanner.min_credit_to_width,
+        },
+        "iron_condor_scanner": {
+            "min_return_on_risk": config.iron_condor_scanner.min_return_on_risk,
+            "require_equal_widths": config.iron_condor_scanner.require_equal_widths,
+        },
+        "debit_scanner": {
+            "min_dte": config.debit_scanner.min_dte,
+            "max_dte": config.debit_scanner.max_dte,
+            "long_delta_min": config.debit_scanner.long_delta_min,
+            "long_delta_max": config.debit_scanner.long_delta_max,
+            "widths": &config.debit_scanner.widths,
+            "min_open_interest": config.debit_scanner.min_open_interest,
+            "max_leg_spread_pct": config.debit_scanner.max_leg_spread_pct,
+            "max_debit_to_width": config.debit_scanner.max_debit_to_width,
+            "min_debit_to_width": config.debit_scanner.min_debit_to_width,
+            "min_reward_to_risk": config.debit_scanner.min_reward_to_risk,
+        },
+        "naked_scanner": naked_scanner_threshold_snapshot(&config.naked_scanner),
+        "naked_1_3dte_scanner": naked_scanner_threshold_snapshot(&config.naked_1_3dte_scanner),
+    })
+}
+
+fn naked_scanner_threshold_snapshot(
+    scanner: &crate::strategy::NakedOptionScannerConfig,
+) -> serde_json::Value {
+    json!({
+        "min_dte": scanner.min_dte,
+        "max_dte": scanner.max_dte,
+        "short_delta_min": scanner.short_delta_min,
+        "short_delta_max": scanner.short_delta_max,
+        "min_open_interest": scanner.min_open_interest,
+        "max_spread_pct": scanner.max_spread_pct,
+        "min_credit": scanner.min_credit,
+        "min_bid_size": scanner.min_bid_size,
+        "min_ask_size": scanner.min_ask_size,
+        "min_daily_volume": scanner.min_daily_volume,
+        "min_implied_volatility": scanner.min_implied_volatility,
+        "max_implied_volatility": scanner.max_implied_volatility,
+        "min_annualized_premium_yield": scanner.min_annualized_premium_yield,
+        "max_buying_power_usage_pct": scanner.max_buying_power_usage_pct,
+        "min_return_on_buying_power": scanner.min_return_on_buying_power,
+        "min_breakeven_pop": scanner.min_breakeven_pop,
+        "max_probability_of_touch": scanner.max_probability_of_touch,
+        "min_distance_to_breakeven_pct": scanner.min_distance_to_breakeven_pct,
+        "min_expected_move_coverage": scanner.min_expected_move_coverage,
+        "min_score": scanner.min_score,
+    })
+}
+
+fn record_decision_event(config: &IndexCreditConfig, trade_date: &str, payload: serde_json::Value) {
+    emit_operator_event("decision", payload.clone());
+    config.record_candidate_ledger(trade_date, "decision", payload);
+}
+
+fn record_submit_result_event(
+    config: &IndexCreditConfig,
+    trade_date: &str,
+    payload: serde_json::Value,
+) {
+    emit_operator_event("submit_result", payload.clone());
+    config.record_candidate_ledger(trade_date, "submit_result", payload);
+}
+
 async fn apply_strategy_decision(
     decision: StrategyDecision,
     config: &IndexCreditConfig,
@@ -431,8 +556,9 @@ async fn apply_strategy_decision(
                 "decision: skipped reason=outside_entry_window window={}-{} timezone={}",
                 config.entry_start, config.entry_end, config.entry_timezone
             );
-            emit_operator_event(
-                "decision",
+            record_decision_event(
+                config,
+                trade_date,
                 json!({
                     "action": "skipped",
                     "reason": "outside_entry_window",
@@ -446,8 +572,9 @@ async fn apply_strategy_decision(
         }
         StrategyDecision::Skip { reason } => {
             println!("decision: skipped reason={reason}");
-            emit_operator_event(
-                "decision",
+            record_decision_event(
+                config,
+                trade_date,
                 json!({
                     "action": "skipped",
                     "reason": reason,
@@ -462,8 +589,9 @@ async fn apply_strategy_decision(
             limit,
         } => {
             println!("decision: skipped reason={reason} current={current} limit={limit}");
-            emit_operator_event(
-                "decision",
+            record_decision_event(
+                config,
+                trade_date,
                 json!({
                     "action": "skipped",
                     "reason": reason,
@@ -486,8 +614,9 @@ async fn apply_strategy_decision(
                 entry.candidate.score,
                 order_list_id,
             );
-            emit_operator_event(
-                "decision",
+            record_decision_event(
+                config,
+                trade_date,
                 json!({
                     "action": "submit",
                     "underlying": &entry.underlying,
@@ -517,8 +646,9 @@ async fn apply_strategy_decision(
                 "submit_result: accepted={} rejected={}",
                 outcome.accepted, outcome.rejected
             );
-            emit_operator_event(
-                "submit_result",
+            record_submit_result_event(
+                config,
+                trade_date,
                 json!({
                     "accepted": outcome.accepted,
                     "rejected": outcome.rejected,
@@ -541,8 +671,9 @@ async fn apply_strategy_decision(
                 entry.candidate.score,
                 order_list_id,
             );
-            emit_operator_event(
-                "decision",
+            record_decision_event(
+                config,
+                trade_date,
                 json!({
                     "action": "submit",
                     "underlying": &entry.underlying,
@@ -574,8 +705,9 @@ async fn apply_strategy_decision(
                 "submit_result: accepted={} rejected={}",
                 outcome.accepted, outcome.rejected
             );
-            emit_operator_event(
-                "submit_result",
+            record_submit_result_event(
+                config,
+                trade_date,
                 json!({
                     "accepted": outcome.accepted,
                     "rejected": outcome.rejected,
@@ -596,8 +728,9 @@ async fn apply_strategy_decision(
                 entry.candidate.score,
                 order_list_id,
             );
-            emit_operator_event(
-                "decision",
+            record_decision_event(
+                config,
+                trade_date,
                 json!({
                     "action": "submit",
                     "underlying": &entry.underlying,
@@ -628,8 +761,9 @@ async fn apply_strategy_decision(
                 "submit_result: accepted={} rejected={}",
                 outcome.accepted, outcome.rejected
             );
-            emit_operator_event(
-                "submit_result",
+            record_submit_result_event(
+                config,
+                trade_date,
                 json!({
                     "accepted": outcome.accepted,
                     "rejected": outcome.rejected,
@@ -672,8 +806,9 @@ async fn apply_strategy_decision(
                     order_list_id,
                 );
             }
-            emit_operator_event(
-                "decision",
+            record_decision_event(
+                config,
+                trade_date,
                 json!({
                     "action": "submit",
                     "underlying": &entry.underlying,
@@ -735,8 +870,9 @@ async fn apply_strategy_decision(
                 "submit_result: accepted={} rejected={}",
                 outcome.accepted, outcome.rejected
             );
-            emit_operator_event(
-                "submit_result",
+            record_submit_result_event(
+                config,
+                trade_date,
                 json!({
                     "accepted": outcome.accepted,
                     "rejected": outcome.rejected,
@@ -755,8 +891,9 @@ async fn apply_strategy_decision(
                 entry.candidate.return_on_risk * 100.0,
                 entry.candidate.score,
             );
-            emit_operator_event(
-                "decision",
+            record_decision_event(
+                config,
+                trade_date,
                 json!({
                     "action": "dry_run",
                     "reason": "submission_disabled",
@@ -784,8 +921,9 @@ async fn apply_strategy_decision(
                 entry.candidate.return_on_risk * 100.0,
                 entry.candidate.score,
             );
-            emit_operator_event(
-                "decision",
+            record_decision_event(
+                config,
+                trade_date,
                 json!({
                     "action": "dry_run",
                     "reason": "submission_disabled",
@@ -813,8 +951,9 @@ async fn apply_strategy_decision(
                 entry.candidate.reward_to_risk * 100.0,
                 entry.candidate.score,
             );
-            emit_operator_event(
-                "decision",
+            record_decision_event(
+                config,
+                trade_date,
                 json!({
                     "action": "dry_run",
                     "reason": "submission_disabled",
@@ -861,8 +1000,9 @@ async fn apply_strategy_decision(
                     entry.candidate.score,
                 );
             }
-            emit_operator_event(
-                "decision",
+            record_decision_event(
+                config,
+                trade_date,
                 json!({
                     "action": "dry_run",
                     "reason": "submission_disabled",
@@ -911,8 +1051,9 @@ async fn apply_strategy_decision(
         }
         StrategyDecision::NoEntry => {
             println!("decision: no_entry");
-            emit_operator_event(
-                "decision",
+            record_decision_event(
+                config,
+                trade_date,
                 json!({
                     "action": "no_entry",
                     "trade_date": trade_date,
@@ -2431,6 +2572,9 @@ mod tests {
             entry_end: NaiveTime::from_hms_opt(14, 30, 0).unwrap(),
             entry_timezone: "America/New_York".parse().unwrap(),
             state_path: PathBuf::from("state.json"),
+            candidate_ledger_enabled: false,
+            candidate_ledger_dir: PathBuf::from("candidate-ledger"),
+            candidate_ledger_max_candidates: 10,
             scanner: PutCreditScannerConfig::default(),
             iron_condor_scanner: IronCondorScannerConfig::default(),
             debit_scanner: DebitSpreadScannerConfig::default(),
