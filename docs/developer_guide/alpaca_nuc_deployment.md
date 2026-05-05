@@ -172,6 +172,11 @@ role and strategy set.
 - TOML `management.max_close_attempts` caps accepted close submissions per entry. Set `0` only for
   unlimited reprice attempts.
 - TOML `management.close_reprice_cooldown_secs` delays resubmission after a close attempt.
+- TOML `management.expiration_exit_days` applies to credit and debit spreads so near-expiration
+  tracked exposure is treated as a close candidate.
+- TOML `[scanner] min_credit_to_width` and `[debit_scanner] min_debit_to_width` reject underpaid
+  spread candidates before ranking. Candidate ranking also favors centered DTE and stronger
+  minimum-leg open interest.
 - TOML `[risk] max_active_entries`, `max_daily_submits`, and `max_open_orders` cap account-level
   exposure before any hosted strategy can submit. Env overrides are available as
   `ALPACA_MAX_ACTIVE_ENTRIES`, `ALPACA_MAX_DAILY_SUBMITS`, and `ALPACA_MAX_OPEN_ORDERS`.
@@ -202,7 +207,9 @@ it does not start services, submit orders, or change account state.
 
 Operator status reports fleet policy blocks as critical `fleet_policy_block` alerts. It also reports
 partial fills and accepted/new orders that have not filled yet so stale order handling can be
-separated from ordinary working-order latency.
+separated from ordinary working-order latency. `last_management_snapshot` includes the latest
+managed spread mark, net premium kind, unrealized PnL, hold time, days to expiration, and any active
+close trigger.
 
 The command reports one engine state:
 
@@ -237,7 +244,8 @@ After the account is flat, set `ALPACA_FORCE_FLATTEN=false` and restart the serv
 
 Stuck close order:
 
-- Check `orders.open`, `active_entries[].close_attempts`, and `last_management_block`.
+- Check `orders.open`, `active_entries[].close_attempts`, `last_management_snapshot`, and
+  `last_management_block`.
 - The engine cancels stale close orders after `management.stale_close_secs`.
 - If `close_attempts_exhausted` appears, inspect the spread, then either increase
   `management.max_close_attempts`, set `ALPACA_FORCE_FLATTEN=true`, or flatten manually at the

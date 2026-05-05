@@ -37,8 +37,9 @@ Completed foundation:
 - The fork has a documented upstream sync workflow in `AGENTS.md`.
 - Native `index_put_credit_entry` and `index_call_credit_entry` scanner/entry paths run from the
   Rust Alpaca runner and submit through Nautilus `SubmitOrderList` when explicitly enabled.
-- Initial credit-spread management can cancel stale entries, evaluate close triggers, build
-  reduce-only close MLegs, and mark filled closes in strategy state.
+- Initial credit/debit spread management can cancel stale entries, evaluate close triggers with
+  expiration-risk exits, emit management snapshots with PnL context, build reduce-only close MLegs,
+  and mark filled closes in strategy state.
 - The NUC has a supervised user service, external env file, lock, logs, health command, operator
   status command, and kill-switch/submission gates.
 
@@ -123,9 +124,10 @@ Work:
   `alpaca-index-credit-engine` Rust runner complete; it scans, applies broker/state admission,
   selects one entry, and can submit through the Alpaca `SubmitOrderList` execution path when
   explicitly enabled.)
-- Port scanner parameters for underlyings, DTE, width, delta, open interest, leg spread, and minimum
-  return-on-risk. (Runner reads these from `ALPACA_CONFIG_PATH`, defaulting to
-  `~/.config/nautilus-trader/alpaca/index-credit.toml`.)
+- Port scanner parameters for underlyings, DTE, width, delta, open interest, leg spread, minimum
+  return-on-risk, and credit/debit-to-width floors. (Runner reads these from `ALPACA_CONFIG_PATH`,
+  defaulting to `~/.config/nautilus-trader/alpaca/index-credit.toml`; ranking favors centered DTE
+  and stronger minimum-leg open interest.)
 - Add account/position/open-order admission checks. (Runner uses the Alpaca adapter admission gate.)
 - Add deterministic sizing and daily duplicate-entry controls. (Runner uses TOML `index.quantity`
   and persists submitted entries by trade date and underlying.)
@@ -187,8 +189,8 @@ Goal: make openings safe by owning the complete lifecycle.
 Work:
 
 - Add profit target, stop loss, max adverse move, stale order timeout, time-based exit, and
-  expiration-risk exit. (Initial profit-target, stop-loss-debit, max-hold, stale-entry, and
-  expiration-risk evaluation complete.)
+  expiration-risk exit. (Initial profit-target, stop-loss-debit, max-hold, stale-entry, debit and
+  credit expiration-risk evaluation, and management snapshot telemetry complete.)
 - Implement close MLeg order-list construction for verticals. (Initial reduce-only close
   `SubmitOrderList` construction complete for credit verticals.)
 - Add cancel stale entry and close orders. (Runner can cancel stale entry orders and submit close
@@ -521,6 +523,8 @@ Parked next steps for earnings debit:
   another account-owning service.
 - Define long-premium management rules before any non-smoke paper open: max debit at entry,
   profit target, stop loss, time stop, expiration-risk handling, and manual flatten behavior.
+  (Initial debit profit target, stop loss, time stop, expiration-risk, and manual flatten handling
+  are wired; paper proof is still pending.)
 - Validate in order: market-hours dry-run, submit-with-cancel smoke, paper open with defined close
   management, then multi-day soak.
 

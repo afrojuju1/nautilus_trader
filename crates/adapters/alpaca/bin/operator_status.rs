@@ -74,6 +74,7 @@ struct OperatorStatus {
     last_scan: Option<Value>,
     last_scanner_diagnostic: Option<Value>,
     last_decision: Option<Value>,
+    last_management_snapshot: Option<Value>,
     last_management_block: Option<Value>,
     last_broker_event: Option<Value>,
     alerts: Vec<OperatorAlert>,
@@ -442,6 +443,7 @@ fn build_status(
     let last_scan = latest_event(events, "strategy_iteration");
     let last_scanner_diagnostic = latest_event(events, "scanner_diagnostic");
     let last_decision = latest_event(events, "decision");
+    let last_management_snapshot = latest_event(events, "management_snapshot");
     let last_management_block = latest_event(events, "management_block");
     let last_broker_event = latest_broker_event(recent_orders, activities);
 
@@ -484,6 +486,7 @@ fn build_status(
         last_scan,
         last_scanner_diagnostic,
         last_decision,
+        last_management_snapshot,
         last_management_block,
         last_broker_event,
         alerts,
@@ -705,6 +708,19 @@ fn build_alerts(
             format!("recent management block: {reason}"),
         ));
     }
+    if let Some(event) = latest_recent_event(events, "management_snapshot", 3600)
+        && let Some(reason) = event.get("close_reason").and_then(Value::as_str)
+    {
+        let underlying = event
+            .get("underlying")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        alerts.push(alert(
+            AlertSeverity::Warning,
+            "close_trigger_active",
+            format!("{underlying} has an active close trigger: {reason}"),
+        ));
+    }
     if recent_event_count(events, "runner_start", 3600) > 1 {
         alerts.push(alert(
             AlertSeverity::Warning,
@@ -859,6 +875,13 @@ fn print_human_status(status: &OperatorStatus) {
         "last_decision: {}",
         status
             .last_decision
+            .as_ref()
+            .map_or_else(|| "none".to_string(), compact_json)
+    );
+    println!(
+        "last_management_snapshot: {}",
+        status
+            .last_management_snapshot
             .as_ref()
             .map_or_else(|| "none".to_string(), compact_json)
     );

@@ -98,6 +98,7 @@ fn strategy_config_from_env() -> PutCreditScannerConfig {
         min_open_interest: env_parse("ALPACA_DRY_RUN_MIN_OPEN_INTEREST", 200),
         max_leg_spread_pct: env_parse("ALPACA_DRY_RUN_MAX_LEG_SPREAD_PCT", 0.15),
         min_return_on_risk: env_parse("ALPACA_DRY_RUN_MIN_RETURN_ON_RISK", 0.13),
+        min_credit_to_width: env_parse("ALPACA_DRY_RUN_MIN_CREDIT_TO_WIDTH", 0.08),
     }
 }
 

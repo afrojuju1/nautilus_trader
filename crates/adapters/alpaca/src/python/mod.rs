@@ -53,6 +53,9 @@ pub struct AlpacaPutCreditScannerConfig {
     /// Minimum credit / max loss.
     #[pyo3(get, set)]
     pub min_return_on_risk: f64,
+    /// Minimum credit as a fraction of spread width.
+    #[pyo3(get, set)]
+    pub min_credit_to_width: f64,
 }
 
 #[pymethods]
@@ -68,6 +71,7 @@ impl AlpacaPutCreditScannerConfig {
         min_open_interest = 200,
         max_leg_spread_pct = 0.15,
         min_return_on_risk = 0.13,
+        min_credit_to_width = 0.08,
     ))]
     #[expect(clippy::too_many_arguments)]
     pub fn new(
@@ -79,6 +83,7 @@ impl AlpacaPutCreditScannerConfig {
         min_open_interest: u64,
         max_leg_spread_pct: f64,
         min_return_on_risk: f64,
+        min_credit_to_width: f64,
     ) -> Self {
         Self {
             min_dte,
@@ -89,6 +94,7 @@ impl AlpacaPutCreditScannerConfig {
             min_open_interest,
             max_leg_spread_pct,
             min_return_on_risk,
+            min_credit_to_width,
         }
     }
 }
@@ -104,6 +110,7 @@ impl From<AlpacaPutCreditScannerConfig> for PutCreditScannerConfig {
             min_open_interest: value.min_open_interest,
             max_leg_spread_pct: value.max_leg_spread_pct,
             min_return_on_risk: value.min_return_on_risk,
+            min_credit_to_width: value.min_credit_to_width,
         }
     }
 }
@@ -212,7 +219,7 @@ pub fn scan_put_credit_once(
 ) -> PyResult<Vec<AlpacaPutCreditScanResult>> {
     py.detach(move || {
         let scanner_config = config.unwrap_or_else(|| {
-            AlpacaPutCreditScannerConfig::new(5, 10, 0.18, 0.28, None, 200, 0.15, 0.13)
+            AlpacaPutCreditScannerConfig::new(5, 10, 0.18, 0.28, None, 200, 0.15, 0.13, 0.08)
         });
         let scanner_config = PutCreditScannerConfig::from(scanner_config);
         let mut data_config = AlpacaDataClientConfig::default();

@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use chrono::{NaiveDate, Utc};
 use time::{Duration, OffsetDateTime};
 
 use crate::{
@@ -100,6 +101,8 @@ pub struct PutCreditScannerConfig {
     pub max_leg_spread_pct: f64,
     /// Minimum credit / max loss.
     pub min_return_on_risk: f64,
+    /// Minimum credit as a fraction of spread width.
+    pub min_credit_to_width: f64,
 }
 
 impl Default for PutCreditScannerConfig {
@@ -113,6 +116,7 @@ impl Default for PutCreditScannerConfig {
             min_open_interest: 200,
             max_leg_spread_pct: 0.15,
             min_return_on_risk: 0.13,
+            min_credit_to_width: 0.08,
         }
     }
 }
@@ -136,6 +140,8 @@ pub struct DebitSpreadScannerConfig {
     pub max_leg_spread_pct: f64,
     /// Maximum debit as a fraction of spread width.
     pub max_debit_to_width: f64,
+    /// Minimum debit as a fraction of spread width.
+    pub min_debit_to_width: f64,
     /// Minimum max-profit / max-loss.
     pub min_reward_to_risk: f64,
 }
@@ -151,6 +157,7 @@ impl Default for DebitSpreadScannerConfig {
             min_open_interest: 200,
             max_leg_spread_pct: 0.15,
             max_debit_to_width: 0.55,
+            min_debit_to_width: 0.20,
             min_reward_to_risk: 0.75,
         }
     }
@@ -184,6 +191,8 @@ pub struct ScoredContract {
     pub symbol: String,
     /// Contract expiration date.
     pub expiration_date: String,
+    /// Calendar days to expiration from the scan date.
+    pub dte: i64,
     /// Strike price.
     pub strike: f64,
     /// Bid price.
@@ -194,6 +203,8 @@ pub struct ScoredContract {
     pub delta_abs: f64,
     /// Bid/ask spread as a fraction of midpoint.
     pub spread_pct: f64,
+    /// Contract open interest.
+    pub open_interest: u64,
     /// Implied volatility, if present.
     pub implied_volatility: Option<f64>,
 }
@@ -536,11 +547,13 @@ pub fn score_contracts(
             Some(ScoredContract {
                 symbol: contract.symbol.clone(),
                 expiration_date: contract.expiration_date.clone(),
+                dte: days_to_expiration(&contract.expiration_date)?,
                 strike: contract.strike_price.parse::<f64>().ok()?,
                 bid,
                 ask,
                 delta_abs,
                 spread_pct,
+                open_interest,
                 implied_volatility: snapshot.implied_volatility,
             })
         })
@@ -583,11 +596,13 @@ pub fn score_debit_contracts(
             Some(ScoredContract {
                 symbol: contract.symbol.clone(),
                 expiration_date: contract.expiration_date.clone(),
+                dte: days_to_expiration(&contract.expiration_date)?,
                 strike: contract.strike_price.parse::<f64>().ok()?,
                 bid,
                 ask,
                 delta_abs,
                 spread_pct,
+                open_interest,
                 implied_volatility: snapshot.implied_volatility,
             })
         })
@@ -646,17 +661,30 @@ pub fn build_candidates_for_kind(
             if return_on_risk < config.min_return_on_risk {
                 continue;
             }
+            let credit_to_width = credit / *width;
+            if credit_to_width < config.min_credit_to_width {
+                continue;
+            }
 
             let delta_midpoint = (config.short_delta_min + config.short_delta_max) / 2.0;
             let delta_half_range = (config.short_delta_max - config.short_delta_min) / 2.0;
             let delta_score =
                 (1.0 - ((short.delta_abs - delta_midpoint).abs() / delta_half_range)).max(0.0);
             let ror_score = (return_on_risk / config.min_return_on_risk).min(2.0) / 2.0;
-            let credit_score = (credit / width).min(0.5) / 0.5;
+            let credit_score = credit_to_width.min(0.5) / 0.5;
+            let term_score = term_score(short.dte, config.min_dte, config.max_dte);
+            let liquidity_score = liquidity_score(
+                short.open_interest.min(long.open_interest),
+                config.min_open_interest,
+            );
             let spread_penalty =
                 ((short.spread_pct + long.spread_pct) / (2.0 * config.max_leg_spread_pct)).min(1.0);
-            let score =
-                delta_score * 35.0 + ror_score * 30.0 + credit_score * 25.0 - spread_penalty * 10.0;
+            let score = delta_score * 35.0
+                + ror_score * 30.0
+                + credit_score * 25.0
+                + term_score * 10.0
+                + liquidity_score * 5.0
+                - spread_penalty * 10.0;
 
             candidates.push(SpreadCandidate {
                 short: short.clone(),
@@ -714,7 +742,10 @@ pub fn build_debit_candidates_for_kind(
             if debit <= 0.0 || debit >= *width {
                 continue;
             }
-            if debit / *width > config.max_debit_to_width {
+            let debit_to_width = debit / *width;
+            if debit_to_width > config.max_debit_to_width
+                || debit_to_width < config.min_debit_to_width
+            {
                 continue;
             }
             let max_profit = width - debit;
@@ -728,10 +759,19 @@ pub fn build_debit_candidates_for_kind(
             let delta_score =
                 (1.0 - ((long.delta_abs - delta_midpoint).abs() / delta_half_range)).max(0.0);
             let reward_score = (reward_to_risk / config.min_reward_to_risk).min(2.0) / 2.0;
-            let debit_score = (1.0 - (debit / *width) / config.max_debit_to_width).max(0.0);
+            let debit_score = (1.0 - debit_to_width / config.max_debit_to_width).max(0.0);
+            let term_score = term_score(long.dte, config.min_dte, config.max_dte);
+            let liquidity_score = liquidity_score(
+                long.open_interest.min(short.open_interest),
+                config.min_open_interest,
+            );
             let spread_penalty =
                 ((long.spread_pct + short.spread_pct) / (2.0 * config.max_leg_spread_pct)).min(1.0);
-            let score = delta_score * 35.0 + reward_score * 30.0 + debit_score * 25.0
+            let score = delta_score * 35.0
+                + reward_score * 30.0
+                + debit_score * 25.0
+                + term_score * 10.0
+                + liquidity_score * 5.0
                 - spread_penalty * 10.0;
 
             candidates.push(DebitSpreadCandidate {
@@ -814,6 +854,31 @@ pub fn build_iron_condor_candidates(
 
 fn strike_key(strike: f64) -> i64 {
     (strike * 1_000.0).round() as i64
+}
+
+fn days_to_expiration(expiration_date: &str) -> Option<i64> {
+    let expiration = NaiveDate::parse_from_str(expiration_date, "%Y-%m-%d").ok()?;
+    Some(
+        expiration
+            .signed_duration_since(Utc::now().date_naive())
+            .num_days(),
+    )
+}
+
+fn term_score(dte: i64, min_dte: i64, max_dte: i64) -> f64 {
+    if max_dte <= min_dte {
+        return if dte == min_dte { 1.0 } else { 0.0 };
+    }
+    let midpoint = (min_dte + max_dte) as f64 / 2.0;
+    let half_range = (max_dte - min_dte) as f64 / 2.0;
+    (1.0 - ((dte as f64 - midpoint).abs() / half_range)).max(0.0)
+}
+
+fn liquidity_score(open_interest: u64, min_open_interest: u64) -> f64 {
+    if min_open_interest == 0 {
+        return 1.0;
+    }
+    (open_interest as f64 / (min_open_interest as f64 * 5.0)).min(1.0)
 }
 
 #[cfg(test)]
@@ -902,6 +967,65 @@ mod tests {
     }
 
     #[test]
+    fn credit_candidates_require_min_credit_to_width() {
+        let config = PutCreditScannerConfig {
+            widths: vec![3.0],
+            min_return_on_risk: 0.01,
+            min_credit_to_width: 0.05,
+            ..Default::default()
+        };
+        let contracts = vec![
+            scored("SPY-P-705", 705.0, 2.00, 2.05),
+            scored("SPY-P-708", 708.0, 2.10, 2.15),
+        ];
+
+        let candidates = build_candidates_for_kind(&contracts, &config, CreditSpreadKind::Put);
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn debit_candidates_require_min_debit_to_width() {
+        let config = DebitSpreadScannerConfig {
+            widths: vec![3.0],
+            min_reward_to_risk: 0.01,
+            min_debit_to_width: 0.25,
+            max_debit_to_width: 0.90,
+            ..Default::default()
+        };
+        let contracts = vec![
+            scored("SPY-C-710", 710.0, 2.50, 2.60),
+            scored("SPY-C-713", 713.0, 2.00, 2.05),
+        ];
+
+        let candidates =
+            build_debit_candidates_for_kind(&contracts, &config, DebitSpreadKind::Call);
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn scanner_score_prefers_centered_dte_when_other_inputs_match() {
+        let config = PutCreditScannerConfig {
+            min_dte: 5,
+            max_dte: 15,
+            widths: vec![3.0],
+            min_return_on_risk: 0.01,
+            ..Default::default()
+        };
+        let contracts = vec![
+            scored_with_expiry("SPY260510P00705000", "2026-05-10", 5, 705.0, 2.00, 2.05),
+            scored_with_expiry("SPY260510P00708000", "2026-05-10", 5, 708.0, 2.50, 2.60),
+            scored_with_expiry("SPY260515P00705000", "2026-05-15", 10, 705.0, 2.00, 2.05),
+            scored_with_expiry("SPY260515P00708000", "2026-05-15", 10, 708.0, 2.50, 2.60),
+        ];
+
+        let candidates = build_candidates_for_kind(&contracts, &config, CreditSpreadKind::Put);
+
+        assert_eq!(candidates[0].short.expiration_date, "2026-05-15");
+    }
+
+    #[test]
     fn iron_condor_candidates_combine_put_and_call_credit_wings() {
         let credit_config = PutCreditScannerConfig {
             widths: vec![3.0],
@@ -942,14 +1066,27 @@ mod tests {
     }
 
     fn scored(symbol: &str, strike: f64, bid: f64, ask: f64) -> ScoredContract {
+        scored_with_expiry(symbol, "2026-05-15", 10, strike, bid, ask)
+    }
+
+    fn scored_with_expiry(
+        symbol: &str,
+        expiration_date: &str,
+        dte: i64,
+        strike: f64,
+        bid: f64,
+        ask: f64,
+    ) -> ScoredContract {
         ScoredContract {
             symbol: symbol.to_string(),
-            expiration_date: "2026-05-15".to_string(),
+            expiration_date: expiration_date.to_string(),
+            dte,
             strike,
             bid,
             ask,
             delta_abs: 0.22,
             spread_pct: 0.02,
+            open_interest: 1_000,
             implied_volatility: Some(0.20),
         }
     }

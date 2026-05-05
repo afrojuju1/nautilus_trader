@@ -31,6 +31,7 @@ widths = [2.0, 3.0, 5.0]
 min_open_interest = 200
 max_leg_spread_pct = 0.15
 min_return_on_risk = 0.13
+min_credit_to_width = 0.08
 
 [iron_condor]
 min_return_on_risk = 0.18
@@ -46,6 +47,7 @@ widths = [2.0, 3.0, 5.0]
 min_open_interest = 200
 max_leg_spread_pct = 0.15
 max_debit_to_width = 0.55
+min_debit_to_width = 0.20
 min_reward_to_risk = 0.75
 
 [risk]

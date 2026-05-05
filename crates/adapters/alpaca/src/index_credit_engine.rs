@@ -37,7 +37,7 @@ use crate::{
         IndexCreditConfig, SelectedDebitEntry, SelectedEntry, SelectedIndexEntry,
         SelectedIronCondorEntry, select_index_strategy_entry,
     },
-    management::credit_spread_close_reason,
+    management::{credit_spread_close_reason, days_to_expiration, recorded_age_secs},
     runtime::{
         StrategyState, StrategyStateEntry, credit_spread_strategy_name, debit_spread_strategy_name,
         emit_operator_event, load_strategy_state, save_strategy_state_atomic,
@@ -1025,9 +1025,21 @@ async fn manage_existing_entries(
                 "manage: close_quote_unavailable short={} long={}",
                 entry.short_symbol, entry.long_symbol
             );
+            emit_operator_event(
+                "management_block",
+                json!({
+                    "action": "close_blocked",
+                    "reason": "close_quote_unavailable",
+                    "underlying": entry.underlying,
+                    "strategy": entry.strategy,
+                    "short_symbol": entry.short_symbol,
+                    "long_symbol": entry.long_symbol,
+                }),
+            );
             continue;
         };
         let close_reason = close_reason(config, entry, close_quote.debit);
+        emit_management_snapshot(entry, &close_quote, close_reason.as_deref());
         if entry.is_debit_spread() {
             println!(
                 "manage: position underlying={} strategy={} close_credit={:.2} entry_debit={:.2} reason={}",
@@ -1052,6 +1064,22 @@ async fn manage_existing_entries(
             continue;
         };
         if !(config.manage_enabled && config.close_enabled) {
+            let reason = if !config.manage_enabled {
+                "management_disabled"
+            } else {
+                "close_disabled"
+            };
+            emit_operator_event(
+                "management_block",
+                json!({
+                    "action": "close_blocked",
+                    "reason": reason,
+                    "underlying": entry.underlying,
+                    "trigger": close_reason,
+                    "manage_enabled": config.manage_enabled,
+                    "close_enabled": config.close_enabled,
+                }),
+            );
             continue;
         }
         if close_attempts_exhausted(config, entry) {
@@ -1266,7 +1294,7 @@ fn debit_spread_close_reason(
     close_credit: f64,
 ) -> Option<String> {
     if config.force_flatten {
-        return Some("force_flatten".to_string());
+        return Some("manual_flatten".to_string());
     }
     let entry_debit = entry.debit?;
     if close_credit >= entry_debit * (1.0 + config.profit_target_close_fraction.max(0.0)) {
@@ -1289,7 +1317,58 @@ fn debit_spread_close_reason(
     {
         return Some("max_hold".to_string());
     }
+    if config.expiration_exit_days >= 0
+        && days_to_expiration(&entry.short_symbol)
+            .or_else(|| days_to_expiration(&entry.long_symbol))
+            .is_some_and(|days| days <= config.expiration_exit_days)
+    {
+        return Some("expiration_risk".to_string());
+    }
     None
+}
+
+fn emit_management_snapshot(
+    entry: &StrategyStateEntry,
+    close_quote: &CloseQuote,
+    close_reason: Option<&str>,
+) {
+    let (net_premium_kind, entry_net_premium, close_net_premium, unrealized_pnl) =
+        if entry.is_debit_spread() {
+            let close_credit = -close_quote.debit;
+            (
+                "debit",
+                entry.debit,
+                Some(close_credit),
+                entry.debit.map(|debit| close_credit - debit),
+            )
+        } else {
+            (
+                "credit",
+                Some(entry.credit),
+                Some(close_quote.debit),
+                Some(entry.credit - close_quote.debit),
+            )
+        };
+    let unrealized_pnl_fraction = unrealized_pnl.and_then(|pnl| {
+        entry_net_premium.and_then(|basis| if basis > 0.0 { Some(pnl / basis) } else { None })
+    });
+    emit_operator_event(
+        "management_snapshot",
+        json!({
+            "underlying": entry.underlying,
+            "strategy": entry.strategy,
+            "net_premium_kind": net_premium_kind,
+            "entry_net_premium": entry_net_premium,
+            "close_net_premium": close_net_premium,
+            "unrealized_pnl": unrealized_pnl,
+            "unrealized_pnl_fraction": unrealized_pnl_fraction,
+            "close_reason": close_reason,
+            "close_attempts": entry.close_attempts,
+            "days_to_expiration": days_to_expiration(&entry.short_symbol)
+                .or_else(|| days_to_expiration(&entry.long_symbol)),
+            "hold_secs": recorded_age_secs(entry),
+        }),
+    );
 }
 
 async fn submit_entry(
@@ -2158,6 +2237,32 @@ mod tests {
     }
 
     #[test]
+    fn debit_close_reason_detects_expiration_risk() {
+        let mut config = config_for_gate_tests();
+        config.expiration_exit_days = 1;
+        config.profit_target_close_fraction = 10.0;
+        config.stop_loss_close_multiple = 0.0;
+        let entry = debit_state_entry_expiring_in_days(1);
+
+        assert_eq!(
+            debit_spread_close_reason(&config, &entry, 1.0),
+            Some("expiration_risk".to_string()),
+        );
+    }
+
+    #[test]
+    fn debit_close_reason_uses_manual_flatten_reason() {
+        let mut config = config_for_gate_tests();
+        config.force_flatten = true;
+        let entry = debit_state_entry_expiring_in_days(30);
+
+        assert_eq!(
+            debit_spread_close_reason(&config, &entry, 1.0),
+            Some("manual_flatten".to_string()),
+        );
+    }
+
+    #[test]
     fn index_credit_strategy_has_stable_host_name() {
         let strategy = IndexCreditStrategy;
 
@@ -2190,5 +2295,19 @@ mod tests {
             recorded_at_utc: "2026-05-04T14:00:00Z".to_string(),
             closed_at_utc: None,
         }
+    }
+
+    fn debit_state_entry_expiring_in_days(days: i64) -> StrategyStateEntry {
+        let expiration = (Utc::now().date_naive() + chrono::Duration::days(days))
+            .format("%y%m%d")
+            .to_string();
+        let mut entry = state_entry();
+        entry.strategy =
+            debit_spread_strategy_name(crate::strategy::DebitSpreadKind::Call).to_string();
+        entry.short_symbol = format!("SPY{expiration}C00713000");
+        entry.long_symbol = format!("SPY{expiration}C00710000");
+        entry.credit = 0.0;
+        entry.debit = Some(1.00);
+        entry
     }
 }

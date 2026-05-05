@@ -832,6 +832,7 @@ struct ScannerSection {
     min_open_interest: Option<u64>,
     max_leg_spread_pct: Option<f64>,
     min_return_on_risk: Option<f64>,
+    min_credit_to_width: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -853,6 +854,7 @@ struct DebitScannerSection {
     min_open_interest: Option<u64>,
     max_leg_spread_pct: Option<f64>,
     max_debit_to_width: Option<f64>,
+    min_debit_to_width: Option<f64>,
     min_reward_to_risk: Option<f64>,
 }
 
@@ -1315,6 +1317,7 @@ fn scanner_config_from_file(config: &ScannerSection) -> PutCreditScannerConfig {
         min_open_interest: config.min_open_interest.unwrap_or(200),
         max_leg_spread_pct: config.max_leg_spread_pct.unwrap_or(0.15),
         min_return_on_risk: config.min_return_on_risk.unwrap_or(0.13),
+        min_credit_to_width: config.min_credit_to_width.unwrap_or(0.08),
     }
 }
 
@@ -1341,6 +1344,7 @@ fn debit_scanner_config_from_file(config: &DebitScannerSection) -> DebitSpreadSc
         min_open_interest: config.min_open_interest.unwrap_or(200),
         max_leg_spread_pct: config.max_leg_spread_pct.unwrap_or(0.15),
         max_debit_to_width: config.max_debit_to_width.unwrap_or(0.55),
+        min_debit_to_width: config.min_debit_to_width.unwrap_or(0.20),
         min_reward_to_risk: config.min_reward_to_risk.unwrap_or(0.75),
     }
 }
@@ -1449,11 +1453,24 @@ widths = [2.0, 5.0]
 min_open_interest = 300
 max_leg_spread_pct = 0.10
 min_return_on_risk = 0.15
+min_credit_to_width = 0.09
 
 [iron_condor]
 min_return_on_risk = 0.20
 wing_min_return_on_risk = 0.11
 require_equal_widths = true
+
+[debit_scanner]
+min_dte = 10
+max_dte = 35
+long_delta_min = 0.45
+long_delta_max = 0.60
+widths = [3.0, 5.0]
+min_open_interest = 250
+max_leg_spread_pct = 0.12
+max_debit_to_width = 0.50
+min_debit_to_width = 0.25
+min_reward_to_risk = 0.80
 
 [risk]
 max_active_entries = 1
@@ -1487,7 +1504,10 @@ expiration_exit_days = 2
         assert_eq!(config.runtime.dry_run_strategies, vec!["iron_condor"]);
         assert_eq!(config.index.underlyings, vec!["SPY", "QQQ"]);
         assert_eq!(config.scanner.widths, Some(vec![2.0, 5.0]));
+        assert_eq!(config.scanner.min_credit_to_width, Some(0.09));
         assert_eq!(config.iron_condor.min_return_on_risk, Some(0.20));
+        assert_eq!(config.debit_scanner.widths, Some(vec![3.0, 5.0]));
+        assert_eq!(config.debit_scanner.min_debit_to_width, Some(0.25));
         assert_eq!(config.risk.max_active_entries, Some(1));
         assert_eq!(config.risk.max_daily_submits, Some(1));
         assert_eq!(config.risk.max_open_orders, Some(1));

@@ -64,11 +64,15 @@ pub fn credit_spread_close_reason(
     None
 }
 
-fn recorded_age_secs(entry: &StrategyStateEntry) -> Option<u64> {
+/// Returns the age in seconds from the state entry's recorded timestamp.
+#[must_use]
+pub fn recorded_age_secs(entry: &StrategyStateEntry) -> Option<u64> {
     age_secs_from_rfc3339(&entry.recorded_at_utc)
 }
 
-fn days_to_expiration(symbol: &str) -> Option<i64> {
+/// Parses an Alpaca option symbol and returns calendar days to expiration.
+#[must_use]
+pub fn days_to_expiration(symbol: &str) -> Option<i64> {
     let chars = symbol.as_bytes();
     for index in 0..chars.len().saturating_sub(6) {
         let date_slice = &chars[index..index + 6];

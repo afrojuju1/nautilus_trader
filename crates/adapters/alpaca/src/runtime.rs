@@ -513,11 +513,13 @@ mod tests {
         crate::strategy::ScoredContract {
             symbol: symbol.to_string(),
             expiration_date: "2026-05-08".to_string(),
+            dte: 4,
             strike,
             bid: 1.0,
             ask: 1.1,
             delta_abs: 0.22,
             spread_pct: 0.05,
+            open_interest: 1_000,
             implied_volatility: Some(0.2),
         }
     }
