@@ -27,7 +27,7 @@ use std::{
 use crate::{
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
-    execution::AlpacaExecutionClient,
+    execution::{AlpacaExecutionClient, check_option_spread_entry_admission},
     http::{
         client::AlpacaHttpClient,
         error::Error,
@@ -35,10 +35,12 @@ use crate::{
     },
     index_credit::{
         IndexCreditConfig, SelectedDebitEntry, SelectedEntry, SelectedIndexEntry,
-        SelectedIronCondorEntry, SelectedNakedOptionEntry, candidate_alert_identity_key,
-        candidate_alert_key, credit_candidate_ledger_payload, debit_candidate_ledger_payload,
-        iron_condor_candidate_ledger_payload, naked_candidate_ledger_payload,
-        select_index_strategy_entry,
+        SelectedIronCondorEntry, SelectedNakedOptionEntry, active_sector_count,
+        active_underlying_count, candidate_alert_identity_key, candidate_alert_key,
+        credit_candidate_ledger_payload, debit_candidate_ledger_payload,
+        fleet_active_underlying_count, fleet_has_active_underlying_elsewhere,
+        fleet_sector_limit_state, iron_condor_candidate_ledger_payload,
+        naked_candidate_ledger_payload, select_index_strategy_entry,
     },
     management::{credit_spread_close_reason, days_to_expiration, recorded_age_secs},
     runtime::{
@@ -90,6 +92,14 @@ struct SubmitOutcome {
     parent_order_id: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct SubmissionBlock {
+    reason: String,
+    current: Option<usize>,
+    limit: Option<usize>,
+    details: Vec<String>,
+}
+
 /// Strategy decision emitted into the Alpaca account engine.
 #[derive(Clone, Debug)]
 pub enum StrategyDecision {
@@ -108,6 +118,19 @@ pub enum StrategyDecision {
         current: usize,
         /// Configured limit.
         limit: usize,
+    },
+    /// Candidate was selected by discovery, but submit admission blocked broker action.
+    SelectedBlocked {
+        /// Selected strategy candidate.
+        entry: SelectedIndexEntry,
+        /// Stable block reason.
+        reason: String,
+        /// Current observed count, if the block is count based.
+        current: Option<usize>,
+        /// Configured limit, if the block is count based.
+        limit: Option<usize>,
+        /// Additional diagnostic details.
+        details: Vec<String>,
     },
     /// Candidate was found, but submission is disabled.
     DryRun {
@@ -229,38 +252,6 @@ impl StrategyRuntime for IndexCreditStrategy {
                 EntryGateDecision::Continue => {}
             }
 
-            match risk_gate_decision(&context).await? {
-                RiskGateDecision::Continue => {}
-                RiskGateDecision::MaxActiveEntries { current, limit } => {
-                    return Ok(StrategyDecision::RiskBlocked {
-                        reason: "risk_max_active_entries",
-                        current,
-                        limit,
-                    });
-                }
-                RiskGateDecision::MaxDailySubmits { current, limit } => {
-                    return Ok(StrategyDecision::RiskBlocked {
-                        reason: "risk_max_daily_submits",
-                        current,
-                        limit,
-                    });
-                }
-                RiskGateDecision::MaxOpenOrders { current, limit } => {
-                    return Ok(StrategyDecision::RiskBlocked {
-                        reason: "risk_max_open_orders",
-                        current,
-                        limit,
-                    });
-                }
-                RiskGateDecision::FleetMaxActiveEntries { current, limit } => {
-                    return Ok(StrategyDecision::RiskBlocked {
-                        reason: "fleet_max_active_entries",
-                        current,
-                        limit,
-                    });
-                }
-            }
-
             let selected = select_index_strategy_entry(
                 context.client,
                 context.data_config,
@@ -269,37 +260,21 @@ impl StrategyRuntime for IndexCreditStrategy {
                 context.trade_date,
             )
             .await?;
-            Ok(match selected {
-                Some(SelectedIndexEntry::Credit(entry))
-                    if context.config.credit_submit_enabled(entry.kind) =>
-                {
-                    StrategyDecision::SubmitOpen { entry }
-                }
-                Some(SelectedIndexEntry::Credit(entry)) => StrategyDecision::DryRun { entry },
-                Some(SelectedIndexEntry::IronCondor(entry))
-                    if context.config.iron_condor_submit_enabled() =>
-                {
-                    StrategyDecision::SubmitIronCondorOpen { entry }
-                }
-                Some(SelectedIndexEntry::IronCondor(entry)) => {
-                    StrategyDecision::DryRunIronCondor { entry }
-                }
-                Some(SelectedIndexEntry::Debit(entry))
-                    if context.config.debit_submit_enabled(entry.kind) =>
-                {
-                    StrategyDecision::SubmitDebitOpen { entry }
-                }
-                Some(SelectedIndexEntry::Debit(entry)) => StrategyDecision::DryRunDebit { entry },
-                Some(SelectedIndexEntry::NakedOption(entry))
-                    if context.config.naked_submit_enabled(entry.kind) =>
-                {
-                    StrategyDecision::SubmitNakedOptionOpen { entry }
-                }
-                Some(SelectedIndexEntry::NakedOption(entry)) => {
-                    StrategyDecision::DryRunNakedOption { entry }
-                }
-                None => StrategyDecision::NoEntry,
-            })
+            let Some(selected) = selected else {
+                return Ok(StrategyDecision::NoEntry);
+            };
+            if selected_submit_enabled(context.config, &selected)
+                && let Some(block) = submission_block_for_selected(&context, &selected).await?
+            {
+                return Ok(StrategyDecision::SelectedBlocked {
+                    entry: selected,
+                    reason: block.reason,
+                    current: block.current,
+                    limit: block.limit,
+                    details: block.details,
+                });
+            }
+            Ok(selected_strategy_decision(context.config, selected))
         })
     }
 }
@@ -318,6 +293,170 @@ enum RiskGateDecision {
     MaxDailySubmits { current: usize, limit: usize },
     MaxOpenOrders { current: usize, limit: usize },
     FleetMaxActiveEntries { current: usize, limit: usize },
+}
+
+fn selected_submit_enabled(config: &IndexCreditConfig, selected: &SelectedIndexEntry) -> bool {
+    match selected {
+        SelectedIndexEntry::Credit(entry) => config.credit_submit_enabled(entry.kind),
+        SelectedIndexEntry::IronCondor(_) => config.iron_condor_submit_enabled(),
+        SelectedIndexEntry::Debit(entry) => config.debit_submit_enabled(entry.kind),
+        SelectedIndexEntry::NakedOption(entry) => config.naked_submit_enabled(entry.kind),
+    }
+}
+
+fn selected_strategy_decision(
+    config: &IndexCreditConfig,
+    selected: SelectedIndexEntry,
+) -> StrategyDecision {
+    match selected {
+        SelectedIndexEntry::Credit(entry) if config.credit_submit_enabled(entry.kind) => {
+            StrategyDecision::SubmitOpen { entry }
+        }
+        SelectedIndexEntry::Credit(entry) => StrategyDecision::DryRun { entry },
+        SelectedIndexEntry::IronCondor(entry) if config.iron_condor_submit_enabled() => {
+            StrategyDecision::SubmitIronCondorOpen { entry }
+        }
+        SelectedIndexEntry::IronCondor(entry) => StrategyDecision::DryRunIronCondor { entry },
+        SelectedIndexEntry::Debit(entry) if config.debit_submit_enabled(entry.kind) => {
+            StrategyDecision::SubmitDebitOpen { entry }
+        }
+        SelectedIndexEntry::Debit(entry) => StrategyDecision::DryRunDebit { entry },
+        SelectedIndexEntry::NakedOption(entry) if config.naked_submit_enabled(entry.kind) => {
+            StrategyDecision::SubmitNakedOptionOpen { entry }
+        }
+        SelectedIndexEntry::NakedOption(entry) => StrategyDecision::DryRunNakedOption { entry },
+    }
+}
+
+async fn submission_block_for_selected(
+    context: &AccountEngineContext<'_>,
+    selected: &SelectedIndexEntry,
+) -> anyhow::Result<Option<SubmissionBlock>> {
+    if let Some(block) = risk_gate_decision(context).await?.into_submission_block() {
+        return Ok(Some(block));
+    }
+
+    let underlying = selected.underlying();
+    if let Some(limit) = context.config.max_active_entries_per_underlying {
+        let current = active_underlying_count(context.state, underlying);
+        if current >= limit {
+            return Ok(Some(SubmissionBlock {
+                reason: "risk_max_active_entries_per_underlying".to_string(),
+                current: Some(current),
+                limit: Some(limit),
+                details: Vec::new(),
+            }));
+        }
+    }
+    if let Some(limit) = context.config.max_active_entries_per_sector
+        && let Some(sector) = context.config.sector_for(underlying)
+    {
+        let current = active_sector_count(context.state, &context.config.sectors, sector);
+        if current >= limit {
+            return Ok(Some(SubmissionBlock {
+                reason: "risk_max_active_entries_per_sector".to_string(),
+                current: Some(current),
+                limit: Some(limit),
+                details: vec![format!("sector={sector}")],
+            }));
+        }
+    }
+    if let Some(limit) = context
+        .config
+        .fleet
+        .as_ref()
+        .and_then(|fleet| fleet.config.fleet.max_active_entries_per_underlying)
+    {
+        let current = fleet_active_underlying_count(context.config, underlying);
+        if current >= limit {
+            return Ok(Some(SubmissionBlock {
+                reason: "fleet_max_active_entries_per_underlying".to_string(),
+                current: Some(current),
+                limit: Some(limit),
+                details: Vec::new(),
+            }));
+        }
+    }
+    if let Some((sector, current, limit)) = fleet_sector_limit_state(context.config, underlying)
+        && current >= limit
+    {
+        return Ok(Some(SubmissionBlock {
+            reason: "fleet_max_active_entries_per_sector".to_string(),
+            current: Some(current),
+            limit: Some(limit),
+            details: vec![format!("sector={sector}")],
+        }));
+    }
+    if context
+        .state
+        .has_submitted_underlying_today(context.trade_date, underlying)
+    {
+        return Ok(Some(SubmissionBlock {
+            reason: "daily_duplicate_state".to_string(),
+            current: None,
+            limit: None,
+            details: vec!["scope=same_day_underlying_reentry".to_string()],
+        }));
+    }
+    if fleet_has_active_underlying_elsewhere(context.config, underlying) {
+        return Ok(Some(SubmissionBlock {
+            reason: "fleet_duplicate_underlying".to_string(),
+            current: None,
+            limit: None,
+            details: Vec::new(),
+        }));
+    }
+
+    let account = context.client.account().await?;
+    let positions = context.client.positions().await?;
+    let open_orders = context
+        .client
+        .orders(&ListOrdersRequest::open_nested())
+        .await?;
+    let symbols = selected.option_symbols();
+    let admission =
+        check_option_spread_entry_admission(&account, &positions, &open_orders, &symbols);
+    if admission.allowed {
+        return Ok(None);
+    }
+    Ok(Some(SubmissionBlock {
+        reason: "broker_admission_rejected".to_string(),
+        current: None,
+        limit: None,
+        details: admission.reasons,
+    }))
+}
+
+impl RiskGateDecision {
+    fn into_submission_block(self) -> Option<SubmissionBlock> {
+        match self {
+            Self::Continue => None,
+            Self::MaxActiveEntries { current, limit } => Some(SubmissionBlock {
+                reason: "risk_max_active_entries".to_string(),
+                current: Some(current),
+                limit: Some(limit),
+                details: Vec::new(),
+            }),
+            Self::MaxDailySubmits { current, limit } => Some(SubmissionBlock {
+                reason: "risk_max_daily_submits".to_string(),
+                current: Some(current),
+                limit: Some(limit),
+                details: Vec::new(),
+            }),
+            Self::MaxOpenOrders { current, limit } => Some(SubmissionBlock {
+                reason: "risk_max_open_orders".to_string(),
+                current: Some(current),
+                limit: Some(limit),
+                details: Vec::new(),
+            }),
+            Self::FleetMaxActiveEntries { current, limit } => Some(SubmissionBlock {
+                reason: "fleet_max_active_entries".to_string(),
+                current: Some(current),
+                limit: Some(limit),
+                details: Vec::new(),
+            }),
+        }
+    }
 }
 
 /// Runs the Alpaca index-credit account engine until configured shutdown.
@@ -696,6 +835,28 @@ fn selected_naked_alert_payload(
     (identity_key, payload)
 }
 
+fn selected_entry_alert_payload(
+    entry: &SelectedIndexEntry,
+    trade_date: &str,
+    action: &str,
+    order_list_id: Option<&str>,
+) -> (String, Value) {
+    match entry {
+        SelectedIndexEntry::Credit(entry) => {
+            selected_credit_alert_payload(entry, trade_date, action, order_list_id)
+        }
+        SelectedIndexEntry::IronCondor(entry) => {
+            selected_iron_condor_alert_payload(entry, trade_date, action, order_list_id)
+        }
+        SelectedIndexEntry::Debit(entry) => {
+            selected_debit_alert_payload(entry, trade_date, action, order_list_id)
+        }
+        SelectedIndexEntry::NakedOption(entry) => {
+            selected_naked_alert_payload(entry, trade_date, action, order_list_id)
+        }
+    }
+}
+
 fn insert_selected_alert_fields(
     payload: &mut Value,
     identity_key: &str,
@@ -778,6 +939,53 @@ async fn apply_strategy_decision(
                     "limit": limit,
                     "trade_date": trade_date,
                 }),
+            );
+            Ok(false)
+        }
+        StrategyDecision::SelectedBlocked {
+            entry,
+            reason,
+            current,
+            limit,
+            details,
+        } => {
+            let (candidate_identity_key, mut candidate_alert_payload) =
+                selected_entry_alert_payload(&entry, trade_date, "selected_but_blocked", None);
+            insert_string_field(&mut candidate_alert_payload, "reason", reason.clone());
+            insert_value_field(
+                &mut candidate_alert_payload,
+                "current",
+                current.map_or(Value::Null, Value::from),
+            );
+            insert_value_field(
+                &mut candidate_alert_payload,
+                "limit",
+                limit.map_or(Value::Null, Value::from),
+            );
+            insert_value_field(&mut candidate_alert_payload, "details", json!(&details));
+            println!(
+                "decision: selected_but_blocked underlying={} reason={} current={} limit={} details={} score={:.1}",
+                entry.underlying(),
+                reason,
+                current
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                limit
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                if details.is_empty() {
+                    "none".to_string()
+                } else {
+                    details.join(" | ")
+                },
+                entry.score(),
+            );
+            record_decision_event(config, trade_date, candidate_alert_payload.clone());
+            record_selected_candidate_alert(
+                config,
+                trade_date,
+                &candidate_identity_key,
+                candidate_alert_payload,
             );
             Ok(false)
         }

@@ -30,9 +30,8 @@ use serde_json::{Map, Value, json};
 use crate::{
     candidate_ledger::{append_candidate_ledger_record, default_candidate_ledger_dir},
     config::AlpacaDataClientConfig,
-    execution::check_option_spread_entry_admission,
     fleet::{ResolvedFleetConfig, load_fleet_config_from_env},
-    http::{client::AlpacaHttpClient, models::ListOrdersRequest},
+    http::client::AlpacaHttpClient,
     management::CreditSpreadManagementConfig,
     runtime::{
         StrategyState, credit_spread_strategy_name, debit_spread_strategy_name,
@@ -418,6 +417,37 @@ impl SelectedIndexEntry {
             Self::NakedOption(entry) => entry.candidate.score,
         }
     }
+
+    /// Returns the underlying symbol.
+    #[must_use]
+    pub fn underlying(&self) -> &str {
+        match self {
+            Self::Credit(entry) => &entry.underlying,
+            Self::IronCondor(entry) => &entry.underlying,
+            Self::Debit(entry) => &entry.underlying,
+            Self::NakedOption(entry) => &entry.underlying,
+        }
+    }
+
+    /// Returns the candidate option symbols.
+    #[must_use]
+    pub fn option_symbols(&self) -> Vec<&str> {
+        match self {
+            Self::Credit(entry) => {
+                vec![&entry.candidate.short.symbol, &entry.candidate.long.symbol]
+            }
+            Self::IronCondor(entry) => vec![
+                &entry.candidate.put.short.symbol,
+                &entry.candidate.put.long.symbol,
+                &entry.candidate.call.short.symbol,
+                &entry.candidate.call.long.symbol,
+            ],
+            Self::Debit(entry) => {
+                vec![&entry.candidate.long.symbol, &entry.candidate.short.symbol]
+            }
+            Self::NakedOption(entry) => vec![&entry.candidate.short.symbol],
+        }
+    }
 }
 
 /// Selects the best allowed index credit entry for one iteration.
@@ -453,196 +483,14 @@ pub async fn select_index_strategy_entry(
     client: &AlpacaHttpClient,
     data_config: &AlpacaDataClientConfig,
     config: &IndexCreditConfig,
-    state: &StrategyState,
+    _state: &StrategyState,
     trade_date: &str,
 ) -> anyhow::Result<Option<SelectedIndexEntry>> {
     let account = client.account().await?;
     let options_buying_power = account_options_buying_power(&account);
-    let positions = client.positions().await?;
-    let open_orders = client.orders(&ListOrdersRequest::open_nested()).await?;
     let mut selected: Option<SelectedIndexEntry> = None;
 
     for underlying in &config.underlyings {
-        if let Some(limit) = config.max_active_entries_per_underlying {
-            let current = active_underlying_count(state, underlying);
-            if current >= limit {
-                println!(
-                    "{underlying}: admission_rejected reason=risk_max_active_entries_per_underlying current={} limit={}",
-                    current, limit,
-                );
-                record_scanner_ledger_result(
-                    config,
-                    trade_date,
-                    json!({
-                        "underlying": underlying,
-                        "result": "admission_rejected",
-                        "reason": "risk_max_active_entries_per_underlying",
-                        "current": current,
-                        "limit": limit,
-                    }),
-                );
-                emit_operator_event(
-                    "scanner_diagnostic",
-                    json!({
-                        "underlying": underlying,
-                        "result": "admission_rejected",
-                        "reason": "risk_max_active_entries_per_underlying",
-                        "current": current,
-                        "limit": limit,
-                    }),
-                );
-                continue;
-            }
-        }
-        if let Some(limit) = config.max_active_entries_per_sector
-            && let Some(sector) = config.sector_for(underlying)
-        {
-            let current = active_sector_count(state, &config.sectors, sector);
-            if current >= limit {
-                println!(
-                    "{underlying}: admission_rejected reason=risk_max_active_entries_per_sector sector={} current={} limit={}",
-                    sector, current, limit,
-                );
-                record_scanner_ledger_result(
-                    config,
-                    trade_date,
-                    json!({
-                        "underlying": underlying,
-                        "result": "admission_rejected",
-                        "reason": "risk_max_active_entries_per_sector",
-                        "sector": sector,
-                        "current": current,
-                        "limit": limit,
-                    }),
-                );
-                emit_operator_event(
-                    "scanner_diagnostic",
-                    json!({
-                        "underlying": underlying,
-                        "result": "admission_rejected",
-                        "reason": "risk_max_active_entries_per_sector",
-                        "sector": sector,
-                        "current": current,
-                        "limit": limit,
-                    }),
-                );
-                continue;
-            }
-        }
-        if let Some(limit) = config
-            .fleet
-            .as_ref()
-            .and_then(|fleet| fleet.config.fleet.max_active_entries_per_underlying)
-        {
-            let current = fleet_active_underlying_count(config, underlying);
-            if current >= limit {
-                println!(
-                    "{underlying}: admission_rejected reason=fleet_max_active_entries_per_underlying current={} limit={}",
-                    current, limit,
-                );
-                record_scanner_ledger_result(
-                    config,
-                    trade_date,
-                    json!({
-                        "underlying": underlying,
-                        "result": "admission_rejected",
-                        "reason": "fleet_max_active_entries_per_underlying",
-                        "current": current,
-                        "limit": limit,
-                    }),
-                );
-                emit_operator_event(
-                    "scanner_diagnostic",
-                    json!({
-                        "underlying": underlying,
-                        "result": "admission_rejected",
-                        "reason": "fleet_max_active_entries_per_underlying",
-                        "current": current,
-                        "limit": limit,
-                    }),
-                );
-                continue;
-            }
-        }
-        if let Some((sector, current, limit)) = fleet_sector_limit_state(config, underlying)
-            && current >= limit
-        {
-            println!(
-                "{underlying}: admission_rejected reason=fleet_max_active_entries_per_sector sector={} current={} limit={}",
-                sector, current, limit,
-            );
-            record_scanner_ledger_result(
-                config,
-                trade_date,
-                json!({
-                    "underlying": underlying,
-                    "result": "admission_rejected",
-                    "reason": "fleet_max_active_entries_per_sector",
-                    "sector": sector,
-                    "current": current,
-                    "limit": limit,
-                }),
-            );
-            emit_operator_event(
-                "scanner_diagnostic",
-                json!({
-                    "underlying": underlying,
-                    "result": "admission_rejected",
-                    "reason": "fleet_max_active_entries_per_sector",
-                    "sector": sector,
-                    "current": current,
-                    "limit": limit,
-                }),
-            );
-            continue;
-        }
-
-        if state.has_submitted_underlying_today(trade_date, underlying) {
-            println!("{underlying}: admission_rejected reason=daily_duplicate_state");
-            record_scanner_ledger_result(
-                config,
-                trade_date,
-                json!({
-                    "underlying": underlying,
-                    "result": "admission_rejected",
-                    "reason": "daily_duplicate_state",
-                    "scope": "same_day_underlying_reentry",
-                }),
-            );
-            emit_operator_event(
-                "scanner_diagnostic",
-                json!({
-                    "underlying": underlying,
-                    "result": "admission_rejected",
-                    "reason": "daily_duplicate_state",
-                    "scope": "same_day_underlying_reentry",
-                }),
-            );
-            continue;
-        }
-
-        if fleet_has_active_underlying_elsewhere(config, underlying) {
-            println!("{underlying}: admission_rejected reason=fleet_duplicate_underlying");
-            record_scanner_ledger_result(
-                config,
-                trade_date,
-                json!({
-                    "underlying": underlying,
-                    "result": "admission_rejected",
-                    "reason": "fleet_duplicate_underlying",
-                }),
-            );
-            emit_operator_event(
-                "scanner_diagnostic",
-                json!({
-                    "underlying": underlying,
-                    "result": "admission_rejected",
-                    "reason": "fleet_duplicate_underlying",
-                }),
-            );
-            continue;
-        }
-
         for kind in &config.spread_kinds {
             let result = match kind {
                 CreditSpreadKind::Put => {
@@ -713,46 +561,6 @@ pub async fn select_index_strategy_entry(
                 );
                 continue;
             };
-
-            let admission = check_option_spread_entry_admission(
-                &account,
-                &positions,
-                &open_orders,
-                &[&best.short.symbol, &best.long.symbol],
-            );
-            if !admission.allowed {
-                println!(
-                    "{underlying}: admission_rejected strategy={} short={} long={} reasons={}",
-                    credit_spread_strategy_name(*kind),
-                    best.short.symbol,
-                    best.long.symbol,
-                    admission.reasons.join(" | "),
-                );
-                record_scanner_ledger_result(
-                    config,
-                    trade_date,
-                    json!({
-                        "underlying": underlying,
-                        "strategy": credit_spread_strategy_name(*kind),
-                        "result": "admission_rejected",
-                        "short_symbol": &best.short.symbol,
-                        "long_symbol": &best.long.symbol,
-                        "reasons": &admission.reasons,
-                    }),
-                );
-                emit_operator_event(
-                    "scanner_diagnostic",
-                    json!({
-                        "underlying": underlying,
-                        "strategy": credit_spread_strategy_name(*kind),
-                        "result": "admission_rejected",
-                        "short_symbol": &best.short.symbol,
-                        "long_symbol": &best.long.symbol,
-                        "reasons": admission.reasons,
-                    }),
-                );
-                continue;
-            }
 
             println!(
                 "{underlying}: candidate strategy={} short={} long={} credit={:.2} ror={:.1}% score={:.1}",
@@ -849,56 +657,6 @@ pub async fn select_index_strategy_entry(
                 );
                 continue;
             };
-
-            let admission = check_option_spread_entry_admission(
-                &account,
-                &positions,
-                &open_orders,
-                &[
-                    &best.put.short.symbol,
-                    &best.put.long.symbol,
-                    &best.call.short.symbol,
-                    &best.call.long.symbol,
-                ],
-            );
-            if !admission.allowed {
-                println!(
-                    "{underlying}: admission_rejected strategy=index_iron_condor_entry short_put={} long_put={} short_call={} long_call={} reasons={}",
-                    best.put.short.symbol,
-                    best.put.long.symbol,
-                    best.call.short.symbol,
-                    best.call.long.symbol,
-                    admission.reasons.join(" | "),
-                );
-                record_scanner_ledger_result(
-                    config,
-                    trade_date,
-                    json!({
-                        "underlying": underlying,
-                        "strategy": "index_iron_condor_entry",
-                        "result": "admission_rejected",
-                        "short_put_symbol": &best.put.short.symbol,
-                        "long_put_symbol": &best.put.long.symbol,
-                        "short_call_symbol": &best.call.short.symbol,
-                        "long_call_symbol": &best.call.long.symbol,
-                        "reasons": &admission.reasons,
-                    }),
-                );
-                emit_operator_event(
-                    "scanner_diagnostic",
-                    json!({
-                        "underlying": underlying,
-                        "strategy": "index_iron_condor_entry",
-                        "result": "admission_rejected",
-                        "short_put_symbol": &best.put.short.symbol,
-                        "long_put_symbol": &best.put.long.symbol,
-                        "short_call_symbol": &best.call.short.symbol,
-                        "long_call_symbol": &best.call.long.symbol,
-                        "reasons": admission.reasons,
-                    }),
-                );
-                continue;
-            }
 
             println!(
                 "{underlying}: candidate strategy=index_iron_condor_entry short_put={} long_put={} short_call={} long_call={} credit={:.2} ror={:.1}% score={:.1}",
@@ -1019,46 +777,6 @@ pub async fn select_index_strategy_entry(
                 continue;
             };
 
-            let admission = check_option_spread_entry_admission(
-                &account,
-                &positions,
-                &open_orders,
-                &[&best.long.symbol, &best.short.symbol],
-            );
-            if !admission.allowed {
-                println!(
-                    "{underlying}: admission_rejected strategy={} long={} short={} reasons={}",
-                    debit_spread_strategy_name(*kind),
-                    best.long.symbol,
-                    best.short.symbol,
-                    admission.reasons.join(" | "),
-                );
-                record_scanner_ledger_result(
-                    config,
-                    trade_date,
-                    json!({
-                        "underlying": underlying,
-                        "strategy": debit_spread_strategy_name(*kind),
-                        "result": "admission_rejected",
-                        "long_symbol": &best.long.symbol,
-                        "short_symbol": &best.short.symbol,
-                        "reasons": &admission.reasons,
-                    }),
-                );
-                emit_operator_event(
-                    "scanner_diagnostic",
-                    json!({
-                        "underlying": underlying,
-                        "strategy": debit_spread_strategy_name(*kind),
-                        "result": "admission_rejected",
-                        "long_symbol": &best.long.symbol,
-                        "short_symbol": &best.short.symbol,
-                        "reasons": admission.reasons,
-                    }),
-                );
-                continue;
-            }
-
             println!(
                 "{underlying}: candidate strategy={} long={} short={} debit={:.2} rtr={:.1}% score={:.1}",
                 debit_spread_strategy_name(*kind),
@@ -1168,43 +886,6 @@ pub async fn select_index_strategy_entry(
                 );
                 continue;
             };
-
-            let admission = check_option_spread_entry_admission(
-                &account,
-                &positions,
-                &open_orders,
-                &[&best.short.symbol],
-            );
-            if !admission.allowed {
-                println!(
-                    "{underlying}: admission_rejected strategy={} short={} reasons={}",
-                    naked_option_strategy_name(*kind),
-                    best.short.symbol,
-                    admission.reasons.join(" | "),
-                );
-                record_scanner_ledger_result(
-                    config,
-                    trade_date,
-                    json!({
-                        "underlying": underlying,
-                        "strategy": naked_option_strategy_name(*kind),
-                        "result": "admission_rejected",
-                        "short_symbol": &best.short.symbol,
-                        "reasons": &admission.reasons,
-                    }),
-                );
-                emit_operator_event(
-                    "scanner_diagnostic",
-                    json!({
-                        "underlying": underlying,
-                        "strategy": naked_option_strategy_name(*kind),
-                        "result": "admission_rejected",
-                        "short_symbol": &best.short.symbol,
-                        "reasons": admission.reasons,
-                    }),
-                );
-                continue;
-            }
 
             let metrics = best.short.metrics.as_ref();
             if let Some(metrics) = metrics {
@@ -2509,7 +2190,7 @@ fn format_rejection_counts(rejections: &BTreeMap<String, usize>) -> String {
         .join(",")
 }
 
-fn active_underlying_count(state: &StrategyState, underlying: &str) -> usize {
+pub(crate) fn active_underlying_count(state: &StrategyState, underlying: &str) -> usize {
     state
         .entries
         .iter()
@@ -2517,7 +2198,7 @@ fn active_underlying_count(state: &StrategyState, underlying: &str) -> usize {
         .count()
 }
 
-fn active_sector_count(
+pub(crate) fn active_sector_count(
     state: &StrategyState,
     sectors: &BTreeMap<String, String>,
     sector: &str,
@@ -2534,7 +2215,10 @@ fn active_sector_count(
         .count()
 }
 
-fn fleet_has_active_underlying_elsewhere(config: &IndexCreditConfig, underlying: &str) -> bool {
+pub(crate) fn fleet_has_active_underlying_elsewhere(
+    config: &IndexCreditConfig,
+    underlying: &str,
+) -> bool {
     let Some(fleet) = &config.fleet else {
         return false;
     };
@@ -2546,7 +2230,7 @@ fn fleet_has_active_underlying_elsewhere(config: &IndexCreditConfig, underlying:
         .contains(&underlying.to_ascii_uppercase())
 }
 
-fn fleet_active_underlying_count(config: &IndexCreditConfig, underlying: &str) -> usize {
+pub(crate) fn fleet_active_underlying_count(config: &IndexCreditConfig, underlying: &str) -> usize {
     config
         .fleet
         .as_ref()
@@ -2561,7 +2245,7 @@ fn fleet_active_underlying_count(config: &IndexCreditConfig, underlying: &str) -
         .unwrap_or(0)
 }
 
-fn fleet_sector_limit_state(
+pub(crate) fn fleet_sector_limit_state(
     config: &IndexCreditConfig,
     underlying: &str,
 ) -> Option<(String, usize, usize)> {

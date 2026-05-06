@@ -422,6 +422,16 @@ fn format_candidate_alert_message(record: &Value, default_account: &str) -> Stri
         Some(_) => "Candidate alert",
     };
     let message = format_candidate_message(title, record, default_account);
+    if record_str(record, "alert_type") == Some("selected_candidate")
+        && record_str(record, "action") == Some("selected_but_blocked")
+    {
+        let reason = record_str(record, "reason").unwrap_or("unknown");
+        let details = record_string_array(record, "details")
+            .filter(|details| !details.is_empty())
+            .map(|details| format!(" | {}", details.join(" | ")))
+            .unwrap_or_default();
+        return format!("{message}\nblocked reason={reason}{details}");
+    }
     if record_str(record, "alert_type") != Some("candidate_submit_rejected") {
         return message;
     }
@@ -575,6 +585,17 @@ fn nested_f64(record: &Value, path: &[&str]) -> Option<f64> {
 
 fn record_u64(record: &Value, key: &str) -> Option<u64> {
     record.get(key)?.as_u64()
+}
+
+fn record_string_array(record: &Value, key: &str) -> Option<Vec<String>> {
+    Some(
+        record
+            .get(key)?
+            .as_array()?
+            .iter()
+            .filter_map(|value| value.as_str().map(ToString::to_string))
+            .collect(),
+    )
 }
 
 fn record_i64(record: &Value, key: &str) -> Option<i64> {
