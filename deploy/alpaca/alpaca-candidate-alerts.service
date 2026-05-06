@@ -1,0 +1,14 @@
+[Unit]
+Description=Nautilus Alpaca candidate Discord alerts
+Documentation=file:%h/Projects/nautilus_trader/docs/developer_guide/alpaca_nuc_deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Projects/nautilus_trader
+ExecStart=%h/.local/bin/alpaca-control alerts candidates --all --send --lookback-minutes 10 --max-rank 2
+
+# Alert delivery must never gain privileges or affect trading services.
+NoNewPrivileges=true
+PrivateTmp=true

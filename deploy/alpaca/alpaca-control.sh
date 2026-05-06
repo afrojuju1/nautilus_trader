@@ -13,6 +13,8 @@ REPO="${NAUTILUS_ALPACA_REPO:-$HOME/Projects/nautilus_trader}"
 ENGINE_BIN="${NAUTILUS_ALPACA_RUNNER_BIN:-$HOME/.local/bin/alpaca-index-credit-engine}"
 OPERATOR_BIN="${NAUTILUS_ALPACA_OPERATOR_BIN:-$HOME/.local/bin/alpaca-operator-status}"
 FLEET_BIN="${NAUTILUS_ALPACA_FLEET_BIN:-$HOME/.local/bin/alpaca-fleet-status}"
+CANDIDATE_ALERTS_BIN="${NAUTILUS_ALPACA_CANDIDATE_ALERTS_BIN:-$HOME/.local/bin/alpaca-candidate-alerts}"
+ALERTS_ENV_FILE="${NAUTILUS_ALPACA_ALERTS_ENV_FILE:-$ALPACA_CONFIG_HOME/alerts.env}"
 OVERRIDE_ENV_FILE=""
 
 cleanup() {
@@ -39,6 +41,8 @@ Commands:
   health                         lightweight service/account health check
   today [--date YYYY-MM-DD]      compact fleet and candidate-ledger status
   ledger-summary [--all]         summarize candidate-ledger records and latest decisions
+  alerts candidates [ARGS...]    send or dry-run Discord candidate alerts from candidate ledger
+  alerts enable|disable|status   control automatic Discord candidate alerts timer
   check-config                   print resolved account config
   validate                       run Alpaca formatting, shell, test, and check commands
   deploy                         build and install local Alpaca runtime files
@@ -59,6 +63,9 @@ Examples:
   $(basename "$0") --account paper-main ledger --lines 20
   $(basename "$0") today
   $(basename "$0") ledger-summary --all
+  $(basename "$0") alerts candidates --all --dry-run
+  $(basename "$0") alerts candidates --all --send
+  $(basename "$0") alerts enable
   $(basename "$0") rollout
 EOF
 }
@@ -667,6 +674,76 @@ run_today() {
   done
 }
 
+run_alerts() {
+  local subcommand
+  subcommand="${1:-}"
+  if [[ $# -gt 0 ]]; then
+    shift
+  fi
+  case "$subcommand" in
+    candidates|candidate)
+      run_candidate_alerts "$@"
+      ;;
+    enable)
+      systemctl --user enable --now alpaca-candidate-alerts.timer
+      systemctl --user list-timers alpaca-candidate-alerts.timer --no-pager
+      ;;
+    disable)
+      systemctl --user disable --now alpaca-candidate-alerts.timer
+      ;;
+    status)
+      systemctl --user status alpaca-candidate-alerts.timer --no-pager || true
+      systemctl --user status alpaca-candidate-alerts.service --no-pager || true
+      ;;
+    *)
+      echo "usage: $(basename "$0") alerts candidates [--all] [--send|--dry-run] [ARGS...] | alerts enable|disable|status" >&2
+      exit 2
+      ;;
+  esac
+}
+
+run_candidate_alerts() {
+  local account all
+  local -a alert_args
+  account="$ACCOUNT"
+  all="false"
+  alert_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all)
+        all="true"
+        shift
+        ;;
+      --account|-a)
+        account="$(normalize_account "${2:-}")"
+        shift 2
+        ;;
+      *)
+        alert_args+=("$1")
+        shift
+        ;;
+    esac
+  done
+  require_executable "$CANDIDATE_ALERTS_BIN" "candidate alerts binary"
+  if [[ "$all" == "true" ]]; then
+    for account in $(known_accounts | sort -u); do
+      run_candidate_alerts_for_account "$account" "${alert_args[@]}"
+    done
+  else
+    run_candidate_alerts_for_account "$account" "${alert_args[@]}"
+  fi
+}
+
+run_candidate_alerts_for_account() {
+  local account
+  account="$(normalize_account "$1")"
+  shift
+  setup_account_env "$account"
+  export NAUTILUS_ALPACA_ALERTS_ENV_FILE="$ALERTS_ENV_FILE"
+  echo "candidate_alerts account=$account alerts_env=$ALERTS_ENV_FILE"
+  "$CANDIDATE_ALERTS_BIN" "$@"
+}
+
 run_validate() {
   cd "$REPO"
   run_logged cargo fmt -p nautilus-alpaca
@@ -773,6 +850,9 @@ case "$COMMAND" in
     ;;
   ledger-summary)
     run_ledger_summary "$@"
+    ;;
+  alerts)
+    run_alerts "$@"
     ;;
   check-config)
     run_check_config "$ACCOUNT"
