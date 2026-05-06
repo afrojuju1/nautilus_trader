@@ -47,11 +47,11 @@ pub mod factories;
 pub mod fleet;
 pub mod http;
 #[cfg(feature = "live")]
-pub mod index_credit;
-#[cfg(feature = "live")]
-pub mod index_credit_engine;
-#[cfg(feature = "live")]
 pub mod management;
+#[cfg(feature = "live")]
+pub mod options_engine;
+#[cfg(feature = "live")]
+pub mod options_runtime;
 pub mod orders;
 pub mod parse;
 pub mod providers;

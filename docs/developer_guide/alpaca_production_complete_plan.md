@@ -2,7 +2,7 @@
 
 This document is the high-level plan for making this fork the production trading engine for the
 Alpaca option-spread workflow. The target state is Nautilus-native execution and strategy runtime.
-`spreads` is legacy/reference material only and must not remain in the live trading loop.
+`spreads` is reference material only and must not remain in the live trading loop.
 
 ## Target State
 
@@ -35,7 +35,7 @@ Completed foundation:
 - Paper smoke tests have submitted an MLeg spread through Nautilus, observed accepted leg events,
   canceled the parent, and verified zero positions/open orders afterward.
 - The fork has a documented upstream sync workflow in `AGENTS.md`.
-- Native `index_put_credit_entry` and `index_call_credit_entry` scanner/entry paths run from the
+- Native `put_credit` and `call_credit` scanner/entry paths run from the
   Rust Alpaca runner and submit through Nautilus `SubmitOrderList` when explicitly enabled.
 - Initial credit/debit spread management can cancel stale entries, evaluate close triggers with
   expiration-risk exits, emit management snapshots with PnL context, build reduce-only close MLegs,
@@ -45,7 +45,7 @@ Completed foundation:
 
 Known gaps:
 
-- The `alpaca-index-credit-engine` binary is now a thin entrypoint over library account-engine
+- The `alpaca-options-engine` binary is now a thin entrypoint over library account-engine
   code, but the account engine still needs a clean strategy-hosting abstraction. Additional
   strategies should plug into one account engine rather than becoming separate account-owning
   runners.
@@ -114,19 +114,19 @@ Exit criteria:
 Status: initial production-capable slice complete; continue validating edge broker lifecycle events
 as paper/live proof expands.
 
-## Phase 3: Native `index_put_credit_entry`
+## Phase 3: Native `put_credit`
 
 Goal: run the first strategy fully inside Nautilus.
 
 Work:
 
 - Build a Nautilus-native put-credit strategy or strategy runner. (Initial
-  `alpaca-index-credit-engine` Rust runner complete; it scans, applies broker/state admission,
+  `alpaca-options-engine` Rust runner complete; it scans, applies broker/state admission,
   selects one entry, and can submit through the Alpaca `SubmitOrderList` execution path when
   explicitly enabled.)
 - Port scanner parameters for underlyings, DTE, width, delta, open interest, leg spread, minimum
   return-on-risk, and credit/debit-to-width floors. (Runner reads these from `ALPACA_CONFIG_PATH`,
-  defaulting to `~/.config/nautilus-trader/alpaca/index-credit.toml`; ranking favors centered DTE
+  defaulting to `~/.config/nautilus-trader/alpaca/options-engine.toml`; ranking favors centered DTE
   and stronger minimum-leg open interest.)
 - Add account/position/open-order admission checks. (Runner uses the Alpaca adapter admission gate.)
 - Add deterministic sizing and daily duplicate-entry controls. (Runner uses TOML `index.quantity`
@@ -134,8 +134,8 @@ Work:
 - Build and submit Nautilus `SubmitOrderList` entries directly. (Submission is disabled by default;
   set TOML `runtime.submit = true` or emergency override `ALPACA_SUBMIT=true` for paper execution.)
 - Persist enough local strategy state to avoid duplicate submits after restart. (Default state path
-  is `$XDG_STATE_HOME/nautilus_trader/alpaca_index_credit_state.json` or
-  `$HOME/.local/state/nautilus_trader/alpaca_index_credit_state.json`.)
+  is `$XDG_STATE_HOME/nautilus_trader/alpaca_options_engine_state.json` or
+  `$HOME/.local/state/nautilus_trader/alpaca_options_engine_state.json`.)
 - Remove any dependency on `spreads` execution intents, workers, or Docker runtime.
 
 Exit criteria:
@@ -149,16 +149,16 @@ Runner commands:
 
 ```bash
 # Validate TOML/env config without scanning or submitting.
-cargo run -p nautilus-alpaca --features live --bin alpaca-index-credit-engine -- --check-config
+cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- --check-config
 
 # Dry-run scan, no order submission.
 ALPACA_IGNORE_ENTRY_WINDOW=true \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-index-credit-engine -- SPY,QQQ,IWM
+  cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- SPY,QQQ,IWM
 
 # Paper submission path; use cancel-after-accept only for smoke testing.
 ALPACA_SUBMIT=true \
 ALPACA_CANCEL_AFTER_ACCEPT=true \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-index-credit-engine -- SPY,QQQ,IWM
+  cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- SPY,QQQ,IWM
 ```
 
 Phase 7A call-credit mode:
@@ -167,7 +167,7 @@ Phase 7A call-credit mode:
 # Scan both index put-credit and index call-credit candidates; submission still disabled.
 ALPACA_IGNORE_ENTRY_WINDOW=true \
 ALPACA_STRATEGIES=both \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-index-credit-engine -- SPY,QQQ,IWM
+  cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- SPY,QQQ,IWM
 ```
 
 Implementation note:
@@ -215,12 +215,12 @@ Management controls:
 ```bash
 # Evaluate management without broker actions.
 ALPACA_MANAGE=false \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-index-credit-engine
+  cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine
 
 # Allow stale-order cancel and close submission when triggers fire.
 ALPACA_MANAGE=true \
 ALPACA_CLOSE=true \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-index-credit-engine
+  cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine
 ```
 
 Key controls:
@@ -247,7 +247,7 @@ Goal: run Nautilus as the only live trading engine on the box.
 Work:
 
 - Create a NUC service definition for the Nautilus strategy runner.
-- Store env/secrets outside the repo. (Initial `deploy/alpaca/alpaca-index-credit.env.example`
+- Store env/secrets outside the repo. (Initial `deploy/alpaca/alpaca-options.env.example`
   documents the external env file shape without secrets.)
 - Add paper/live mode, account ID, strategy config, and symbol universe config. (Initial env
   template covers paper URLs, strategy universe, scan cadence, and safety gates.)
@@ -260,7 +260,7 @@ Work:
 Current status:
 
 - Deployment files are documented in [Alpaca NUC Deployment](alpaca_nuc_deployment.md).
-- On 2026-05-02, `alpaca-index-credit.service` was installed, started, health-checked, and stopped
+- On 2026-05-02, `alpaca-options.service` was installed, started, health-checked, and stopped
   on `ade-nucbox-k8-plus` with kill-switch enabled and submission disabled.
 - The runner supports TOML `runtime.max_iterations = 0` for continuous service mode.
 
@@ -290,7 +290,7 @@ Work:
 
 Current status:
 
-- `alpaca-index-credit-control.sh operator` reports service, account, orders, positions, strategy
+- `alpaca-control.sh operator` reports service, account, orders, positions, strategy
   state, last scan, last decision, latest broker event, and alerts from one command.
 - `alpaca-control alerts candidates` consumes typed `candidate_alert` records from per-account
   candidate-ledger JSONL and can dry-run or send Discord candidate alerts using an external
@@ -312,7 +312,7 @@ Goal: turn the proven runner/deployment slice into a maintainable single account
 
 Work:
 
-- Build and install release binaries for `alpaca-index-credit-engine` and
+- Build and install release binaries for `alpaca-options-engine` and
   `alpaca-operator-status`; stop using `cargo run` from systemd and control scripts. (Complete:
   installer builds release binaries and service/control scripts execute installed binaries.)
 - Move strategy state structs, atomic state persistence, operator-event emission, and credit-spread
@@ -341,9 +341,9 @@ Exit criteria:
 Current status:
 
 - Release binaries were built and installed on `ade-nucbox-k8-plus` on 2026-05-02.
-- `alpaca-index-credit.service` was verified running `~/.local/bin/alpaca-index-credit-engine`
+- `alpaca-options.service` was verified running `~/.local/bin/alpaca-options-engine`
   instead of `cargo run`.
-- `alpaca-index-credit-control.sh operator|health` was verified running
+- `alpaca-control.sh operator|health` was verified running
   `~/.local/bin/alpaca-operator-status`.
 - Strategy state persistence is atomic and shared between runner and operator status through the
   `runtime` module.
@@ -358,21 +358,21 @@ strategies, not a one-off strategy runner.
 Work:
 
 - Split the remaining runner logic into library modules:
-  - `runtime/config.rs`: environment/config parsing and validation. (Initial index-credit config
-    moved to `index_credit`.)
+  - `runtime/config.rs`: environment/config parsing and validation. (Initial options-engine config
+    moved to `options_runtime`.)
   - `runtime/engine.rs`: account-engine loop, lifecycle, iteration cadence, shutdown behavior.
-    (Initial index-credit account-engine loop moved to `index_credit_engine`.)
-  - `runtime/selection.rs`: scan, admission, and candidate selection. (Initial index-credit
-    selection moved to `index_credit`.)
+    (Initial options-engine account-engine loop moved to `options_engine`.)
+  - `runtime/selection.rs`: scan, admission, and candidate selection. (Initial options-engine
+    selection moved to `options_runtime`.)
   - `runtime/broker.rs`: submit, cancel, lookup, and reconciliation helper orchestration. (Initial
-    index-credit submit/cancel/lookup orchestration moved to `index_credit_engine`.)
+    options-engine submit/cancel/lookup orchestration moved to `options_engine`.)
 - Define an account context that owns broker connectivity, account snapshots, orders, positions,
   strategy state, operator events, and account-level risk controls. (Initial
-  `AccountEngineContext` complete for hosted index-credit decisions.)
+  `AccountEngineContext` complete for hosted options-engine decisions.)
 - Define a strategy runtime trait or equivalent interface so strategies produce decisions against
   the account context instead of directly owning broker I/O. (Initial `StrategyRuntime` trait
   complete.)
-- Port index credit into that strategy interface while preserving current behavior and environment
+- Port options into that strategy interface while preserving current behavior and environment
   gates. (Complete for entry decisions; management still runs inside the account engine.)
 - Keep Alpaca broker-native MLeg submission on the Rust `SubmitOrderList` path. Do not relax the
   Python/core `OrderList` single-instrument assumption just to support Alpaca option spreads.
@@ -386,7 +386,7 @@ Work:
 
 Exit criteria:
 
-- `bin/index_credit_engine.rs` is a thin entrypoint over library account-engine code.
+- `bin/options_engine.rs` is a thin entrypoint over library account-engine code.
 - Index credit behavior is preserved through tests and dry-run/paper smoke commands.
 - Adding another strategy does not require another account-owning systemd service.
 - Strategy decisions can be tested without Alpaca credentials.
@@ -395,15 +395,15 @@ Exit criteria:
 
 Current status:
 
-- `IndexCreditConfig` now lives in library code and owns environment parsing/validation for the
-  index-credit runtime.
+- `OptionsEngineConfig` now lives in library code and owns environment parsing/validation for the
+  options-engine runtime.
 - Index-credit scan/admission/candidate selection now lives in library code as
-  `select_index_credit_entry`.
-- The installed `alpaca-index-credit-engine` binary is now a thin Tokio entrypoint over
-  `index_credit_engine::run_index_credit_engine`.
+  `select_credit_spread_entry`.
+- The installed `alpaca-options-engine` binary is now a thin Tokio entrypoint over
+  `options_engine::run_options_engine`.
 - The account-engine loop, management orchestration, and broker submit/cancel/lookup helpers now
   live in library code.
-- The engine hosts `IndexCreditStrategy` through `StrategyRuntime`, receives explicit
+- The engine hosts `OptionsRuntimeStrategy` through `StrategyRuntime`, receives explicit
   `StrategyDecision` values, and keeps broker submission as account-engine responsibility.
 - Direct tests cover underlying parsing, scanner-width parsing, and credential-free entry gates.
 - Account-level risk caps are now part of the account engine and operator status:
@@ -412,7 +412,7 @@ Current status:
 - Installed release binary was rebuilt and service health-checked after extraction on 2026-05-02.
 - Remaining Phase 6.6 work: paper-observe the extracted hosted engine during market hours.
 
-Status: engineering complete for index-credit account-engine hosting; market-hours paper proof
+Status: engineering complete for options-engine account-engine hosting; market-hours paper proof
 remains.
 
 ## Phase 6.7: Multi-Account Foundation
@@ -431,7 +431,7 @@ Work:
 - Add a fleet status command that checks enabled accounts by running the existing operator status
   command inside a hermetic child process built from each account's env file plus registry service
   and config metadata.
-- Keep the current account as `paper-main` on `alpaca-index-credit.service`; keep future accounts
+- Keep the current account as `paper-main` on `alpaca-options.service`; keep future accounts
   disabled until credentials are provided and reviewed.
 
 Exit criteria:
@@ -452,9 +452,9 @@ policy blocks in operator status. This is not yet a full allocator.
 
 Migration order:
 
-1. `index_put_credit_entry` (initial native runner complete)
-2. `index_call_credit_entry` (Phase 7A scanner path complete through `ALPACA_STRATEGIES=call|both`)
-3. `index_call_debit_entry` / `index_put_debit_entry` for the directional paper account (hosted
+1. `put_credit` (initial native runner complete)
+2. `call_credit` (Phase 7A scanner path complete through `ALPACA_STRATEGIES=call|both`)
+3. `call_debit` / `put_debit` for the directional paper account (hosted
    scanner, submit, state, and debit-spread close-management path complete; paper proof pending)
 4. `earnings_call_debit_entry` / `earnings_put_debit_entry` (debit-spread Alpaca MLeg order payload
    builders complete; explicit earnings-event CSV input policy complete; earnings-event selection
@@ -496,7 +496,7 @@ Phase 7 blockers:
   2. Enforce account-level caps before enabling additional strategies.
   3. Show cap status and cap alerts in operator status.
   4. Paper-prove caps with existing open strategy state.
-  5. Enable `index_call_credit_entry` under strict caps.
+  5. Enable `call_credit` under strict caps.
   6. Paper-prove one call-credit open/management/close lifecycle. (Open proof complete on
      May 4, 2026; close proof remains under management.)
   7. Expand to put-plus-call only after single-call proof is clean. (Initial 10-symbol scan list is
@@ -554,7 +554,7 @@ Rollout order:
 Pre-rollout gates:
 
 - Phase 6.5 is complete.
-- Phase 6.6 is complete for the index-credit account engine.
+- Phase 6.6 is complete for the options-engine account engine.
 - Paper account starts clean: active account, zero unmanaged positions, zero open orders unless the
   test intentionally creates them.
 - Operator status reports `idle`, `blocked`, or `trading` accurately during the whole paper run and

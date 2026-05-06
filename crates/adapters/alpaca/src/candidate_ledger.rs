@@ -118,7 +118,7 @@ mod tests {
         );
         assert_eq!(
             default_candidate_ledger_dir(
-                Path::new("/tmp/nautilus_trader/alpaca_index_credit_state.json"),
+                Path::new("/tmp/nautilus_trader/alpaca_options_engine_state.json"),
                 Some("paper-main"),
             ),
             PathBuf::from("/tmp/nautilus_trader/alpaca/paper-main/candidate-ledger"),

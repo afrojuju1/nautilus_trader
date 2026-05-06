@@ -1,4 +1,4 @@
-# Copy to ~/.config/nautilus-trader/alpaca/base-index-credit.toml.
+# Copy to ~/.config/nautilus-trader/alpaca/base-options-engine.toml.
 # Account configs explicitly inherit this file with `extends`.
 
 [runtime]
@@ -12,7 +12,7 @@ candidate_ledger_enabled = true
 # Omit candidate_ledger_dir to derive ~/.local/state/nautilus_trader/alpaca/<account>/candidate-ledger.
 candidate_ledger_max_candidates = 10
 
-[index]
+[universe]
 underlyings = ["SPY", "QQQ", "IWM", "DIA", "GLD", "GDX", "SLV", "TLT", "XLE", "XLF", "XLK", "XLV", "XLY", "XLI", "XLP", "XLU", "XLB", "XLC", "SMH", "USO", "XOP", "XOM"]
 quantity = 1
 entry_start = "09:45"

@@ -112,7 +112,7 @@ impl StrategyState {
         self.entries.push(StrategyStateEntry {
             trade_date,
             underlying,
-            strategy: "index_iron_condor_entry".to_string(),
+            strategy: "iron_condor".to_string(),
             order_list_id,
             short_symbol: candidate.put.short.symbol.clone(),
             long_symbol: candidate.put.long.symbol.clone(),
@@ -356,8 +356,8 @@ impl StrategyStateEntry {
 #[must_use]
 pub fn credit_spread_strategy_name(kind: CreditSpreadKind) -> &'static str {
     match kind {
-        CreditSpreadKind::Put => "index_put_credit_entry",
-        CreditSpreadKind::Call => "index_call_credit_entry",
+        CreditSpreadKind::Put => "put_credit",
+        CreditSpreadKind::Call => "call_credit",
     }
 }
 
@@ -365,8 +365,8 @@ pub fn credit_spread_strategy_name(kind: CreditSpreadKind) -> &'static str {
 #[must_use]
 pub fn debit_spread_strategy_name(kind: DebitSpreadKind) -> &'static str {
     match kind {
-        DebitSpreadKind::Call => "index_call_debit_entry",
-        DebitSpreadKind::Put => "index_put_debit_entry",
+        DebitSpreadKind::Call => "call_debit",
+        DebitSpreadKind::Put => "put_debit",
     }
 }
 
@@ -374,10 +374,10 @@ pub fn debit_spread_strategy_name(kind: DebitSpreadKind) -> &'static str {
 #[must_use]
 pub fn naked_option_strategy_name(kind: NakedOptionKind) -> &'static str {
     match kind {
-        NakedOptionKind::Call => "index_naked_call_entry",
-        NakedOptionKind::Put => "index_naked_put_entry",
-        NakedOptionKind::CallOneToThreeDte => "index_naked_call_1_3dte_entry",
-        NakedOptionKind::PutOneToThreeDte => "index_naked_put_1_3dte_entry",
+        NakedOptionKind::Call => "naked_call",
+        NakedOptionKind::Put => "naked_put",
+        NakedOptionKind::CallOneToThreeDte => "naked_call_1_3dte",
+        NakedOptionKind::PutOneToThreeDte => "naked_put_1_3dte",
     }
 }
 

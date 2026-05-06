@@ -23,12 +23,12 @@ use nautilus_alpaca::{
         client::AlpacaHttpClient,
         models::{AlpacaPosition, ListOrdersRequest},
     },
-    runtime_env::load_index_credit_env_file,
+    runtime_env::load_options_env_file,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    load_index_credit_env_file()?;
+    load_options_env_file()?;
     let mut config = AlpacaDataClientConfig::default();
     config.trading_base_url = env::var("ALPACA_TRADING_BASE_URL").ok();
     config.data_base_url = env::var("ALPACA_DATA_BASE_URL").ok();

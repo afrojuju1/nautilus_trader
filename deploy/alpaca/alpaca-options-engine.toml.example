@@ -1,7 +1,7 @@
-# Copy to ~/.config/nautilus-trader/alpaca/index-credit.toml before running the service.
-# Shared scanner, universe, sector, and management defaults live in base-index-credit.toml.
+# Copy to ~/.config/nautilus-trader/alpaca/options-engine.toml before running the service.
+# Shared scanner, universe, sector, and management defaults live in base-options-engine.toml.
 
-extends = "base-index-credit.toml"
+extends = "base-options-engine.toml"
 
 [runtime]
 strategies = ["put"]
@@ -10,7 +10,7 @@ submit = false
 manage = false
 close = false
 kill_switch = true
-state_path = "/home/ade/.local/state/nautilus_trader/alpaca_index_credit_state.json"
+state_path = "/home/ade/.local/state/nautilus_trader/alpaca_options_engine_state.json"
 
 [risk]
 # Account-level caps checked before any hosted strategy can submit a new entry.

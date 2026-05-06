@@ -101,8 +101,8 @@ doc = false
 test = false
 
 [[bin]]
-# Legacy diagnostic scanner for the put-credit leg only. The production account engine is
-# `alpaca-index-credit-engine`.
+# Diagnostic scanner for the put-credit leg only. The production account engine is
+# `alpaca-options-engine`.
 name = "alpaca-dry-run-put-credit"
 path = "bin/dry_run_put_credit.rs"
 required-features = ["live"]
@@ -110,8 +110,8 @@ doc = false
 test = false
 
 [[bin]]
-name = "alpaca-index-credit-engine"
-path = "bin/index_credit_engine.rs"
+name = "alpaca-options-engine"
+path = "bin/options_engine.rs"
 required-features = ["live"]
 doc = false
 test = false
@@ -201,8 +201,8 @@ doc = false
 test = false
 
 [[bin]]
-# Legacy diagnostic loop for the put-credit leg only. The production account engine is
-# `alpaca-index-credit-engine`.
+# Diagnostic loop for the put-credit leg only. The production account engine is
+# `alpaca-options-engine`.
 name = "alpaca-put-credit-strategy-loop"
 path = "bin/put_credit_strategy_loop.rs"
 required-features = ["live"]

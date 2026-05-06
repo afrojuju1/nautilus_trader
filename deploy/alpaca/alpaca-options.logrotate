@@ -1,4 +1,4 @@
-/home/ade/.local/state/nautilus_trader/logs/alpaca-index-credit.log {
+/home/ade/.local/state/nautilus_trader/logs/alpaca-options.log {
     daily
     rotate 14
     compress

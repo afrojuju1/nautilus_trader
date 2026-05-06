@@ -1,5 +1,5 @@
 [Unit]
-Description=Nautilus Alpaca index credit runner (%i)
+Description=Nautilus Alpaca options runner (%i)
 Documentation=file:%h/Projects/nautilus_trader/docs/developer_guide/alpaca_nuc_deployment.md
 After=network-online.target
 Wants=network-online.target
@@ -9,15 +9,15 @@ Type=simple
 WorkingDirectory=%h/Projects/nautilus_trader
 Environment=NAUTILUS_ALPACA_ACCOUNT=%i
 Environment=NAUTILUS_ALPACA_ENV_FILE=%h/.config/nautilus-trader/alpaca/accounts/%i.env
-Environment=NAUTILUS_ALPACA_SERVICE=alpaca-index-credit@%i.service
+Environment=NAUTILUS_ALPACA_SERVICE=alpaca-options@%i.service
 Environment=NAUTILUS_ALPACA_REPO=%h/Projects/nautilus_trader
-Environment=NAUTILUS_ALPACA_RUNNER_BIN=%h/.local/bin/alpaca-index-credit-engine
+Environment=NAUTILUS_ALPACA_RUNNER_BIN=%h/.local/bin/alpaca-options-engine
 Environment=NAUTILUS_ALPACA_OPERATOR_BIN=%h/.local/bin/alpaca-operator-status
 Environment=NAUTILUS_ALPACA_LOG_DIR=%h/.local/state/nautilus_trader/alpaca/%i/logs
 Environment=NAUTILUS_ALPACA_LOCK_DIR=%h/.local/state/nautilus_trader/alpaca/%i/locks
-Environment=ALPACA_CONFIG_PATH=%h/.config/nautilus-trader/alpaca/configs/%i-index-credit.toml
+Environment=ALPACA_CONFIG_PATH=%h/.config/nautilus-trader/alpaca/configs/%i-options-engine.toml
 EnvironmentFile=%h/.config/nautilus-trader/alpaca/accounts/%i.env
-ExecStart=%h/.local/bin/alpaca-index-credit-runner
+ExecStart=%h/.local/bin/alpaca-options-runner
 Restart=on-failure
 RestartSec=30
 TimeoutStopSec=30

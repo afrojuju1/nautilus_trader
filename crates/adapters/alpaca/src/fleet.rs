@@ -430,7 +430,7 @@ mod tests {
 
             [[accounts]]
             id = "paper-main"
-            service = "alpaca-index-credit.service"
+            service = "alpaca-options.service"
             env_file = "/tmp/main.env"
 
             [accounts.permissions]

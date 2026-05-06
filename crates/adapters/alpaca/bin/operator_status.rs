@@ -29,7 +29,7 @@ use nautilus_alpaca::{
         client::AlpacaHttpClient,
         models::{AlpacaAccount, AlpacaActivity, AlpacaOrder, AlpacaPosition, ListOrdersRequest},
     },
-    index_credit::IndexCreditConfig,
+    options_runtime::OptionsEngineConfig,
     runtime::{StrategyState, load_strategy_state, read_operator_events},
 };
 use serde::Serialize;
@@ -245,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
 
 impl OperatorConfig {
     fn from_env() -> anyhow::Result<Self> {
-        let strategy_config = IndexCreditConfig::from_runtime_env()?;
+        let strategy_config = OptionsEngineConfig::from_runtime_env()?;
         let account_defaults = strategy_config.fleet.as_ref().and_then(|fleet| {
             fleet
                 .current_account()
@@ -291,10 +291,10 @@ impl OperatorConfig {
                         .as_ref()
                         .map(|defaults| defaults.service_name.clone())
                 })
-                .unwrap_or_else(|| "alpaca-index-credit.service".to_string()),
+                .unwrap_or_else(|| "alpaca-options.service".to_string()),
             state_path: strategy_config.state_path,
-            log_path: log_dir.join("alpaca-index-credit.log"),
-            lock_path: lock_dir.join("alpaca-index-credit.lock"),
+            log_path: log_dir.join("alpaca-options.log"),
+            lock_path: lock_dir.join("alpaca-options.lock"),
             stale_order_secs: strategy_config.stale_entry_secs as i64,
             max_close_attempts: strategy_config.max_close_attempts,
             trade_date: Utc::now()

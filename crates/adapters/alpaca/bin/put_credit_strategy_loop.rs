@@ -13,9 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Legacy timer-style put-credit strategy loop using the shared Alpaca scanner.
+//! Timer-style put-credit strategy loop using the shared Alpaca scanner.
 //!
-//! The production account engine is `alpaca-index-credit-engine`.
+//! The production account engine is `alpaca-options-engine`.
 
 use std::{env, str::FromStr, time::Duration};
 

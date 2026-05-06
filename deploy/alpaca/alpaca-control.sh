@@ -6,11 +6,11 @@ STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 ALPACA_CONFIG_HOME="${NAUTILUS_ALPACA_CONFIG_HOME:-$CONFIG_HOME/nautilus-trader/alpaca}"
 ALPACA_STATE_HOME="${NAUTILUS_ALPACA_STATE_HOME:-$STATE_HOME/nautilus_trader/alpaca}"
 DEFAULT_ACCOUNT="${NAUTILUS_ALPACA_DEFAULT_ACCOUNT:-paper-main}"
-DEFAULT_ENV_FILE="${NAUTILUS_ALPACA_DEFAULT_ENV_FILE:-$ALPACA_CONFIG_HOME/index-credit.env}"
+DEFAULT_ENV_FILE="${NAUTILUS_ALPACA_DEFAULT_ENV_FILE:-$ALPACA_CONFIG_HOME/options-engine.env}"
 ACCOUNT_ENV_DIR="${NAUTILUS_ALPACA_ACCOUNT_ENV_DIR:-$ALPACA_CONFIG_HOME/accounts}"
 ACCOUNT_CONFIG_DIR="${NAUTILUS_ALPACA_ACCOUNT_CONFIG_DIR:-$ALPACA_CONFIG_HOME/configs}"
 REPO="${NAUTILUS_ALPACA_REPO:-$HOME/Projects/nautilus_trader}"
-ENGINE_BIN="${NAUTILUS_ALPACA_RUNNER_BIN:-$HOME/.local/bin/alpaca-index-credit-engine}"
+ENGINE_BIN="${NAUTILUS_ALPACA_RUNNER_BIN:-$HOME/.local/bin/alpaca-options-engine}"
 OPERATOR_BIN="${NAUTILUS_ALPACA_OPERATOR_BIN:-$HOME/.local/bin/alpaca-operator-status}"
 FLEET_BIN="${NAUTILUS_ALPACA_FLEET_BIN:-$HOME/.local/bin/alpaca-fleet-status}"
 CANDIDATE_ALERTS_BIN="${NAUTILUS_ALPACA_CANDIDATE_ALERTS_BIN:-$HOME/.local/bin/alpaca-candidate-alerts}"
@@ -95,9 +95,9 @@ account_config_file() {
   local account
   account="$(normalize_account "$1")"
   if [[ "$account" == "paper-main" ]]; then
-    printf '%s\n' "$ALPACA_CONFIG_HOME/index-credit.toml"
+    printf '%s\n' "$ALPACA_CONFIG_HOME/options-engine.toml"
   else
-    printf '%s\n' "$ACCOUNT_CONFIG_DIR/$account-index-credit.toml"
+    printf '%s\n' "$ACCOUNT_CONFIG_DIR/$account-options-engine.toml"
   fi
 }
 
@@ -105,9 +105,20 @@ account_service() {
   local account
   account="$(normalize_account "$1")"
   if [[ "$account" == "paper-main" ]]; then
-    printf '%s\n' "alpaca-index-credit.service"
+    printf '%s\n' "alpaca-options.service"
   else
-    printf '%s\n' "alpaca-index-credit@$account.service"
+    printf '%s\n' "alpaca-options@$account.service"
+  fi
+}
+
+active_account_service() {
+  local account service
+  account="$(normalize_account "$1")"
+  service="$(account_service "$account")"
+  if systemctl --user is-active --quiet "$service"; then
+    printf '%s\n' "$service"
+  else
+    printf '%s\n' "$service"
   fi
 }
 
@@ -749,14 +760,15 @@ run_validate() {
   run_logged cargo fmt -p nautilus-alpaca
   run_logged git diff --check
   run_logged bash -n deploy/alpaca/alpaca-control.sh
-  run_logged bash -n deploy/alpaca/alpaca-index-credit-control.sh
+  run_logged bash -n deploy/alpaca/alpaca-options-install.sh
+  run_logged bash -n deploy/alpaca/alpaca-options-runner.sh
   run_logged cargo test -p nautilus-alpaca --features live --lib
   run_logged cargo check -p nautilus-alpaca --features live --bins
 }
 
 run_deploy() {
   cd "$REPO"
-  run_logged deploy/alpaca/alpaca-index-credit-install.sh
+  run_logged deploy/alpaca/alpaca-options-install.sh
 }
 
 restart_all_services() {
@@ -772,7 +784,7 @@ check_all_services_active() {
   local account service failed
   failed=0
   for account in $(known_accounts | sort -u); do
-    service="$(account_service "$account")"
+    service="$(active_account_service "$account")"
     if systemctl --user is-active --quiet "$service"; then
       echo "service=$service active=true"
     else
@@ -820,6 +832,7 @@ case "$COMMAND" in
     ;;
   status)
     setup_account_env "$ACCOUNT"
+    NAUTILUS_ALPACA_SERVICE="$(active_account_service "$ACCOUNT")"
     systemctl --user status "$NAUTILUS_ALPACA_SERVICE" --no-pager || true
     run_operator_status "$ACCOUNT" || true
     ;;
@@ -832,12 +845,13 @@ case "$COMMAND" in
     ;;
   health)
     setup_account_env "$ACCOUNT"
+    NAUTILUS_ALPACA_SERVICE="$(active_account_service "$ACCOUNT")"
     if ! systemctl --user is-active --quiet "$NAUTILUS_ALPACA_SERVICE"; then
       echo "health=down service=$NAUTILUS_ALPACA_SERVICE"
       exit 1
     fi
-    lock_file="$NAUTILUS_ALPACA_LOCK_DIR/alpaca-index-credit.lock"
-    log_file="$NAUTILUS_ALPACA_LOG_DIR/alpaca-index-credit.log"
+    lock_file="$NAUTILUS_ALPACA_LOCK_DIR/alpaca-options.lock"
+    log_file="$NAUTILUS_ALPACA_LOG_DIR/alpaca-options.log"
     if [[ ! -f "$lock_file" ]]; then
       echo "health=degraded reason=missing_lock service=$NAUTILUS_ALPACA_SERVICE lock_file=$lock_file"
       exit 1
@@ -872,7 +886,7 @@ case "$COMMAND" in
     ;;
   stop)
     setup_account_env "$ACCOUNT"
-    systemctl --user stop "$NAUTILUS_ALPACA_SERVICE"
+    systemctl --user stop "$NAUTILUS_ALPACA_SERVICE" || true
     ;;
   restart)
     setup_account_env "$ACCOUNT"
@@ -883,6 +897,7 @@ case "$COMMAND" in
     ;;
   logs)
     setup_account_env "$ACCOUNT"
+    NAUTILUS_ALPACA_SERVICE="$(active_account_service "$ACCOUNT")"
     journalctl --user -u "$NAUTILUS_ALPACA_SERVICE" -f
     ;;
   scan)

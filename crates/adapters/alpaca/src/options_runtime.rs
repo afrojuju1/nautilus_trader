@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Index credit strategy configuration and candidate selection.
+//! Alpaca options runtime configuration and candidate selection.
 
 use std::{
     collections::BTreeMap,
@@ -55,14 +55,14 @@ const CANDIDATE_ALERT_IRON_CONDOR_MIN_SCORE: f64 = 80.0;
 const CANDIDATE_ALERT_CREDIT_MIN_SCORE: f64 = 80.0;
 const CANDIDATE_ALERT_DEBIT_MIN_SCORE: f64 = 80.0;
 
-/// Runtime config for the index credit account-engine slice.
+/// Runtime config for the options account-engine slice.
 #[derive(Debug)]
-pub struct IndexCreditConfig {
+pub struct OptionsEngineConfig {
     /// Underlyings to scan.
     pub underlyings: Vec<String>,
     /// Enabled spread kinds.
     pub spread_kinds: Vec<CreditSpreadKind>,
-    /// Whether the index iron-condor strategy is enabled.
+    /// Whether the iron-condor strategy is enabled.
     pub iron_condor_enabled: bool,
     /// Enabled long-premium debit spread kinds.
     pub debit_kinds: Vec<DebitSpreadKind>,
@@ -164,7 +164,7 @@ pub struct IndexCreditConfig {
     pub fleet_policy_blocks: Vec<String>,
 }
 
-impl IndexCreditConfig {
+impl OptionsEngineConfig {
     /// Builds config from TOML config, short environment overrides, and optional positional
     /// underlyings.
     ///
@@ -172,8 +172,8 @@ impl IndexCreditConfig {
     ///
     /// Returns an error when config, strategy names, times, or timezone values are invalid.
     pub fn from_env() -> anyhow::Result<Self> {
-        crate::runtime_env::load_index_credit_env_file()?;
-        build_index_credit_config(
+        crate::runtime_env::load_options_env_file()?;
+        build_options_engine_config(
             load_runtime_config_file_from_env()?,
             env::args().skip(1).collect::<Vec<_>>(),
         )
@@ -185,8 +185,8 @@ impl IndexCreditConfig {
     ///
     /// Returns an error when config, strategy names, times, or timezone values are invalid.
     pub fn from_runtime_env() -> anyhow::Result<Self> {
-        crate::runtime_env::load_index_credit_env_file()?;
-        build_index_credit_config(load_runtime_config_file_from_env()?, Vec::new())
+        crate::runtime_env::load_options_env_file()?;
+        build_options_engine_config(load_runtime_config_file_from_env()?, Vec::new())
     }
 
     /// Returns pure management thresholds for this runtime config.
@@ -269,7 +269,7 @@ impl IndexCreditConfig {
             .map(|kind| credit_spread_strategy_name(*kind))
             .collect::<Vec<_>>();
         if self.iron_condor_enabled {
-            names.push("index_iron_condor_entry");
+            names.push("iron_condor");
         }
         names.extend(
             self.debit_kinds
@@ -293,7 +293,7 @@ impl IndexCreditConfig {
             .map(|kind| credit_spread_strategy_name(*kind))
             .collect::<Vec<_>>();
         if self.iron_condor_dry_run {
-            names.push("index_iron_condor_entry");
+            names.push("iron_condor");
         }
         names.extend(
             self.dry_run_debit_kinds
@@ -362,7 +362,7 @@ pub struct SelectedEntry {
     pub candidate: SpreadCandidate,
 }
 
-/// Selected index iron-condor candidate.
+/// Selected iron-condor candidate.
 #[derive(Clone, Debug)]
 pub struct SelectedIronCondorEntry {
     /// Underlying symbol.
@@ -393,9 +393,9 @@ pub struct SelectedNakedOptionEntry {
     pub candidate: NakedOptionCandidate,
 }
 
-/// Selected index strategy candidate.
+/// Selected options strategy candidate.
 #[derive(Clone, Debug)]
-pub enum SelectedIndexEntry {
+pub enum SelectedOptionsEntry {
     /// Two-leg credit spread.
     Credit(SelectedEntry),
     /// Four-leg iron condor.
@@ -406,7 +406,7 @@ pub enum SelectedIndexEntry {
     NakedOption(SelectedNakedOptionEntry),
 }
 
-impl SelectedIndexEntry {
+impl SelectedOptionsEntry {
     /// Returns the scanner score.
     #[must_use]
     pub fn score(&self) -> f64 {
@@ -450,45 +450,45 @@ impl SelectedIndexEntry {
     }
 }
 
-/// Selects the best allowed index credit entry for one iteration.
+/// Selects the best allowed options entry for one iteration.
 ///
 /// # Errors
 ///
 /// Returns an error when Alpaca account, position, order, contract, or snapshot requests fail.
-pub async fn select_index_credit_entry(
+pub async fn select_credit_spread_entry(
     client: &AlpacaHttpClient,
     data_config: &AlpacaDataClientConfig,
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     state: &StrategyState,
     trade_date: &str,
 ) -> anyhow::Result<Option<SelectedEntry>> {
     Ok(
-        select_index_strategy_entry(client, data_config, config, state, trade_date)
+        select_options_entry(client, data_config, config, state, trade_date)
             .await?
             .and_then(|entry| match entry {
-                SelectedIndexEntry::Credit(entry) => Some(entry),
-                SelectedIndexEntry::IronCondor(_) => None,
-                SelectedIndexEntry::Debit(_) => None,
-                SelectedIndexEntry::NakedOption(_) => None,
+                SelectedOptionsEntry::Credit(entry) => Some(entry),
+                SelectedOptionsEntry::IronCondor(_) => None,
+                SelectedOptionsEntry::Debit(_) => None,
+                SelectedOptionsEntry::NakedOption(_) => None,
             }),
     )
 }
 
-/// Selects the best allowed index strategy entry for one iteration.
+/// Selects the best allowed options strategy entry for one iteration.
 ///
 /// # Errors
 ///
 /// Returns an error when Alpaca account, position, order, contract, or snapshot requests fail.
-pub async fn select_index_strategy_entry(
+pub async fn select_options_entry(
     client: &AlpacaHttpClient,
     data_config: &AlpacaDataClientConfig,
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     _state: &StrategyState,
     trade_date: &str,
-) -> anyhow::Result<Option<SelectedIndexEntry>> {
+) -> anyhow::Result<Option<SelectedOptionsEntry>> {
     let account = client.account().await?;
     let options_buying_power = account_options_buying_power(&account);
-    let mut selected: Option<SelectedIndexEntry> = None;
+    let mut selected: Option<SelectedOptionsEntry> = None;
 
     for underlying in &config.underlyings {
         for kind in &config.spread_kinds {
@@ -590,7 +590,7 @@ pub async fn select_index_strategy_entry(
                 .as_ref()
                 .is_none_or(|current| best.score > current.score())
             {
-                selected = Some(SelectedIndexEntry::Credit(SelectedEntry {
+                selected = Some(SelectedOptionsEntry::Credit(SelectedEntry {
                     underlying: underlying.clone(),
                     kind: *kind,
                     candidate: best.clone(),
@@ -618,7 +618,7 @@ pub async fn select_index_strategy_entry(
                 trade_date,
                 json!({
                     "underlying": underlying,
-                    "strategy": "index_iron_condor_entry",
+                    "strategy": "iron_condor",
                     "result": if result.candidates.is_empty() { "no_candidate" } else { "candidate" },
                     "reason": scanner_reason,
                     "contracts": result.contract_count,
@@ -635,7 +635,7 @@ pub async fn select_index_strategy_entry(
                     result.scoreable_count,
                 );
                 println!(
-                    "{underlying}: no_candidate strategy=index_iron_condor_entry reason={} contracts={} snapshots={} scoreable={} rejections={}",
+                    "{underlying}: no_candidate strategy=iron_condor reason={} contracts={} snapshots={} scoreable={} rejections={}",
                     reason,
                     result.contract_count,
                     result.snapshot_count,
@@ -646,7 +646,7 @@ pub async fn select_index_strategy_entry(
                     "scanner_diagnostic",
                     json!({
                         "underlying": underlying,
-                        "strategy": "index_iron_condor_entry",
+                        "strategy": "iron_condor",
                         "result": "no_candidate",
                         "reason": reason,
                         "contracts": result.contract_count,
@@ -659,7 +659,7 @@ pub async fn select_index_strategy_entry(
             };
 
             println!(
-                "{underlying}: candidate strategy=index_iron_condor_entry short_put={} long_put={} short_call={} long_call={} credit={:.2} ror={:.1}% score={:.1}",
+                "{underlying}: candidate strategy=iron_condor short_put={} long_put={} short_call={} long_call={} credit={:.2} ror={:.1}% score={:.1}",
                 best.put.short.symbol,
                 best.put.long.symbol,
                 best.call.short.symbol,
@@ -672,7 +672,7 @@ pub async fn select_index_strategy_entry(
                 "scanner_diagnostic",
                 json!({
                     "underlying": underlying,
-                    "strategy": "index_iron_condor_entry",
+                    "strategy": "iron_condor",
                     "result": "candidate",
                     "short_put_symbol": &best.put.short.symbol,
                     "long_put_symbol": &best.put.long.symbol,
@@ -689,7 +689,7 @@ pub async fn select_index_strategy_entry(
                 .as_ref()
                 .is_none_or(|current| best.score > current.score())
             {
-                selected = Some(SelectedIndexEntry::IronCondor(SelectedIronCondorEntry {
+                selected = Some(SelectedOptionsEntry::IronCondor(SelectedIronCondorEntry {
                     underlying: underlying.clone(),
                     candidate: best.clone(),
                 }));
@@ -805,7 +805,7 @@ pub async fn select_index_strategy_entry(
                 .as_ref()
                 .is_none_or(|current| best.score > current.score())
             {
-                selected = Some(SelectedIndexEntry::Debit(SelectedDebitEntry {
+                selected = Some(SelectedOptionsEntry::Debit(SelectedDebitEntry {
                     underlying: underlying.clone(),
                     kind: *kind,
                     candidate: best.clone(),
@@ -968,11 +968,13 @@ pub async fn select_index_strategy_entry(
                 .as_ref()
                 .is_none_or(|current| best.score > current.score())
             {
-                selected = Some(SelectedIndexEntry::NakedOption(SelectedNakedOptionEntry {
-                    underlying: underlying.clone(),
-                    kind: *kind,
-                    candidate: best.clone(),
-                }));
+                selected = Some(SelectedOptionsEntry::NakedOption(
+                    SelectedNakedOptionEntry {
+                        underlying: underlying.clone(),
+                        kind: *kind,
+                        candidate: best.clone(),
+                    },
+                ));
             }
         }
     }
@@ -993,7 +995,7 @@ struct StrategyConfig {
 struct RuntimeConfigFile {
     extends: Option<PathBuf>,
     runtime: RuntimeSection,
-    index: IndexSection,
+    universe: UniverseSection,
     scanner: ScannerSection,
     iron_condor: IronCondorSection,
     debit_scanner: DebitScannerSection,
@@ -1008,7 +1010,7 @@ impl RuntimeConfigFile {
         Self {
             extends: None,
             runtime: self.runtime.merge_parent(parent.runtime),
-            index: self.index.merge_parent(parent.index),
+            universe: self.universe.merge_parent(parent.universe),
             scanner: self.scanner.merge_parent(parent.scanner),
             iron_condor: self.iron_condor.merge_parent(parent.iron_condor),
             debit_scanner: self.debit_scanner.merge_parent(parent.debit_scanner),
@@ -1070,7 +1072,7 @@ impl RuntimeSection {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct IndexSection {
+struct UniverseSection {
     underlyings: Vec<String>,
     quantity: Option<u64>,
     entry_start: Option<String>,
@@ -1078,7 +1080,7 @@ struct IndexSection {
     entry_timezone: Option<String>,
 }
 
-impl IndexSection {
+impl UniverseSection {
     fn merge_parent(self, parent: Self) -> Self {
         Self {
             underlyings: merge_vec(self.underlyings, parent.underlyings),
@@ -1399,10 +1401,10 @@ fn parse_runtime_config_at_path(raw: &str, path: &Path) -> anyhow::Result<Runtim
     })
 }
 
-fn build_index_credit_config(
+fn build_options_engine_config(
     file: RuntimeConfigFile,
     cli_underlyings: Vec<String>,
-) -> anyhow::Result<IndexCreditConfig> {
+) -> anyhow::Result<OptionsEngineConfig> {
     let strategy_values = env::var("ALPACA_STRATEGIES")
         .ok()
         .map(|value| split_strings([value]))
@@ -1424,8 +1426,8 @@ fn build_index_credit_config(
     let scanner = scanner_config_from_file(&file.scanner);
     let stale_entry_secs = file.management.stale_entry_secs.unwrap_or(900);
     let fleet = load_fleet_config_from_env()?;
-    let mut config = IndexCreditConfig {
-        underlyings: underlyings_from_sources(cli_underlyings, &file.index),
+    let mut config = OptionsEngineConfig {
+        underlyings: underlyings_from_sources(cli_underlyings, &file.universe),
         spread_kinds: strategy_config.credit_kinds,
         iron_condor_enabled: strategy_config.iron_condor_enabled,
         debit_kinds: strategy_config.debit_kinds,
@@ -1448,7 +1450,9 @@ fn build_index_credit_config(
         interval_secs: env_parse("ALPACA_INTERVAL_SECS")
             .or(file.runtime.interval_secs)
             .unwrap_or(300),
-        quantity: env_parse("ALPACA_QTY").or(file.index.quantity).unwrap_or(1),
+        quantity: env_parse("ALPACA_QTY")
+            .or(file.universe.quantity)
+            .unwrap_or(1),
         submit_enabled: env_bool("ALPACA_SUBMIT")
             .or(file.runtime.submit)
             .unwrap_or(false),
@@ -1491,10 +1495,10 @@ fn build_index_credit_config(
         ignore_entry_window: env_bool("ALPACA_IGNORE_ENTRY_WINDOW")
             .or(file.runtime.ignore_entry_window)
             .unwrap_or(false),
-        entry_start: parse_time_value(file.index.entry_start.as_deref(), "09:45")?,
-        entry_end: parse_time_value(file.index.entry_end.as_deref(), "14:30")?,
+        entry_start: parse_time_value(file.universe.entry_start.as_deref(), "09:45")?,
+        entry_end: parse_time_value(file.universe.entry_end.as_deref(), "14:30")?,
         entry_timezone: file
-            .index
+            .universe
             .entry_timezone
             .as_deref()
             .unwrap_or("America/New_York")
@@ -1535,10 +1539,10 @@ fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyCo
         .map(|value| value.to_ascii_lowercase())
     {
         match raw.as_str() {
-            "put" | "put_credit" | "index_put_credit_entry" => {
+            "put" | "put_credit" => {
                 kinds.push(CreditSpreadKind::Put);
             }
-            "call" | "call_credit" | "index_call_credit_entry" => {
+            "call" | "call_credit" => {
                 kinds.push(CreditSpreadKind::Call);
             }
             "both" => {
@@ -1550,29 +1554,29 @@ fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyCo
                 kinds.push(CreditSpreadKind::Call);
                 iron_condor_enabled = true;
             }
-            "iron_condor" | "condor" | "index_iron_condor_entry" => {
+            "iron_condor" | "condor" => {
                 iron_condor_enabled = true;
             }
-            "call_debit" | "index_call_debit_entry" | "earnings_call_debit_entry" => {
+            "call_debit" | "earnings_call_debit_entry" => {
                 debit_kinds.push(DebitSpreadKind::Call);
             }
-            "put_debit" | "index_put_debit_entry" | "earnings_put_debit_entry" => {
+            "put_debit" | "earnings_put_debit_entry" => {
                 debit_kinds.push(DebitSpreadKind::Put);
             }
             "debit" | "long_premium" | "directional" => {
                 debit_kinds.push(DebitSpreadKind::Call);
                 debit_kinds.push(DebitSpreadKind::Put);
             }
-            "naked_call" | "short_call" | "index_naked_call_entry" => {
+            "naked_call" | "short_call" => {
                 naked_kinds.push(NakedOptionKind::Call);
             }
-            "naked_put" | "short_put" | "index_naked_put_entry" => {
+            "naked_put" | "short_put" => {
                 naked_kinds.push(NakedOptionKind::Put);
             }
-            "naked_call_1_3dte" | "short_call_1_3dte" | "index_naked_call_1_3dte_entry" => {
+            "naked_call_1_3dte" | "short_call_1_3dte" => {
                 naked_kinds.push(NakedOptionKind::CallOneToThreeDte);
             }
-            "naked_put_1_3dte" | "short_put_1_3dte" | "index_naked_put_1_3dte_entry" => {
+            "naked_put_1_3dte" | "short_put_1_3dte" => {
                 naked_kinds.push(NakedOptionKind::PutOneToThreeDte);
             }
             "naked_1_3dte" | "undefined_risk_1_3dte" | "short_premium_1_3dte" => {
@@ -1627,7 +1631,7 @@ fn dry_run_strategy_config_from_values(values: Vec<String>) -> anyhow::Result<St
     strategy_config_from_values(values)
 }
 
-fn apply_fleet_policy(config: &mut IndexCreditConfig) {
+fn apply_fleet_policy(config: &mut OptionsEngineConfig) {
     let Some(fleet) = &config.fleet else {
         return;
     };
@@ -1697,11 +1701,11 @@ fn apply_fleet_policy(config: &mut IndexCreditConfig) {
     }
 }
 
-fn has_defined_risk_strategies(config: &IndexCreditConfig) -> bool {
+fn has_defined_risk_strategies(config: &OptionsEngineConfig) -> bool {
     !config.spread_kinds.is_empty() || config.iron_condor_enabled
 }
 
-fn has_undefined_risk_strategies(config: &IndexCreditConfig) -> bool {
+fn has_undefined_risk_strategies(config: &OptionsEngineConfig) -> bool {
     !config.naked_kinds.is_empty()
 }
 
@@ -1709,7 +1713,7 @@ fn min_limit(current: Option<usize>, fleet_limit: usize) -> usize {
     current.map_or(fleet_limit, |current| current.min(fleet_limit))
 }
 
-fn underlyings_from_sources(cli_underlyings: Vec<String>, config: &IndexSection) -> Vec<String> {
+fn underlyings_from_sources(cli_underlyings: Vec<String>, config: &UniverseSection) -> Vec<String> {
     let args = split_strings(cli_underlyings);
     if !args.is_empty() {
         return args;
@@ -1735,12 +1739,12 @@ fn split_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
-fn record_scanner_ledger_result(config: &IndexCreditConfig, trade_date: &str, payload: Value) {
+fn record_scanner_ledger_result(config: &OptionsEngineConfig, trade_date: &str, payload: Value) {
     config.record_candidate_ledger(trade_date, "scanner_result", payload);
 }
 
 fn record_credit_candidate_ledger(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     trade_date: &str,
     underlying: &str,
     strategy: &str,
@@ -1768,7 +1772,7 @@ fn record_credit_candidate_ledger(
 }
 
 fn record_debit_candidate_ledger(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     trade_date: &str,
     underlying: &str,
     strategy: &str,
@@ -1796,7 +1800,7 @@ fn record_debit_candidate_ledger(
 }
 
 fn record_iron_condor_candidate_ledger(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     trade_date: &str,
     underlying: &str,
     candidates: &[IronCondorCandidate],
@@ -1811,7 +1815,7 @@ fn record_iron_condor_candidate_ledger(
         record_high_score_candidate_alert(
             config,
             trade_date,
-            "index_iron_condor_entry",
+            "iron_condor",
             underlying,
             &candidate.put.short.symbol,
             &[
@@ -1827,7 +1831,7 @@ fn record_iron_condor_candidate_ledger(
 }
 
 fn record_naked_candidate_ledger(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     trade_date: &str,
     underlying: &str,
     strategy: &str,
@@ -1922,7 +1926,7 @@ pub fn iron_condor_candidate_ledger_payload(
 ) -> Value {
     let mut payload = json!({
         "underlying": underlying,
-        "strategy": "index_iron_condor_entry",
+        "strategy": "iron_condor",
         "candidate_type": "iron_condor",
         "short_put_symbol": &candidate.put.short.symbol,
         "long_put_symbol": &candidate.put.long.symbol,
@@ -1994,7 +1998,7 @@ pub fn candidate_alert_key(alert_type: &str, identity_key: &str) -> String {
 }
 
 fn record_high_score_candidate_alert(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     trade_date: &str,
     strategy: &str,
     underlying: &str,
@@ -2216,7 +2220,7 @@ pub(crate) fn active_sector_count(
 }
 
 pub(crate) fn fleet_has_active_underlying_elsewhere(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     underlying: &str,
 ) -> bool {
     let Some(fleet) = &config.fleet else {
@@ -2230,7 +2234,10 @@ pub(crate) fn fleet_has_active_underlying_elsewhere(
         .contains(&underlying.to_ascii_uppercase())
 }
 
-pub(crate) fn fleet_active_underlying_count(config: &IndexCreditConfig, underlying: &str) -> usize {
+pub(crate) fn fleet_active_underlying_count(
+    config: &OptionsEngineConfig,
+    underlying: &str,
+) -> usize {
     config
         .fleet
         .as_ref()
@@ -2246,7 +2253,7 @@ pub(crate) fn fleet_active_underlying_count(config: &IndexCreditConfig, underlyi
 }
 
 pub(crate) fn fleet_sector_limit_state(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     underlying: &str,
 ) -> Option<(String, usize, usize)> {
     let fleet = config.fleet.as_ref()?;
@@ -2421,32 +2428,32 @@ fn default_config_path() -> PathBuf {
         return PathBuf::from(value)
             .join("nautilus-trader")
             .join("alpaca")
-            .join("index-credit.toml");
+            .join("options-engine.toml");
     }
     if let Some(value) = env::var_os("HOME") {
         return PathBuf::from(value)
             .join(".config")
             .join("nautilus-trader")
             .join("alpaca")
-            .join("index-credit.toml");
+            .join("options-engine.toml");
     }
-    PathBuf::from("index-credit.toml")
+    PathBuf::from("options-engine.toml")
 }
 
 fn default_state_path() -> PathBuf {
     if let Some(value) = env::var_os("XDG_STATE_HOME") {
         return PathBuf::from(value)
             .join("nautilus_trader")
-            .join("alpaca_index_credit_state.json");
+            .join("alpaca_options_engine_state.json");
     }
     if let Some(value) = env::var_os("HOME") {
         return PathBuf::from(value)
             .join(".local")
             .join("state")
             .join("nautilus_trader")
-            .join("alpaca_index_credit_state.json");
+            .join("alpaca_options_engine_state.json");
     }
-    PathBuf::from("alpaca_index_credit_state.json")
+    PathBuf::from("alpaca_options_engine_state.json")
 }
 
 fn env_bool(name: &str) -> Option<bool> {
@@ -2492,7 +2499,7 @@ max_iterations = 0
 candidate_ledger_enabled = true
 candidate_ledger_max_candidates = 5
 
-[index]
+[universe]
 underlyings = ["SPY", "GLD"]
 quantity = 1
 
@@ -2536,8 +2543,8 @@ GDX = "metals"
         assert_eq!(merged.runtime.max_iterations, Some(0));
         assert_eq!(merged.runtime.candidate_ledger_enabled, Some(true));
         assert_eq!(merged.runtime.candidate_ledger_max_candidates, Some(20));
-        assert_eq!(merged.index.underlyings, vec!["SPY", "GLD"]);
-        assert_eq!(merged.index.quantity, Some(1));
+        assert_eq!(merged.universe.underlyings, vec!["SPY", "GLD"]);
+        assert_eq!(merged.universe.quantity, Some(1));
         assert_eq!(merged.naked_scanner.max_buying_power_usage_pct, Some(0.03),);
         assert_eq!(merged.naked_scanner.min_score, Some(70.0));
         assert_eq!(merged.risk.max_active_entries, Some(3));
@@ -2569,7 +2576,7 @@ candidate_ledger_enabled = true
 candidate_ledger_dir = "/tmp/candidate-ledger"
 candidate_ledger_max_candidates = 7
 
-[index]
+[universe]
 underlyings = ["SPY", "QQQ"]
 quantity = 2
 entry_start = "09:45"
@@ -2684,7 +2691,7 @@ expiration_exit_days = 2
             Some(PathBuf::from("/tmp/candidate-ledger")),
         );
         assert_eq!(config.runtime.candidate_ledger_max_candidates, Some(7));
-        assert_eq!(config.index.underlyings, vec!["SPY", "QQQ"]);
+        assert_eq!(config.universe.underlyings, vec!["SPY", "QQQ"]);
         assert_eq!(config.scanner.widths, Some(vec![2.0, 5.0]));
         assert_eq!(config.scanner.min_credit_to_width, Some(0.09));
         assert_eq!(config.iron_condor.min_return_on_risk, Some(0.20));

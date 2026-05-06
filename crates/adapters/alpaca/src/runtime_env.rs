@@ -43,7 +43,7 @@ const ACCOUNT_COMMAND_PASSTHROUGH_ENV: &[&str] = &[
     "RUST_LOG",
 ];
 
-/// Loads the deployed Alpaca index-credit environment file when present.
+/// Loads the deployed Alpaca options-engine environment file when present.
 ///
 /// The default env file preserves existing process environment values for manual operator
 /// overrides. An explicit `NAUTILUS_ALPACA_ENV_FILE` is treated as an account boundary, so that
@@ -53,10 +53,10 @@ const ACCOUNT_COMMAND_PASSTHROUGH_ENV: &[&str] = &[
 ///
 /// Returns an error if `NAUTILUS_ALPACA_ENV_FILE` points to a missing/unreadable file, the default
 /// env file cannot be inspected, or the env file is invalid.
-pub fn load_index_credit_env_file() -> anyhow::Result<Option<PathBuf>> {
+pub fn load_options_env_file() -> anyhow::Result<Option<PathBuf>> {
     let (path, explicit) = env::var_os("NAUTILUS_ALPACA_ENV_FILE")
         .map(|path| (PathBuf::from(path), true))
-        .unwrap_or_else(|| (default_index_credit_env_path(), false));
+        .unwrap_or_else(|| (default_options_env_path(), false));
 
     match path.try_exists() {
         Ok(true) => {
@@ -114,11 +114,11 @@ pub fn configure_account_command_env(command: &mut Command, env_file: &Path) -> 
     Ok(())
 }
 
-fn default_index_credit_env_path() -> PathBuf {
+fn default_options_env_path() -> PathBuf {
     default_config_home()
         .join("nautilus-trader")
         .join("alpaca")
-        .join("index-credit.env")
+        .join("options-engine.env")
 }
 
 fn default_config_home() -> PathBuf {

@@ -33,7 +33,7 @@ pub const ENV_APCA_API_SECRET_KEY: &str = "APCA_API_SECRET_KEY";
 /// Fallback environment variable used by some existing Nautilus deployments.
 pub const ENV_ALPACA_SECRET_KEY: &str = "ALPACA_SECRET_KEY";
 
-/// Legacy fallback environment variable for the Alpaca API secret.
+/// Alternate environment variable for the Alpaca API secret.
 pub const ENV_ALPACA_API_SECRET: &str = "ALPACA_API_SECRET";
 
 /// Alpaca option symbol pattern used by the options contracts and market data APIs.

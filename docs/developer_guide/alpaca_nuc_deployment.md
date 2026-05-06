@@ -1,48 +1,46 @@
 # Alpaca NUC Deployment
 
-This deployment runs the Rust Alpaca index credit runner as one supervised user service for the
+This deployment runs the Rust Alpaca options runner as one supervised user service for the
 active account. It keeps secrets outside the repo, writes logs under the user's state directory, and
 uses a file lock so only one runner can own a given Alpaca account workflow.
 
 ## Files
 
-- `deploy/alpaca/alpaca-index-credit.env.example`: credentials, endpoints, service paths, and
+- `deploy/alpaca/alpaca-options-engine.env.example`: credentials, endpoints, service paths, and
   emergency override template.
-- `deploy/alpaca/alpaca-index-credit.account.env.example`: account-scoped env template for future
+- `deploy/alpaca/alpaca-options-engine.account.env.example`: account-scoped env template for future
   supervised account instances.
-- `deploy/alpaca/alpaca-index-credit.base.toml.example`: shared strategy universe, scanner, sector,
+- `deploy/alpaca/alpaca-options-engine.base.toml.example`: shared strategy universe, scanner, sector,
   and management defaults inherited by account configs.
-- `deploy/alpaca/alpaca-index-credit.toml.example`: strategy/scanner/management config template.
+- `deploy/alpaca/alpaca-options-engine.toml.example`: strategy/scanner/management config template.
 - `deploy/alpaca/alpaca-fleet.toml.example`: read-only fleet registry template.
-- `deploy/alpaca/alpaca-index-credit-install.sh`: builds release binaries and installs user files.
-- `deploy/alpaca/alpaca-index-credit-runner.sh`: `flock`-guarded runner wrapper.
-- `deploy/alpaca/alpaca-index-credit.service`: user systemd service.
-- `deploy/alpaca/alpaca-index-credit@.service`: disabled-by-default account-instance service
+- `deploy/alpaca/alpaca-options-install.sh`: builds release binaries and installs user files.
+- `deploy/alpaca/alpaca-options-runner.sh`: `flock`-guarded runner wrapper.
+- `deploy/alpaca/alpaca-options.service`: user systemd service.
+- `deploy/alpaca/alpaca-options@.service`: disabled-by-default account-instance service
   template.
 - `deploy/alpaca/alpaca-control.sh`: account-aware operator status, config checks, candidate
   scans, ledger summaries, health, validation/deploy rollout helpers, service control, fleet
   status, and logs.
-- `deploy/alpaca/alpaca-index-credit-control.sh`: legacy compatibility shim for
-  `alpaca-control`.
-- `deploy/alpaca/alpaca-index-credit.logrotate`: optional logrotate policy.
+- `deploy/alpaca/alpaca-options.logrotate`: optional logrotate policy.
 
 ## Install
 
 From the repo root:
 
 ```bash
-deploy/alpaca/alpaca-index-credit-install.sh
+deploy/alpaca/alpaca-options-install.sh
 ```
 
-Edit `~/.config/nautilus-trader/alpaca/index-credit.env` and add Alpaca paper credentials. Keep
+Edit `~/.config/nautilus-trader/alpaca/options-engine.env` and add Alpaca paper credentials. Keep
 `ALPACA_KILL_SWITCH=true`, `ALPACA_SUBMIT=false`, `ALPACA_MANAGE=false`, and `ALPACA_CLOSE=false`
 until paper proof is intentionally enabled.
 
 The installed engine, operator status command, and account/order probe auto-load
-`~/.config/nautilus-trader/alpaca/index-credit.env` when present. Set
+`~/.config/nautilus-trader/alpaca/options-engine.env` when present. Set
 `NAUTILUS_ALPACA_ENV_FILE` only when intentionally pointing at a different env file.
 
-Edit `~/.config/nautilus-trader/alpaca/base-index-credit.toml` for shared scanner, universe,
+Edit `~/.config/nautilus-trader/alpaca/base-options-engine.toml` for shared scanner, universe,
 sector, and management settings. Account configs can set top-level `extends` to inherit from that
 base, then override only strategy identity, state path, risk caps, or account-specific scanner
 limits. TOML `runtime.max_iterations = 0` is continuous service mode. Set
@@ -96,7 +94,7 @@ goal is to execute one normal engine iteration with the account's configured run
 To enable start on user login:
 
 ```bash
-systemctl --user enable alpaca-index-credit.service
+systemctl --user enable alpaca-options.service
 loginctl enable-linger "$USER"
 ```
 
@@ -104,9 +102,9 @@ loginctl enable-linger "$USER"
 
 Default state files from the env template:
 
-- Logs: `~/.local/state/nautilus_trader/logs/alpaca-index-credit.log`
-- Lock: `~/.local/state/nautilus_trader/locks/alpaca-index-credit.lock`
-- Strategy state: `~/.local/state/nautilus_trader/alpaca_index_credit_state.json`
+- Logs: `~/.local/state/nautilus_trader/logs/alpaca-options.log`
+- Lock: `~/.local/state/nautilus_trader/locks/alpaca-options.lock`
+- Strategy state: `~/.local/state/nautilus_trader/alpaca_options_engine_state.json`
 - Candidate ledger: `~/.local/state/nautilus_trader/alpaca/<account-id>/candidate-ledger/*.jsonl`
 
 The runner wrapper takes an exclusive non-blocking lock. If another process already owns the lock,
@@ -114,7 +112,7 @@ the service exits without starting another Alpaca account owner.
 
 The service runs installed release binaries by default:
 
-- Runner: `~/.local/bin/alpaca-index-credit-engine`
+- Runner: `~/.local/bin/alpaca-options-engine`
 - Operator status: `~/.local/bin/alpaca-operator-status`
 - Fleet status: `~/.local/bin/alpaca-fleet-status`
 
@@ -127,10 +125,10 @@ inside its account config so one account cannot read or write another account's 
 
 ## Multi-Account Foundation
 
-The existing paper account remains `alpaca-index-credit.service` and continues to use:
+The existing paper account remains `alpaca-options.service` and continues to use:
 
-- Env: `~/.config/nautilus-trader/alpaca/index-credit.env`
-- Config: `~/.config/nautilus-trader/alpaca/index-credit.toml`
+- Env: `~/.config/nautilus-trader/alpaca/options-engine.env`
+- Config: `~/.config/nautilus-trader/alpaca/options-engine.toml`
 
 Additional accounts are represented in `~/.config/nautilus-trader/alpaca/fleet.toml` with explicit
 roles, permissions, risk budgets, service names, env files, config files, state files, log
@@ -145,12 +143,14 @@ account instead of inheriting any `ALPACA_*` or `NAUTILUS_ALPACA_*` values from 
 
 The hosted strategy names are:
 
-- `put`, `put_credit`, `index_put_credit_entry`: put-credit verticals.
-- `call`, `call_credit`, `index_call_credit_entry`: call-credit verticals.
-- `iron_condor`, `condor`, `index_iron_condor_entry`: four-leg iron condors.
-- `call_debit`, `index_call_debit_entry`: long call-debit verticals.
-- `put_debit`, `index_put_debit_entry`: long put-debit verticals.
+- `put`, `put_credit`: put-credit verticals.
+- `call`, `call_credit`: call-credit verticals.
+- `iron_condor`, `condor`: four-leg iron condors.
+- `call_debit`: long call-debit verticals.
+- `put_debit`: long put-debit verticals.
 - `debit`, `long_premium`, `directional`: both call-debit and put-debit verticals.
+- `naked_call`, `naked_put`: undefined-risk short options.
+- `naked_call_1_3dte`, `naked_put_1_3dte`: short-DTE undefined-risk profile.
 
 Accounts with credit verticals or iron condors require `defined_risk = true` in the fleet registry.
 Accounts with debit verticals require `long_premium = true`. A mismatch forces
@@ -166,7 +166,7 @@ Future account env files should live under:
 Future account configs should live under:
 
 ```text
-~/.config/nautilus-trader/alpaca/configs/<account-id>-index-credit.toml
+~/.config/nautilus-trader/alpaca/configs/<account-id>-options-engine.toml
 ```
 
 Keep extra accounts disabled in the fleet registry and keep their env gates inert until credentials,
@@ -182,7 +182,7 @@ ALPACA_KILL_SWITCH=true
 After an account env/config pair is reviewed, the account can be enabled explicitly:
 
 ```bash
-systemctl --user start alpaca-index-credit@paper-directional.service
+systemctl --user start alpaca-options@paper-directional.service
 ```
 
 Do not enable account-instance services on login until paper proof is complete for that account's
@@ -302,8 +302,8 @@ Force flatten:
 
 ```bash
 sed -i 's/^ALPACA_FORCE_FLATTEN=.*/ALPACA_FORCE_FLATTEN=true/' \
-  ~/.config/nautilus-trader/alpaca/index-credit.env
-systemctl --user restart alpaca-index-credit.service
+  ~/.config/nautilus-trader/alpaca/options-engine.env
+systemctl --user restart alpaca-options.service
 alpaca-operator-status --json
 ```
 
@@ -335,8 +335,8 @@ Rejected MLeg:
 For system logrotate, copy the example policy and adjust the username/path if needed:
 
 ```bash
-sudo cp deploy/alpaca/alpaca-index-credit.logrotate /etc/logrotate.d/alpaca-index-credit
+sudo cp deploy/alpaca/alpaca-options.logrotate /etc/logrotate.d/alpaca-options
 ```
 
 The service also writes stdout/stderr to journald through systemd, so `journalctl --user -u
-alpaca-index-credit.service` remains available.
+alpaca-options.service` remains available.

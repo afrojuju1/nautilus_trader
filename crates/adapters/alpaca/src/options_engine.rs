@@ -13,10 +13,10 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Account-engine runtime for the Alpaca index-credit strategy slice.
+//! Account-engine runtime for the Alpaca options-engine strategy slice.
 //!
 //! This module owns the process loop and broker orchestration used by the installed
-//! `alpaca-index-credit-engine` binary. The binary stays as a thin entrypoint so the live
+//! `alpaca-options-engine` binary. The binary stays as a thin entrypoint so the live
 //! runtime can be tested and evolved from library code.
 
 use std::{
@@ -33,16 +33,16 @@ use crate::{
         error::Error,
         models::{AlpacaOrder, AlpacaPosition, ListOrdersRequest, OptionSnapshotsRequest},
     },
-    index_credit::{
-        IndexCreditConfig, SelectedDebitEntry, SelectedEntry, SelectedIndexEntry,
-        SelectedIronCondorEntry, SelectedNakedOptionEntry, active_sector_count,
+    management::{credit_spread_close_reason, days_to_expiration, recorded_age_secs},
+    options_runtime::{
+        OptionsEngineConfig, SelectedDebitEntry, SelectedEntry, SelectedIronCondorEntry,
+        SelectedNakedOptionEntry, SelectedOptionsEntry, active_sector_count,
         active_underlying_count, candidate_alert_identity_key, candidate_alert_key,
         credit_candidate_ledger_payload, debit_candidate_ledger_payload,
         fleet_active_underlying_count, fleet_has_active_underlying_elsewhere,
         fleet_sector_limit_state, iron_condor_candidate_ledger_payload,
-        naked_candidate_ledger_payload, select_index_strategy_entry,
+        naked_candidate_ledger_payload, select_options_entry,
     },
-    management::{credit_spread_close_reason, days_to_expiration, recorded_age_secs},
     runtime::{
         StrategyState, StrategyStateEntry, credit_spread_strategy_name, debit_spread_strategy_name,
         emit_operator_event, load_strategy_state, naked_option_strategy_name,
@@ -81,7 +81,7 @@ use tokio::{
 };
 
 const DEFAULT_EVENT_TIMEOUT_SECS: u64 = 20;
-const STRATEGY_FAMILY: &str = "INDEX-PUT-CREDIT-ENTRY";
+const STRATEGY_FAMILY: &str = "ALPACA-OPTIONS-ENGINE";
 const SELECTED_CANDIDATE_ALERT: &str = "selected_candidate";
 const CANDIDATE_SUBMIT_REJECTED_ALERT: &str = "candidate_submit_rejected";
 
@@ -122,7 +122,7 @@ pub enum StrategyDecision {
     /// Candidate was selected by discovery, but submit admission blocked broker action.
     SelectedBlocked {
         /// Selected strategy candidate.
-        entry: SelectedIndexEntry,
+        entry: SelectedOptionsEntry,
         /// Stable block reason.
         reason: String,
         /// Current observed count, if the block is count based.
@@ -179,7 +179,7 @@ pub enum StrategyDecision {
 pub struct AccountEngineContext<'a> {
     client: &'a AlpacaHttpClient,
     data_config: &'a AlpacaDataClientConfig,
-    config: &'a IndexCreditConfig,
+    config: &'a OptionsEngineConfig,
     state: &'a StrategyState,
     trade_date: &'a str,
 }
@@ -188,7 +188,7 @@ impl<'a> AccountEngineContext<'a> {
     fn new(
         client: &'a AlpacaHttpClient,
         data_config: &'a AlpacaDataClientConfig,
-        config: &'a IndexCreditConfig,
+        config: &'a OptionsEngineConfig,
         state: &'a StrategyState,
         trade_date: &'a str,
     ) -> Self {
@@ -224,13 +224,13 @@ pub trait StrategyRuntime {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<StrategyDecision>> + 'a>>;
 }
 
-/// Index-credit strategy implementation hosted by the Alpaca account engine.
+/// Options strategy implementation hosted by the Alpaca account engine.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct IndexCreditStrategy;
+pub struct OptionsRuntimeStrategy;
 
-impl StrategyRuntime for IndexCreditStrategy {
+impl StrategyRuntime for OptionsRuntimeStrategy {
     fn name(&self) -> &'static str {
-        "index_credit"
+        "options_engine"
     }
 
     fn evaluate<'a>(
@@ -252,7 +252,7 @@ impl StrategyRuntime for IndexCreditStrategy {
                 EntryGateDecision::Continue => {}
             }
 
-            let selected = select_index_strategy_entry(
+            let selected = select_options_entry(
                 context.client,
                 context.data_config,
                 context.config,
@@ -295,42 +295,42 @@ enum RiskGateDecision {
     FleetMaxActiveEntries { current: usize, limit: usize },
 }
 
-fn selected_submit_enabled(config: &IndexCreditConfig, selected: &SelectedIndexEntry) -> bool {
+fn selected_submit_enabled(config: &OptionsEngineConfig, selected: &SelectedOptionsEntry) -> bool {
     match selected {
-        SelectedIndexEntry::Credit(entry) => config.credit_submit_enabled(entry.kind),
-        SelectedIndexEntry::IronCondor(_) => config.iron_condor_submit_enabled(),
-        SelectedIndexEntry::Debit(entry) => config.debit_submit_enabled(entry.kind),
-        SelectedIndexEntry::NakedOption(entry) => config.naked_submit_enabled(entry.kind),
+        SelectedOptionsEntry::Credit(entry) => config.credit_submit_enabled(entry.kind),
+        SelectedOptionsEntry::IronCondor(_) => config.iron_condor_submit_enabled(),
+        SelectedOptionsEntry::Debit(entry) => config.debit_submit_enabled(entry.kind),
+        SelectedOptionsEntry::NakedOption(entry) => config.naked_submit_enabled(entry.kind),
     }
 }
 
 fn selected_strategy_decision(
-    config: &IndexCreditConfig,
-    selected: SelectedIndexEntry,
+    config: &OptionsEngineConfig,
+    selected: SelectedOptionsEntry,
 ) -> StrategyDecision {
     match selected {
-        SelectedIndexEntry::Credit(entry) if config.credit_submit_enabled(entry.kind) => {
+        SelectedOptionsEntry::Credit(entry) if config.credit_submit_enabled(entry.kind) => {
             StrategyDecision::SubmitOpen { entry }
         }
-        SelectedIndexEntry::Credit(entry) => StrategyDecision::DryRun { entry },
-        SelectedIndexEntry::IronCondor(entry) if config.iron_condor_submit_enabled() => {
+        SelectedOptionsEntry::Credit(entry) => StrategyDecision::DryRun { entry },
+        SelectedOptionsEntry::IronCondor(entry) if config.iron_condor_submit_enabled() => {
             StrategyDecision::SubmitIronCondorOpen { entry }
         }
-        SelectedIndexEntry::IronCondor(entry) => StrategyDecision::DryRunIronCondor { entry },
-        SelectedIndexEntry::Debit(entry) if config.debit_submit_enabled(entry.kind) => {
+        SelectedOptionsEntry::IronCondor(entry) => StrategyDecision::DryRunIronCondor { entry },
+        SelectedOptionsEntry::Debit(entry) if config.debit_submit_enabled(entry.kind) => {
             StrategyDecision::SubmitDebitOpen { entry }
         }
-        SelectedIndexEntry::Debit(entry) => StrategyDecision::DryRunDebit { entry },
-        SelectedIndexEntry::NakedOption(entry) if config.naked_submit_enabled(entry.kind) => {
+        SelectedOptionsEntry::Debit(entry) => StrategyDecision::DryRunDebit { entry },
+        SelectedOptionsEntry::NakedOption(entry) if config.naked_submit_enabled(entry.kind) => {
             StrategyDecision::SubmitNakedOptionOpen { entry }
         }
-        SelectedIndexEntry::NakedOption(entry) => StrategyDecision::DryRunNakedOption { entry },
+        SelectedOptionsEntry::NakedOption(entry) => StrategyDecision::DryRunNakedOption { entry },
     }
 }
 
 async fn submission_block_for_selected(
     context: &AccountEngineContext<'_>,
-    selected: &SelectedIndexEntry,
+    selected: &SelectedOptionsEntry,
 ) -> anyhow::Result<Option<SubmissionBlock>> {
     if let Some(block) = risk_gate_decision(context).await?.into_submission_block() {
         return Ok(Some(block));
@@ -459,19 +459,19 @@ impl RiskGateDecision {
     }
 }
 
-/// Runs the Alpaca index-credit account engine until configured shutdown.
+/// Runs the Alpaca options-engine account engine until configured shutdown.
 ///
 /// # Errors
 ///
 /// Returns an error if configuration parsing, broker I/O, selection, submission, cancellation,
 /// state persistence, or execution-client lifecycle operations fail.
-pub async fn run_index_credit_engine() -> anyhow::Result<()> {
-    let config = IndexCreditConfig::from_env()?;
+pub async fn run_options_engine() -> anyhow::Result<()> {
+    let config = OptionsEngineConfig::from_env()?;
     let mut state = load_strategy_state(&config.state_path)?;
-    let strategy = IndexCreditStrategy;
+    let strategy = OptionsRuntimeStrategy;
 
     println!(
-        "index_credit_entry: underlyings={} strategies={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} state_path={}",
+        "options_engine_entry: underlyings={} strategies={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} state_path={}",
         config.underlyings.join(","),
         config.enabled_strategy_names().join(","),
         config.submit_enabled,
@@ -566,7 +566,7 @@ pub async fn run_index_credit_engine() -> anyhow::Result<()> {
 }
 
 fn record_scan_started(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     trade_date: &str,
     iteration: u64,
     hosted_strategy: &str,
@@ -595,7 +595,7 @@ fn record_scan_started(
     );
 }
 
-fn candidate_ledger_threshold_snapshot(config: &IndexCreditConfig) -> serde_json::Value {
+fn candidate_ledger_threshold_snapshot(config: &OptionsEngineConfig) -> serde_json::Value {
     json!({
         "underlyings": &config.underlyings,
         "strategies": config.enabled_strategy_names(),
@@ -672,13 +672,17 @@ fn naked_scanner_threshold_snapshot(
     })
 }
 
-fn record_decision_event(config: &IndexCreditConfig, trade_date: &str, payload: serde_json::Value) {
+fn record_decision_event(
+    config: &OptionsEngineConfig,
+    trade_date: &str,
+    payload: serde_json::Value,
+) {
     emit_operator_event("decision", payload.clone());
     config.record_candidate_ledger(trade_date, "decision", payload);
 }
 
 fn record_submit_result_event(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     trade_date: &str,
     payload: serde_json::Value,
 ) {
@@ -687,7 +691,7 @@ fn record_submit_result_event(
 }
 
 fn record_selected_candidate_alert(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     trade_date: &str,
     identity_key: &str,
     payload: Value,
@@ -702,7 +706,7 @@ fn record_selected_candidate_alert(
 }
 
 fn record_submit_rejected_candidate_alert(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     trade_date: &str,
     identity_key: &str,
     mut payload: Value,
@@ -766,7 +770,7 @@ fn selected_iron_condor_alert_payload(
     order_list_id: Option<&str>,
 ) -> (String, Value) {
     let identity_key = candidate_alert_identity_key(
-        "index_iron_condor_entry",
+        "iron_condor",
         &entry.underlying,
         &[
             &entry.candidate.put.short.symbol,
@@ -836,22 +840,22 @@ fn selected_naked_alert_payload(
 }
 
 fn selected_entry_alert_payload(
-    entry: &SelectedIndexEntry,
+    entry: &SelectedOptionsEntry,
     trade_date: &str,
     action: &str,
     order_list_id: Option<&str>,
 ) -> (String, Value) {
     match entry {
-        SelectedIndexEntry::Credit(entry) => {
+        SelectedOptionsEntry::Credit(entry) => {
             selected_credit_alert_payload(entry, trade_date, action, order_list_id)
         }
-        SelectedIndexEntry::IronCondor(entry) => {
+        SelectedOptionsEntry::IronCondor(entry) => {
             selected_iron_condor_alert_payload(entry, trade_date, action, order_list_id)
         }
-        SelectedIndexEntry::Debit(entry) => {
+        SelectedOptionsEntry::Debit(entry) => {
             selected_debit_alert_payload(entry, trade_date, action, order_list_id)
         }
-        SelectedIndexEntry::NakedOption(entry) => {
+        SelectedOptionsEntry::NakedOption(entry) => {
             selected_naked_alert_payload(entry, trade_date, action, order_list_id)
         }
     }
@@ -884,7 +888,7 @@ fn insert_value_field(payload: &mut Value, key: &str, value: Value) {
 
 async fn apply_strategy_decision(
     decision: StrategyDecision,
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     state: &mut StrategyState,
     trade_date: &str,
 ) -> anyhow::Result<bool> {
@@ -1089,7 +1093,7 @@ async fn apply_strategy_decision(
                 json!({
                     "action": "submit",
                     "underlying": &entry.underlying,
-                    "strategy": "index_iron_condor_entry",
+                    "strategy": "iron_condor",
                     "short_put_symbol": &entry.candidate.put.short.symbol,
                     "long_put_symbol": &entry.candidate.put.long.symbol,
                     "short_call_symbol": &entry.candidate.call.short.symbol,
@@ -1410,7 +1414,7 @@ async fn apply_strategy_decision(
                     "action": "dry_run",
                     "reason": "submission_disabled",
                     "underlying": &entry.underlying,
-                    "strategy": "index_iron_condor_entry",
+                    "strategy": "iron_condor",
                     "short_put_symbol": &entry.candidate.put.short.symbol,
                     "long_put_symbol": &entry.candidate.put.long.symbol,
                     "short_call_symbol": &entry.candidate.call.short.symbol,
@@ -1788,7 +1792,7 @@ fn order_symbols(orders: &[AlpacaOrder]) -> BTreeSet<String> {
 async fn manage_existing_entries(
     client: &AlpacaHttpClient,
     data_config: &AlpacaDataClientConfig,
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     state: &mut StrategyState,
 ) -> anyhow::Result<bool> {
     let mut changed = false;
@@ -2144,7 +2148,7 @@ async fn close_quote(
 }
 
 fn close_reason(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     entry: &StrategyStateEntry,
     close_debit: f64,
 ) -> Option<String> {
@@ -2157,7 +2161,7 @@ fn close_reason(
 }
 
 fn debit_spread_close_reason(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     entry: &StrategyStateEntry,
     close_credit: f64,
 ) -> Option<String> {
@@ -2243,7 +2247,7 @@ async fn submit_entry(
     entry: &SelectedEntry,
     order_list_id: &str,
     quantity: u64,
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
 ) -> anyhow::Result<SubmitOutcome> {
     let exec_config = exec_config_from_env();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2298,7 +2302,7 @@ async fn submit_iron_condor_entry(
     entry: &SelectedIronCondorEntry,
     order_list_id: &str,
     quantity: u64,
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
 ) -> anyhow::Result<SubmitOutcome> {
     let exec_config = exec_config_from_env();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2353,7 +2357,7 @@ async fn submit_debit_entry(
     entry: &SelectedDebitEntry,
     order_list_id: &str,
     quantity: u64,
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
 ) -> anyhow::Result<SubmitOutcome> {
     let exec_config = exec_config_from_env();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2408,7 +2412,7 @@ async fn submit_naked_option_entry(
     entry: &SelectedNakedOptionEntry,
     order_list_id: &str,
     quantity: u64,
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
 ) -> anyhow::Result<SubmitOutcome> {
     let exec_config = exec_config_from_env();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2463,7 +2467,7 @@ async fn submit_close_entry(
     entry: &StrategyStateEntry,
     quote: &CloseQuote,
     order_list_id: &str,
-    _config: &IndexCreditConfig,
+    _config: &OptionsEngineConfig,
 ) -> anyhow::Result<SubmitOutcome> {
     let exec_config = exec_config_from_env();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2891,14 +2895,14 @@ fn alpaca_instrument_id(symbol: &str) -> anyhow::Result<InstrumentId> {
 
 fn order_list_id(trade_date: &str, underlying: &str) -> String {
     format!(
-        "index-credit-entry-{trade_date}-{underlying}-{}",
+        "options-engine-entry-{trade_date}-{underlying}-{}",
         UUID4::new()
     )
 }
 
 fn close_order_list_id(entry: &StrategyStateEntry) -> String {
     format!(
-        "index-credit-close-{}-{}-{}",
+        "options-engine-close-{}-{}-{}",
         entry.trade_date,
         entry.underlying,
         UUID4::new()
@@ -2936,7 +2940,7 @@ fn age_secs_from_rfc3339(value: &str) -> Option<u64> {
         .map(|duration| duration.as_secs())
 }
 
-fn inside_entry_window_at(config: &IndexCreditConfig, now: DateTime<Utc>) -> bool {
+fn inside_entry_window_at(config: &OptionsEngineConfig, now: DateTime<Utc>) -> bool {
     let now = now.with_timezone(&config.entry_timezone).time();
     config.entry_start <= now && now <= config.entry_end
 }
@@ -2948,7 +2952,7 @@ enum CloseSubmissionGateDecision {
 }
 
 fn close_submission_gate_decision(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     now: DateTime<Utc>,
 ) -> CloseSubmissionGateDecision {
     if config.force_flatten
@@ -2961,19 +2965,19 @@ fn close_submission_gate_decision(
     }
 }
 
-fn inside_close_window_at(config: &IndexCreditConfig, now: DateTime<Utc>) -> bool {
+fn inside_close_window_at(config: &OptionsEngineConfig, now: DateTime<Utc>) -> bool {
     let now = now.with_timezone(&config.entry_timezone).time();
     config.close_start <= now && now <= config.close_end
 }
 
-fn close_attempts_exhausted(config: &IndexCreditConfig, entry: &StrategyStateEntry) -> bool {
+fn close_attempts_exhausted(config: &OptionsEngineConfig, entry: &StrategyStateEntry) -> bool {
     !config.force_flatten
         && config.max_close_attempts > 0
         && entry.close_attempts >= config.max_close_attempts
 }
 
 fn close_reprice_cooldown_remaining_secs(
-    config: &IndexCreditConfig,
+    config: &OptionsEngineConfig,
     entry: &StrategyStateEntry,
 ) -> Option<u64> {
     if config.force_flatten || config.close_reprice_cooldown_secs == 0 {
@@ -2987,7 +2991,7 @@ fn close_reprice_cooldown_remaining_secs(
     (age < config.close_reprice_cooldown_secs).then_some(config.close_reprice_cooldown_secs - age)
 }
 
-fn entry_gate_decision(config: &IndexCreditConfig, now: DateTime<Utc>) -> EntryGateDecision {
+fn entry_gate_decision(config: &OptionsEngineConfig, now: DateTime<Utc>) -> EntryGateDecision {
     if config.kill_switch {
         EntryGateDecision::KillSwitch
     } else if !config.ignore_entry_window && !inside_entry_window_at(config, now) {
@@ -2997,7 +3001,7 @@ fn entry_gate_decision(config: &IndexCreditConfig, now: DateTime<Utc>) -> EntryG
     }
 }
 
-fn market_trade_date(config: &IndexCreditConfig) -> String {
+fn market_trade_date(config: &OptionsEngineConfig) -> String {
     Utc::now()
         .with_timezone(&config.entry_timezone)
         .date_naive()
@@ -3033,8 +3037,8 @@ mod tests {
         DebitSpreadScannerConfig, IronCondorScannerConfig, PutCreditScannerConfig,
     };
 
-    fn config_for_gate_tests() -> IndexCreditConfig {
-        IndexCreditConfig {
+    fn config_for_gate_tests() -> OptionsEngineConfig {
+        OptionsEngineConfig {
             underlyings: vec!["SPY".to_string()],
             spread_kinds: vec![CreditSpreadKind::Put],
             iron_condor_enabled: false,
@@ -3260,10 +3264,10 @@ mod tests {
     }
 
     #[test]
-    fn index_credit_strategy_has_stable_host_name() {
-        let strategy = IndexCreditStrategy;
+    fn options_engine_strategy_has_stable_host_name() {
+        let strategy = OptionsRuntimeStrategy;
 
-        assert_eq!(strategy.name(), "index_credit");
+        assert_eq!(strategy.name(), "options_engine");
     }
 
     #[test]

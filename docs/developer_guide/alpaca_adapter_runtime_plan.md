@@ -1,7 +1,7 @@
 # Alpaca Adapter Runtime Plan
 
 This document captures the proposed path for building an Alpaca Markets adapter in
-NautilusTrader and migrating a strategy equivalent to `index_put_credit_entry`.
+NautilusTrader and migrating a strategy equivalent to `put_credit`.
 
 ## Goal
 
@@ -40,7 +40,7 @@ from `APCA_API_KEY_ID`/`APCA_API_SECRET_KEY`, then from the existing deployment 
 `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`.
 The contract provider can also convert Alpaca option contract payloads into Nautilus
 `OptionContract` instruments on venue `ALPACA`.
-An initial legacy diagnostic scanner (`alpaca-dry-run-put-credit`) screens active 5-10 DTE put
+An initial diagnostic scanner (`alpaca-dry-run-put-credit`) screens active 5-10 DTE put
 credit spreads without submitting orders.
 The next runtime slice adds account, position, and open-order polling through Alpaca Trading REST
 plus a non-submitting multi-leg order payload builder/validator for paper put credit spread
@@ -114,7 +114,7 @@ Phase 2:
 
 Phase 3:
 
-- Port the `index_put_credit_entry` selection logic into a Nautilus `Strategy`.
+- Port the `put_credit` selection logic into a Nautilus `Strategy`.
 - Replace the transitional strategy subprocess scanner call with direct Python bindings once the
   Alpaca Rust scanner/client is exposed through PyO3.
 - Add target/stop exit policy.
@@ -123,11 +123,11 @@ Phase 3:
 
 Initial Phase 3 runner:
 
-- `alpaca-index-credit-engine` scans configured underlyings, applies account/position/open-order
+- `alpaca-options-engine` scans configured underlyings, applies account/position/open-order
   admission checks, enforces daily duplicate-entry state, selects one candidate, and can submit a
   Nautilus `SubmitOrderList` through the Alpaca execution client when
   TOML `runtime.submit = true` or `ALPACA_SUBMIT=true`.
-- The same runner can scan Phase 7A `index_call_credit_entry` candidates by setting
+- The same runner can scan Phase 7A `call_credit` candidates by setting
   `ALPACA_STRATEGIES=call` or scan both vertical-credit directions with `both`.
 - The runner evaluates stale entry cancellation and close triggers from persisted state. Broker
   management actions are disabled unless TOML `runtime.manage = true` or `ALPACA_MANAGE=true`;
@@ -135,7 +135,7 @@ Initial Phase 3 runner:
 - Management triggers include profit target, stop-loss debit, max hold, expiration-risk exit,
   force-flatten, stale entry cancellation, and a kill switch for blocking new entries.
 - Strategy/scanner/management parameters live in `ALPACA_CONFIG_PATH`, defaulting to
-  `~/.config/nautilus-trader/alpaca/index-credit.toml`; env remains for secrets, endpoints, and
+  `~/.config/nautilus-trader/alpaca/options-engine.toml`; env remains for secrets, endpoints, and
   emergency runtime overrides.
 - Submission is disabled by default so paper soak can run safely before enabling execution.
 - Python strategy submission remains blocked by the current Python `OrderList` invariant that all

@@ -22,7 +22,7 @@ use std::{
 };
 
 use chrono::{DateTime, Duration, Utc};
-use nautilus_alpaca::index_credit::IndexCreditConfig;
+use nautilus_alpaca::options_runtime::OptionsEngineConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -73,7 +73,7 @@ struct AlertState {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
     load_alerts_env(args.alerts_env_file.as_deref())?;
-    let config = IndexCreditConfig::from_runtime_env()?;
+    let config = OptionsEngineConfig::from_runtime_env()?;
     let account_id = config
         .fleet_account_id
         .clone()
