@@ -855,16 +855,23 @@ async fn apply_strategy_decision(
             );
             let outcome =
                 submit_naked_option_entry(&entry, &order_list_id, config.quantity, config).await?;
-            if outcome.accepted > 0 {
+            let terminal_rejection = outcome.accepted == 0 && outcome.rejected > 0;
+            if outcome.accepted > 0 || terminal_rejection {
                 state.record_naked_option_submission(
                     trade_date.to_string(),
-                    entry.underlying,
+                    entry.underlying.clone(),
                     entry.kind,
                     config.quantity,
                     order_list_id,
                     &entry.candidate,
                     outcome.parent_order_id.clone(),
                 );
+                if terminal_rejection {
+                    if let Some(entry) = state.entries.last_mut() {
+                        entry.mark_canceled();
+                        entry.close_reason = Some("entry_rejected".to_string());
+                    }
+                }
             }
             println!(
                 "submit_result: accepted={} rejected={}",
@@ -877,9 +884,10 @@ async fn apply_strategy_decision(
                     "accepted": outcome.accepted,
                     "rejected": outcome.rejected,
                     "parent_order_id": outcome.parent_order_id,
+                    "terminal_rejection_recorded": terminal_rejection,
                 }),
             );
-            Ok(outcome.accepted > 0)
+            Ok(outcome.accepted > 0 || terminal_rejection)
         }
         StrategyDecision::DryRun { entry } => {
             println!(

@@ -2465,8 +2465,8 @@ fn debit_scanner_config_from_file(config: &DebitScannerSection) -> DebitSpreadSc
 
 fn naked_scanner_config_from_file(config: &NakedScannerSection) -> NakedOptionScannerConfig {
     NakedOptionScannerConfig {
-        min_dte: config.min_dte.unwrap_or(7),
-        max_dte: config.max_dte.unwrap_or(21),
+        min_dte: config.min_dte.unwrap_or(5),
+        max_dte: config.max_dte.unwrap_or(14),
         short_delta_min: config.short_delta_min.unwrap_or(0.10),
         short_delta_max: config.short_delta_max.unwrap_or(0.20),
         min_open_interest: config.min_open_interest.unwrap_or(500),
@@ -2494,7 +2494,7 @@ fn naked_1_3dte_scanner_config_from_file(config: &NakedScannerSection) -> NakedO
         max_dte: config.max_dte.unwrap_or(3),
         short_delta_min: config.short_delta_min.unwrap_or(0.06),
         short_delta_max: config.short_delta_max.unwrap_or(0.14),
-        min_open_interest: config.min_open_interest.unwrap_or(1_000),
+        min_open_interest: config.min_open_interest.unwrap_or(300),
         max_spread_pct: config.max_spread_pct.unwrap_or(0.08),
         min_credit: config.min_credit.unwrap_or(0.12),
         min_bid_size: config.min_bid_size.unwrap_or(1),
@@ -2709,11 +2709,11 @@ min_debit_to_width = 0.25
 min_reward_to_risk = 0.80
 
 [naked_scanner]
-min_dte = 3
-max_dte = 7
+min_dte = 5
+max_dte = 14
 short_delta_min = 0.08
 short_delta_max = 0.16
-min_open_interest = 1000
+min_open_interest = 500
 max_spread_pct = 0.08
 min_credit = 0.20
 min_bid_size = 1
@@ -2735,7 +2735,7 @@ min_dte = 1
 max_dte = 3
 short_delta_min = 0.06
 short_delta_max = 0.14
-min_open_interest = 1000
+min_open_interest = 300
 max_spread_pct = 0.08
 min_credit = 0.12
 min_bid_size = 1
@@ -2794,7 +2794,7 @@ expiration_exit_days = 2
         assert_eq!(config.iron_condor.min_return_on_risk, Some(0.20));
         assert_eq!(config.debit_scanner.widths, Some(vec![3.0, 5.0]));
         assert_eq!(config.debit_scanner.min_debit_to_width, Some(0.25));
-        assert_eq!(config.naked_scanner.min_dte, Some(3));
+        assert_eq!(config.naked_scanner.min_dte, Some(5));
         assert_eq!(config.naked_scanner.max_spread_pct, Some(0.08));
         assert_eq!(config.naked_scanner.min_credit, Some(0.20));
         assert_eq!(config.naked_scanner.min_daily_volume, Some(50));

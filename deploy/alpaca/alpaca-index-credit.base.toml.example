@@ -48,11 +48,11 @@ min_debit_to_width = 0.20
 min_reward_to_risk = 0.75
 
 [naked_scanner]
-min_dte = 3
-max_dte = 7
+min_dte = 5
+max_dte = 14
 short_delta_min = 0.08
 short_delta_max = 0.16
-min_open_interest = 1000
+min_open_interest = 500
 max_spread_pct = 0.08
 min_credit = 0.20
 min_bid_size = 1
@@ -75,7 +75,7 @@ min_dte = 1
 max_dte = 3
 short_delta_min = 0.06
 short_delta_max = 0.14
-min_open_interest = 1000
+min_open_interest = 300
 max_spread_pct = 0.08
 min_credit = 0.12
 min_bid_size = 1

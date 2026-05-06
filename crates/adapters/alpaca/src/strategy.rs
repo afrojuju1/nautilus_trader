@@ -286,8 +286,8 @@ pub struct NakedOptionScannerConfig {
 impl Default for NakedOptionScannerConfig {
     fn default() -> Self {
         Self {
-            min_dte: 7,
-            max_dte: 21,
+            min_dte: 5,
+            max_dte: 14,
             short_delta_min: 0.10,
             short_delta_max: 0.20,
             min_open_interest: 500,
@@ -1143,15 +1143,11 @@ pub fn score_naked_option_contracts_with_rejections(
     let mut scored = Vec::new();
     let mut rejections = BTreeMap::new();
     for contract in contracts {
-        let Some(open_interest) = contract
+        let open_interest = contract
             .open_interest
             .as_deref()
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
-            record_rejection(&mut rejections, "missing_open_interest");
-            continue;
-        };
-        if open_interest < config.min_open_interest {
+            .and_then(|value| value.parse::<u64>().ok());
+        if open_interest.is_some_and(|value| value < config.min_open_interest) {
             record_rejection(&mut rejections, "min_open_interest");
             continue;
         }
@@ -1204,6 +1200,18 @@ pub fn score_naked_option_contracts_with_rejections(
             record_rejection(&mut rejections, "min_credit");
             continue;
         }
+        let open_interest = match open_interest {
+            Some(open_interest) => open_interest,
+            None => {
+                if !allow_missing_open_interest_for_naked_option(
+                    config, bid_size, ask_size, volume, spread_pct,
+                ) {
+                    record_rejection(&mut rejections, "missing_open_interest");
+                    continue;
+                }
+                0
+            }
+        };
 
         let Some(implied_volatility) = snapshot.implied_volatility else {
             record_rejection(&mut rejections, "missing_implied_volatility");
@@ -1859,6 +1867,21 @@ pub fn build_iron_condor_candidates_with_rejections(
 
 fn record_rejection(rejections: &mut BTreeMap<String, usize>, reason: &'static str) {
     *rejections.entry(reason.to_string()).or_insert(0) += 1;
+}
+
+fn allow_missing_open_interest_for_naked_option(
+    config: &NakedOptionScannerConfig,
+    bid_size: u64,
+    ask_size: u64,
+    volume: u64,
+    spread_pct: f64,
+) -> bool {
+    let min_fallback_volume = config.min_daily_volume.saturating_mul(2).max(1);
+    let max_fallback_spread_pct = config.max_spread_pct * 0.75;
+    bid_size >= config.min_bid_size
+        && ask_size >= config.min_ask_size
+        && volume >= min_fallback_volume
+        && spread_pct <= max_fallback_spread_pct
 }
 
 fn merge_rejection_counts(target: &mut BTreeMap<String, usize>, source: &BTreeMap<String, usize>) {
