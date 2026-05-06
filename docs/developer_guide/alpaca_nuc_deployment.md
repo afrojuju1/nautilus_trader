@@ -19,8 +19,11 @@ uses a file lock so only one runner can own a given Alpaca account workflow.
 - `deploy/alpaca/alpaca-index-credit.service`: user systemd service.
 - `deploy/alpaca/alpaca-index-credit@.service`: disabled-by-default account-instance service
   template.
-- `deploy/alpaca/alpaca-index-credit-control.sh`: account-aware operator status, config checks,
-  candidate scans, ledger tails, health, service control, fleet status, and logs.
+- `deploy/alpaca/alpaca-control.sh`: account-aware operator status, config checks, candidate
+  scans, ledger summaries, health, validation/deploy rollout helpers, service control, fleet
+  status, and logs.
+- `deploy/alpaca/alpaca-index-credit-control.sh`: legacy compatibility shim for
+  `alpaca-control`.
 - `deploy/alpaca/alpaca-index-credit.logrotate`: optional logrotate policy.
 
 ## Install
@@ -57,17 +60,22 @@ registry is read-only operator metadata; credentials remain in each account env 
 ## Commands
 
 ```bash
-alpaca-index-credit-control accounts
-alpaca-index-credit-control --account paper-main status
-alpaca-index-credit-control --account paper-directional status
-alpaca-index-credit-control --account paper-undefined-risk status
-alpaca-index-credit-control --account paper-undefined-risk check-config
-alpaca-index-credit-control --account paper-undefined-risk scan naked GDX,SLV
-alpaca-index-credit-control --account paper-directional scan directional XLF,XLK
-alpaca-index-credit-control --account paper-main ledger --lines 20
-alpaca-index-credit-control fleet --json
-alpaca-index-credit-control health
-alpaca-index-credit-control logs
+alpaca-control accounts
+alpaca-control today
+alpaca-control ledger-summary --all
+alpaca-control --account paper-main status
+alpaca-control --account paper-directional status
+alpaca-control --account paper-undefined-risk status
+alpaca-control --account paper-undefined-risk check-config
+alpaca-control --account paper-undefined-risk scan naked GDX,SLV
+alpaca-control --account paper-directional scan directional XLF,XLK
+alpaca-control --account paper-main ledger --lines 20
+alpaca-control validate
+alpaca-control deploy
+alpaca-control rollout
+alpaca-control fleet --json
+alpaca-control health
+alpaca-control logs
 alpaca-fleet-status --json
 ```
 
@@ -212,6 +220,9 @@ role and strategy set.
 - TOML `[risk] max_active_entries`, `max_daily_submits`, and `max_open_orders` cap account-level
   exposure before any hosted strategy can submit. Env overrides are available as
   `ALPACA_MAX_ACTIVE_ENTRIES`, `ALPACA_MAX_DAILY_SUBMITS`, and `ALPACA_MAX_OPEN_ORDERS`.
+- The entry scanner blocks same-day re-entry for an underlying after any accepted entry submission,
+  including entries later closed by stop-loss or marked canceled. This prevents intraday churn back
+  into the same name after a losing close.
 - TOML `[risk] max_active_entries_per_underlying`, `max_active_entries_per_sector`, and
   `[risk.sectors]` cap concentration by symbol and configured correlation group. Env overrides are
   available for the two numeric caps as `ALPACA_MAX_ACTIVE_ENTRIES_PER_UNDERLYING` and
@@ -230,14 +241,23 @@ tiny live canary.
 
 ## Operator Status
 
-`alpaca-index-credit-control.sh operator` runs the `alpaca-operator-status` binary and summarizes
-service state, account status, open orders, positions, strategy state, the last structured
-scan/decision event, the latest broker event, and operator alerts. Use `--json` for machine-readable
-output.
+`alpaca-control operator` runs the `alpaca-operator-status` binary and summarizes service state,
+account status, open orders, positions, strategy state, the last structured scan/decision event, the
+latest broker event, and operator alerts. Use `--json` for machine-readable output.
 
-`alpaca-index-credit-control.sh fleet` runs `alpaca-fleet-status`, reads the fleet registry, and
-executes per-account operator status with each account's env file. It is a read-only fleet summary;
-it does not start services, submit orders, or change account state.
+`alpaca-control fleet` runs `alpaca-fleet-status`, reads the fleet registry, and executes
+per-account operator status with each account's env file. It is a read-only fleet summary; it does
+not start services, submit orders, or change account state.
+
+`alpaca-control validate` runs the targeted Alpaca formatting, shell syntax, library test, and binary
+check commands used before installing runtime changes. `alpaca-control deploy` builds and installs
+the local runtime without restarting services. `alpaca-control rollout` runs validation, deploys,
+restarts every configured account service, verifies service activity, and prints the compact
+`today` summary.
+
+`alpaca-control today` prints compact fleet health plus per-account candidate-ledger counts.
+`alpaca-control ledger-summary` prints record-type counts, latest submit results, latest decisions,
+and same-day re-entry blocks for one account; add `--all` for every known local account.
 
 Operator status reports fleet policy blocks as critical `fleet_policy_block` alerts. It also reports
 partial fills and accepted/new orders that have not filled yet so stale order handling can be

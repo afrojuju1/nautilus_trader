@@ -83,6 +83,7 @@ env/
 .tmp-pre-commit/
 *.bak
 *.sh
+!deploy/alpaca/*.sh
 !scripts/ci/install-cargo-nextest.sh
 !scripts/ci/verify-ci-inputs.sh
 !.pre-commit-hooks/*.sh

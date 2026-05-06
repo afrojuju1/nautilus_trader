@@ -50,6 +50,17 @@ impl StrategyState {
         })
     }
 
+    /// Returns `true` when any submitted entry exists for a trade date and underlying.
+    ///
+    /// This intentionally includes entries later marked closed or canceled so the entry scanner
+    /// cannot churn back into the same underlying after an intraday stop-loss or terminal order.
+    #[must_use]
+    pub fn has_submitted_underlying_today(&self, trade_date: &str, underlying: &str) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.submitted && entry.trade_date == trade_date && entry.underlying == underlying
+        })
+    }
+
     /// Appends one submitted spread entry to the state.
     pub fn record_submission(
         &mut self,
@@ -539,6 +550,9 @@ mod tests {
         );
         assert!(entry.closed_at_utc.is_some());
         assert!(!state.has_submitted_underlying("2026-05-04", "SPY"));
+        assert!(state.has_submitted_underlying_today("2026-05-04", "SPY"));
+        assert!(!state.has_submitted_underlying_today("2026-05-04", "QQQ"));
+        assert!(!state.has_submitted_underlying_today("2026-05-05", "SPY"));
     }
 
     #[test]

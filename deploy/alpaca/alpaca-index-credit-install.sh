@@ -24,6 +24,8 @@ install -Dm755 target/release/alpaca-fleet-status \
   "$HOME/.local/bin/alpaca-fleet-status"
 install -Dm755 deploy/alpaca/alpaca-index-credit-runner.sh \
   "$HOME/.local/bin/alpaca-index-credit-runner"
+install -Dm755 deploy/alpaca/alpaca-control.sh \
+  "$HOME/.local/bin/alpaca-control"
 install -Dm755 deploy/alpaca/alpaca-index-credit-control.sh \
   "$HOME/.local/bin/alpaca-index-credit-control"
 install -Dm644 deploy/alpaca/alpaca-index-credit.service \
@@ -57,3 +59,5 @@ echo "account_config_dir=$ACCOUNT_CONFIG_DIR"
 echo "runner=$HOME/.local/bin/alpaca-index-credit-engine"
 echo "operator=$HOME/.local/bin/alpaca-operator-status"
 echo "fleet_operator=$HOME/.local/bin/alpaca-fleet-status"
+echo "control=$HOME/.local/bin/alpaca-control"
+echo "legacy_control=$HOME/.local/bin/alpaca-index-credit-control"

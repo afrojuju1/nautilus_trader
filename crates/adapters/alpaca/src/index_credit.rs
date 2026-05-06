@@ -564,7 +564,7 @@ pub async fn select_index_strategy_entry(
             continue;
         }
 
-        if state.has_submitted_underlying(trade_date, underlying) {
+        if state.has_submitted_underlying_today(trade_date, underlying) {
             println!("{underlying}: admission_rejected reason=daily_duplicate_state");
             record_scanner_ledger_result(
                 config,
@@ -573,13 +573,16 @@ pub async fn select_index_strategy_entry(
                     "underlying": underlying,
                     "result": "admission_rejected",
                     "reason": "daily_duplicate_state",
+                    "scope": "same_day_underlying_reentry",
                 }),
             );
             emit_operator_event(
                 "scanner_diagnostic",
                 json!({
                     "underlying": underlying,
+                    "result": "admission_rejected",
                     "reason": "daily_duplicate_state",
+                    "scope": "same_day_underlying_reentry",
                 }),
             );
             continue;
