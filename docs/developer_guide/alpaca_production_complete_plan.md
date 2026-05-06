@@ -292,8 +292,9 @@ Current status:
 
 - `alpaca-index-credit-control.sh operator` reports service, account, orders, positions, strategy
   state, last scan, last decision, latest broker event, and alerts from one command.
-- `alpaca-control alerts candidates` reads per-account candidate-ledger JSONL and can dry-run or send
-  Discord candidate alerts using an external `alerts.env` webhook.
+- `alpaca-control alerts candidates` consumes typed `candidate_alert` records from per-account
+  candidate-ledger JSONL and can dry-run or send Discord candidate alerts using an external
+  `alerts.env` webhook.
 - On 2026-05-02, operator status was verified on `ade-nucbox-k8-plus` with the user service active,
   kill-switch enabled, submission disabled, zero open orders, and zero positions.
 

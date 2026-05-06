@@ -35,7 +35,10 @@ use crate::{
     },
     index_credit::{
         IndexCreditConfig, SelectedDebitEntry, SelectedEntry, SelectedIndexEntry,
-        SelectedIronCondorEntry, SelectedNakedOptionEntry, select_index_strategy_entry,
+        SelectedIronCondorEntry, SelectedNakedOptionEntry, candidate_alert_identity_key,
+        candidate_alert_key, credit_candidate_ledger_payload, debit_candidate_ledger_payload,
+        iron_condor_candidate_ledger_payload, naked_candidate_ledger_payload,
+        select_index_strategy_entry,
     },
     management::{credit_spread_close_reason, days_to_expiration, recorded_age_secs},
     runtime::{
@@ -69,7 +72,7 @@ use nautilus_model::{
     },
     types::{Price, Quantity},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::{
     sync::mpsc,
     time::{Instant, sleep, timeout},
@@ -77,6 +80,8 @@ use tokio::{
 
 const DEFAULT_EVENT_TIMEOUT_SECS: u64 = 20;
 const STRATEGY_FAMILY: &str = "INDEX-PUT-CREDIT-ENTRY";
+const SELECTED_CANDIDATE_ALERT: &str = "selected_candidate";
+const CANDIDATE_SUBMIT_REJECTED_ALERT: &str = "candidate_submit_rejected";
 
 #[derive(Clone, Debug)]
 struct SubmitOutcome {
@@ -542,6 +547,180 @@ fn record_submit_result_event(
     config.record_candidate_ledger(trade_date, "submit_result", payload);
 }
 
+fn record_selected_candidate_alert(
+    config: &IndexCreditConfig,
+    trade_date: &str,
+    identity_key: &str,
+    payload: Value,
+) {
+    config.record_candidate_alert_ledger(
+        trade_date,
+        SELECTED_CANDIDATE_ALERT,
+        "info",
+        candidate_alert_key(SELECTED_CANDIDATE_ALERT, identity_key),
+        payload,
+    );
+}
+
+fn record_submit_rejected_candidate_alert(
+    config: &IndexCreditConfig,
+    trade_date: &str,
+    identity_key: &str,
+    mut payload: Value,
+    outcome: &SubmitOutcome,
+    terminal_rejection_recorded: Option<bool>,
+) {
+    insert_value_field(&mut payload, "accepted", Value::from(outcome.accepted));
+    insert_value_field(&mut payload, "rejected", Value::from(outcome.rejected));
+    insert_value_field(
+        &mut payload,
+        "parent_order_id",
+        outcome
+            .parent_order_id
+            .as_ref()
+            .map_or(Value::Null, |value| Value::String(value.clone())),
+    );
+    if let Some(recorded) = terminal_rejection_recorded {
+        insert_value_field(
+            &mut payload,
+            "terminal_rejection_recorded",
+            Value::Bool(recorded),
+        );
+    }
+    config.record_candidate_alert_ledger(
+        trade_date,
+        CANDIDATE_SUBMIT_REJECTED_ALERT,
+        "warning",
+        candidate_alert_key(CANDIDATE_SUBMIT_REJECTED_ALERT, identity_key),
+        payload,
+    );
+}
+
+fn selected_credit_alert_payload(
+    entry: &SelectedEntry,
+    trade_date: &str,
+    action: &str,
+    order_list_id: Option<&str>,
+) -> (String, Value) {
+    let strategy = strategy_name(entry.kind);
+    let identity_key = candidate_alert_identity_key(
+        strategy,
+        &entry.underlying,
+        &[&entry.candidate.short.symbol, &entry.candidate.long.symbol],
+    );
+    let mut payload =
+        credit_candidate_ledger_payload(&entry.underlying, strategy, None, &entry.candidate);
+    insert_selected_alert_fields(
+        &mut payload,
+        &identity_key,
+        action,
+        trade_date,
+        order_list_id,
+    );
+    (identity_key, payload)
+}
+
+fn selected_iron_condor_alert_payload(
+    entry: &SelectedIronCondorEntry,
+    trade_date: &str,
+    action: &str,
+    order_list_id: Option<&str>,
+) -> (String, Value) {
+    let identity_key = candidate_alert_identity_key(
+        "index_iron_condor_entry",
+        &entry.underlying,
+        &[
+            &entry.candidate.put.short.symbol,
+            &entry.candidate.put.long.symbol,
+            &entry.candidate.call.short.symbol,
+            &entry.candidate.call.long.symbol,
+        ],
+    );
+    let mut payload =
+        iron_condor_candidate_ledger_payload(&entry.underlying, None, &entry.candidate);
+    insert_selected_alert_fields(
+        &mut payload,
+        &identity_key,
+        action,
+        trade_date,
+        order_list_id,
+    );
+    (identity_key, payload)
+}
+
+fn selected_debit_alert_payload(
+    entry: &SelectedDebitEntry,
+    trade_date: &str,
+    action: &str,
+    order_list_id: Option<&str>,
+) -> (String, Value) {
+    let strategy = debit_spread_strategy_name(entry.kind);
+    let identity_key = candidate_alert_identity_key(
+        strategy,
+        &entry.underlying,
+        &[&entry.candidate.long.symbol, &entry.candidate.short.symbol],
+    );
+    let mut payload =
+        debit_candidate_ledger_payload(&entry.underlying, strategy, None, &entry.candidate);
+    insert_selected_alert_fields(
+        &mut payload,
+        &identity_key,
+        action,
+        trade_date,
+        order_list_id,
+    );
+    (identity_key, payload)
+}
+
+fn selected_naked_alert_payload(
+    entry: &SelectedNakedOptionEntry,
+    trade_date: &str,
+    action: &str,
+    order_list_id: Option<&str>,
+) -> (String, Value) {
+    let strategy = naked_option_strategy_name(entry.kind);
+    let identity_key = candidate_alert_identity_key(
+        strategy,
+        &entry.underlying,
+        &[&entry.candidate.short.symbol],
+    );
+    let mut payload =
+        naked_candidate_ledger_payload(&entry.underlying, strategy, None, None, &entry.candidate);
+    insert_selected_alert_fields(
+        &mut payload,
+        &identity_key,
+        action,
+        trade_date,
+        order_list_id,
+    );
+    (identity_key, payload)
+}
+
+fn insert_selected_alert_fields(
+    payload: &mut Value,
+    identity_key: &str,
+    action: &str,
+    trade_date: &str,
+    order_list_id: Option<&str>,
+) {
+    insert_string_field(payload, "candidate_identity_key", identity_key.to_string());
+    insert_string_field(payload, "action", action.to_string());
+    insert_string_field(payload, "trade_date", trade_date.to_string());
+    if let Some(order_list_id) = order_list_id {
+        insert_string_field(payload, "order_list_id", order_list_id.to_string());
+    }
+}
+
+fn insert_string_field(payload: &mut Value, key: &str, value: String) {
+    insert_value_field(payload, key, Value::String(value));
+}
+
+fn insert_value_field(payload: &mut Value, key: &str, value: Value) {
+    if let Value::Object(fields) = payload {
+        fields.insert(key.to_string(), value);
+    }
+}
+
 async fn apply_strategy_decision(
     decision: StrategyDecision,
     config: &IndexCreditConfig,
@@ -604,6 +783,8 @@ async fn apply_strategy_decision(
         }
         StrategyDecision::SubmitOpen { entry } => {
             let order_list_id = order_list_id(trade_date, &entry.underlying);
+            let (candidate_identity_key, candidate_alert_payload) =
+                selected_credit_alert_payload(&entry, trade_date, "submit", Some(&order_list_id));
             println!(
                 "decision: submit underlying={} short={} long={} credit={:.2} ror={:.1}% score={:.1} order_list_id={}",
                 entry.underlying,
@@ -630,6 +811,12 @@ async fn apply_strategy_decision(
                     "trade_date": trade_date,
                 }),
             );
+            record_selected_candidate_alert(
+                config,
+                trade_date,
+                &candidate_identity_key,
+                candidate_alert_payload.clone(),
+            );
             let outcome = submit_entry(&entry, &order_list_id, config.quantity, config).await?;
             if outcome.accepted > 0 {
                 state.record_submission(
@@ -652,13 +839,30 @@ async fn apply_strategy_decision(
                 json!({
                     "accepted": outcome.accepted,
                     "rejected": outcome.rejected,
-                    "parent_order_id": outcome.parent_order_id,
+                    "parent_order_id": outcome.parent_order_id.clone(),
                 }),
             );
+            if outcome.rejected > 0 {
+                record_submit_rejected_candidate_alert(
+                    config,
+                    trade_date,
+                    &candidate_identity_key,
+                    candidate_alert_payload,
+                    &outcome,
+                    None,
+                );
+            }
             Ok(outcome.accepted > 0)
         }
         StrategyDecision::SubmitIronCondorOpen { entry } => {
             let order_list_id = order_list_id(trade_date, &entry.underlying);
+            let (candidate_identity_key, candidate_alert_payload) =
+                selected_iron_condor_alert_payload(
+                    &entry,
+                    trade_date,
+                    "submit",
+                    Some(&order_list_id),
+                );
             println!(
                 "decision: submit underlying={} short_put={} long_put={} short_call={} long_call={} credit={:.2} ror={:.1}% score={:.1} order_list_id={}",
                 entry.underlying,
@@ -689,6 +893,12 @@ async fn apply_strategy_decision(
                     "trade_date": trade_date,
                 }),
             );
+            record_selected_candidate_alert(
+                config,
+                trade_date,
+                &candidate_identity_key,
+                candidate_alert_payload.clone(),
+            );
             let outcome =
                 submit_iron_condor_entry(&entry, &order_list_id, config.quantity, config).await?;
             if outcome.accepted > 0 {
@@ -711,13 +921,25 @@ async fn apply_strategy_decision(
                 json!({
                     "accepted": outcome.accepted,
                     "rejected": outcome.rejected,
-                    "parent_order_id": outcome.parent_order_id,
+                    "parent_order_id": outcome.parent_order_id.clone(),
                 }),
             );
+            if outcome.rejected > 0 {
+                record_submit_rejected_candidate_alert(
+                    config,
+                    trade_date,
+                    &candidate_identity_key,
+                    candidate_alert_payload,
+                    &outcome,
+                    None,
+                );
+            }
             Ok(outcome.accepted > 0)
         }
         StrategyDecision::SubmitDebitOpen { entry } => {
             let order_list_id = order_list_id(trade_date, &entry.underlying);
+            let (candidate_identity_key, candidate_alert_payload) =
+                selected_debit_alert_payload(&entry, trade_date, "submit", Some(&order_list_id));
             println!(
                 "decision: submit underlying={} long={} short={} debit={:.2} rtr={:.1}% score={:.1} order_list_id={}",
                 entry.underlying,
@@ -744,6 +966,12 @@ async fn apply_strategy_decision(
                     "trade_date": trade_date,
                 }),
             );
+            record_selected_candidate_alert(
+                config,
+                trade_date,
+                &candidate_identity_key,
+                candidate_alert_payload.clone(),
+            );
             let outcome =
                 submit_debit_entry(&entry, &order_list_id, config.quantity, config).await?;
             if outcome.accepted > 0 {
@@ -767,13 +995,25 @@ async fn apply_strategy_decision(
                 json!({
                     "accepted": outcome.accepted,
                     "rejected": outcome.rejected,
-                    "parent_order_id": outcome.parent_order_id,
+                    "parent_order_id": outcome.parent_order_id.clone(),
                 }),
             );
+            if outcome.rejected > 0 {
+                record_submit_rejected_candidate_alert(
+                    config,
+                    trade_date,
+                    &candidate_identity_key,
+                    candidate_alert_payload,
+                    &outcome,
+                    None,
+                );
+            }
             Ok(outcome.accepted > 0)
         }
         StrategyDecision::SubmitNakedOptionOpen { entry } => {
             let order_list_id = order_list_id(trade_date, &entry.underlying);
+            let (candidate_identity_key, candidate_alert_payload) =
+                selected_naked_alert_payload(&entry, trade_date, "submit", Some(&order_list_id));
             let metrics = entry.candidate.short.metrics.as_ref();
             if let Some(metrics) = metrics {
                 println!(
@@ -853,6 +1093,12 @@ async fn apply_strategy_decision(
                     "trade_date": trade_date,
                 }),
             );
+            record_selected_candidate_alert(
+                config,
+                trade_date,
+                &candidate_identity_key,
+                candidate_alert_payload.clone(),
+            );
             let outcome =
                 submit_naked_option_entry(&entry, &order_list_id, config.quantity, config).await?;
             let terminal_rejection = outcome.accepted == 0 && outcome.rejected > 0;
@@ -883,13 +1129,25 @@ async fn apply_strategy_decision(
                 json!({
                     "accepted": outcome.accepted,
                     "rejected": outcome.rejected,
-                    "parent_order_id": outcome.parent_order_id,
+                    "parent_order_id": outcome.parent_order_id.clone(),
                     "terminal_rejection_recorded": terminal_rejection,
                 }),
             );
+            if outcome.rejected > 0 {
+                record_submit_rejected_candidate_alert(
+                    config,
+                    trade_date,
+                    &candidate_identity_key,
+                    candidate_alert_payload,
+                    &outcome,
+                    Some(terminal_rejection),
+                );
+            }
             Ok(outcome.accepted > 0 || terminal_rejection)
         }
         StrategyDecision::DryRun { entry } => {
+            let (candidate_identity_key, candidate_alert_payload) =
+                selected_credit_alert_payload(&entry, trade_date, "dry_run", None);
             println!(
                 "decision: dry_run underlying={} short={} long={} credit={:.2} ror={:.1}% score={:.1} reason=submission_disabled",
                 entry.underlying,
@@ -915,9 +1173,17 @@ async fn apply_strategy_decision(
                     "trade_date": trade_date,
                 }),
             );
+            record_selected_candidate_alert(
+                config,
+                trade_date,
+                &candidate_identity_key,
+                candidate_alert_payload,
+            );
             Ok(false)
         }
         StrategyDecision::DryRunIronCondor { entry } => {
+            let (candidate_identity_key, candidate_alert_payload) =
+                selected_iron_condor_alert_payload(&entry, trade_date, "dry_run", None);
             println!(
                 "decision: dry_run underlying={} short_put={} long_put={} short_call={} long_call={} credit={:.2} ror={:.1}% score={:.1} reason=submission_disabled",
                 entry.underlying,
@@ -947,9 +1213,17 @@ async fn apply_strategy_decision(
                     "trade_date": trade_date,
                 }),
             );
+            record_selected_candidate_alert(
+                config,
+                trade_date,
+                &candidate_identity_key,
+                candidate_alert_payload,
+            );
             Ok(false)
         }
         StrategyDecision::DryRunDebit { entry } => {
+            let (candidate_identity_key, candidate_alert_payload) =
+                selected_debit_alert_payload(&entry, trade_date, "dry_run", None);
             println!(
                 "decision: dry_run underlying={} long={} short={} debit={:.2} rtr={:.1}% score={:.1} reason=submission_disabled",
                 entry.underlying,
@@ -975,9 +1249,17 @@ async fn apply_strategy_decision(
                     "trade_date": trade_date,
                 }),
             );
+            record_selected_candidate_alert(
+                config,
+                trade_date,
+                &candidate_identity_key,
+                candidate_alert_payload,
+            );
             Ok(false)
         }
         StrategyDecision::DryRunNakedOption { entry } => {
+            let (candidate_identity_key, candidate_alert_payload) =
+                selected_naked_alert_payload(&entry, trade_date, "dry_run", None);
             let metrics = entry.candidate.short.metrics.as_ref();
             if let Some(metrics) = metrics {
                 println!(
@@ -1054,6 +1336,12 @@ async fn apply_strategy_decision(
                     "score": entry.candidate.score,
                     "trade_date": trade_date,
                 }),
+            );
+            record_selected_candidate_alert(
+                config,
+                trade_date,
+                &candidate_identity_key,
+                candidate_alert_payload,
             );
             Ok(false)
         }

@@ -54,9 +54,10 @@ When `runtime.candidate_ledger_dir` is omitted, each account writes JSONL record
 `runtime.candidate_ledger_max_candidates` controls how many ranked candidates per scanner result
 are persisted; `0` records all ranked candidates.
 
-Candidate Discord alerts are emitted by a sidecar command which reads the candidate ledger, not by
-the trading loop. Put the webhook in `~/.config/nautilus-trader/alpaca/alerts.env` as
-`DISCORD_WEBHOOK_URL=...`; keep the file mode at `600`.
+Candidate Discord alerts are emitted by a sidecar command which consumes typed `candidate_alert`
+records from the candidate ledger, not by the trading loop. Put the webhook in
+`~/.config/nautilus-trader/alpaca/alerts.env` as `DISCORD_WEBHOOK_URL=...`; keep the file mode at
+`600`.
 
 The installer also creates `~/.config/nautilus-trader/alpaca/fleet.toml` if missing. The fleet
 registry is read-only operator metadata; credentials remain in each account env file.

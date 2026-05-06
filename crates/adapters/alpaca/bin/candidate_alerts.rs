@@ -29,11 +29,6 @@ use serde_json::{Value, json};
 const DEFAULT_LOOKBACK_MINUTES: i64 = 30;
 const DEFAULT_DEDUPE_TTL_SECS: i64 = 3_600;
 const DEFAULT_MAX_RANK: u64 = 3;
-const DEFAULT_NAKED_SCORE: f64 = 95.0;
-const DEFAULT_NAKED_ONE_TO_THREE_DTE_SCORE: f64 = 100.0;
-const DEFAULT_IRON_CONDOR_SCORE: f64 = 80.0;
-const DEFAULT_CREDIT_SCORE: f64 = 80.0;
-const DEFAULT_DEBIT_SCORE: f64 = 80.0;
 
 #[derive(Debug)]
 struct Args {
@@ -48,17 +43,25 @@ struct Args {
     include_selected: bool,
     include_high_score: bool,
     include_submit_rejects: bool,
-    min_score_naked: f64,
-    min_score_naked_1_3dte: f64,
-    min_score_iron_condor: f64,
-    min_score_credit: f64,
-    min_score_debit: f64,
 }
 
 #[derive(Debug)]
 struct CandidateAlert {
     key: String,
     content: String,
+}
+
+#[derive(Debug, Default)]
+struct AlertCollection {
+    candidate_alert_records: usize,
+    filtered: usize,
+    alerts: Vec<CandidateAlert>,
+}
+
+impl AlertCollection {
+    fn eligible(&self) -> usize {
+        self.alerts.len()
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -96,16 +99,20 @@ async fn main() -> anyhow::Result<()> {
     let records = read_ledger_records(&ledger_path)?;
     let mut state = load_alert_state(&state_path)?;
     prune_alert_state(&mut state, args.dedupe_ttl_secs.max(60));
-    let alerts = collect_candidate_alerts(&records, &args, &account_id, cutoff);
-    let pending = alerts
+    let collection = collect_candidate_alerts(&records, &args, &account_id, cutoff);
+    let eligible = collection.eligible();
+    let pending = collection
+        .alerts
         .into_iter()
         .filter(|alert| !state.sent.contains_key(&alert.key))
         .collect::<Vec<_>>();
 
     if pending.is_empty() {
         println!(
-            "candidate_alerts account={account_id} date={trade_date} ledger={} pending=0 dry_run={}",
+            "candidate_alerts account={account_id} date={trade_date} ledger={} candidate_alert_records={} filtered={} eligible={eligible} pending=0 dry_run={}",
             ledger_path.display(),
+            collection.candidate_alert_records,
+            collection.filtered,
             args.dry_run,
         );
         save_alert_state(&state_path, &state)?;
@@ -114,8 +121,10 @@ async fn main() -> anyhow::Result<()> {
 
     if args.dry_run {
         println!(
-            "candidate_alerts account={account_id} date={trade_date} ledger={} pending={} dry_run=true",
+            "candidate_alerts account={account_id} date={trade_date} ledger={} candidate_alert_records={} filtered={} eligible={eligible} pending={} dry_run=true",
             ledger_path.display(),
+            collection.candidate_alert_records,
+            collection.filtered,
             pending.len(),
         );
         for alert in &pending {
@@ -126,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
 
     let webhook_url = discord_webhook_url()?;
     let client = reqwest::Client::new();
+    let sent = pending.len();
     for alert in pending {
         client
             .post(&webhook_url)
@@ -137,8 +147,10 @@ async fn main() -> anyhow::Result<()> {
     }
     save_alert_state(&state_path, &state)?;
     println!(
-        "candidate_alerts account={account_id} date={trade_date} ledger={} sent=true",
+        "candidate_alerts account={account_id} date={trade_date} ledger={} candidate_alert_records={} filtered={} eligible={eligible} sent={sent} dry_run=false",
         ledger_path.display(),
+        collection.candidate_alert_records,
+        collection.filtered,
     );
     Ok(())
 }
@@ -157,11 +169,6 @@ impl Args {
             include_selected: true,
             include_high_score: true,
             include_submit_rejects: true,
-            min_score_naked: DEFAULT_NAKED_SCORE,
-            min_score_naked_1_3dte: DEFAULT_NAKED_ONE_TO_THREE_DTE_SCORE,
-            min_score_iron_condor: DEFAULT_IRON_CONDOR_SCORE,
-            min_score_credit: DEFAULT_CREDIT_SCORE,
-            min_score_debit: DEFAULT_DEBIT_SCORE,
         };
 
         let mut iter = env::args().skip(1);
@@ -186,21 +193,19 @@ impl Args {
                 }
                 "--max-rank" => args.max_rank = next_arg(&mut iter, "--max-rank")?.parse()?,
                 "--min-score-naked" => {
-                    args.min_score_naked = next_arg(&mut iter, "--min-score-naked")?.parse()?;
+                    let _: f64 = next_arg(&mut iter, "--min-score-naked")?.parse()?;
                 }
                 "--min-score-naked-1-3dte" => {
-                    args.min_score_naked_1_3dte =
-                        next_arg(&mut iter, "--min-score-naked-1-3dte")?.parse()?;
+                    let _: f64 = next_arg(&mut iter, "--min-score-naked-1-3dte")?.parse()?;
                 }
                 "--min-score-iron-condor" => {
-                    args.min_score_iron_condor =
-                        next_arg(&mut iter, "--min-score-iron-condor")?.parse()?;
+                    let _: f64 = next_arg(&mut iter, "--min-score-iron-condor")?.parse()?;
                 }
                 "--min-score-credit" => {
-                    args.min_score_credit = next_arg(&mut iter, "--min-score-credit")?.parse()?;
+                    let _: f64 = next_arg(&mut iter, "--min-score-credit")?.parse()?;
                 }
                 "--min-score-debit" => {
-                    args.min_score_debit = next_arg(&mut iter, "--min-score-debit")?.parse()?;
+                    let _: f64 = next_arg(&mut iter, "--min-score-debit")?.parse()?;
                 }
                 "--send" => args.dry_run = false,
                 "--dry-run" => args.dry_run = true,
@@ -324,122 +329,106 @@ fn collect_candidate_alerts(
     args: &Args,
     default_account: &str,
     cutoff: DateTime<Utc>,
-) -> Vec<CandidateAlert> {
-    let selected = selected_candidate_signatures(records);
-    let candidate_lookup = candidate_records_by_signature(records);
-    let mut alerts = Vec::new();
-    let mut last_selected: Option<Value> = None;
+) -> AlertCollection {
+    let selected_identities = selected_candidate_alert_identities(records);
+    let mut collection = AlertCollection::default();
     for record in records {
-        if is_selected_decision(record) {
-            last_selected = Some(enriched_candidate_record(record, &candidate_lookup));
+        if record_str(record, "type") != Some("candidate_alert") {
+            continue;
         }
+        collection.candidate_alert_records += 1;
         let Some(ts) = record_ts(record) else {
+            collection.filtered += 1;
             continue;
         };
         if ts < cutoff {
+            collection.filtered += 1;
             continue;
         }
-        match record_str(record, "type") {
-            Some("candidate") if args.include_high_score => {
-                if selected.contains(&candidate_signature(record)) {
-                    continue;
-                }
-                if let Some(alert) = high_score_alert(record, args, default_account) {
-                    alerts.push(alert);
-                }
-            }
-            Some("decision") if args.include_selected && is_selected_decision(record) => {
-                let record = enriched_candidate_record(record, &candidate_lookup);
-                alerts.push(selected_alert(&record, default_account));
-            }
-            Some("submit_result") if args.include_submit_rejects => {
-                if record_u64(record, "rejected").unwrap_or(0) > 0
-                    && let Some(decision) = &last_selected
-                {
-                    alerts.push(submit_rejected_alert(record, decision, default_account));
-                }
-            }
-            _ => {}
+        if !include_alert_record(record, args) {
+            collection.filtered += 1;
+            continue;
         }
+        if record_str(record, "alert_type") == Some("high_score_candidate") {
+            if record_u64(record, "rank").unwrap_or(1) > args.max_rank {
+                collection.filtered += 1;
+                continue;
+            }
+            if record_str(record, "candidate_identity_key")
+                .is_some_and(|identity| selected_identities.contains(identity))
+            {
+                collection.filtered += 1;
+                continue;
+            }
+        }
+        collection
+            .alerts
+            .push(candidate_alert_from_record(record, default_account));
     }
-    alerts
+    collection
 }
 
-fn selected_candidate_signatures(records: &[Value]) -> BTreeSet<String> {
+fn selected_candidate_alert_identities(records: &[Value]) -> BTreeSet<String> {
     records
         .iter()
-        .filter(|record| is_selected_decision(record))
-        .map(candidate_signature)
+        .filter(|record| record_str(record, "type") == Some("candidate_alert"))
+        .filter(|record| {
+            matches!(
+                record_str(record, "alert_type"),
+                Some("selected_candidate" | "candidate_submit_rejected")
+            )
+        })
+        .filter_map(|record| record_str(record, "candidate_identity_key").map(ToString::to_string))
         .collect()
 }
 
-fn candidate_records_by_signature(records: &[Value]) -> BTreeMap<String, Value> {
-    records
-        .iter()
-        .filter(|record| record_str(record, "type") == Some("candidate"))
-        .map(|record| (candidate_signature(record), record.clone()))
-        .collect()
+fn include_alert_record(record: &Value, args: &Args) -> bool {
+    match record_str(record, "alert_type") {
+        Some("selected_candidate") => args.include_selected,
+        Some("high_score_candidate") => args.include_high_score,
+        Some("candidate_submit_rejected") => args.include_submit_rejects,
+        Some(_) | None => true,
+    }
 }
 
-fn enriched_candidate_record(record: &Value, candidates: &BTreeMap<String, Value>) -> Value {
-    let Some(candidate) = candidates.get(&candidate_signature(record)) else {
-        return record.clone();
-    };
-    let Value::Object(mut merged) = candidate.clone() else {
-        return record.clone();
-    };
-    if let Value::Object(fields) = record {
-        merged.extend(fields.clone());
-    }
-    Value::Object(merged)
-}
-
-fn high_score_alert(record: &Value, args: &Args, default_account: &str) -> Option<CandidateAlert> {
-    let score = record_f64(record, "score")?;
-    if record_u64(record, "rank").unwrap_or(1) > args.max_rank {
-        return None;
-    }
-    if score < score_threshold(record, args) {
-        return None;
-    }
-    let key = format!("candidate|{}", candidate_signature(record));
-    Some(CandidateAlert {
-        key,
-        content: format_candidate_message("Scanner candidate", record, default_account),
-    })
-}
-
-fn selected_alert(record: &Value, default_account: &str) -> CandidateAlert {
-    let key = format!(
-        "selected|{}|{}",
-        record_str(record, "action").unwrap_or("decision"),
-        candidate_signature(record)
-    );
+fn candidate_alert_from_record(record: &Value, default_account: &str) -> CandidateAlert {
     CandidateAlert {
-        key,
-        content: format_candidate_message("Selected candidate", record, default_account),
+        key: candidate_alert_dedupe_key(record, default_account),
+        content: format_candidate_alert_message(record, default_account),
     }
 }
 
-fn submit_rejected_alert(
-    submit_result: &Value,
-    decision: &Value,
-    default_account: &str,
-) -> CandidateAlert {
-    let key = format!(
-        "submit_rejected|{}|{}",
-        record_str(decision, "order_list_id").unwrap_or("unknown_order"),
-        candidate_signature(decision)
-    );
-    let rejected = record_u64(submit_result, "rejected").unwrap_or(0);
-    CandidateAlert {
-        key,
-        content: format!(
-            "{}\nsubmit rejected legs/orders: {}",
-            format_candidate_message("Candidate submit rejected", decision, default_account),
-            rejected,
-        ),
+fn candidate_alert_dedupe_key(record: &Value, default_account: &str) -> String {
+    let account = record_str(record, "account_id").unwrap_or(default_account);
+    let trade_date = record_str(record, "trade_date").unwrap_or("unknown_date");
+    let alert_key = record_str(record, "alert_key")
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "{}|{}",
+                record_str(record, "alert_type").unwrap_or("candidate_alert"),
+                candidate_signature(record)
+            )
+        });
+    format!("{account}|{trade_date}|{alert_key}")
+}
+
+fn format_candidate_alert_message(record: &Value, default_account: &str) -> String {
+    let title = match record_str(record, "alert_type") {
+        Some("selected_candidate") => "Selected candidate",
+        Some("high_score_candidate") => "Scanner candidate",
+        Some("candidate_submit_rejected") => "Candidate submit rejected",
+        Some("candidate_alert") | None => "Candidate alert",
+        Some(_) => "Candidate alert",
+    };
+    let message = format_candidate_message(title, record, default_account);
+    if record_str(record, "alert_type") != Some("candidate_submit_rejected") {
+        return message;
     }
+    let accepted = record_u64(record, "accepted").unwrap_or(0);
+    let rejected = record_u64(record, "rejected").unwrap_or(0);
+    let parent = record_str(record, "parent_order_id").unwrap_or("n/a");
+    format!("{message}\nsubmit accepted={accepted} rejected={rejected} parent={parent}")
 }
 
 fn format_candidate_message(title: &str, record: &Value, default_account: &str) -> String {
@@ -496,28 +485,6 @@ fn candidate_signature(record: &Value) -> String {
         record_str(record, "underlying").unwrap_or("unknown_underlying"),
         primary_symbol(record).unwrap_or_else(|| "unknown_symbol".to_string()),
     )
-}
-
-fn is_selected_decision(record: &Value) -> bool {
-    record_str(record, "type") == Some("decision")
-        && matches!(record_str(record, "action"), Some("submit" | "dry_run"))
-        && record_str(record, "strategy").is_some()
-}
-
-fn score_threshold(record: &Value, args: &Args) -> f64 {
-    let strategy = record_str(record, "strategy").unwrap_or_default();
-    let candidate_type = record_str(record, "candidate_type").unwrap_or_default();
-    if strategy.contains("naked") && strategy.contains("1_3dte") {
-        args.min_score_naked_1_3dte
-    } else if strategy.contains("naked") || candidate_type == "naked_option" {
-        args.min_score_naked
-    } else if candidate_type == "iron_condor" {
-        args.min_score_iron_condor
-    } else if candidate_type == "debit_spread" {
-        args.min_score_debit
-    } else {
-        args.min_score_credit
-    }
 }
 
 fn primary_symbol(record: &Value) -> Option<String> {

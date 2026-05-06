@@ -25,7 +25,7 @@ use std::{
 use chrono::NaiveTime;
 use chrono_tz::Tz;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     candidate_ledger::{append_candidate_ledger_record, default_candidate_ledger_dir},
@@ -48,6 +48,13 @@ use crate::{
         scan_put_credit_underlying, scan_put_debit_underlying,
     },
 };
+
+const HIGH_SCORE_CANDIDATE_ALERT: &str = "high_score_candidate";
+const CANDIDATE_ALERT_NAKED_MIN_SCORE: f64 = 95.0;
+const CANDIDATE_ALERT_NAKED_ONE_TO_THREE_DTE_MIN_SCORE: f64 = 100.0;
+const CANDIDATE_ALERT_IRON_CONDOR_MIN_SCORE: f64 = 80.0;
+const CANDIDATE_ALERT_CREDIT_MIN_SCORE: f64 = 80.0;
+const CANDIDATE_ALERT_DEBIT_MIN_SCORE: f64 = 80.0;
 
 /// Runtime config for the index credit account-engine slice.
 #[derive(Debug)]
@@ -218,6 +225,32 @@ impl IndexCreditConfig {
                 }),
             );
         }
+    }
+
+    /// Appends one typed candidate alert event to the candidate ledger when enabled.
+    pub fn record_candidate_alert_ledger(
+        &self,
+        trade_date: &str,
+        alert_type: &str,
+        severity: &str,
+        alert_key: String,
+        payload: Value,
+    ) {
+        let mut record = match payload {
+            Value::Object(fields) => fields,
+            value => {
+                let mut fields = Map::new();
+                fields.insert("payload".to_string(), value);
+                fields
+            }
+        };
+        record.insert(
+            "alert_type".to_string(),
+            Value::String(alert_type.to_string()),
+        );
+        record.insert("severity".to_string(), Value::String(severity.to_string()));
+        record.insert("alert_key".to_string(), Value::String(alert_key));
+        self.record_candidate_ledger(trade_date, "candidate_alert", Value::Object(record));
     }
 
     fn candidate_ledger_candidate_limit(&self, candidate_count: usize) -> usize {
@@ -2037,24 +2070,18 @@ fn record_credit_candidate_ledger(
         .take(config.candidate_ledger_candidate_limit(candidates.len()))
         .enumerate()
     {
-        config.record_candidate_ledger(
+        let payload =
+            credit_candidate_ledger_payload(underlying, strategy, Some(index + 1), candidate);
+        config.record_candidate_ledger(trade_date, "candidate", payload.clone());
+        record_high_score_candidate_alert(
+            config,
             trade_date,
-            "candidate",
-            json!({
-                "underlying": underlying,
-                "strategy": strategy,
-                "candidate_type": "credit_spread",
-                "rank": index + 1,
-                "short_symbol": &candidate.short.symbol,
-                "long_symbol": &candidate.long.symbol,
-                "width": candidate.width,
-                "credit": candidate.credit,
-                "max_loss": candidate.max_loss,
-                "return_on_risk": candidate.return_on_risk,
-                "score": candidate.score,
-                "short": scored_contract_ledger_payload(&candidate.short),
-                "long": scored_contract_ledger_payload(&candidate.long),
-            }),
+            strategy,
+            underlying,
+            &candidate.short.symbol,
+            &[&candidate.short.symbol, &candidate.long.symbol],
+            candidate.score,
+            payload,
         );
     }
 }
@@ -2071,25 +2098,18 @@ fn record_debit_candidate_ledger(
         .take(config.candidate_ledger_candidate_limit(candidates.len()))
         .enumerate()
     {
-        config.record_candidate_ledger(
+        let payload =
+            debit_candidate_ledger_payload(underlying, strategy, Some(index + 1), candidate);
+        config.record_candidate_ledger(trade_date, "candidate", payload.clone());
+        record_high_score_candidate_alert(
+            config,
             trade_date,
-            "candidate",
-            json!({
-                "underlying": underlying,
-                "strategy": strategy,
-                "candidate_type": "debit_spread",
-                "rank": index + 1,
-                "long_symbol": &candidate.long.symbol,
-                "short_symbol": &candidate.short.symbol,
-                "width": candidate.width,
-                "debit": candidate.debit,
-                "max_profit": candidate.max_profit,
-                "max_loss": candidate.max_loss,
-                "reward_to_risk": candidate.reward_to_risk,
-                "score": candidate.score,
-                "long": scored_contract_ledger_payload(&candidate.long),
-                "short": scored_contract_ledger_payload(&candidate.short),
-            }),
+            strategy,
+            underlying,
+            &candidate.long.symbol,
+            &[&candidate.long.symbol, &candidate.short.symbol],
+            candidate.score,
+            payload,
         );
     }
 }
@@ -2105,25 +2125,22 @@ fn record_iron_condor_candidate_ledger(
         .take(config.candidate_ledger_candidate_limit(candidates.len()))
         .enumerate()
     {
-        config.record_candidate_ledger(
+        let payload = iron_condor_candidate_ledger_payload(underlying, Some(index + 1), candidate);
+        config.record_candidate_ledger(trade_date, "candidate", payload.clone());
+        record_high_score_candidate_alert(
+            config,
             trade_date,
-            "candidate",
-            json!({
-                "underlying": underlying,
-                "strategy": "index_iron_condor_entry",
-                "candidate_type": "iron_condor",
-                "rank": index + 1,
-                "short_put_symbol": &candidate.put.short.symbol,
-                "long_put_symbol": &candidate.put.long.symbol,
-                "short_call_symbol": &candidate.call.short.symbol,
-                "long_call_symbol": &candidate.call.long.symbol,
-                "credit": candidate.credit,
-                "max_loss": candidate.max_loss,
-                "return_on_risk": candidate.return_on_risk,
-                "score": candidate.score,
-                "put": spread_candidate_ledger_payload(&candidate.put),
-                "call": spread_candidate_ledger_payload(&candidate.call),
-            }),
+            "index_iron_condor_entry",
+            underlying,
+            &candidate.put.short.symbol,
+            &[
+                &candidate.put.short.symbol,
+                &candidate.put.long.symbol,
+                &candidate.call.short.symbol,
+                &candidate.call.long.symbol,
+            ],
+            candidate.score,
+            payload,
         );
     }
 }
@@ -2141,30 +2158,225 @@ fn record_naked_candidate_ledger(
         .take(config.candidate_ledger_candidate_limit(candidates.len()))
         .enumerate()
     {
-        config.record_candidate_ledger(
-            trade_date,
-            "candidate",
-            json!({
-                "underlying": underlying,
-                "strategy": strategy,
-                "candidate_type": "naked_option",
-                "rank": index + 1,
-                "short_symbol": &candidate.short.symbol,
-                "credit": candidate.credit,
-                "account_options_buying_power": options_buying_power,
-                "capital_requirement_model": candidate.capital_requirement_model.as_str(),
-                "estimated_buying_power_requirement": candidate.estimated_buying_power_requirement,
-                "buying_power_usage_pct": candidate.buying_power_usage_pct,
-                "return_on_buying_power": candidate.return_on_buying_power,
-                "annualized_premium_yield": annualized_premium_yield(
-                    candidate.credit,
-                    candidate.short.strike,
-                    candidate.short.dte,
-                ),
-                "score": candidate.score,
-                "short": scored_contract_ledger_payload(&candidate.short),
-            }),
+        let payload = naked_candidate_ledger_payload(
+            underlying,
+            strategy,
+            options_buying_power,
+            Some(index + 1),
+            candidate,
         );
+        config.record_candidate_ledger(trade_date, "candidate", payload.clone());
+        record_high_score_candidate_alert(
+            config,
+            trade_date,
+            strategy,
+            underlying,
+            &candidate.short.symbol,
+            &[&candidate.short.symbol],
+            candidate.score,
+            payload,
+        );
+    }
+}
+
+/// Builds the shared candidate-ledger payload for a credit-spread candidate.
+#[must_use]
+pub fn credit_candidate_ledger_payload(
+    underlying: &str,
+    strategy: &str,
+    rank: Option<usize>,
+    candidate: &SpreadCandidate,
+) -> Value {
+    let mut payload = json!({
+        "underlying": underlying,
+        "strategy": strategy,
+        "candidate_type": "credit_spread",
+        "short_symbol": &candidate.short.symbol,
+        "long_symbol": &candidate.long.symbol,
+        "width": candidate.width,
+        "credit": candidate.credit,
+        "max_loss": candidate.max_loss,
+        "return_on_risk": candidate.return_on_risk,
+        "score": candidate.score,
+        "short": scored_contract_ledger_payload(&candidate.short),
+        "long": scored_contract_ledger_payload(&candidate.long),
+    });
+    insert_optional_rank(&mut payload, rank);
+    payload
+}
+
+/// Builds the shared candidate-ledger payload for a debit-spread candidate.
+#[must_use]
+pub fn debit_candidate_ledger_payload(
+    underlying: &str,
+    strategy: &str,
+    rank: Option<usize>,
+    candidate: &DebitSpreadCandidate,
+) -> Value {
+    let mut payload = json!({
+        "underlying": underlying,
+        "strategy": strategy,
+        "candidate_type": "debit_spread",
+        "long_symbol": &candidate.long.symbol,
+        "short_symbol": &candidate.short.symbol,
+        "width": candidate.width,
+        "debit": candidate.debit,
+        "max_profit": candidate.max_profit,
+        "max_loss": candidate.max_loss,
+        "reward_to_risk": candidate.reward_to_risk,
+        "score": candidate.score,
+        "long": scored_contract_ledger_payload(&candidate.long),
+        "short": scored_contract_ledger_payload(&candidate.short),
+    });
+    insert_optional_rank(&mut payload, rank);
+    payload
+}
+
+/// Builds the shared candidate-ledger payload for an iron-condor candidate.
+#[must_use]
+pub fn iron_condor_candidate_ledger_payload(
+    underlying: &str,
+    rank: Option<usize>,
+    candidate: &IronCondorCandidate,
+) -> Value {
+    let mut payload = json!({
+        "underlying": underlying,
+        "strategy": "index_iron_condor_entry",
+        "candidate_type": "iron_condor",
+        "short_put_symbol": &candidate.put.short.symbol,
+        "long_put_symbol": &candidate.put.long.symbol,
+        "short_call_symbol": &candidate.call.short.symbol,
+        "long_call_symbol": &candidate.call.long.symbol,
+        "credit": candidate.credit,
+        "max_loss": candidate.max_loss,
+        "return_on_risk": candidate.return_on_risk,
+        "score": candidate.score,
+        "put": spread_candidate_ledger_payload(&candidate.put),
+        "call": spread_candidate_ledger_payload(&candidate.call),
+    });
+    insert_optional_rank(&mut payload, rank);
+    payload
+}
+
+/// Builds the shared candidate-ledger payload for a naked-option candidate.
+#[must_use]
+pub fn naked_candidate_ledger_payload(
+    underlying: &str,
+    strategy: &str,
+    options_buying_power: Option<f64>,
+    rank: Option<usize>,
+    candidate: &NakedOptionCandidate,
+) -> Value {
+    let mut payload = json!({
+        "underlying": underlying,
+        "strategy": strategy,
+        "candidate_type": "naked_option",
+        "short_symbol": &candidate.short.symbol,
+        "credit": candidate.credit,
+        "account_options_buying_power": options_buying_power,
+        "capital_requirement_model": candidate.capital_requirement_model.as_str(),
+        "estimated_buying_power_requirement": candidate.estimated_buying_power_requirement,
+        "buying_power_usage_pct": candidate.buying_power_usage_pct,
+        "return_on_buying_power": candidate.return_on_buying_power,
+        "annualized_premium_yield": annualized_premium_yield(
+            candidate.credit,
+            candidate.short.strike,
+            candidate.short.dte,
+        ),
+        "score": candidate.score,
+        "short": scored_contract_ledger_payload(&candidate.short),
+    });
+    insert_optional_rank(&mut payload, rank);
+    payload
+}
+
+/// Returns a stable key for one candidate independent of account and trade date.
+#[must_use]
+pub fn candidate_alert_identity_key(strategy: &str, underlying: &str, symbols: &[&str]) -> String {
+    format!(
+        "{}|{}|{}",
+        strategy,
+        underlying,
+        symbols
+            .iter()
+            .copied()
+            .filter(|symbol| !symbol.is_empty())
+            .collect::<Vec<_>>()
+            .join("|")
+    )
+}
+
+/// Returns a stable key for a typed candidate alert.
+#[must_use]
+pub fn candidate_alert_key(alert_type: &str, identity_key: &str) -> String {
+    format!("{alert_type}|{identity_key}")
+}
+
+fn record_high_score_candidate_alert(
+    config: &IndexCreditConfig,
+    trade_date: &str,
+    strategy: &str,
+    underlying: &str,
+    primary_symbol: &str,
+    symbols: &[&str],
+    score: f64,
+    payload: Value,
+) {
+    if score < high_score_candidate_alert_threshold(strategy, payload_candidate_type(&payload)) {
+        return;
+    }
+    let identity_key = candidate_alert_identity_key(strategy, underlying, symbols);
+    let mut alert_payload = payload;
+    insert_string_field(
+        &mut alert_payload,
+        "candidate_identity_key",
+        identity_key.clone(),
+    );
+    insert_string_field(
+        &mut alert_payload,
+        "primary_symbol",
+        primary_symbol.to_string(),
+    );
+    config.record_candidate_alert_ledger(
+        trade_date,
+        HIGH_SCORE_CANDIDATE_ALERT,
+        "info",
+        candidate_alert_key(HIGH_SCORE_CANDIDATE_ALERT, &identity_key),
+        alert_payload,
+    );
+}
+
+fn high_score_candidate_alert_threshold(strategy: &str, candidate_type: Option<&str>) -> f64 {
+    if strategy.contains("naked") && strategy.contains("1_3dte") {
+        CANDIDATE_ALERT_NAKED_ONE_TO_THREE_DTE_MIN_SCORE
+    } else if strategy.contains("naked") || candidate_type == Some("naked_option") {
+        CANDIDATE_ALERT_NAKED_MIN_SCORE
+    } else if candidate_type == Some("iron_condor") {
+        CANDIDATE_ALERT_IRON_CONDOR_MIN_SCORE
+    } else if candidate_type == Some("debit_spread") {
+        CANDIDATE_ALERT_DEBIT_MIN_SCORE
+    } else {
+        CANDIDATE_ALERT_CREDIT_MIN_SCORE
+    }
+}
+
+fn payload_candidate_type(payload: &Value) -> Option<&str> {
+    payload.get("candidate_type").and_then(Value::as_str)
+}
+
+fn insert_optional_rank(payload: &mut Value, rank: Option<usize>) {
+    if let Some(rank) = rank {
+        insert_value_field(payload, "rank", Value::from(rank));
+    }
+}
+
+fn insert_string_field(payload: &mut Value, key: &str, value: String) {
+    insert_value_field(payload, key, Value::String(value));
+}
+
+fn insert_value_field(payload: &mut Value, key: &str, value: Value) {
+    if let Value::Object(fields) = payload {
+        fields.insert(key.to_string(), value);
     }
 }
 
