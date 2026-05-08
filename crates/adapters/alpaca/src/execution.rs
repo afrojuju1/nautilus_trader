@@ -1058,7 +1058,7 @@ impl AlpacaExecutionClient {
         self.core
             .cache()
             .order(&client_order_id)
-            .cloned()
+            .map(|order| order.cloned())
             .map_or_else(|| Ok(OrderAny::try_from(order_init)?), Ok)
     }
 
@@ -1101,7 +1101,10 @@ impl ExecutionClient for AlpacaExecutionClient {
     }
 
     fn get_account(&self) -> Option<AccountAny> {
-        self.core.cache().account(&self.core.account_id).cloned()
+        self.core
+            .cache()
+            .account(&self.core.account_id)
+            .map(|account| account.cloned())
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
