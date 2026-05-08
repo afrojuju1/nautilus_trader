@@ -96,6 +96,9 @@ for official NautilusTrader documentation.
   - [ ] Bars.
   - [ ] Greeks and implied volatility.
   - [ ] Underlying snapshots.
+- [ ] Add a real-time option quote/trade stream cache or explicitly document why REST snapshots are
+      the supported quote path for the release.
+- [ ] Add entitlement-aware feed behavior for indicative versus OPRA option data.
 - [ ] Wire an Alpaca instrument provider into the standard Nautilus cache path if publishing as a
       normal adapter.
 - [x] Document option data entitlement requirements.
@@ -128,6 +131,9 @@ for official NautilusTrader documentation.
 - [x] Document how to cancel accepted smoke-test orders.
 - [x] Document ledger locations and meanings.
 - [x] Document historical opportunity tracking and close-PnL accounting.
+- [ ] Document account capability preflight and options-level strategy gating.
+- [ ] Document assignment, exercise, expiry, and option non-trade activity polling once implemented.
+- [ ] Document historical option replay outputs once implemented.
 
 ## Strategy runtime documentation
 
@@ -164,10 +170,15 @@ for official NautilusTrader documentation.
 - [x] Add fixture tests for multi-leg signed premium handling.
 - [x] Add fixture tests for order status mapping.
 - [x] Add fixture tests for fill/activity mapping.
+- [ ] Add fixture tests for option assignment, expiry, and option trade activity mapping.
 - [x] Add fixture tests for partial fills.
 - [x] Add fixture tests for rejected, canceled, expired, and replaced orders where applicable.
 - [ ] Add fixture tests for startup reconciliation.
 - [ ] Add fixture tests for terminal position reconciliation.
+- [ ] Add fixture tests for account options trading-level and approval preflight.
+- [ ] Add fixture tests for real-time option quote/trade stream parsing if the stream cache is
+      included in the release scope.
+- [ ] Add replay-harness tests for candidate outcomes against historical option data fixtures.
 - [x] Add docs example smoke/import tests.
 - [ ] Keep live Alpaca credential tests out of normal CI unless explicitly configured.
 
@@ -200,6 +211,9 @@ for official NautilusTrader documentation.
       proof before being advertised as complete.
 - [x] Add a note that market-data capabilities depend on Alpaca account entitlements.
 - [x] Add a note that real smoke tests must cancel accepted orders unless intentionally left open.
+- [ ] Add capability-level warnings for strategies that require higher Alpaca options approval.
+- [ ] Add expiration-day and assignment-risk operator procedures before documenting undefined-risk
+      strategies as production-ready.
 
 ## Proposed rollout
 
@@ -211,4 +225,8 @@ for official NautilusTrader documentation.
 - [ ] Phase 2: implement Python `TradingNode` adapter factories.
 - [ ] Phase 2: wire standard data/instrument provider behavior.
 - [x] Phase 2: add adapter integration fixtures and example smoke tests.
-- [ ] Phase 3: broaden data, order, assignment/exercise/expiry, and historical-data support.
+- [ ] Phase 3: add account capability preflight.
+- [ ] Phase 3: add assignment/exercise/expiry polling and lifecycle-risk handling.
+- [ ] Phase 3: add real-time option quote/trade cache or explicitly defer it.
+- [ ] Phase 3: add historical option replay/research harness.
+- [ ] Phase 3: broaden remaining data, order, and historical-data support.

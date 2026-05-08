@@ -31,8 +31,7 @@ use crate::{
     management::{credit_spread_close_reason, days_to_expiration, recorded_age_secs},
     options_runtime::{
         OptionsEngineConfig, SelectedOptionsEntry, active_sector_count, active_underlying_count,
-        fleet_active_underlying_count, fleet_has_active_underlying_elsewhere,
-        fleet_sector_limit_state, select_options_entry,
+        fleet_active_underlying_count, fleet_sector_limit_state, select_options_entry,
     },
     performance::{
         EntryOrderIds, append_performance_ledger_record, collect_order_ids,
@@ -327,21 +326,8 @@ async fn submission_block_for_selected(
             }));
         }
     }
-    if let Some(limit) = context
-        .config
-        .fleet
-        .as_ref()
-        .and_then(|fleet| fleet.config.fleet.max_active_entries_per_underlying)
-    {
-        let current = fleet_active_underlying_count(context.config, underlying);
-        if current >= limit {
-            return Ok(Some(SubmissionBlock {
-                reason: "fleet_max_active_entries_per_underlying".to_string(),
-                current: Some(current),
-                limit: Some(limit),
-                details: Vec::new(),
-            }));
-        }
+    if let Some(block) = fleet_underlying_limit_block(context.config, underlying) {
+        return Ok(Some(block));
     }
     if let Some((sector, current, limit)) = fleet_sector_limit_state(context.config, underlying)
         && current >= limit
@@ -364,15 +350,6 @@ async fn submission_block_for_selected(
             details: vec!["scope=same_day_underlying_reentry".to_string()],
         }));
     }
-    if fleet_has_active_underlying_elsewhere(context.config, underlying) {
-        return Ok(Some(SubmissionBlock {
-            reason: "fleet_duplicate_underlying".to_string(),
-            current: None,
-            limit: None,
-            details: Vec::new(),
-        }));
-    }
-
     let account = context.client.account().await?;
     let positions = context.client.positions().await?;
     let open_orders = context
@@ -386,11 +363,72 @@ async fn submission_block_for_selected(
         return Ok(None);
     }
     Ok(Some(SubmissionBlock {
-        reason: "broker_admission_rejected".to_string(),
+        reason: admission_block_reason(&admission.reasons).to_string(),
         current: None,
         limit: None,
         details: admission.reasons,
     }))
+}
+
+fn fleet_underlying_limit_block(
+    config: &OptionsEngineConfig,
+    underlying: &str,
+) -> Option<SubmissionBlock> {
+    let limit = config
+        .fleet
+        .as_ref()
+        .and_then(|fleet| fleet.config.fleet.max_active_entries_per_underlying)?;
+    let current = fleet_active_underlying_count(config, underlying);
+    if current >= limit {
+        Some(SubmissionBlock {
+            reason: "fleet_max_active_entries_per_underlying".to_string(),
+            current: Some(current),
+            limit: Some(limit),
+            details: Vec::new(),
+        })
+    } else {
+        None
+    }
+}
+
+fn admission_block_reason(reasons: &[String]) -> &'static str {
+    if reasons.iter().any(|reason| {
+        matches!(
+            reason.as_str(),
+            "account trading_blocked is true"
+                | "account_blocked is true"
+                | "trade_suspended_by_user is true"
+        ) || reason.starts_with("account status is ")
+    }) {
+        "account_not_tradable"
+    } else if reasons
+        .iter()
+        .any(|reason| reason == "candidate option symbols must resolve to one underlying")
+    {
+        "invalid_candidate_symbols"
+    } else if reasons
+        .iter()
+        .any(|reason| reason.starts_with("existing open position on candidate leg "))
+    {
+        "existing_candidate_leg_position"
+    } else if reasons
+        .iter()
+        .any(|reason| reason.starts_with("existing open option position on underlying "))
+    {
+        "existing_underlying_position"
+    } else if reasons
+        .iter()
+        .any(|reason| reason.starts_with("working order already references candidate leg "))
+    {
+        "working_candidate_leg_order"
+    } else if reasons
+        .iter()
+        .any(|reason| reason.starts_with("working order already references underlying "))
+    {
+        "working_underlying_order"
+    } else {
+        "broker_admission_rejected"
+    }
 }
 
 impl RiskGateDecision {
@@ -1580,6 +1618,7 @@ mod tests {
     use super::*;
     use crate::{
         common::consts::ALPACA_CLIENT_ID,
+        fleet::{AccountConfig, FleetConfig, FleetSection, ResolvedFleetConfig},
         options_runtime::SelectedNakedOptionEntry,
         runtime::{debit_spread_strategy_name, naked_option_strategy_name},
         strategy::{
@@ -1808,6 +1847,57 @@ mod tests {
     }
 
     #[test]
+    fn fleet_underlying_limit_allows_same_underlying_below_limit() {
+        let (config, dir) = config_with_fleet_underlying_limit(2);
+
+        assert!(fleet_underlying_limit_block(&config, "SPY").is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fleet_underlying_limit_blocks_at_configured_limit() {
+        let (config, dir) = config_with_fleet_underlying_limit(1);
+
+        let block = fleet_underlying_limit_block(&config, "SPY").unwrap();
+
+        assert_eq!(block.reason, "fleet_max_active_entries_per_underlying");
+        assert_eq!(block.current, Some(1));
+        assert_eq!(block.limit, Some(1));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn admission_block_reason_classifies_underlying_position_conflicts() {
+        let reasons =
+            vec!["existing open option position on underlying SLV: SLV260515P00067000".to_string()];
+
+        assert_eq!(
+            admission_block_reason(&reasons),
+            "existing_underlying_position",
+        );
+    }
+
+    #[test]
+    fn admission_block_reason_classifies_working_underlying_orders() {
+        let reasons =
+            vec!["working order already references underlying SLV: SLV260515P00067000".to_string()];
+
+        assert_eq!(admission_block_reason(&reasons), "working_underlying_order");
+    }
+
+    #[test]
+    fn admission_block_reason_prefers_account_state_blocks() {
+        let reasons = vec![
+            "existing open option position on underlying SLV: SLV260515P00067000".to_string(),
+            "account trading_blocked is true".to_string(),
+        ];
+
+        assert_eq!(admission_block_reason(&reasons), "account_not_tradable");
+    }
+
+    #[test]
     fn debit_close_reason_detects_expiration_risk() {
         let mut config = config_for_gate_tests();
         config.expiration_exit_days = 1;
@@ -1924,6 +2014,41 @@ mod tests {
             recorded_at_utc: "2026-05-04T14:00:00Z".to_string(),
             closed_at_utc: None,
         }
+    }
+
+    fn config_with_fleet_underlying_limit(limit: usize) -> (OptionsEngineConfig, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "nautilus-alpaca-fleet-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let state_path = dir.join("paper-main-state.json");
+        save_strategy_state_atomic(
+            &state_path,
+            &StrategyState {
+                entries: vec![state_entry()],
+            },
+        )
+        .unwrap();
+
+        let mut config = config_for_gate_tests();
+        config.fleet = Some(ResolvedFleetConfig {
+            path: dir.join("fleet.toml"),
+            registry_dir: dir.clone(),
+            config: FleetConfig {
+                fleet: FleetSection {
+                    max_active_entries_per_underlying: Some(limit),
+                    ..FleetSection::default()
+                },
+                accounts: vec![AccountConfig {
+                    id: "paper-main".to_string(),
+                    enabled: true,
+                    state_path: Some(state_path),
+                    ..AccountConfig::default()
+                }],
+            },
+        });
+        (config, dir)
     }
 
     fn debit_state_entry_expiring_in_days(days: i64) -> StrategyStateEntry {

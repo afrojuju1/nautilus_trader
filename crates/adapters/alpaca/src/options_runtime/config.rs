@@ -880,21 +880,6 @@ pub(crate) fn active_sector_count(
         .count()
 }
 
-pub(crate) fn fleet_has_active_underlying_elsewhere(
-    config: &OptionsEngineConfig,
-    underlying: &str,
-) -> bool {
-    let Some(fleet) = &config.fleet else {
-        return false;
-    };
-    let Some(account_id) = config.fleet_account_id.as_deref() else {
-        return false;
-    };
-    fleet
-        .active_underlyings_excluding(account_id)
-        .contains(&underlying.to_ascii_uppercase())
-}
-
 pub(crate) fn fleet_active_underlying_count(
     config: &OptionsEngineConfig,
     underlying: &str,

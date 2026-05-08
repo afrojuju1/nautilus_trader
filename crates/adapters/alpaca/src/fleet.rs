@@ -16,7 +16,7 @@
 //! Account fleet registry parsing and account-boundary policy helpers.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
 };
@@ -283,22 +283,6 @@ impl ResolvedFleetConfig {
             add_state_exposure(&mut exposure, &state, &self.config.fleet.sectors);
         }
         exposure
-    }
-
-    /// Computes active underlyings across enabled accounts other than `account_id`.
-    pub fn active_underlyings_excluding(&self, account_id: &str) -> BTreeSet<String> {
-        self.enabled_accounts()
-            .filter(|account| account.id != account_id)
-            .filter_map(|account| self.state_path(account))
-            .filter_map(|path| load_strategy_state(&path).ok())
-            .flat_map(|state| {
-                state
-                    .entries
-                    .into_iter()
-                    .filter(|entry| entry.is_active())
-                    .map(|entry| entry.underlying.to_ascii_uppercase())
-            })
-            .collect()
     }
 }
 

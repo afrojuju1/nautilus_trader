@@ -63,6 +63,16 @@ Known gaps:
 - Multi-account support currently has an operator/deployment foundation only. It still needs account
   admission policy, allocation rules, per-role strategy configs, and paper proof before undefined
   risk is allowed to submit.
+- Assignment, exercise, and expiration are still not first-class runtime events. Alpaca exposes
+  option non-trade activity records for these lifecycle events, but assignment events are not
+  delivered over trade-update websockets, so production readiness needs a REST poller and explicit
+  expiry-risk controls.
+- The scanner still relies primarily on REST snapshots. Alpaca option quote/trade streams can
+  improve active-position marks and quote freshness, but subscriptions require explicit symbols and
+  entitlement-aware feed selection.
+- Historical opportunity tracking exists, but strategy tuning still needs a replay/research harness
+  over historical option data and candidate ledgers before sizing or strategy expansion is justified
+  by evidence.
 
 ## Phase 1: Foundation Lock
 
@@ -107,6 +117,10 @@ Work:
 - Add REST polling repair for missed trade-update events.
 - Validate assignment, exercise, expiry, cancellation, rejection, partial fill, and filled lifecycle
   mapping.
+- Poll option account activities for assignment, expiry, and option trade settlement records and
+  translate them into explicit operator/runtime events.
+- Add account capability preflight for options approval/trading levels so strategies above the
+  account's current level are blocked before scanner or broker submission.
 - Add cancel/replace support for working MLeg entries where Alpaca supports it.
 - Keep single-leg submit disabled unless a strategy explicitly needs it.
 
@@ -196,6 +210,9 @@ Work:
 - Add profit target, stop loss, max adverse move, stale order timeout, time-based exit, and
   expiration-risk exit. (Initial profit-target, stop-loss-debit, max-hold, stale-entry, debit and
   credit expiration-risk evaluation, and management snapshot telemetry complete.)
+- Add expiration/assignment risk automation: DTE-zero entry block timing, close-before-expiry
+  controls, ITM/buying-power checks where data allows, and operator alerts for positions exposed to
+  exercise or assignment risk.
 - Implement close MLeg order-list construction for verticals. (Initial reduce-only close
   `SubmitOrderList` construction complete for credit verticals.)
 - Add cancel stale entry and close orders. (Runner can cancel stale entry orders and submit close
@@ -529,6 +546,113 @@ Phase 7 blockers:
   buying-power/Greek budget enforcement beyond static fleet metadata, and emergency flatten proof.
 - Straddles/strangles should wait until long-premium management and max-loss behavior are specified.
 
+## Phase 7.5: Alpaca Capability Roadmap
+
+Goal: refine the live Alpaca runtime with the minimum platform features needed for official-quality
+documentation and evidence-driven strategy operation.
+
+Required before promoting beyond experimental:
+
+1. Account capability preflight.
+   - Read account options approval/trading-level fields and account configuration limits at startup
+     and in operator status.
+   - Map enabled strategies to the required options level and fail closed when an account is not
+     approved for the configured strategy set.
+   - Emit clear operator blocks such as `options_level_insufficient` before scanning or submitting.
+
+2. Assignment, exercise, and expiration risk daemon.
+   - Poll account activities for option assignment, expiry, and option trade records because these
+     lifecycle events are not guaranteed through trade-update websockets.
+   - Add DTE-zero and near-expiry controls aligned with Alpaca's expiration handling window.
+   - Surface exercise/assignment/expiry events in performance ledgers, operator status, and alerts.
+   - Keep manual DNE and exercise instructions as documented operator procedures unless an explicit
+     API-backed workflow is designed and paper-proven.
+
+3. Real-time option quote cache for active risk.
+   - Subscribe to explicit active-position and high-rank candidate option symbols on Alpaca's
+     option data stream.
+   - Decode the stream format, store last quote/trade timestamp, and fall back to REST snapshots
+     when a subscription, entitlement, or stream-health check fails.
+   - Use the cache first for active-position marks, close triggers, stale-quote alerts, and
+     candidate freshness checks.
+
+4. Historical option research and replay harness.
+   - Replay candidate ledgers against Alpaca historical option data where available.
+   - Produce score-bucket, strategy, underlying, DTE, delta, spread-width, and liquidity summaries.
+   - Feed results back into scanner thresholds before expanding size, symbols, or strategy count.
+
+High-value after the required platform work:
+
+5. Strategy regime router.
+   - Classify market conditions from realized volatility, trend, breadth, gap behavior, event load,
+     and volatility proxies.
+   - Enable or down-rank strategy families by regime: iron condors in quiet mean-reverting markets,
+     debit spreads in directional markets, and reduced naked exposure during event shocks.
+   - Record the selected regime and strategy-routing decision in the candidate ledger so outcomes
+     can be audited later.
+
+6. Portfolio Greek and stress governor.
+   - Track account and fleet delta, gamma, vega, theta, and buying-power usage from active option
+     exposure where data allows.
+   - Add scenario stress such as underlying +/-1%, +/-2%, volatility up/down, and gap-open
+     approximations before allowing new exposure.
+   - Make this a higher-level risk layer above count caps so the system can block correlated
+     exposures that look harmless by entry count alone.
+
+7. Fill-quality intelligence.
+   - Measure each submitted order against quote midpoint, bid/ask spread, quote age, fill delay,
+     reprice count, and post-fill drift.
+   - Summarize fill quality by strategy, underlying, account, time of day, and order type.
+   - Feed poor execution quality back into universe scoring, scanner thresholds, and symbol
+     quarantine.
+
+8. Smart MLeg repricing engine.
+   - Submit entries and closes with a controlled limit ladder instead of one static price.
+   - Start near the desired midpoint, improve by configured ticks while edge remains acceptable,
+     and cancel when quote quality or expected value decays.
+   - Keep repricing bounded by max attempts, max slippage, stale-quote checks, and current
+     management gates.
+
+9. Event shock guard.
+   - Consume earnings, real-time news, historical news, and corporate-action inputs to pause symbols
+     around material events.
+   - Add symbol cooldowns for mergers, splits, lawsuit/FDA/headline shocks, unexpected halts, and
+     event clusters.
+   - Record event blocks as first-class decision reasons so skipped trades can be reviewed.
+
+10. Replay lab and decision time machine.
+    - Reconstruct any trading day from config, account state, market snapshots, candidate ledgers,
+      decisions, submissions, fills, and management snapshots.
+    - Produce a human-readable explanation for why a trade was selected, blocked, submitted,
+      repriced, closed, or skipped.
+    - Use the replay output for docs, audits, and regression tests when scanner/risk rules change.
+
+11. Native roll and adjustment engine.
+   - Support explicit spread/condor roll candidates that close current legs and open replacement
+     legs as one broker-native MLeg order where Alpaca supports the structure.
+   - Keep rolls disabled by default until open, replace/cancel, close, and rollback behavior have
+     paper proof.
+
+Parked for now:
+
+- Equity-plus-option combo orders, because Alpaca currently documents restrictions around equity
+  legs in MLeg orders.
+- Broker API multi-user product work; the current target remains this fork's trading engine, not a
+  broker platform.
+- API-triggered exercise instructions, unless we intentionally design a separate operator workflow.
+
+Reference sources:
+
+- Alpaca Options Trading: `https://docs.alpaca.markets/docs/options-trading`
+- Alpaca Options Level 3 Trading: `https://docs.alpaca.markets/docs/options-level-3-trading`
+- Alpaca Real-time Option Data: `https://docs.alpaca.markets/docs/real-time-option-data`
+- Alpaca Historical Option Data: `https://docs.alpaca.markets/docs/historical-option-data`
+- Alpaca Real-time News: `https://docs.alpaca.markets/docs/streaming-real-time-news`
+- Alpaca Historical News Data: `https://docs.alpaca.markets/v1.3/docs/historical-news-data`
+- Alpaca Corporate Actions: `https://docs.alpaca.markets/reference/corporateactions-1`
+- Alpaca Market Clock: `https://docs.alpaca.markets/reference/clock-1`
+- Alpaca Market Calendar: `https://docs.alpaca.markets/reference/calendar-2`
+
 Parked next steps for earnings debit:
 
 - Add earnings strategy config for approved CSV path, call/put debit enablement, entry window, max
@@ -578,5 +702,16 @@ Current status:
 
 ## Immediate Next Milestone
 
-Paper-prove the undefined-risk paper account with strict caps, then verify one naked-option
-open/management/close lifecycle before expanding the undefined-risk symbol list or sizing.
+Implement the Phase 7.5 required platform work in this order:
+
+1. Account capability preflight.
+2. Assignment, exercise, and expiration risk daemon.
+3. Real-time option quote cache for active risk.
+4. Historical option research and replay harness.
+5. Strategy regime router with portfolio Greek/stress governor.
+6. Fill-quality intelligence and smart MLeg repricing.
+7. Event shock guard and replay lab.
+
+In parallel with that platform work, continue paper-proving the undefined-risk account under strict
+caps. Do not expand undefined-risk symbols or sizing until one naked-option open/management/close
+lifecycle and the new lifecycle-risk checks are proven.

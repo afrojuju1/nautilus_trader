@@ -66,7 +66,7 @@ use config::{
 };
 pub(crate) use config::{
     active_sector_count, active_underlying_count, fleet_active_underlying_count,
-    fleet_has_active_underlying_elsewhere, fleet_sector_limit_state,
+    fleet_sector_limit_state,
 };
 use config::{build_options_engine_config, load_runtime_config_file_from_env};
 
