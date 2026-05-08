@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Configuration structures for the Alpaca adapter scaffold.
+//! Configuration structures shared by the Alpaca Rust runtime and Python adapter package.
 
 use crate::common::{
     credentials::AlpacaCredential,
@@ -98,12 +98,14 @@ impl AlpacaOptionFeed {
     }
 }
 
-/// Configuration for the planned Alpaca live data client.
+/// Configuration for Alpaca market-data access used by the Rust runtime and future Python data
+/// client.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AlpacaDataClientConfig {
-    /// Optional API key. If omitted, the adapter reads `ALPACA_API_KEY`.
+    /// Optional API key. If omitted, the adapter reads `APCA_API_KEY_ID` or `ALPACA_API_KEY`.
     pub api_key: Option<String>,
-    /// Optional API secret. If omitted, the adapter reads `ALPACA_API_SECRET`.
+    /// Optional API secret. If omitted, the adapter reads `APCA_API_SECRET_KEY`,
+    /// `ALPACA_SECRET_KEY`, or `ALPACA_API_SECRET`.
     pub api_secret: Option<String>,
     /// Trading environment used when data requests need account context.
     pub environment: AlpacaEnvironment,
@@ -168,12 +170,14 @@ impl AlpacaDataClientConfig {
     }
 }
 
-/// Configuration for the planned Alpaca live execution client.
+/// Configuration for Alpaca execution access used by the Rust runtime and future Python execution
+/// client.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AlpacaExecClientConfig {
-    /// Optional API key. If omitted, the adapter reads `ALPACA_API_KEY`.
+    /// Optional API key. If omitted, the adapter reads `APCA_API_KEY_ID` or `ALPACA_API_KEY`.
     pub api_key: Option<String>,
-    /// Optional API secret. If omitted, the adapter reads `ALPACA_API_SECRET`.
+    /// Optional API secret. If omitted, the adapter reads `APCA_API_SECRET_KEY`,
+    /// `ALPACA_SECRET_KEY`, or `ALPACA_API_SECRET`.
     pub api_secret: Option<String>,
     /// Trading environment.
     pub environment: AlpacaEnvironment,

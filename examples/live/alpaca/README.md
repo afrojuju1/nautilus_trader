@@ -1,0 +1,121 @@
+# Alpaca Live Examples
+
+These examples exercise the current Rust Alpaca options runtime safely. They are designed for
+paper credentials and do not submit orders by default.
+
+The standard Python `TradingNode` Alpaca factories are not wired yet, so this directory uses the
+Rust binaries from `nautilus-alpaca`.
+
+## Credentials
+
+Use Alpaca paper credentials first:
+
+```bash
+export APCA_API_KEY_ID="YOUR_PAPER_KEY"
+export APCA_API_SECRET_KEY="YOUR_PAPER_SECRET"
+export ALPACA_TRADING_BASE_URL="https://paper-api.alpaca.markets"
+```
+
+The runtime also accepts `ALPACA_API_KEY` for the key and `ALPACA_SECRET_KEY` or
+`ALPACA_API_SECRET` for the secret.
+
+## Read-only account status
+
+This command reads account state, positions, and open orders. It does not submit or cancel orders.
+
+```bash
+cargo run -p nautilus-alpaca --features live --bin alpaca-check-account-orders
+```
+
+## Load option contracts
+
+This command loads active put option contracts for the requested underlyings. It does not submit
+orders.
+
+```bash
+cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-contracts -- SPY QQQ
+```
+
+Optional expiration filters:
+
+```bash
+export ALPACA_CONTRACTS_MIN_EXPIRATION="2026-01-16"
+export ALPACA_CONTRACTS_MAX_EXPIRATION="2026-01-23"
+cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-contracts -- SPY
+```
+
+## Load option snapshots
+
+This command loads active option contracts and then requests snapshots for a bounded number of
+symbols. It does not submit orders.
+
+```bash
+export ALPACA_SNAPSHOT_CONTRACT_LIMIT=50
+cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-snapshots -- SPY
+```
+
+## Dry-run put-credit scanner
+
+This command scans for put-credit candidates and prints the top candidate for each underlying. It
+does not submit orders.
+
+```bash
+cargo run -p nautilus-alpaca --features live --bin alpaca-dry-run-put-credit -- SPY QQQ IWM
+```
+
+Optional scanner overrides:
+
+```bash
+export ALPACA_DRY_RUN_MIN_DTE=5
+export ALPACA_DRY_RUN_MAX_DTE=10
+export ALPACA_DRY_RUN_SHORT_DELTA_MIN=0.18
+export ALPACA_DRY_RUN_SHORT_DELTA_MAX=0.28
+export ALPACA_DRY_RUN_WIDTHS="2,3,5"
+cargo run -p nautilus-alpaca --features live --bin alpaca-dry-run-put-credit -- SPY
+```
+
+## Validate a multi-leg order payload
+
+This command builds and validates a put-credit multi-leg order payload locally. It prints JSON and
+does not submit the order.
+
+```bash
+cargo run -p nautilus-alpaca --features live --bin alpaca-validate-mleg-order -- \
+  SPY260116P00450000 SPY260116P00445000 0.40 1
+```
+
+## Check the options-engine config
+
+Keep submission, management, and close handling disabled while checking config:
+
+```bash
+export ALPACA_SUBMIT=false
+export ALPACA_MANAGE=false
+export ALPACA_CLOSE=false
+export ALPACA_KILL_SWITCH=true
+
+cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- --check-config
+```
+
+To use an account-specific env file:
+
+```bash
+export NAUTILUS_ALPACA_ENV_FILE="$HOME/.config/nautilus-trader/alpaca/options-engine.env"
+cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- --check-config
+```
+
+Copy the sample config files from `deploy/alpaca/` before running the engine as a service:
+
+```bash
+mkdir -p "$HOME/.config/nautilus-trader/alpaca"
+cp deploy/alpaca/alpaca-options-engine.env.example \
+  "$HOME/.config/nautilus-trader/alpaca/options-engine.env"
+cp deploy/alpaca/alpaca-options-engine.base.toml.example \
+  "$HOME/.config/nautilus-trader/alpaca/base-options-engine.toml"
+cp deploy/alpaca/alpaca-options-engine.toml.example \
+  "$HOME/.config/nautilus-trader/alpaca/options-engine.toml"
+chmod 600 "$HOME/.config/nautilus-trader/alpaca/options-engine.env"
+```
+
+Do not enable `ALPACA_SUBMIT`, `ALPACA_MANAGE`, or `ALPACA_CLOSE` until paper credentials,
+endpoints, account status, open orders, positions, and risk caps have been verified.

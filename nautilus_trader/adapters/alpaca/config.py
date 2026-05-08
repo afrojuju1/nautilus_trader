@@ -27,7 +27,8 @@ AlpacaStockFeed = Literal["iex", "sip", "delayed_sip"]
 
 class AlpacaDataClientConfig(LiveDataClientConfig, frozen=True):
     """
-    Configuration for planned ``AlpacaDataClient`` instances.
+    Configuration shared by Alpaca market-data utilities and future ``AlpacaDataClient``
+    instances.
 
     Parameters
     ----------
@@ -38,7 +39,7 @@ class AlpacaDataClientConfig(LiveDataClientConfig, frozen=True):
     api_secret : str, optional
         The Alpaca API secret.
         If ``None`` then will source the `APCA_API_SECRET_KEY` or `ALPACA_SECRET_KEY`
-        environment variable.
+        or `ALPACA_API_SECRET` environment variable.
     environment : {"paper", "live"}, default "paper"
         The Alpaca trading environment used when data requests need account context.
     data_base_url : str, optional
@@ -72,7 +73,8 @@ class AlpacaDataClientConfig(LiveDataClientConfig, frozen=True):
 
 class AlpacaExecClientConfig(LiveExecClientConfig, frozen=True):
     """
-    Configuration for planned ``AlpacaExecutionClient`` instances.
+    Configuration shared by the Alpaca Rust execution runtime and future
+    ``AlpacaExecutionClient`` instances.
 
     Parameters
     ----------
@@ -83,7 +85,7 @@ class AlpacaExecClientConfig(LiveExecClientConfig, frozen=True):
     api_secret : str, optional
         The Alpaca API secret.
         If ``None`` then will source the `APCA_API_SECRET_KEY` or `ALPACA_SECRET_KEY`
-        environment variable.
+        or `ALPACA_API_SECRET` environment variable.
     environment : {"paper", "live"}, default "paper"
         The Alpaca trading environment.
     trading_base_url : str, optional

@@ -13,10 +13,11 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Alpaca Markets adapter scaffold for NautilusTrader.
+Alpaca Markets integration package for NautilusTrader.
 
-The package currently exposes configuration and factory placeholders while the Rust
-data and execution clients are implemented.
+The Rust Alpaca options runtime is implemented in ``nautilus-alpaca`` and exposed through
+diagnostic/operator binaries plus selected PyO3 bindings. The Python ``TradingNode`` data and
+execution factories are still placeholders and should not be registered as live clients yet.
 """
 
 from nautilus_trader.adapters.alpaca.config import AlpacaDataClientConfig

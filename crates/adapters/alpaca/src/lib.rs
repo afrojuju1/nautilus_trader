@@ -13,17 +13,21 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! [NautilusTrader](https://nautilustrader.io) adapter scaffold for
+//! [NautilusTrader](https://nautilustrader.io) integration work for
 //! [Alpaca Markets](https://alpaca.markets/).
 //!
-//! The `nautilus-alpaca` crate currently defines shared configuration and endpoint constants for
-//! the planned live market data and execution adapter. The first production target is US equity and
-//! US equity option workflows, including short-dated multi-leg option spreads submitted through
-//! Alpaca paper trading.
+//! The `nautilus-alpaca` crate currently provides shared configuration, Alpaca REST clients,
+//! option contract and snapshot access, option order payload builders, a Rust execution client, and
+//! an account-level options runtime. The first production target is US equity option workflows,
+//! including short-dated multi-leg option spreads submitted through Alpaca paper trading.
+//!
+//! The Python `TradingNode` data and execution factories are not wired to live clients yet. Public
+//! documentation should describe this crate as an experimental Rust Alpaca options runtime until
+//! the standard Python adapter path is implemented.
 //!
 //! # Feature flags
 //!
-//! - `python`: Enables Python bindings once the Rust clients are exposed through PyO3.
+//! - `python`: Enables the Alpaca PyO3 bindings currently exposed through `nautilus_pyo3`.
 //! - `extension-module`: Builds as a Python extension module (used together with `python`).
 //! - `high-precision`: Reserved for parity with the Nautilus adapter workspace.
 

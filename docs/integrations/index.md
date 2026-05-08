@@ -6,6 +6,7 @@ The following integrations are currently supported:
 
 | Name                                                                         | ID                    | Type                    | Status                                                  | Docs                     |
 | :--------------------------------------------------------------------------- | :-------------------- | :---------------------- | :------------------------------------------------------ | :----------------------- |
+| [Alpaca](https://alpaca.markets)                                             | `ALPACA`              | Brokerage (US options)  | ![status](https://img.shields.io/badge/building-yellow) | [Guide](alpaca.md)      |
 | [AX Exchange](https://architect.exchange)                                    | `AX`                  | Perpetuals Exchange     | ![status](https://img.shields.io/badge/stable-green)    | [Guide](architect_ax.md) |
 | [Betfair](https://betfair.com)                                               | `BETFAIR`             | Sports Betting Exchange | ![status](https://img.shields.io/badge/stable-green)    | [Guide](betfair.md)      |
 | [Binance](https://binance.com)                                               | `BINANCE`             | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green)    | [Guide](binance.md)      |

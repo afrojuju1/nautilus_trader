@@ -24,7 +24,10 @@ from nautilus_trader.live.factories import LiveExecClientFactory
 
 class AlpacaLiveDataClientFactory(LiveDataClientFactory):
     """
-    Factory for planned ``AlpacaDataClient`` instances.
+    Placeholder factory for future Python ``AlpacaDataClient`` instances.
+
+    The Rust Alpaca options runtime is implemented, but the standard Python ``TradingNode`` data
+    client is not wired yet.
     """
 
     @staticmethod
@@ -37,14 +40,17 @@ class AlpacaLiveDataClientFactory(LiveDataClientFactory):
         clock: LiveClock,
     ):
         raise NotImplementedError(
-            "Alpaca data client is scaffolded but not implemented. "
-            "Build the Rust HTTP/WebSocket clients before registering this factory.",
+            "The Python Alpaca data client factory is not wired yet. "
+            "Use the Rust Alpaca options runtime utilities for the current implemented surface.",
         )
 
 
 class AlpacaLiveExecClientFactory(LiveExecClientFactory):
     """
-    Factory for planned ``AlpacaExecutionClient`` instances.
+    Placeholder factory for future Python ``AlpacaExecutionClient`` instances.
+
+    The Rust Alpaca options execution runtime is implemented, but the standard Python
+    ``TradingNode`` execution client is not wired yet.
     """
 
     @staticmethod
@@ -57,6 +63,6 @@ class AlpacaLiveExecClientFactory(LiveExecClientFactory):
         clock: LiveClock,
     ):
         raise NotImplementedError(
-            "Alpaca execution client is scaffolded but not implemented. "
-            "Build the Rust account/order client and trade update stream before registering this factory.",
+            "The Python Alpaca execution client factory is not wired yet. "
+            "Use the Rust Alpaca options runtime utilities for the current implemented surface.",
         )

@@ -4,6 +4,11 @@ This document is the high-level plan for making this fork the production trading
 Alpaca option-spread workflow. The target state is Nautilus-native execution and strategy runtime.
 `spreads` is reference material only and must not remain in the live trading loop.
 
+Public documentation readiness is tracked in
+[Alpaca Official Docs Readiness Checklist](alpaca_official_docs_readiness_checklist.md). The
+current public-facing integration page is [Alpaca](../integrations/alpaca.md), which documents the
+implemented Rust options runtime as experimental until the Python `TradingNode` factories are wired.
+
 ## Target State
 
 - Nautilus owns live strategy runtime, Alpaca market data access, Alpaca execution, order events,
