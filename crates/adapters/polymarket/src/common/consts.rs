@@ -17,12 +17,20 @@
 
 use std::sync::LazyLock;
 
-use nautilus_model::identifiers::Venue;
+use nautilus_model::identifiers::{ClientId, Venue};
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use ustr::Ustr;
 
+/// Venue identifier string.
 pub const POLYMARKET: &str = "POLYMARKET";
 
+/// Static venue instance.
 pub static POLYMARKET_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(Ustr::from(POLYMARKET)));
+
+/// Static client ID instance.
+pub static POLYMARKET_CLIENT_ID: LazyLock<ClientId> =
+    LazyLock::new(|| ClientId::new(Ustr::from(POLYMARKET)));
 
 /// Polymarket builder code for order attribution.
 pub const POLYMARKET_NAUTILUS_BUILDER_CODE: &str =
@@ -59,6 +67,9 @@ pub const DUST_POSITION_THRESHOLD: f64 = 0.01;
 /// A diff at or above this threshold is left unsnapped and surfaces to the
 /// engine. See `docs/integrations/polymarket.md` (Fill quantity normalization).
 pub const DUST_SNAP_THRESHOLD: f64 = 0.01;
+
+/// Decimal form of [`DUST_SNAP_THRESHOLD`] for `Decimal` arithmetic paths.
+pub const DUST_SNAP_THRESHOLD_DEC: Decimal = dec!(0.01);
 
 pub const WS_MAX_SUBSCRIPTIONS: usize = 200;
 pub const WS_DEFAULT_SUBSCRIPTIONS: usize = 200;

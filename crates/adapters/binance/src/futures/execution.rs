@@ -385,7 +385,7 @@ impl BinanceFuturesExecutionClient {
             .core
             .cache()
             .order(&cmd.client_order_id)
-            .cloned()
+            .map(|o| o.clone())
             .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
 
         let emitter = self.emitter.clone();
@@ -918,7 +918,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
     }
 
     fn get_account(&self) -> Option<AccountAny> {
-        self.core.cache().account(&self.core.account_id).cloned()
+        self.core.cache().account_owned(&self.core.account_id)
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
@@ -1733,7 +1733,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             .core
             .cache()
             .order(&cmd.client_order_id)
-            .cloned()
+            .map(|o| o.clone())
             .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
 
         if order.is_closed() {
@@ -1809,7 +1809,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
         let order = {
             let cache = self.core.cache();
-            cache.order(&cmd.client_order_id).cloned()
+            cache.order(&cmd.client_order_id).map(|o| o.clone())
         };
 
         let Some(order) = order else {

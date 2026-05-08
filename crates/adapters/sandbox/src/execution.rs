@@ -620,7 +620,7 @@ impl SandboxExecutionClient {
         self.cache
             .borrow()
             .order(client_order_id)
-            .cloned()
+            .map(|o| o.clone())
             .ok_or_else(|| anyhow::anyhow!("Order not found in cache for {client_order_id}"))
     }
 }
@@ -659,7 +659,7 @@ impl ExecutionClient for SandboxExecutionClient {
 
     fn get_account(&self) -> Option<AccountAny> {
         let account_id = self.core.borrow().account_id;
-        self.cache.borrow().account(&account_id).cloned()
+        self.cache.borrow().account_owned(&account_id)
     }
 
     fn generate_account_state(

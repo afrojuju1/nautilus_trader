@@ -58,11 +58,22 @@ use nautilus_model::{
 };
 use rstest::{fixture, rstest};
 
-use crate::cache::{Cache, CacheConfig, CacheView};
+use crate::cache::{Cache, CacheConfig, CacheView, OrderRef};
 
 #[fixture]
 fn cache() -> Cache {
     Cache::default()
+}
+
+fn assert_orders_eq(actual: &[OrderRef<'_>], expected: &[&OrderAny]) {
+    assert_eq!(actual.len(), expected.len(), "order list length mismatch");
+    for (a, e) in actual.iter().zip(expected.iter().copied()) {
+        assert_eq!(a, e);
+    }
+}
+
+fn orders_contains(actual: &[OrderRef<'_>], expected: &OrderAny) -> bool {
+    actual.iter().any(|r| r == expected)
 }
 
 #[rstest]
@@ -428,13 +439,15 @@ fn test_order_when_initialized(mut cache: Cache, audusd_sim: CurrencyPair) {
     let client_order_id = order.client_order_id();
     cache.add_order(order, None, None, false).unwrap();
 
-    let order = cache.order(&client_order_id).unwrap();
-    assert_eq!(cache.orders(None, None, None, None, None), vec![order]);
+    let order_ref = cache.order(&client_order_id).unwrap();
+    let order = order_ref.clone();
+    drop(order_ref);
+    assert_orders_eq(&cache.orders(None, None, None, None, None), &[&order]);
     assert!(cache.orders_open(None, None, None, None, None).is_empty());
     assert!(cache.orders_closed(None, None, None, None, None).is_empty());
-    assert_eq!(
-        cache.orders_active_local(None, None, None, None, None),
-        vec![order]
+    assert_orders_eq(
+        &cache.orders_active_local(None, None, None, None, None),
+        &[&order],
     );
     assert!(
         cache
@@ -487,8 +500,9 @@ fn test_order_when_submitted(mut cache: Cache, audusd_sim: CurrencyPair) {
     let result = cache.order(&order.client_order_id()).unwrap();
 
     assert_eq!(order.status(), OrderStatus::Submitted);
-    assert_eq!(result, &order);
-    assert_eq!(cache.orders(None, None, None, None, None), vec![&order]);
+    assert_eq!(&*result, &order);
+    drop(result);
+    assert_orders_eq(&cache.orders(None, None, None, None, None), &[&order]);
     assert!(cache.orders_open(None, None, None, None, None).is_empty());
     assert!(cache.orders_closed(None, None, None, None, None).is_empty());
     assert!(
@@ -600,6 +614,102 @@ fn test_update_order_rejects_invalid_transition_without_mutating(
 }
 
 #[rstest]
+fn test_order_mut_returns_none_for_missing_order(mut cache: Cache) {
+    let client_order_id = ClientOrderId::from("O-MISSING");
+    assert!(cache.order_mut(&client_order_id).is_none());
+}
+
+#[rstest]
+fn test_order_owned_returns_independent_snapshot(mut cache: Cache, audusd_sim: CurrencyPair) {
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(audusd_sim.id)
+        .side(OrderSide::Buy)
+        .price(Price::from("1.00000"))
+        .quantity(Quantity::from(100_000))
+        .build();
+    let client_order_id = order.client_order_id();
+    cache.add_order(order, None, None, false).unwrap();
+
+    let snapshot = cache.order_owned(&client_order_id).unwrap();
+
+    // Snapshot is independent: subsequent cache mutations do not affect it.
+    cache
+        .order_mut(&client_order_id)
+        .unwrap()
+        .set_position_id(Some(PositionId::from("P-001")));
+
+    assert!(snapshot.position_id().is_none());
+    assert_eq!(
+        cache.order(&client_order_id).unwrap().position_id(),
+        Some(PositionId::from("P-001"))
+    );
+}
+
+#[rstest]
+fn test_order_mut_writes_propagate_to_subsequent_reads(mut cache: Cache, audusd_sim: CurrencyPair) {
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(audusd_sim.id)
+        .side(OrderSide::Buy)
+        .price(Price::from("1.00000"))
+        .quantity(Quantity::from(100_000))
+        .build();
+    let client_order_id = order.client_order_id();
+    cache.add_order(order, None, None, false).unwrap();
+
+    cache
+        .order_mut(&client_order_id)
+        .unwrap()
+        .set_position_id(Some(PositionId::from("P-001")));
+
+    assert_eq!(
+        cache.order(&client_order_id).unwrap().position_id(),
+        Some(PositionId::from("P-001"))
+    );
+}
+
+#[rstest]
+fn test_add_order_replace_existing_overwrites_value(mut cache: Cache, audusd_sim: CurrencyPair) {
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(audusd_sim.id)
+        .side(OrderSide::Buy)
+        .price(Price::from("1.00000"))
+        .quantity(Quantity::from(100_000))
+        .build();
+    let client_order_id = order.client_order_id();
+    cache.add_order(order.clone(), None, None, false).unwrap();
+
+    let mut replacement = order;
+    replacement.set_position_id(Some(PositionId::from("P-NEW")));
+    cache.add_order(replacement, None, None, true).unwrap();
+
+    assert_eq!(
+        cache.order(&client_order_id).unwrap().position_id(),
+        Some(PositionId::from("P-NEW"))
+    );
+}
+
+#[rstest]
+fn test_replace_order_overwrites_value(mut cache: Cache, audusd_sim: CurrencyPair) {
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(audusd_sim.id)
+        .side(OrderSide::Buy)
+        .price(Price::from("1.00000"))
+        .quantity(Quantity::from(100_000))
+        .build();
+    let client_order_id = order.client_order_id();
+    cache.add_order(order.clone(), None, None, false).unwrap();
+
+    let mut replacement = order;
+    replacement.set_position_id(Some(PositionId::from("P-REPLACED")));
+    cache.replace_order(&replacement).unwrap();
+
+    assert_eq!(
+        cache.order(&client_order_id).unwrap().position_id(),
+        Some(PositionId::from("P-REPLACED"))
+    );
+}
+
+#[rstest]
 fn test_update_order_rejects_venue_fallback_when_event_client_id_differs(
     mut cache: Cache,
     audusd_sim: CurrencyPair,
@@ -693,12 +803,13 @@ fn test_order_when_rejected(mut cache: Cache, audusd_sim: CurrencyPair) {
     let result = cache.order(&order.client_order_id()).unwrap();
 
     assert!(order.is_closed());
-    assert_eq!(result, &order);
-    assert_eq!(cache.orders(None, None, None, None, None), vec![&order]);
+    assert_eq!(&*result, &order);
+    drop(result);
+    assert_orders_eq(&cache.orders(None, None, None, None, None), &[&order]);
     assert!(cache.orders_open(None, None, None, None, None).is_empty());
-    assert_eq!(
-        cache.orders_closed(None, None, None, None, None),
-        vec![&order]
+    assert_orders_eq(
+        &cache.orders_closed(None, None, None, None, None),
+        &[&order],
     );
     assert!(
         cache
@@ -743,12 +854,10 @@ fn test_order_when_accepted(mut cache: Cache, audusd_sim: CurrencyPair) {
     let result = cache.order(&order.client_order_id()).unwrap();
 
     assert!(order.is_open());
-    assert_eq!(result, &order);
-    assert_eq!(cache.orders(None, None, None, None, None), vec![&order]);
-    assert_eq!(
-        cache.orders_open(None, None, None, None, None),
-        vec![&order]
-    );
+    assert_eq!(&*result, &order);
+    drop(result);
+    assert_orders_eq(&cache.orders(None, None, None, None, None), &[&order]);
+    assert_orders_eq(&cache.orders_open(None, None, None, None, None), &[&order]);
     assert!(cache.orders_closed(None, None, None, None, None).is_empty());
     assert!(
         cache
@@ -1003,11 +1112,12 @@ fn test_order_when_filled(mut cache: Cache, audusd_sim: CurrencyPair) {
     let result = cache.order(&order.client_order_id()).unwrap();
 
     assert!(order.is_closed());
-    assert_eq!(result, &order);
-    assert_eq!(cache.orders(None, None, None, None, None), vec![&order]);
-    assert_eq!(
-        cache.orders_closed(None, None, None, None, None),
-        vec![&order]
+    assert_eq!(&*result, &order);
+    drop(result);
+    assert_orders_eq(&cache.orders(None, None, None, None, None), &[&order]);
+    assert_orders_eq(
+        &cache.orders_closed(None, None, None, None, None),
+        &[&order],
     );
     assert!(cache.orders_open(None, None, None, None, None).is_empty());
     assert!(
@@ -1070,8 +1180,9 @@ fn test_orders_for_position(mut cache: Cache, audusd_sim: CurrencyPair) {
         .add_order(order.clone(), Some(position_id), None, false)
         .unwrap();
     let result = cache.order(&order.client_order_id()).unwrap();
-    assert_eq!(result, &order);
-    assert_eq!(cache.orders_for_position(&position_id), vec![&order]);
+    assert_eq!(&*result, &order);
+    drop(result);
+    assert_orders_eq(&cache.orders_for_position(&position_id), &[&order]);
 }
 
 #[rstest]
@@ -1241,7 +1352,7 @@ fn test_add_order_with_account_id_populates_account_index() {
     // Verify account-filtered query returns the order
     let orders_for_account = cache.orders(None, None, None, Some(&account_id), None);
     assert_eq!(orders_for_account.len(), 1);
-    assert!(orders_for_account.contains(&&order));
+    assert!(orders_contains(&orders_for_account, &order));
 }
 
 #[rstest]
@@ -1341,25 +1452,150 @@ fn test_position_when_some(mut cache: Cache, audusd_sim: CurrencyPair) {
     let position = Position::new(&audusd_sim, filled.into());
     cache.add_position(&position, OmsType::Netting).unwrap();
 
-    let result = cache.position(&position.id);
-    assert_eq!(result, Some(&position));
+    let result = cache.position(&position.id).unwrap();
+    assert_eq!(result, position);
     assert!(cache.position_exists(&position.id));
     assert_eq!(
         cache.position_id(&order.client_order_id()),
         Some(&position.id)
     );
-    assert_eq!(
-        cache.positions_open(None, None, None, None, None),
-        vec![&position]
-    );
-    assert_eq!(
-        cache.positions_closed(None, None, None, None, None),
-        Vec::<&Position>::new()
+    let open = cache.positions_open(None, None, None, None, None);
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0], position);
+    assert!(
+        cache
+            .positions_closed(None, None, None, None, None)
+            .is_empty()
     );
     assert_eq!(cache.positions_open_count(None, None, None, None, None), 1);
     assert_eq!(
         cache.positions_closed_count(None, None, None, None, None),
         0
+    );
+}
+
+#[rstest]
+fn test_position_mut_returns_none_for_missing_position(mut cache: Cache) {
+    let position_id = PositionId::from("P-MISSING");
+    assert!(cache.position_mut(&position_id).is_none());
+}
+
+#[rstest]
+fn test_position_owned_returns_none_for_missing_position(cache: Cache) {
+    let position_id = PositionId::from("P-MISSING");
+    assert!(cache.position_owned(&position_id).is_none());
+}
+
+#[rstest]
+fn test_position_mut_writes_propagate_to_subsequent_reads(
+    mut cache: Cache,
+    audusd_sim: CurrencyPair,
+) {
+    let audusd_sim = InstrumentAny::CurrencyPair(audusd_sim);
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(audusd_sim.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .build();
+    let filled = TestOrderEventStubs::filled(
+        &order,
+        &audusd_sim,
+        None,
+        Some(PositionId::new("P-MUT-1")),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let position = Position::new(&audusd_sim, filled.into());
+    let position_id = position.id;
+    cache.add_position(&position, OmsType::Netting).unwrap();
+
+    cache.position_mut(&position_id).unwrap().quantity = Quantity::from(7);
+
+    assert_eq!(
+        cache.position(&position_id).unwrap().quantity,
+        Quantity::from(7)
+    );
+}
+
+#[rstest]
+fn test_position_owned_returns_independent_snapshot(mut cache: Cache, audusd_sim: CurrencyPair) {
+    let audusd_sim = InstrumentAny::CurrencyPair(audusd_sim);
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(audusd_sim.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .build();
+    let filled = TestOrderEventStubs::filled(
+        &order,
+        &audusd_sim,
+        None,
+        Some(PositionId::new("P-OWN-1")),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let position = Position::new(&audusd_sim, filled.into());
+    let position_id = position.id;
+    let original_quantity = position.quantity;
+    cache.add_position(&position, OmsType::Netting).unwrap();
+
+    let snapshot = cache.position_owned(&position_id).unwrap();
+
+    cache.position_mut(&position_id).unwrap().quantity = Quantity::from(7);
+
+    assert_eq!(snapshot.quantity, original_quantity);
+    assert_eq!(
+        cache.position(&position_id).unwrap().quantity,
+        Quantity::from(7)
+    );
+}
+
+#[rstest]
+fn test_update_position_reuses_existing_cell(mut cache: Cache, audusd_sim: CurrencyPair) {
+    let audusd_sim = InstrumentAny::CurrencyPair(audusd_sim);
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(audusd_sim.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .build();
+    let filled = TestOrderEventStubs::filled(
+        &order,
+        &audusd_sim,
+        None,
+        Some(PositionId::new("P-REUSE-1")),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let position = Position::new(&audusd_sim, filled.into());
+    let position_id = position.id;
+    cache.add_position(&position, OmsType::Netting).unwrap();
+
+    let cell_ptr_before = cache.positions.get(&position_id).unwrap().as_ptr();
+
+    let mut updated = position.clone();
+    updated.quantity = Quantity::from(50_000);
+    cache.update_position(&updated).unwrap();
+
+    let cell_ptr_after = cache.positions.get(&position_id).unwrap().as_ptr();
+
+    assert_eq!(
+        cell_ptr_before, cell_ptr_after,
+        "update_position must reuse the existing cell"
+    );
+    assert_eq!(
+        cache.position(&position_id).unwrap().quantity,
+        Quantity::from(50_000)
     );
 }
 
@@ -2009,8 +2245,8 @@ fn test_cache_update_account_owned_restores_venue_index(mut cache: Cache) {
 
     cache.update_account_owned(account.clone()).unwrap();
 
-    assert_eq!(cache.account(&account_id), Some(&account));
-    assert_eq!(cache.account_for_venue(&venue), Some(&account));
+    assert_eq!(cache.account(&account_id).unwrap(), account);
+    assert_eq!(cache.account_for_venue(&venue).unwrap(), account);
 }
 
 #[rstest]
@@ -2059,6 +2295,182 @@ fn test_cache_update_account_state_apply_failure_leaves_account_intact(mut cache
     assert!(error.contains("borrowing not allowed"));
     assert_eq!(cached.balances(), starting_balances);
     assert_eq!(cached.events().len(), 1);
+}
+
+fn make_cash_account_state(account_id: AccountId, total_usd: &str) -> AccountState {
+    AccountState::new(
+        account_id,
+        AccountType::Cash,
+        vec![AccountBalance::new(
+            Money::from(format!("{total_usd} USD")),
+            Money::from("0 USD"),
+            Money::from(format!("{total_usd} USD")),
+        )],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        Some(Currency::USD()),
+    )
+}
+
+#[rstest]
+fn test_cache_account_mut_returns_none_for_missing_account(mut cache: Cache) {
+    assert!(cache.account_mut(&AccountId::test_default()).is_none());
+}
+
+#[rstest]
+fn test_cache_account_owned_returns_none_for_missing_account(cache: Cache) {
+    assert!(cache.account_owned(&AccountId::test_default()).is_none());
+}
+
+#[rstest]
+fn test_cache_account_for_venue_owned_returns_none_for_missing_venue(cache: Cache) {
+    assert!(
+        cache
+            .account_for_venue_owned(&Venue::test_default())
+            .is_none()
+    );
+}
+
+#[rstest]
+fn test_cache_account_mut_writes_propagate_to_subsequent_reads(mut cache: Cache) {
+    let account = AccountAny::default();
+    let account_id = account.id();
+    let starting_event_count = account.events().len();
+    cache.add_account(account).unwrap();
+
+    let event = make_cash_account_state(account_id, "2000");
+
+    cache
+        .account_mut(&account_id)
+        .unwrap()
+        .apply(event.clone())
+        .unwrap();
+
+    let cached = cache.account(&account_id).unwrap();
+    assert_eq!(cached.events().len(), starting_event_count + 1);
+    assert_eq!(cached.events().last().unwrap(), &event);
+}
+
+#[rstest]
+fn test_cache_account_owned_returns_independent_snapshot(mut cache: Cache) {
+    let account = AccountAny::default();
+    let account_id = account.id();
+    let starting_event_count = account.events().len();
+    cache.add_account(account).unwrap();
+
+    let snapshot = cache.account_owned(&account_id).unwrap();
+
+    let event = make_cash_account_state(account_id, "2000");
+    cache
+        .account_mut(&account_id)
+        .unwrap()
+        .apply(event)
+        .unwrap();
+
+    assert_eq!(snapshot.events().len(), starting_event_count);
+    assert_eq!(
+        cache.account(&account_id).unwrap().events().len(),
+        starting_event_count + 1
+    );
+}
+
+#[rstest]
+fn test_cache_account_for_venue_owned_returns_independent_snapshot(mut cache: Cache) {
+    let account = AccountAny::default();
+    let account_id = account.id();
+    let venue = account_id.get_issuer();
+    let starting_event_count = account.events().len();
+    cache.add_account(account).unwrap();
+
+    let snapshot = cache.account_for_venue_owned(&venue).unwrap();
+
+    let event = make_cash_account_state(account_id, "2000");
+    cache
+        .account_mut(&account_id)
+        .unwrap()
+        .apply(event)
+        .unwrap();
+
+    assert_eq!(snapshot.events().len(), starting_event_count);
+    assert_eq!(
+        cache.account_for_venue(&venue).unwrap().events().len(),
+        starting_event_count + 1
+    );
+}
+
+#[rstest]
+fn test_update_account_reuses_existing_cell(mut cache: Cache) {
+    let account = AccountAny::default();
+    let account_id = account.id();
+    cache.add_account(account.clone()).unwrap();
+
+    let cell_ptr_before = cache.accounts.get(&account_id).unwrap().as_ptr();
+
+    cache.update_account(&account).unwrap();
+
+    let cell_ptr_after = cache.accounts.get(&account_id).unwrap().as_ptr();
+
+    assert_eq!(
+        cell_ptr_before, cell_ptr_after,
+        "update_account must reuse the existing cell"
+    );
+}
+
+#[rstest]
+fn test_update_account_state_grows_event_log_in_place(mut cache: Cache) {
+    let account = AccountAny::default();
+    let account_id = account.id();
+    let starting_event_count = account.events().len();
+    cache.add_account(account).unwrap();
+
+    let cell_ptr_before = cache.accounts.get(&account_id).unwrap().as_ptr();
+
+    let event = make_cash_account_state(account_id, "2000");
+    cache.update_account_state(&event).unwrap();
+
+    let cell_ptr_after = cache.accounts.get(&account_id).unwrap().as_ptr();
+
+    let cached = cache.account(&account_id).unwrap();
+    assert_eq!(cached.events().len(), starting_event_count + 1);
+    assert_eq!(cached.events().last().unwrap(), &event);
+    assert_eq!(
+        cell_ptr_before, cell_ptr_after,
+        "update_account_state must apply in place, not replace the cell"
+    );
+}
+
+#[rstest]
+#[should_panic(expected = "sole owner")]
+fn test_take_account_panics_when_cell_aliased(mut cache: Cache) {
+    let account = AccountAny::default();
+    let account_id = account.id();
+    cache.add_account(account).unwrap();
+
+    // Manufacture an aliased SharedCell handle by cloning the inner Rc.
+    // This violates the sole-owner invariant; take_account must panic.
+    let _alias = cache.accounts.get(&account_id).unwrap().clone();
+    let _ = cache.take_account(&account_id);
+}
+
+#[rstest]
+#[case::matching(true)]
+#[case::non_matching(false)]
+fn test_cache_accounts_filters_by_id(mut cache: Cache, #[case] matching: bool) {
+    let account = AccountAny::default();
+    let account_id = account.id();
+    cache.add_account(account.clone()).unwrap();
+
+    if matching {
+        let result = cache.accounts(&account_id);
+        assert_eq!(result.len(), 1);
+        assert_eq!(*result[0], account);
+    } else {
+        let result = cache.accounts(&AccountId::from("OTHER-001"));
+        assert!(result.is_empty());
+    }
 }
 
 #[rstest]
@@ -2911,7 +3323,7 @@ fn test_purge_order_cleans_up_strategy_orders_index() {
 
     // Query orders for strategy should not crash and should not include purged order
     let orders_for_strategy = cache.orders(None, None, Some(&strategy_id), None, None);
-    assert!(!orders_for_strategy.contains(&&order));
+    assert!(!orders_contains(&orders_for_strategy, &order));
 }
 
 #[rstest]
@@ -2980,7 +3392,7 @@ fn test_purge_order_cleans_up_exec_spawn_orders_index() {
 
     // Query orders for exec spawn should not crash and should not include purged order
     let orders_for_spawn = cache.orders_for_exec_spawn(&parent_id);
-    assert!(!orders_for_spawn.contains(&&child_order));
+    assert!(!orders_contains(&orders_for_spawn, &child_order));
 }
 
 #[rstest]
@@ -3079,7 +3491,7 @@ fn test_purge_order_cleans_up_account_orders_index() {
     assert!(!cache.index.account_orders.contains_key(&account_id));
 
     let orders_for_account = cache.orders(None, None, None, Some(&account_id), None);
-    assert!(!orders_for_account.contains(&&order));
+    assert!(!orders_contains(&orders_for_account, &order));
 }
 
 #[rstest]

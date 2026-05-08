@@ -545,7 +545,7 @@ impl ExecutionClient for BybitExecutionClient {
     }
 
     fn get_account(&self) -> Option<AccountAny> {
-        self.core.cache().account(&self.core.account_id).cloned()
+        self.core.cache().account_owned(&self.core.account_id)
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
@@ -1262,7 +1262,7 @@ impl ExecutionClient for BybitExecutionClient {
 
                 for cid in &cmd.order_list.client_order_ids {
                     if let Some(order) = cache.order(cid) {
-                        self.emitter.emit_order_denied(order, &e.to_string());
+                        self.emitter.emit_order_denied(&order, &e.to_string());
                     }
                 }
                 return Ok(());
@@ -1280,7 +1280,7 @@ impl ExecutionClient for BybitExecutionClient {
             for cid in &cmd.order_list.client_order_ids {
                 if let Some(order) = cache.order(cid) {
                     self.emitter.emit_order_denied(
-                        order,
+                        &order,
                         "Native TP/SL and option params are not supported in demo mode",
                     );
                 }
@@ -1316,7 +1316,7 @@ impl ExecutionClient for BybitExecutionClient {
                     break;
                 }
 
-                if let Err(e) = Self::validate_bbo_params(order, product_type, &tp_sl) {
+                if let Err(e) = Self::validate_bbo_params(&order, product_type, &tp_sl) {
                     deny_reason = Some(e.to_string());
                     break;
                 }
@@ -1328,7 +1328,7 @@ impl ExecutionClient for BybitExecutionClient {
             if let Some(reason) = deny_reason {
                 for cid in &cmd.order_list.client_order_ids {
                     if let Some(order) = cache.order(cid) {
-                        self.emitter.emit_order_denied(order, &reason);
+                        self.emitter.emit_order_denied(&order, &reason);
                     }
                 }
                 return Ok(());
@@ -1916,14 +1916,17 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::common::enums::BybitMarketUnit;
+    use crate::common::{
+        consts::{BYBIT_CLIENT_ID, BYBIT_VENUE},
+        enums::BybitMarketUnit,
+    };
 
     fn test_execution_client() -> (BybitExecutionClient, Rc<RefCell<Cache>>) {
         let cache = Rc::new(RefCell::new(Cache::default()));
         let core = ExecutionClientCore::new(
             TraderId::from("TESTER-001"),
-            ClientId::from("BYBIT"),
-            Venue::from("BYBIT"),
+            *BYBIT_CLIENT_ID,
+            *BYBIT_VENUE,
             OmsType::Netting,
             AccountId::from("BYBIT-001"),
             AccountType::Margin,

@@ -21,6 +21,7 @@ pub mod config;
 pub mod database;
 pub mod fifo;
 pub mod quote;
+pub mod refs;
 
 mod index;
 
@@ -41,7 +42,7 @@ pub use config::CacheConfig; // Re-export
 use database::{CacheDatabaseAdapter, CacheMap};
 use index::CacheIndex;
 use nautilus_core::{
-    UUID4, UnixNanos,
+    SharedCell, UUID4, UnixNanos,
     correctness::{
         check_key_not_in_map, check_predicate_false, check_slice_not_empty,
         check_valid_string_ascii,
@@ -72,6 +73,7 @@ use nautilus_model::{
     position::Position,
     types::{Currency, Money, Price, Quantity},
 };
+pub use refs::{AccountRef, AccountRefMut, OrderRef, OrderRefMut, PositionRef, PositionRefMut};
 use ustr::Ustr;
 
 use crate::xrate::get_exchange_rate;
@@ -134,10 +136,10 @@ pub struct Cache {
     greeks: AHashMap<InstrumentId, GreeksData>,
     option_greeks: AHashMap<InstrumentId, OptionGreeks>,
     yield_curves: AHashMap<String, YieldCurveData>,
-    accounts: AHashMap<AccountId, AccountAny>,
-    orders: AHashMap<ClientOrderId, OrderAny>,
+    accounts: AHashMap<AccountId, SharedCell<AccountAny>>,
+    orders: AHashMap<ClientOrderId, SharedCell<OrderAny>>,
     order_lists: AHashMap<OrderListId, OrderList>,
-    positions: AHashMap<PositionId, Position>,
+    positions: AHashMap<PositionId, SharedCell<Position>>,
     position_snapshots: AHashMap<PositionId, Vec<Bytes>>,
     #[cfg(feature = "defi")]
     pub(crate) defi: crate::defi::cache::DefiCache,
@@ -271,9 +273,21 @@ impl Cache {
         self.currencies = cache_map.currencies;
         self.instruments = cache_map.instruments;
         self.synthetics = cache_map.synthetics;
-        self.accounts = cache_map.accounts;
-        self.orders = cache_map.orders;
-        self.positions = cache_map.positions;
+        self.accounts = cache_map
+            .accounts
+            .into_iter()
+            .map(|(id, account)| (id, SharedCell::new(account)))
+            .collect();
+        self.orders = cache_map
+            .orders
+            .into_iter()
+            .map(|(id, order)| (id, SharedCell::new(order)))
+            .collect();
+        self.positions = cache_map
+            .positions
+            .into_iter()
+            .map(|(id, position)| (id, SharedCell::new(position)))
+            .collect();
 
         self.assign_position_ids_to_contingencies();
         Ok(())
@@ -334,7 +348,12 @@ impl Cache {
     /// Returns an error if loading accounts cache fails.
     pub async fn cache_accounts(&mut self) -> anyhow::Result<()> {
         self.accounts = match &mut self.database {
-            Some(db) => db.load_accounts().await?,
+            Some(db) => db
+                .load_accounts()
+                .await?
+                .into_iter()
+                .map(|(id, account)| (id, SharedCell::new(account)))
+                .collect(),
             None => AHashMap::new(),
         };
 
@@ -352,7 +371,12 @@ impl Cache {
     /// Returns an error if loading orders cache fails.
     pub async fn cache_orders(&mut self) -> anyhow::Result<()> {
         self.orders = match &mut self.database {
-            Some(db) => db.load_orders().await?,
+            Some(db) => db
+                .load_orders()
+                .await?
+                .into_iter()
+                .map(|(id, order)| (id, SharedCell::new(order)))
+                .collect(),
             None => AHashMap::new(),
         };
 
@@ -369,7 +393,12 @@ impl Cache {
     /// Returns an error if loading positions cache fails.
     pub async fn cache_positions(&mut self) -> anyhow::Result<()> {
         self.positions = match &mut self.database {
-            Some(db) => db.load_positions().await?,
+            Some(db) => db
+                .load_positions()
+                .await?
+                .into_iter()
+                .map(|(id, position)| (id, SharedCell::new(position)))
+                .collect(),
             None => AHashMap::new(),
         };
 
@@ -389,7 +418,8 @@ impl Cache {
         }
 
         // Index orders
-        for (client_order_id, order) in &self.orders {
+        for (client_order_id, order_cell) in &self.orders {
+            let order = order_cell.borrow();
             let instrument_id = order.instrument_id();
             let venue = instrument_id.venue;
             let strategy_id = order.strategy_id();
@@ -502,7 +532,8 @@ impl Cache {
         }
 
         // Index positions
-        for (position_id, position) in &self.positions {
+        for (position_id, position_cell) in &self.positions {
+            let position = position_cell.borrow();
             let instrument_id = position.instrument_id;
             let venue = instrument_id.venue;
             let strategy_id = position.strategy_id;
@@ -630,7 +661,9 @@ impl Cache {
             }
         }
 
-        for (client_order_id, order) in &self.orders {
+        for (client_order_id, order_cell) in &self.orders {
+            let order = order_cell.borrow();
+
             if !self.index.order_strategy.contains_key(client_order_id) {
                 log::error!(
                     "{failure} in orders: {client_order_id} not found in `self.index.order_strategy`"
@@ -697,7 +730,9 @@ impl Cache {
             }
         }
 
-        for (position_id, position) in &self.positions {
+        for (position_id, position_cell) in &self.positions {
+            let position = position_cell.borrow();
+
             if !self.index.position_strategy.contains_key(position_id) {
                 log::error!(
                     "{failure} in positions: {position_id} not found in `self.index.position_strategy`",
@@ -1006,29 +1041,41 @@ impl Cache {
         let mut affected_order_list_ids: AHashSet<OrderListId> = AHashSet::new();
 
         'outer: for client_order_id in self.index.orders_closed.clone() {
-            if let Some(order) = self.orders.get(&client_order_id)
-                && order.is_closed()
-                && let Some(ts_closed) = order.ts_closed()
-                && ts_closed + buffer_ns <= ts_now
-            {
-                // Check any linked orders (contingency orders)
-                if let Some(linked_order_ids) = order.linked_order_ids() {
-                    for linked_order_id in linked_order_ids {
-                        if let Some(linked_order) = self.orders.get(linked_order_id)
-                            && linked_order.is_open()
-                        {
-                            // Do not purge if linked order still open
-                            continue 'outer;
-                        }
+            let purge_target = self.orders.get(&client_order_id).and_then(|order_cell| {
+                let order = order_cell.borrow();
+                if order.is_closed()
+                    && let Some(ts_closed) = order.ts_closed()
+                    && ts_closed + buffer_ns <= ts_now
+                {
+                    let linked = order.linked_order_ids().map(<[_]>::to_vec);
+                    let order_list_id = order.order_list_id();
+                    Some((linked, order_list_id))
+                } else {
+                    None
+                }
+            });
+
+            let Some((linked, order_list_id)) = purge_target else {
+                continue;
+            };
+
+            // Check any linked orders (contingency orders)
+            if let Some(linked_order_ids) = linked {
+                for linked_order_id in &linked_order_ids {
+                    if let Some(linked_order_cell) = self.orders.get(linked_order_id)
+                        && linked_order_cell.borrow().is_open()
+                    {
+                        // Do not purge if linked order still open
+                        continue 'outer;
                     }
                 }
-
-                if let Some(order_list_id) = order.order_list_id() {
-                    affected_order_list_ids.insert(order_list_id);
-                }
-
-                self.purge_order(client_order_id);
             }
+
+            if let Some(order_list_id) = order_list_id {
+                affected_order_list_ids.insert(order_list_id);
+            }
+
+            self.purge_order(client_order_id);
         }
 
         for order_list_id in affected_order_list_ids {
@@ -1060,11 +1107,15 @@ impl Cache {
         let buffer_ns = secs_to_nanos_unchecked(buffer_secs as f64);
 
         for position_id in self.index.positions_closed.clone() {
-            if let Some(position) = self.positions.get(&position_id)
-                && position.is_closed()
-                && let Some(ts_closed) = position.ts_closed
-                && ts_closed + buffer_ns <= ts_now
-            {
+            let should_purge = self.positions.get(&position_id).is_some_and(|cell| {
+                let position = cell.borrow();
+                position.is_closed()
+                    && position
+                        .ts_closed
+                        .is_some_and(|ts_closed| ts_closed + buffer_ns <= ts_now)
+            });
+
+            if should_purge {
                 self.purge_position(position_id);
             }
         }
@@ -1075,47 +1126,51 @@ impl Cache {
     /// For safety, an order is prevented from being purged if it's open.
     pub fn purge_order(&mut self, client_order_id: ClientOrderId) {
         // Check if order exists and is safe to purge before removing
-        let order = self.orders.get(&client_order_id).cloned();
+        let order_cell = self.orders.get(&client_order_id).cloned();
 
         // Prevent purging open orders
-        if let Some(ref ord) = order
-            && ord.is_open()
+        if let Some(ref order_cell) = order_cell
+            && order_cell.borrow().is_open()
         {
             log::warn!("Order {client_order_id} found open when purging, skipping purge");
             return;
         }
 
         // If order exists in cache, remove it and clean up order-specific indices
-        if let Some(ref ord) = order {
+        if let Some(ref order_cell) = order_cell {
+            let order = order_cell.borrow();
             // Safe to purge
             self.orders.remove(&client_order_id);
 
             // Remove order from venue index
-            if let Some(venue_orders) = self.index.venue_orders.get_mut(&ord.instrument_id().venue)
+            if let Some(venue_orders) = self
+                .index
+                .venue_orders
+                .get_mut(&order.instrument_id().venue)
             {
                 venue_orders.remove(&client_order_id);
                 if venue_orders.is_empty() {
-                    self.index.venue_orders.remove(&ord.instrument_id().venue);
+                    self.index.venue_orders.remove(&order.instrument_id().venue);
                 }
             }
 
             // Remove venue order ID index if exists
-            if let Some(venue_order_id) = ord.venue_order_id() {
+            if let Some(venue_order_id) = order.venue_order_id() {
                 self.index.venue_order_ids.remove(&venue_order_id);
             }
 
             // Remove from instrument orders index
             if let Some(instrument_orders) =
-                self.index.instrument_orders.get_mut(&ord.instrument_id())
+                self.index.instrument_orders.get_mut(&order.instrument_id())
             {
                 instrument_orders.remove(&client_order_id);
                 if instrument_orders.is_empty() {
-                    self.index.instrument_orders.remove(&ord.instrument_id());
+                    self.index.instrument_orders.remove(&order.instrument_id());
                 }
             }
 
             // Remove from position orders index if associated with a position
-            if let Some(position_id) = ord.position_id()
+            if let Some(position_id) = order.position_id()
                 && let Some(position_orders) = self.index.position_orders.get_mut(&position_id)
             {
                 position_orders.remove(&client_order_id);
@@ -1125,7 +1180,7 @@ impl Cache {
             }
 
             // Remove from exec algorithm orders index if it has an exec algorithm
-            if let Some(exec_algorithm_id) = ord.exec_algorithm_id()
+            if let Some(exec_algorithm_id) = order.exec_algorithm_id()
                 && let Some(exec_algorithm_orders) =
                     self.index.exec_algorithm_orders.get_mut(&exec_algorithm_id)
             {
@@ -1136,15 +1191,16 @@ impl Cache {
             }
 
             // Clean up strategy orders reverse index
-            if let Some(strategy_orders) = self.index.strategy_orders.get_mut(&ord.strategy_id()) {
+            if let Some(strategy_orders) = self.index.strategy_orders.get_mut(&order.strategy_id())
+            {
                 strategy_orders.remove(&client_order_id);
                 if strategy_orders.is_empty() {
-                    self.index.strategy_orders.remove(&ord.strategy_id());
+                    self.index.strategy_orders.remove(&order.strategy_id());
                 }
             }
 
             // Clean up account orders index
-            if let Some(account_id) = ord.account_id()
+            if let Some(account_id) = order.account_id()
                 && let Some(account_orders) = self.index.account_orders.get_mut(&account_id)
             {
                 account_orders.remove(&client_order_id);
@@ -1154,7 +1210,7 @@ impl Cache {
             }
 
             // Clean up exec spawn reverse index (if this order is a spawned child)
-            if let Some(exec_spawn_id) = ord.exec_spawn_id()
+            if let Some(exec_spawn_id) = order.exec_spawn_id()
                 && let Some(spawn_orders) = self.index.exec_spawn_orders.get_mut(&exec_spawn_id)
             {
                 spawn_orders.remove(&client_order_id);
@@ -1200,8 +1256,11 @@ impl Cache {
     ///
     /// For safety, a position is prevented from being purged if it's open.
     pub fn purge_position(&mut self, position_id: PositionId) {
-        // Check if position exists and is safe to purge before removing
-        let position = self.positions.get(&position_id).cloned();
+        // Snapshot the position so we can release the borrow before mutating indexes.
+        let position = self
+            .positions
+            .get(&position_id)
+            .map(|cell| cell.borrow().clone());
 
         // Prevent purging open positions
         if let Some(ref pos) = position
@@ -1381,7 +1440,8 @@ impl Cache {
             }
         );
 
-        for account in self.accounts.values_mut() {
+        for account_cell in self.accounts.values() {
+            let mut account = account_cell.borrow_mut();
             let event_count = account.event_count();
             account.purge_account_events(ts_now, lookback_secs);
             let count_diff = event_count - account.event_count();
@@ -1928,7 +1988,7 @@ impl Cache {
         }
 
         let account_id = account.id();
-        self.accounts.insert(account_id, account);
+        self.accounts.insert(account_id, SharedCell::new(account));
         self.index
             .venue_account
             .insert(account_id.get_issuer(), account_id);
@@ -2097,7 +2157,14 @@ impl Cache {
             // }
         }
 
-        self.orders.insert(client_order_id, order);
+        match self.orders.get(&client_order_id) {
+            // Reuse the existing cell on replace so the canonical entry stays in place
+            // rather than orphaning a stale cell.
+            Some(order_cell) => *order_cell.borrow_mut() = order,
+            None => {
+                self.orders.insert(client_order_id, SharedCell::new(order));
+            }
+        }
 
         Ok(())
     }
@@ -2182,7 +2249,8 @@ impl Cache {
     fn assign_position_ids_to_contingencies(&mut self) {
         let mut assignments: Vec<(PositionId, ClientOrderId)> = Vec::new();
 
-        for parent in self.orders.values() {
+        for parent_order_cell in self.orders.values() {
+            let parent = parent_order_cell.borrow();
             if parent.contingency_type() != Some(ContingencyType::Oto) {
                 continue;
             }
@@ -2198,8 +2266,8 @@ impl Cache {
                     None => {
                         log::error!("Contingency order {client_order_id} not found");
                     }
-                    Some(contingent) => {
-                        if contingent.position_id().is_none() {
+                    Some(contingent_order_cell) => {
+                        if contingent_order_cell.borrow().position_id().is_none() {
                             assignments.push((parent_position_id, *client_order_id));
                         }
                     }
@@ -2208,12 +2276,11 @@ impl Cache {
         }
 
         for (position_id, client_order_id) in assignments {
-            let Some((venue, strategy_id)) =
-                self.orders.get_mut(&client_order_id).map(|contingent| {
-                    contingent.set_position_id(Some(position_id));
-                    (contingent.instrument_id().venue, contingent.strategy_id())
-                })
-            else {
+            let Some((venue, strategy_id)) = self.orders.get(&client_order_id).map(|order_cell| {
+                let mut contingent = order_cell.borrow_mut();
+                contingent.set_position_id(Some(position_id));
+                (contingent.instrument_id().venue, contingent.strategy_id())
+            }) else {
                 continue;
             };
 
@@ -2253,7 +2320,8 @@ impl Cache {
     ///
     /// Returns an error if persisting the position to the backing database fails.
     pub fn add_position(&mut self, position: &Position, _oms_type: OmsType) -> anyhow::Result<()> {
-        self.positions.insert(position.id, position.clone());
+        self.positions
+            .insert(position.id, SharedCell::new(position.clone()));
         self.index.positions.insert(position.id);
         self.index.positions_open.insert(position.id);
         self.index.positions_closed.remove(&position.id); // Cleanup for NETTING reopen
@@ -2304,12 +2372,21 @@ impl Cache {
 
     /// Updates the `account` in the cache.
     ///
+    /// Reuses the existing cell when present so any held [`AccountRef`] handles continue to point
+    /// at the canonical entry; only inserts a new cell when the account is unknown.
+    ///
     /// # Errors
     ///
     /// Returns an error if updating the account in the database fails.
     pub fn update_account(&mut self, account: &AccountAny) -> anyhow::Result<()> {
         let account_id = account.id();
-        self.accounts.insert(account_id, account.clone());
+        match self.accounts.get(&account_id) {
+            Some(account_cell) => *account_cell.borrow_mut() = account.clone(),
+            None => {
+                self.accounts
+                    .insert(account_id, SharedCell::new(account.clone()));
+            }
+        }
 
         if let Some(database) = &mut self.database {
             database.update_account(account)?;
@@ -2320,10 +2397,26 @@ impl Cache {
     /// Removes the `account` from the cache and returns it.
     ///
     /// This supports hot paths which need owned account mutation without
-    /// cloning the account event history.
+    /// cloning the account event history. The cache is the sole owner of the
+    /// account cell (the field is private and accessors only hand out
+    /// lifetime-scoped [`AccountRef`] borrows), so the value is moved out of
+    /// its cell rather than cloned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cache no longer holds the only strong handle to the
+    /// account cell. This indicates an internal invariant violation: some
+    /// component cloned the underlying [`SharedCell`] and held it past the
+    /// scope of a single cache method.
     #[must_use]
     pub fn take_account(&mut self, account_id: &AccountId) -> Option<AccountAny> {
-        self.accounts.remove(account_id)
+        self.accounts.remove(account_id).map(|cell| {
+            let rc: Rc<RefCell<AccountAny>> = cell.into();
+            Rc::try_unwrap(rc).map_or_else(
+                |_| panic!("take_account: cache must be sole owner of {account_id} cell"),
+                RefCell::into_inner,
+            )
+        })
     }
 
     /// Caches the `account` in memory without updating the database.
@@ -2332,7 +2425,12 @@ impl Cache {
         self.index
             .venue_account
             .insert(account_id.get_issuer(), account_id);
-        self.accounts.insert(account_id, account);
+        match self.accounts.get(&account_id) {
+            Some(account_cell) => *account_cell.borrow_mut() = account,
+            None => {
+                self.accounts.insert(account_id, SharedCell::new(account));
+            }
+        }
     }
 
     /// Updates the `account` in the cache, taking ownership of the updated account.
@@ -2345,34 +2443,32 @@ impl Cache {
         self.cache_account_owned(account);
 
         if let Some(database) = &mut self.database {
-            let Some(account) = self.accounts.get(&account_id) else {
+            let Some(account_cell) = self.accounts.get(&account_id) else {
                 anyhow::bail!("Account {account_id} not found after cache update");
             };
-            database.update_account(account)?;
+            database.update_account(&account_cell.borrow())?;
         }
         Ok(())
     }
 
     /// Applies an account state event to the cached account.
     ///
+    /// Mutates the cached account in place to avoid cloning the account event
+    /// history on the hot path; long-running sessions accumulate many events
+    /// per account, so a snapshot-clone here would be O(history) per update.
+    ///
     /// # Errors
     ///
     /// Returns an error if applying or persisting the account state fails.
     pub fn update_account_state(&mut self, event: &AccountState) -> anyhow::Result<()> {
-        if let Some(account) = self.accounts.get_mut(&event.account_id) {
-            account.apply(event.clone())?;
-        } else {
+        let Some(cell) = self.accounts.get(&event.account_id) else {
             return self.add_account(AccountAny::from_events(std::slice::from_ref(event))?);
-        }
+        };
+
+        cell.borrow_mut().apply(event.clone())?;
 
         if let Some(database) = &mut self.database {
-            let Some(account) = self.accounts.get(&event.account_id) else {
-                anyhow::bail!(
-                    "Account {} not found after account state update",
-                    event.account_id
-                );
-            };
-            database.update_account(account)?;
+            database.update_account(&cell.borrow())?;
         }
         Ok(())
     }
@@ -2388,7 +2484,16 @@ impl Cache {
     pub fn replace_order(&mut self, order: &OrderAny) -> anyhow::Result<()> {
         self.refresh_order(order)?;
 
-        self.orders.insert(order.client_order_id(), order.clone());
+        let client_order_id = order.client_order_id();
+        match self.orders.get(&client_order_id) {
+            // Reuse the existing cell so the canonical entry stays in place rather than
+            // orphaning a stale cell.
+            Some(order_cell) => *order_cell.borrow_mut() = order.clone(),
+            None => {
+                self.orders
+                    .insert(client_order_id, SharedCell::new(order.clone()));
+            }
+        }
 
         Ok(())
     }
@@ -2412,21 +2517,24 @@ impl Cache {
             return Err(OrderError::NotFound(event_client_order_id).into());
         };
 
-        let mut order = self
+        let order_cell = self
             .orders
             .get(&client_order_id)
-            .ok_or(OrderError::NotFound(client_order_id))?
-            .clone();
+            .cloned()
+            .ok_or(OrderError::NotFound(client_order_id))?;
 
-        order.apply(event.clone())?;
+        // Apply on a snapshot first so a fallible `apply` (e.g. invalid state
+        // transition) leaves the canonical cell untouched. On success we swap the
+        // post-event value back into the cell so subsequent reads see the new state.
+        let mut snapshot = order_cell.borrow().clone();
+        snapshot.apply(event.clone())?;
+        *order_cell.borrow_mut() = snapshot.clone();
 
-        if let Err(e) = self.refresh_order(&order) {
+        if let Err(e) = self.refresh_order(&snapshot) {
             log::error!("Error updating order in cache: {e}");
         }
 
-        self.orders.insert(client_order_id, order.clone());
-
-        Ok(order)
+        Ok(snapshot)
     }
 
     fn refresh_order(&mut self, order: &OrderAny) -> anyhow::Result<()> {
@@ -2516,6 +2624,9 @@ impl Cache {
 
     /// Updates the `position` in the cache.
     ///
+    /// Reuses the existing cell when present so any held [`PositionRef`] handles continue to point
+    /// at the canonical entry; only inserts a new cell when the position is unknown.
+    ///
     /// # Errors
     ///
     /// Returns an error if updating the position in the database fails.
@@ -2538,7 +2649,13 @@ impl Cache {
             // }
         }
 
-        self.positions.insert(position.id, position.clone());
+        match self.positions.get(&position.id) {
+            Some(position_cell) => *position_cell.borrow_mut() = position.clone(),
+            None => {
+                self.positions
+                    .insert(position.id, SharedCell::new(position.clone()));
+            }
+        }
 
         Ok(())
     }
@@ -2705,8 +2822,8 @@ impl Cache {
 
         for (position_id, _) in &self.position_snapshots {
             // Check if this position is for the requested instrument
-            if let Some(position) = self.positions.get(position_id)
-                && position.instrument_id == *instrument_id
+            if let Some(position_cell) = self.positions.get(position_id)
+                && position_cell.borrow().instrument_id == *instrument_id
             {
                 result.insert(*position_id);
             }
@@ -2900,15 +3017,16 @@ impl Cache {
         &self,
         client_order_ids: &AHashSet<ClientOrderId>,
         side: Option<OrderSide>,
-    ) -> Vec<&OrderAny> {
+    ) -> Vec<OrderRef<'_>> {
         let side = side.unwrap_or(OrderSide::NoOrderSide);
         let mut orders = Vec::new();
 
         for client_order_id in client_order_ids {
-            let order = self
+            let order_cell = self
                 .orders
                 .get(client_order_id)
                 .unwrap_or_else(|| panic!("Order {client_order_id} not found"));
+            let order = OrderRef::new(order_cell.borrow());
 
             if side == OrderSide::NoOrderSide || side == order.order_side() {
                 orders.push(order);
@@ -2923,6 +3041,10 @@ impl Cache {
 
     /// Retrieves positions corresponding to the `position_ids`, optionally filtering by `side`.
     ///
+    /// Each [`PositionRef`] in the returned vector borrows its underlying cell; mutating any of
+    /// those positions while the vector is alive will panic at runtime. Drop the vector before
+    /// issuing writes.
+    ///
     /// # Panics
     ///
     /// Panics if any `position_id` in the set is not found in the cache.
@@ -2930,15 +3052,16 @@ impl Cache {
         &self,
         position_ids: &AHashSet<PositionId>,
         side: Option<PositionSide>,
-    ) -> Vec<&Position> {
+    ) -> Vec<PositionRef<'_>> {
         let side = side.unwrap_or(PositionSide::NoPositionSide);
         let mut positions = Vec::new();
 
         for position_id in position_ids {
-            let position = self
+            let position_cell = self
                 .positions
                 .get(position_id)
                 .unwrap_or_else(|| panic!("Position {position_id} not found"));
+            let position = PositionRef::new(position_cell.borrow());
 
             if side == PositionSide::NoPositionSide || side == position.side {
                 positions.push(position);
@@ -3171,10 +3294,44 @@ impl Cache {
 
     // -- ORDER QUERIES ---------------------------------------------------------------------------
 
-    /// Gets a reference to the order with the `client_order_id` (if found).
+    /// Gets a borrow of the order with the `client_order_id` (if found).
+    ///
+    /// The returned [`OrderRef`] is tied to the cache borrow's scope and panics at runtime if
+    /// held across a mutation of the same order. Drop the borrow before dispatching events; if
+    /// post-event state is required, perform a fresh lookup. Use [`Self::order_owned`] when an
+    /// owned snapshot is needed for a boundary handover.
     #[must_use]
-    pub fn order(&self, client_order_id: &ClientOrderId) -> Option<&OrderAny> {
-        self.orders.get(client_order_id)
+    pub fn order(&self, client_order_id: &ClientOrderId) -> Option<OrderRef<'_>> {
+        self.orders
+            .get(client_order_id)
+            .map(|order_cell| OrderRef::new(order_cell.borrow()))
+    }
+
+    /// Gets an exclusive write borrow of the order with the `client_order_id` (if found).
+    ///
+    /// Requires `&mut Cache` so cache writes are reachable only by privileged crates that hold
+    /// `Rc<RefCell<Cache>>` directly. Adapter-facing code receives [`CacheView`], which only
+    /// exposes immutable cache borrows and therefore cannot reach this method.
+    ///
+    /// While the returned [`OrderRefMut`] is alive, no other read or write of the same order is
+    /// permitted. Drop the borrow before dispatching events or taking any other cache borrow that
+    /// may re-enter the same order.
+    #[must_use]
+    pub fn order_mut(&mut self, client_order_id: &ClientOrderId) -> Option<OrderRefMut<'_>> {
+        self.orders
+            .get(client_order_id)
+            .map(|order_cell| OrderRefMut::new(order_cell.borrow_mut()))
+    }
+
+    /// Gets an owned snapshot of the order with the `client_order_id` (if found).
+    ///
+    /// Use when downstream needs an owned [`OrderAny`] that crosses a boundary (for example, an
+    /// adapter `get_order` API). The snapshot will not reflect later cache mutations.
+    #[must_use]
+    pub fn order_owned(&self, client_order_id: &ClientOrderId) -> Option<OrderAny> {
+        self.orders
+            .get(client_order_id)
+            .map(|order_cell| order_cell.borrow().clone())
     }
 
     /// Gets cloned orders for the given `client_order_ids`, logging an error for any missing.
@@ -3187,17 +3344,11 @@ impl Cache {
         let mut orders = Vec::with_capacity(client_order_ids.len());
         for id in client_order_ids {
             match self.orders.get(id) {
-                Some(order) => orders.push(order.clone()),
+                Some(order_cell) => orders.push(order_cell.borrow().clone()),
                 None => log::error!("Order {id} not found in cache for {context}"),
             }
         }
         orders
-    }
-
-    /// Gets a reference to the order with the `client_order_id` (if found).
-    #[must_use]
-    pub fn mut_order(&mut self, client_order_id: &ClientOrderId) -> Option<&mut OrderAny> {
-        self.orders.get_mut(client_order_id)
     }
 
     /// Gets a reference to the client order ID for the `venue_order_id` (if found).
@@ -3218,7 +3369,11 @@ impl Cache {
         self.index.order_client.get(client_order_id)
     }
 
-    /// Returns references to all orders matching the optional filter parameters.
+    /// Returns borrows of all orders matching the optional filter parameters.
+    ///
+    /// Each [`Ref`] in the returned vector borrows its underlying cell; mutating any of
+    /// those orders while the vector is alive will panic at runtime. Drop the vector
+    /// before issuing writes.
     #[must_use]
     pub fn orders(
         &self,
@@ -3227,12 +3382,12 @@ impl Cache {
         strategy_id: Option<&StrategyId>,
         account_id: Option<&AccountId>,
         side: Option<OrderSide>,
-    ) -> Vec<&OrderAny> {
+    ) -> Vec<OrderRef<'_>> {
         let client_order_ids = self.client_order_ids(venue, instrument_id, strategy_id, account_id);
         self.get_orders_for_ids(&client_order_ids, side)
     }
 
-    /// Returns references to all open orders matching the optional filter parameters.
+    /// Returns borrows of all open orders matching the optional filter parameters.
     #[must_use]
     pub fn orders_open(
         &self,
@@ -3241,13 +3396,13 @@ impl Cache {
         strategy_id: Option<&StrategyId>,
         account_id: Option<&AccountId>,
         side: Option<OrderSide>,
-    ) -> Vec<&OrderAny> {
+    ) -> Vec<OrderRef<'_>> {
         let client_order_ids =
             self.client_order_ids_open(venue, instrument_id, strategy_id, account_id);
         self.get_orders_for_ids(&client_order_ids, side)
     }
 
-    /// Returns references to all closed orders matching the optional filter parameters.
+    /// Returns borrows of all closed orders matching the optional filter parameters.
     #[must_use]
     pub fn orders_closed(
         &self,
@@ -3256,13 +3411,13 @@ impl Cache {
         strategy_id: Option<&StrategyId>,
         account_id: Option<&AccountId>,
         side: Option<OrderSide>,
-    ) -> Vec<&OrderAny> {
+    ) -> Vec<OrderRef<'_>> {
         let client_order_ids =
             self.client_order_ids_closed(venue, instrument_id, strategy_id, account_id);
         self.get_orders_for_ids(&client_order_ids, side)
     }
 
-    /// Returns references to all locally active orders matching the optional filter parameters.
+    /// Returns borrows of all locally active orders matching the optional filter parameters.
     ///
     /// Locally active orders are in the `INITIALIZED`, `EMULATED`, or `RELEASED` state
     /// (a superset of emulated orders).
@@ -3274,13 +3429,13 @@ impl Cache {
         strategy_id: Option<&StrategyId>,
         account_id: Option<&AccountId>,
         side: Option<OrderSide>,
-    ) -> Vec<&OrderAny> {
+    ) -> Vec<OrderRef<'_>> {
         let client_order_ids =
             self.client_order_ids_active_local(venue, instrument_id, strategy_id, account_id);
         self.get_orders_for_ids(&client_order_ids, side)
     }
 
-    /// Returns references to all emulated orders matching the optional filter parameters.
+    /// Returns borrows of all emulated orders matching the optional filter parameters.
     #[must_use]
     pub fn orders_emulated(
         &self,
@@ -3289,13 +3444,13 @@ impl Cache {
         strategy_id: Option<&StrategyId>,
         account_id: Option<&AccountId>,
         side: Option<OrderSide>,
-    ) -> Vec<&OrderAny> {
+    ) -> Vec<OrderRef<'_>> {
         let client_order_ids =
             self.client_order_ids_emulated(venue, instrument_id, strategy_id, account_id);
         self.get_orders_for_ids(&client_order_ids, side)
     }
 
-    /// Returns references to all in-flight orders matching the optional filter parameters.
+    /// Returns borrows of all in-flight orders matching the optional filter parameters.
     #[must_use]
     pub fn orders_inflight(
         &self,
@@ -3304,15 +3459,15 @@ impl Cache {
         strategy_id: Option<&StrategyId>,
         account_id: Option<&AccountId>,
         side: Option<OrderSide>,
-    ) -> Vec<&OrderAny> {
+    ) -> Vec<OrderRef<'_>> {
         let client_order_ids =
             self.client_order_ids_inflight(venue, instrument_id, strategy_id, account_id);
         self.get_orders_for_ids(&client_order_ids, side)
     }
 
-    /// Returns references to all orders for the `position_id`.
+    /// Returns borrows of all orders for the `position_id`.
     #[must_use]
-    pub fn orders_for_position(&self, position_id: &PositionId) -> Vec<&OrderAny> {
+    pub fn orders_for_position(&self, position_id: &PositionId) -> Vec<OrderRef<'_>> {
         let client_order_ids = self.index.position_orders.get(position_id);
         match client_order_ids {
             Some(client_order_ids) => {
@@ -3486,9 +3641,9 @@ impl Cache {
         if let Some(account_id) = account_id {
             order_lists.retain(|ol| {
                 ol.client_order_ids.iter().any(|client_order_id| {
-                    self.orders
-                        .get(client_order_id)
-                        .is_some_and(|order| order.account_id().as_ref() == Some(account_id))
+                    self.orders.get(client_order_id).is_some_and(|order_cell| {
+                        order_cell.borrow().account_id().as_ref() == Some(account_id)
+                    })
                 })
             });
         }
@@ -3515,7 +3670,7 @@ impl Cache {
         strategy_id: Option<&StrategyId>,
         account_id: Option<&AccountId>,
         side: Option<OrderSide>,
-    ) -> Vec<&OrderAny> {
+    ) -> Vec<OrderRef<'_>> {
         let query =
             self.build_order_query_filter_set(venue, instrument_id, strategy_id, account_id);
         let exec_algorithm_order_ids = self.index.exec_algorithm_orders.get(exec_algorithm_id);
@@ -3535,7 +3690,7 @@ impl Cache {
 
     /// Returns references to all orders with the `exec_spawn_id`.
     #[must_use]
-    pub fn orders_for_exec_spawn(&self, exec_spawn_id: &ClientOrderId) -> Vec<&OrderAny> {
+    pub fn orders_for_exec_spawn(&self, exec_spawn_id: &ClientOrderId) -> Vec<OrderRef<'_>> {
         self.get_orders_for_ids(
             self.index
                 .exec_spawn_orders
@@ -3622,19 +3777,49 @@ impl Cache {
 
     // -- POSITION QUERIES ------------------------------------------------------------------------
 
-    /// Returns a reference to the position with the `position_id` (if found).
+    /// Returns a borrow of the position with the `position_id` (if found).
     #[must_use]
-    pub fn position(&self, position_id: &PositionId) -> Option<&Position> {
-        self.positions.get(position_id)
+    pub fn position(&self, position_id: &PositionId) -> Option<PositionRef<'_>> {
+        self.positions
+            .get(position_id)
+            .map(|position_cell| PositionRef::new(position_cell.borrow()))
     }
 
-    /// Returns a reference to the position for the `client_order_id` (if found).
+    /// Gets an exclusive write borrow of the position with the `position_id` (if found).
+    ///
+    /// Requires `&mut Cache` so cache writes are reachable only by privileged crates that hold
+    /// `Rc<RefCell<Cache>>` directly. Adapter-facing code receives [`CacheView`], which only
+    /// exposes immutable cache borrows and therefore cannot reach this method.
+    ///
+    /// While the returned [`PositionRefMut`] is alive, no other read or write of the same position
+    /// is permitted. Drop the borrow before dispatching events or taking any other cache borrow
+    /// that may re-enter the same position.
     #[must_use]
-    pub fn position_for_order(&self, client_order_id: &ClientOrderId) -> Option<&Position> {
+    pub fn position_mut(&mut self, position_id: &PositionId) -> Option<PositionRefMut<'_>> {
+        self.positions
+            .get(position_id)
+            .map(|position_cell| PositionRefMut::new(position_cell.borrow_mut()))
+    }
+
+    /// Gets an owned snapshot of the position with the `position_id` (if found).
+    ///
+    /// Use when downstream needs an owned [`Position`] that crosses a boundary. The snapshot will
+    /// not reflect later cache mutations.
+    #[must_use]
+    pub fn position_owned(&self, position_id: &PositionId) -> Option<Position> {
+        self.positions
+            .get(position_id)
+            .map(|position_cell| position_cell.borrow().clone())
+    }
+
+    /// Returns a borrow of the position for the `client_order_id` (if found).
+    #[must_use]
+    pub fn position_for_order(&self, client_order_id: &ClientOrderId) -> Option<PositionRef<'_>> {
         self.index
             .order_position
             .get(client_order_id)
             .and_then(|position_id| self.positions.get(position_id))
+            .map(|position_cell| PositionRef::new(position_cell.borrow()))
     }
 
     /// Returns a reference to the position ID for the `client_order_id` (if found).
@@ -3643,7 +3828,11 @@ impl Cache {
         self.index.order_position.get(client_order_id)
     }
 
-    /// Returns a reference to all positions matching the optional filter parameters.
+    /// Returns borrows of all positions matching the optional filter parameters.
+    ///
+    /// Each [`PositionRef`] in the returned vector borrows its underlying cell; mutating any of
+    /// those positions while the vector is alive will panic at runtime. Drop the vector before
+    /// issuing writes.
     #[must_use]
     pub fn positions(
         &self,
@@ -3652,12 +3841,12 @@ impl Cache {
         strategy_id: Option<&StrategyId>,
         account_id: Option<&AccountId>,
         side: Option<PositionSide>,
-    ) -> Vec<&Position> {
+    ) -> Vec<PositionRef<'_>> {
         let position_ids = self.position_ids(venue, instrument_id, strategy_id, account_id);
         self.get_positions_for_ids(&position_ids, side)
     }
 
-    /// Returns a reference to all open positions matching the optional filter parameters.
+    /// Returns borrows of all open positions matching the optional filter parameters.
     #[must_use]
     pub fn positions_open(
         &self,
@@ -3666,12 +3855,12 @@ impl Cache {
         strategy_id: Option<&StrategyId>,
         account_id: Option<&AccountId>,
         side: Option<PositionSide>,
-    ) -> Vec<&Position> {
+    ) -> Vec<PositionRef<'_>> {
         let position_ids = self.position_open_ids(venue, instrument_id, strategy_id, account_id);
         self.get_positions_for_ids(&position_ids, side)
     }
 
-    /// Returns a reference to all closed positions matching the optional filter parameters.
+    /// Returns borrows of all closed positions matching the optional filter parameters.
     #[must_use]
     pub fn positions_closed(
         &self,
@@ -3680,7 +3869,7 @@ impl Cache {
         strategy_id: Option<&StrategyId>,
         account_id: Option<&AccountId>,
         side: Option<PositionSide>,
-    ) -> Vec<&Position> {
+    ) -> Vec<PositionRef<'_>> {
         let position_ids = self.position_closed_ids(venue, instrument_id, strategy_id, account_id);
         self.get_positions_for_ids(&position_ids, side)
     }
@@ -4217,19 +4406,62 @@ impl Cache {
 
     // -- ACCOUNT QUERIES -----------------------------------------------------------------------
 
-    /// Returns a reference to the account for the `account_id` (if found).
+    /// Returns a borrow of the account for the `account_id` (if found).
     #[must_use]
-    pub fn account(&self, account_id: &AccountId) -> Option<&AccountAny> {
-        self.accounts.get(account_id)
+    pub fn account(&self, account_id: &AccountId) -> Option<AccountRef<'_>> {
+        self.accounts
+            .get(account_id)
+            .map(|account_cell| AccountRef::new(account_cell.borrow()))
     }
 
-    /// Returns a reference to the account for the `venue` (if found).
+    /// Gets an exclusive write borrow of the account with the `account_id` (if found).
+    ///
+    /// Requires `&mut Cache` so cache writes are reachable only by privileged crates that hold
+    /// `Rc<RefCell<Cache>>` directly. Adapter-facing code receives [`CacheView`], which only
+    /// exposes immutable cache borrows and therefore cannot reach this method.
+    ///
+    /// While the returned [`AccountRefMut`] is alive, no other read or write of the same account
+    /// is permitted. Drop the borrow before dispatching events or taking any other cache borrow
+    /// that may re-enter the same account.
     #[must_use]
-    pub fn account_for_venue(&self, venue: &Venue) -> Option<&AccountAny> {
+    pub fn account_mut(&mut self, account_id: &AccountId) -> Option<AccountRefMut<'_>> {
+        self.accounts
+            .get(account_id)
+            .map(|account_cell| AccountRefMut::new(account_cell.borrow_mut()))
+    }
+
+    /// Gets an owned snapshot of the account with the `account_id` (if found).
+    ///
+    /// Use when downstream needs an owned [`AccountAny`] that crosses a boundary. The snapshot
+    /// will not reflect later cache mutations.
+    #[must_use]
+    pub fn account_owned(&self, account_id: &AccountId) -> Option<AccountAny> {
+        self.accounts
+            .get(account_id)
+            .map(|account_cell| account_cell.borrow().clone())
+    }
+
+    /// Returns a borrow of the account for the `venue` (if found).
+    #[must_use]
+    pub fn account_for_venue(&self, venue: &Venue) -> Option<AccountRef<'_>> {
         self.index
             .venue_account
             .get(venue)
             .and_then(|account_id| self.accounts.get(account_id))
+            .map(|account_cell| AccountRef::new(account_cell.borrow()))
+    }
+
+    /// Returns an owned snapshot of the account for the `venue` (if found).
+    ///
+    /// Use when downstream needs an owned [`AccountAny`] that crosses a boundary. The snapshot
+    /// will not reflect later cache mutations.
+    #[must_use]
+    pub fn account_for_venue_owned(&self, venue: &Venue) -> Option<AccountAny> {
+        self.index
+            .venue_account
+            .get(venue)
+            .and_then(|account_id| self.accounts.get(account_id))
+            .map(|account_cell| account_cell.borrow().clone())
     }
 
     /// Returns a reference to the account ID for the `venue` (if found).
@@ -4238,12 +4470,17 @@ impl Cache {
         self.index.venue_account.get(venue)
     }
 
-    /// Returns references to all accounts for the `account_id`.
+    /// Returns borrows of all accounts for the `account_id`.
+    ///
+    /// Each [`AccountRef`] in the returned vector borrows its underlying cell; mutating any of
+    /// those accounts while the vector is alive will panic at runtime. Drop the vector before
+    /// issuing writes.
     #[must_use]
-    pub fn accounts(&self, account_id: &AccountId) -> Vec<&AccountAny> {
+    pub fn accounts(&self, account_id: &AccountId) -> Vec<AccountRef<'_>> {
         self.accounts
             .values()
-            .filter(|account| &account.id() == account_id)
+            .filter(|account_cell| &account_cell.borrow().id() == account_id)
+            .map(|account_cell| AccountRef::new(account_cell.borrow()))
             .collect()
     }
 
@@ -4304,9 +4541,17 @@ impl Cache {
     /// terminal orders are properly cleaned up from own books and all relevant indexes.
     /// Replicates the index cleanup that `update_order` performs for closed orders.
     pub fn force_remove_from_own_order_book(&mut self, client_order_id: &ClientOrderId) {
-        let Some(order) = self.orders.get(client_order_id) else {
+        let Some(order_cell) = self.orders.get(client_order_id) else {
             return;
         };
+        let order = order_cell.borrow();
+        let instrument_id = order.instrument_id();
+        let own_book_order = if order.has_price() {
+            Some(order.to_own_book_order())
+        } else {
+            None
+        };
+        drop(order);
 
         self.index.orders_open.remove(client_order_id);
         self.index.orders_pending_cancel.remove(client_order_id);
@@ -4314,10 +4559,9 @@ impl Cache {
         self.index.orders_emulated.remove(client_order_id);
         self.index.orders_active_local.remove(client_order_id);
 
-        if let Some(own_book) = self.own_books.get_mut(&order.instrument_id())
-            && order.has_price()
+        if let Some(own_book) = self.own_books.get_mut(&instrument_id)
+            && let Some(own_book_order) = own_book_order
         {
-            let own_book_order = order.to_own_book_order();
             if let Err(e) = own_book.delete(own_book_order) {
                 log::debug!("Could not force delete {client_order_id} from own book: {e}");
             } else {

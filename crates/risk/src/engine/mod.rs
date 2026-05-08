@@ -643,7 +643,7 @@ impl RiskEngine {
     fn handle_modify_order(&mut self, command: ModifyOrder) {
         let order_exists = {
             let cache = self.cache.borrow();
-            cache.order(&command.client_order_id).cloned()
+            cache.order(&command.client_order_id).map(|o| o.clone())
         };
 
         let order = if let Some(order) = order_exists {
@@ -839,9 +839,9 @@ impl RiskEngine {
             let cache = self.cache.borrow();
 
             if let Some(account_id) = account_id {
-                cache.account(&account_id).cloned()
+                cache.account_owned(&account_id)
             } else {
-                cache.account_for_venue(&instrument.id().venue).cloned()
+                cache.account_for_venue_owned(&instrument.id().venue)
             }
         };
 
@@ -1593,7 +1593,7 @@ impl RiskEngine {
             TradingCommand::SubmitOrder(command) => {
                 let order = {
                     let cache = self.cache.borrow();
-                    cache.order(&command.client_order_id).cloned()
+                    cache.order(&command.client_order_id).map(|o| o.clone())
                 };
 
                 if let Some(ref order) = order {
@@ -1691,7 +1691,9 @@ impl RiskEngine {
                 TradingCommand::SubmitOrder(submit_order) => {
                     let order = {
                         let cache = self.cache.borrow();
-                        cache.order(&submit_order.client_order_id).cloned()
+                        cache
+                            .order(&submit_order.client_order_id)
+                            .map(|o| o.clone())
                     };
 
                     if let Some(ref order) = order {
@@ -1712,7 +1714,9 @@ impl RiskEngine {
                     TradingCommand::SubmitOrder(submit_order) => {
                         let order = {
                             let cache = self.cache.borrow();
-                            cache.order(&submit_order.client_order_id).cloned()
+                            cache
+                                .order(&submit_order.client_order_id)
+                                .map(|o| o.clone())
                         };
 
                         if let Some(ref order) = order {

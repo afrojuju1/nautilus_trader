@@ -64,7 +64,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
     io::Cursor,
     ops::Bound as RangeBound,
@@ -103,8 +103,8 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
 };
 use nautilus_serialization::arrow::{
-    DecodeDataFromRecordBatch, DecodeTypedFromRecordBatch, EncodeToRecordBatch,
-    custom::CustomDataDecoder,
+    ArrowSchemaProvider, DecodeDataFromRecordBatch, DecodeTypedFromRecordBatch,
+    EncodeToRecordBatch, custom::CustomDataDecoder,
 };
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use serde::Serialize;
@@ -1894,18 +1894,35 @@ impl ParquetDataCatalog {
             return Ok(Vec::new());
         }
 
-        let table_name = "custom_data_table";
-
         // Use CustomDataDecoder for all custom data. Pass type_name so decode can look up
         // the type when Parquet/DataFusion does not preserve schema metadata. Callers must
         // ensure Rust custom types are registered via ensure_custom_data_registered::<T>().
-        for file in files {
-            let resolved_path = self.resolve_path_for_datafusion(&file);
-            let sql_query = build_query(table_name, start, end, where_clause);
+        let mut lookup_metadata = HashMap::new();
+        lookup_metadata.insert("type_name".to_string(), type_name.to_string());
+        let registered_schema = CustomDataDecoder::get_schema(Some(lookup_metadata));
+        registered_schema.field_with_name("ts_init").map_err(|_| {
+            anyhow::anyhow!(
+                "custom data type '{type_name}' is not registered with an Arrow schema containing ts_init; \
+                 call ensure_custom_data_registered::<T>() before querying"
+            )
+        })?;
 
+        for file in files {
+            let identifier = extract_identifier_from_path(&file);
+            let safe_type_name = make_sql_safe_identifier(type_name);
+            let safe_sql_identifier = make_sql_safe_identifier(&identifier);
+            let safe_filename = extract_sql_safe_filename(&file);
+            let table_name =
+                format!("custom_{safe_type_name}_{safe_sql_identifier}_{safe_filename}");
+            let resolved_path = self.resolve_path_for_datafusion(&file);
+            let sql_query = build_query(&table_name, start, end, where_clause);
+
+            // Use schemaless registration so DataFusion preserves the parquet file's
+            // schema metadata (e.g. `bar_type`) on output batches, since the
+            // explicit-schema variant strips per-batch metadata that decoders rely on.
             self.session
                 .add_file::<CustomDataDecoder>(
-                    table_name,
+                    &table_name,
                     &resolved_path,
                     Some(&sql_query),
                     Some(type_name),
@@ -4321,12 +4338,19 @@ pub fn extract_identifier_from_path(file_path: &str) -> String {
 
 /// Makes an identifier safe for use in SQL table names.
 ///
-/// Removes forward slashes, replaces dots, hyphens, and spaces with underscores, and converts to lowercase.
+/// Keeps ASCII alphanumerics and underscores; replaces everything else with `_`, then lowercases.
 #[must_use]
 pub fn make_sql_safe_identifier(identifier: &str) -> String {
     urisafe_instrument_id(identifier)
-        .replace(['.', '-', ' ', '%'], "_")
-        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Extracts the filename from a file path and makes it SQL-safe.
