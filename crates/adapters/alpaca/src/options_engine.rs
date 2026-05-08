@@ -1023,7 +1023,7 @@ async fn manage_existing_entries(
                 entry.underlying,
                 entry.strategy,
                 -close_quote.debit,
-                entry.debit.unwrap_or_default(),
+                entry.entry_debit().unwrap_or_default(),
                 close_reason.as_deref().unwrap_or("none"),
             );
         } else {
@@ -1383,7 +1383,7 @@ fn debit_spread_close_reason(
     if config.force_flatten {
         return Some("manual_flatten".to_string());
     }
-    let entry_debit = entry.debit?;
+    let entry_debit = entry.entry_debit()?;
     if close_credit >= entry_debit * (1.0 + config.profit_target_close_fraction.max(0.0)) {
         return Some("profit_target".to_string());
     }
@@ -1424,9 +1424,9 @@ fn emit_management_snapshot(
             let close_credit = -close_quote.debit;
             (
                 "debit",
-                entry.debit,
+                entry.entry_debit(),
                 Some(close_credit),
-                entry.debit.map(|debit| close_credit - debit),
+                entry.entry_debit().map(|debit| close_credit - debit),
             )
         } else {
             (
@@ -1727,6 +1727,25 @@ mod tests {
         assert!((cushioned.short_ask - 0.72).abs() < 1e-9);
         assert!((cushioned.long_bid - 0.20).abs() < 1e-9);
         assert!((cushioned.debit - 0.52).abs() < 1e-9);
+    }
+
+    #[test]
+    fn close_quote_cushion_splits_across_iron_condor_short_legs() {
+        let quote = CloseQuote {
+            short_ask: 0.70,
+            long_bid: 0.20,
+            short_call_ask: Some(0.80),
+            long_call_bid: Some(0.30),
+            debit: 1.00,
+        };
+
+        let cushioned = quote.with_price_cushion(0.04);
+
+        assert!((cushioned.short_ask - 0.72).abs() < 1e-9);
+        assert!((cushioned.long_bid - 0.20).abs() < 1e-9);
+        assert!((cushioned.short_call_ask.unwrap() - 0.82).abs() < 1e-9);
+        assert!((cushioned.long_call_bid.unwrap() - 0.30).abs() < 1e-9);
+        assert!((cushioned.debit - 1.04).abs() < 1e-9);
     }
 
     #[test]

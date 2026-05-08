@@ -369,7 +369,15 @@ impl StrategyStateEntry {
     /// Returns `true` when this entry stores a long-premium debit spread.
     #[must_use]
     pub fn is_debit_spread(&self) -> bool {
-        self.debit.is_some() || self.strategy.contains("_debit_")
+        self.debit.is_some() || is_debit_strategy_name(&self.strategy)
+    }
+
+    /// Returns the entry debit for long-premium spreads.
+    #[must_use]
+    pub fn entry_debit(&self) -> Option<f64> {
+        self.debit.or_else(|| {
+            (is_debit_strategy_name(&self.strategy) && self.credit < 0.0).then_some(-self.credit)
+        })
     }
 
     /// Returns `true` when this entry can be exempted from one same-day replacement limit.
@@ -538,6 +546,12 @@ fn default_quantity() -> u64 {
     1
 }
 
+fn is_debit_strategy_name(strategy: &str) -> bool {
+    matches!(strategy, "call_debit" | "put_debit")
+        || strategy.contains("_debit_")
+        || strategy.ends_with("_debit")
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -689,6 +703,15 @@ mod tests {
 
         assert_eq!(state.risk_counted_daily_submits("2026-05-04"), 1);
         assert!(state.has_risk_counted_submitted_underlying_today("2026-05-04", "SLV"));
+    }
+
+    #[test]
+    fn debit_strategy_name_recovers_legacy_negative_credit_entry_debit() {
+        let mut entry = debit_state_entry("open-list-1");
+        entry.debit = None;
+
+        assert!(entry.is_debit_spread());
+        assert_eq!(entry.entry_debit(), Some(0.88));
     }
 
     #[test]

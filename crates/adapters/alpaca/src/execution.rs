@@ -2881,6 +2881,38 @@ mod tests {
 
     #[cfg(feature = "live")]
     #[test]
+    fn build_mleg_payload_from_order_list_supports_four_leg_iron_condor_close() {
+        let orders = vec![
+            mleg_limit_order("O-1", "SPY260508P00500000", OrderSide::Buy, 1.20, true),
+            mleg_limit_order("O-2", "SPY260508P00495000", OrderSide::Sell, 0.30, true),
+            mleg_limit_order("O-3", "SPY260508C00520000", OrderSide::Buy, 1.40, true),
+            mleg_limit_order("O-4", "SPY260508C00525000", OrderSide::Sell, 0.40, true),
+        ];
+        let cmd = submit_order_list_for_orders("OL-IC-CLOSE-1", &orders);
+
+        let payload = build_mleg_payload_from_order_list(&cmd, &orders).unwrap();
+
+        assert_eq!(payload.client_order_id.as_deref(), Some("OL-IC-CLOSE-1"));
+        assert_eq!(payload.qty, "1");
+        assert_eq!(payload.limit_price, "1.90");
+        assert_eq!(payload.legs.len(), 4);
+        assert_eq!(
+            payload
+                .legs
+                .iter()
+                .map(|leg| leg.position_intent)
+                .collect::<Vec<_>>(),
+            vec![
+                AlpacaPositionIntent::BuyToClose,
+                AlpacaPositionIntent::SellToClose,
+                AlpacaPositionIntent::BuyToClose,
+                AlpacaPositionIntent::SellToClose,
+            ]
+        );
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
     fn replace_order_request_from_modify_order_prefers_alpaca_net_limit_param() {
         let mut params = Params::new();
         params.insert("alpaca_limit_price".to_string(), json!("-0.45"));

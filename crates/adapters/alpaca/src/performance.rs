@@ -893,7 +893,7 @@ fn open_unrealized_pnl(entry: &StrategyStateEntry, positions: &[AlpacaPosition])
 
 fn quoted_entry_premium(entry: &StrategyStateEntry) -> Option<f64> {
     if entry.is_debit_spread() {
-        entry.debit.map(|debit| -debit)
+        entry.entry_debit().map(|debit| -debit)
     } else {
         Some(entry.credit)
     }
@@ -973,6 +973,100 @@ mod tests {
         assert_close(performance.open.cashflow.unwrap(), 40.0);
         assert_close(performance.close.cashflow.unwrap(), -90.0);
         assert_close(performance.realized_pnl.unwrap(), -50.0);
+        assert!(performance.warnings.is_empty());
+    }
+
+    #[test]
+    fn entry_performance_reconstructs_closed_iron_condor_pnl() {
+        let entry = iron_condor_state_entry();
+        let order_ids = EntryOrderIds {
+            open: BTreeSet::from([
+                "open-short-put".to_string(),
+                "open-long-put".to_string(),
+                "open-short-call".to_string(),
+                "open-long-call".to_string(),
+            ]),
+            close: BTreeSet::from([
+                "close-short-put".to_string(),
+                "close-long-put".to_string(),
+                "close-short-call".to_string(),
+                "close-long-call".to_string(),
+            ]),
+        };
+        let activities = vec![
+            activity(
+                "FILL",
+                "open-short-put",
+                "GLD260515P00410000",
+                "sell",
+                "1",
+                "0.55",
+            ),
+            activity(
+                "FILL",
+                "open-long-put",
+                "GLD260515P00405000",
+                "buy",
+                "1",
+                "0.18",
+            ),
+            activity(
+                "FILL",
+                "open-short-call",
+                "GLD260515C00430000",
+                "sell",
+                "1",
+                "2.21",
+            ),
+            activity(
+                "FILL",
+                "open-long-call",
+                "GLD260515C00435000",
+                "buy",
+                "1",
+                "0.64",
+            ),
+            activity(
+                "FILL",
+                "close-short-put",
+                "GLD260515P00410000",
+                "buy",
+                "1",
+                "0.07",
+            ),
+            activity(
+                "FILL",
+                "close-long-put",
+                "GLD260515P00405000",
+                "sell",
+                "1",
+                "0.02",
+            ),
+            activity(
+                "FILL",
+                "close-short-call",
+                "GLD260515C00430000",
+                "buy",
+                "1",
+                "4.76",
+            ),
+            activity(
+                "FILL",
+                "close-long-call",
+                "GLD260515C00435000",
+                "sell",
+                "1",
+                "0.94",
+            ),
+        ];
+
+        let performance = entry_performance(&entry, &order_ids, &activities, &[]);
+
+        assert_close(performance.open.cashflow.unwrap(), 194.0);
+        assert_close(performance.close.cashflow.unwrap(), -387.0);
+        assert_close(performance.realized_pnl.unwrap(), -193.0);
+        assert_eq!(performance.quoted_entry_premium, Some(1.94));
+        assert_eq!(performance.quoted_entry_cashflow, Some(194.0));
         assert!(performance.warnings.is_empty());
     }
 
@@ -1106,6 +1200,34 @@ mod tests {
             closed: true,
             recorded_at_utc: "2026-05-07T14:00:00Z".to_string(),
             closed_at_utc: Some("2026-05-08T14:02:00Z".to_string()),
+        }
+    }
+
+    fn iron_condor_state_entry() -> StrategyStateEntry {
+        StrategyStateEntry {
+            trade_date: "2026-05-05".to_string(),
+            underlying: "GLD".to_string(),
+            strategy: "iron_condor".to_string(),
+            order_list_id: "entry-list".to_string(),
+            short_symbol: "GLD260515P00410000".to_string(),
+            long_symbol: "GLD260515P00405000".to_string(),
+            short_call_symbol: Some("GLD260515C00430000".to_string()),
+            long_call_symbol: Some("GLD260515C00435000".to_string()),
+            quantity: 1,
+            credit: 1.94,
+            debit: None,
+            score: 70.4,
+            parent_order_id: Some("open-parent".to_string()),
+            close_order_list_id: Some("close-list".to_string()),
+            close_parent_order_id: Some("close-parent".to_string()),
+            close_reason: Some("stop_loss".to_string()),
+            close_attempts: 1,
+            last_close_submitted_at_utc: Some("2026-05-08T13:31:00Z".to_string()),
+            submitted: true,
+            canceled: false,
+            closed: true,
+            recorded_at_utc: "2026-05-05T15:56:44Z".to_string(),
+            closed_at_utc: Some("2026-05-08T13:36:49Z".to_string()),
         }
     }
 
