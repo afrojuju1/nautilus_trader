@@ -27,6 +27,7 @@ use crate::{
 
 /// Python scanner configuration for put credit spreads.
 #[derive(Clone, Debug)]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.alpaca")]
 #[pyclass(module = "nautilus_trader.core.nautilus_pyo3.alpaca", from_py_object)]
 pub struct AlpacaPutCreditScannerConfig {
     /// Minimum days to expiration.
@@ -58,21 +59,7 @@ pub struct AlpacaPutCreditScannerConfig {
     pub min_credit_to_width: f64,
 }
 
-#[pymethods]
 impl AlpacaPutCreditScannerConfig {
-    /// Creates a scanner configuration.
-    #[new]
-    #[pyo3(signature = (
-        min_dte = 5,
-        max_dte = 10,
-        short_delta_min = 0.18,
-        short_delta_max = 0.28,
-        widths = None,
-        min_open_interest = 200,
-        max_leg_spread_pct = 0.15,
-        min_return_on_risk = 0.13,
-        min_credit_to_width = 0.08,
-    ))]
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         min_dte: i64,
@@ -99,6 +86,48 @@ impl AlpacaPutCreditScannerConfig {
     }
 }
 
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl AlpacaPutCreditScannerConfig {
+    /// Creates a scanner configuration.
+    #[new]
+    #[pyo3(signature = (
+        min_dte = 5,
+        max_dte = 10,
+        short_delta_min = 0.18,
+        short_delta_max = 0.28,
+        widths = None,
+        min_open_interest = 200,
+        max_leg_spread_pct = 0.15,
+        min_return_on_risk = 0.13,
+        min_credit_to_width = 0.08,
+    ))]
+    #[expect(clippy::too_many_arguments)]
+    fn py_new(
+        min_dte: i64,
+        max_dte: i64,
+        short_delta_min: f64,
+        short_delta_max: f64,
+        widths: Option<Vec<f64>>,
+        min_open_interest: u64,
+        max_leg_spread_pct: f64,
+        min_return_on_risk: f64,
+        min_credit_to_width: f64,
+    ) -> Self {
+        Self::new(
+            min_dte,
+            max_dte,
+            short_delta_min,
+            short_delta_max,
+            widths,
+            min_open_interest,
+            max_leg_spread_pct,
+            min_return_on_risk,
+            min_credit_to_width,
+        )
+    }
+}
+
 impl From<AlpacaPutCreditScannerConfig> for PutCreditScannerConfig {
     fn from(value: AlpacaPutCreditScannerConfig) -> Self {
         Self {
@@ -117,6 +146,7 @@ impl From<AlpacaPutCreditScannerConfig> for PutCreditScannerConfig {
 
 /// Python representation of a spread candidate.
 #[derive(Clone, Debug)]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.alpaca")]
 #[pyclass(
     module = "nautilus_trader.core.nautilus_pyo3.alpaca",
     skip_from_py_object
@@ -173,6 +203,7 @@ impl From<SpreadCandidate> for AlpacaPutCreditCandidate {
 
 /// Python representation of a put credit scan result.
 #[derive(Clone, Debug)]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.alpaca")]
 #[pyclass(
     module = "nautilus_trader.core.nautilus_pyo3.alpaca",
     skip_from_py_object
@@ -211,6 +242,7 @@ impl From<PutCreditScanResult> for AlpacaPutCreditScanResult {
 ///
 /// This binding is synchronous because Nautilus strategy callbacks are synchronous today.
 #[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.alpaca")]
 #[pyo3(name = "scan_put_credit_once", signature = (underlyings, config=None))]
 pub fn scan_put_credit_once(
     py: Python<'_>,

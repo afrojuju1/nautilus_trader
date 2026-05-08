@@ -73,7 +73,7 @@ for official NautilusTrader documentation.
 - [x] Document the PyO3 scanner/runtime bindings that are intentionally public.
 - [x] Document config objects and clearly mark fields that are engine-specific rather than generic
       adapter configuration.
-- [ ] Confirm generated stubs include the Alpaca module as intended.
+- [x] Confirm generated stubs include the Alpaca module as intended.
 - [x] Run the docs build after adding the API page.
 
 ## Python adapter completion
@@ -185,7 +185,7 @@ for official NautilusTrader documentation.
 ## Packaging and release readiness
 
 - [ ] Confirm Alpaca Python modules are included in built wheels.
-- [ ] Confirm the `nautilus_pyo3.alpaca` module is intentionally exposed.
+- [x] Confirm the `nautilus_pyo3.alpaca` module is intentionally exposed.
 - [ ] Confirm docs references do not create broken links.
 - [x] Confirm examples do not require real credentials unless explicitly marked.
 - [x] Confirm secrets guidance is present and no real credentials are committed.

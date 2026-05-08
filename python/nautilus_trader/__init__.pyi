@@ -2,6 +2,7 @@
 # ruff: noqa: F401
 
 from . import _libnautilus
+from . import alpaca
 from . import analysis
 from . import architect_ax
 from . import backtest
@@ -37,6 +38,7 @@ from . import testkit
 from . import trading
 
 __all__ = [
+    "alpaca",
     "analysis",
     "architect_ax",
     "backtest",
