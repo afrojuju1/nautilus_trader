@@ -39,6 +39,37 @@ pub struct StrategyState {
     pub entries: Vec<StrategyStateEntry>,
 }
 
+/// Draft for one newly submitted strategy-state entry.
+#[derive(Clone, Debug)]
+pub struct StrategyStateEntryDraft {
+    /// Market trade date for the entry.
+    pub trade_date: String,
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Strategy name.
+    pub strategy: String,
+    /// Entry order-list/client ID.
+    pub order_list_id: String,
+    /// Primary short option symbol.
+    pub short_symbol: String,
+    /// Primary long option symbol, if any.
+    pub long_symbol: String,
+    /// Short call symbol for four-leg entries.
+    pub short_call_symbol: Option<String>,
+    /// Long call symbol for four-leg entries.
+    pub long_call_symbol: Option<String>,
+    /// Strategy quantity.
+    pub quantity: u64,
+    /// Entry credit. Debits are stored as a negative credit for legacy state readers.
+    pub credit: f64,
+    /// Entry debit for long-premium strategies.
+    pub debit: Option<f64>,
+    /// Scanner score at entry.
+    pub score: f64,
+    /// Broker parent order ID.
+    pub parent_order_id: Option<String>,
+}
+
 impl StrategyState {
     /// Returns `true` when a live entry already exists for a trade date and underlying.
     #[must_use]
@@ -128,7 +159,7 @@ impl StrategyState {
         candidate: &SpreadCandidate,
         parent_order_id: Option<String>,
     ) {
-        self.entries.push(StrategyStateEntry {
+        self.record_entry_submission(StrategyStateEntryDraft {
             trade_date,
             underlying,
             strategy: credit_spread_strategy_name(kind).to_string(),
@@ -142,16 +173,6 @@ impl StrategyState {
             debit: None,
             score: candidate.score,
             parent_order_id,
-            close_order_list_id: None,
-            close_parent_order_id: None,
-            close_reason: None,
-            close_attempts: 0,
-            last_close_submitted_at_utc: None,
-            submitted: true,
-            canceled: false,
-            closed: false,
-            recorded_at_utc: Utc::now().to_rfc3339(),
-            closed_at_utc: None,
         });
     }
 
@@ -165,7 +186,7 @@ impl StrategyState {
         candidate: &IronCondorCandidate,
         parent_order_id: Option<String>,
     ) {
-        self.entries.push(StrategyStateEntry {
+        self.record_entry_submission(StrategyStateEntryDraft {
             trade_date,
             underlying,
             strategy: "iron_condor".to_string(),
@@ -179,16 +200,6 @@ impl StrategyState {
             debit: None,
             score: candidate.score,
             parent_order_id,
-            close_order_list_id: None,
-            close_parent_order_id: None,
-            close_reason: None,
-            close_attempts: 0,
-            last_close_submitted_at_utc: None,
-            submitted: true,
-            canceled: false,
-            closed: false,
-            recorded_at_utc: Utc::now().to_rfc3339(),
-            closed_at_utc: None,
         });
     }
 
@@ -203,7 +214,7 @@ impl StrategyState {
         candidate: &DebitSpreadCandidate,
         parent_order_id: Option<String>,
     ) {
-        self.entries.push(StrategyStateEntry {
+        self.record_entry_submission(StrategyStateEntryDraft {
             trade_date,
             underlying,
             strategy: debit_spread_strategy_name(kind).to_string(),
@@ -217,16 +228,6 @@ impl StrategyState {
             debit: Some(candidate.debit),
             score: candidate.score,
             parent_order_id,
-            close_order_list_id: None,
-            close_parent_order_id: None,
-            close_reason: None,
-            close_attempts: 0,
-            last_close_submitted_at_utc: None,
-            submitted: true,
-            canceled: false,
-            closed: false,
-            recorded_at_utc: Utc::now().to_rfc3339(),
-            closed_at_utc: None,
         });
     }
 
@@ -241,7 +242,7 @@ impl StrategyState {
         candidate: &NakedOptionCandidate,
         parent_order_id: Option<String>,
     ) {
-        self.entries.push(StrategyStateEntry {
+        self.record_entry_submission(StrategyStateEntryDraft {
             trade_date,
             underlying,
             strategy: naked_option_strategy_name(kind).to_string(),
@@ -255,6 +256,25 @@ impl StrategyState {
             debit: None,
             score: candidate.score,
             parent_order_id,
+        });
+    }
+
+    /// Appends one submitted entry draft to the state.
+    pub fn record_entry_submission(&mut self, draft: StrategyStateEntryDraft) {
+        self.entries.push(StrategyStateEntry {
+            trade_date: draft.trade_date,
+            underlying: draft.underlying,
+            strategy: draft.strategy,
+            order_list_id: draft.order_list_id,
+            short_symbol: draft.short_symbol,
+            long_symbol: draft.long_symbol,
+            short_call_symbol: draft.short_call_symbol,
+            long_call_symbol: draft.long_call_symbol,
+            quantity: draft.quantity,
+            credit: draft.credit,
+            debit: draft.debit,
+            score: draft.score,
+            parent_order_id: draft.parent_order_id,
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,

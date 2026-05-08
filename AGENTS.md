@@ -7,6 +7,7 @@
 - Do not commit or push unless the user explicitly asks.
 - Do not rewrite published fork history unless the user explicitly asks for a force-push workflow.
 - Prefer non-destructive Git operations. Do not use `git reset --hard`, `git checkout --`, or branch deletion as part of normal sync work.
+- Do not add the long Nautech copyright/license banner block to new or edited files unless the user explicitly asks for it.
 
 ## Upstream Sync
 

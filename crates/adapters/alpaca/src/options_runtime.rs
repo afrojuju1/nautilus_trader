@@ -429,6 +429,43 @@ impl SelectedOptionsEntry {
         }
     }
 
+    /// Returns the stable strategy name.
+    #[must_use]
+    pub fn strategy_name(&self) -> &'static str {
+        match self {
+            Self::Credit(entry) => credit_spread_strategy_name(entry.kind),
+            Self::IronCondor(_) => "iron_condor",
+            Self::Debit(entry) => debit_spread_strategy_name(entry.kind),
+            Self::NakedOption(entry) => naked_option_strategy_name(entry.kind),
+        }
+    }
+
+    /// Returns whether the selected entry is a single-leg naked option.
+    #[must_use]
+    pub fn is_naked_option(&self) -> bool {
+        matches!(self, Self::NakedOption(_))
+    }
+
+    /// Returns the entry premium kind.
+    #[must_use]
+    pub fn entry_premium_kind(&self) -> &'static str {
+        match self {
+            Self::Debit(_) => "debit",
+            _ => "credit",
+        }
+    }
+
+    /// Returns the entry premium per spread or option.
+    #[must_use]
+    pub fn entry_premium(&self) -> f64 {
+        match self {
+            Self::Credit(entry) => entry.candidate.credit,
+            Self::IronCondor(entry) => entry.candidate.credit,
+            Self::Debit(entry) => entry.candidate.debit,
+            Self::NakedOption(entry) => entry.candidate.credit,
+        }
+    }
+
     /// Returns the candidate option symbols.
     #[must_use]
     pub fn option_symbols(&self) -> Vec<&str> {

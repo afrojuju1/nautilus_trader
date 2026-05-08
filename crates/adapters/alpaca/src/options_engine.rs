@@ -51,14 +51,11 @@ use crate::{
         default_performance_ledger_dir, entry_performance,
     },
     runtime::{
-        StrategyState, StrategyStateEntry, credit_spread_strategy_name, debit_spread_strategy_name,
-        emit_operator_event, load_strategy_state, naked_option_strategy_name,
-        save_strategy_state_atomic,
+        StrategyState, StrategyStateEntry, StrategyStateEntryDraft, credit_spread_strategy_name,
+        debit_spread_strategy_name, emit_operator_event, load_strategy_state,
+        naked_option_strategy_name, save_strategy_state_atomic,
     },
-    strategy::{
-        CreditSpreadKind, DebitSpreadCandidate, IronCondorCandidate, NakedOptionCandidate,
-        annualized_premium_yield,
-    },
+    strategy::{CreditSpreadKind, DebitSpreadCandidate, IronCondorCandidate, NakedOptionCandidate},
     submit::{
         MlegSubmitLeg, MlegSubmitOrderListRequest, SimpleSubmitOrderRequest,
         build_mleg_submit_order_list, build_simple_submit_order,
@@ -139,46 +136,35 @@ pub enum StrategyDecision {
         /// Additional diagnostic details.
         details: Vec<String>,
     },
-    /// Candidate was found, but submission is disabled.
-    DryRun {
-        /// Selected entry candidate.
-        entry: SelectedEntry,
+    /// Candidate was selected for either broker submission or dry-run recording.
+    Selected {
+        /// Selected strategy candidate.
+        entry: SelectedOptionsEntry,
+        /// Entry action mode.
+        mode: EntryMode,
     },
-    /// Iron-condor candidate was found, but submission is disabled.
-    DryRunIronCondor {
-        /// Selected iron-condor candidate.
-        entry: SelectedIronCondorEntry,
-    },
-    /// Debit-spread candidate was found, but submission is disabled.
-    DryRunDebit {
-        /// Selected debit-spread candidate.
-        entry: SelectedDebitEntry,
-    },
-    /// Naked-option candidate was found, but submission is disabled.
-    DryRunNakedOption {
-        /// Selected naked-option candidate.
-        entry: SelectedNakedOptionEntry,
-    },
-    /// Submit an opening broker-native MLeg order list.
-    SubmitOpen {
-        /// Selected entry candidate.
-        entry: SelectedEntry,
-    },
-    /// Submit an opening broker-native iron-condor MLeg order list.
-    SubmitIronCondorOpen {
-        /// Selected iron-condor candidate.
-        entry: SelectedIronCondorEntry,
-    },
-    /// Submit an opening long-premium debit spread broker-native MLeg order list.
-    SubmitDebitOpen {
-        /// Selected debit-spread candidate.
-        entry: SelectedDebitEntry,
-    },
-    /// Submit an opening broker-native naked-option simple order.
-    SubmitNakedOptionOpen {
-        /// Selected naked-option candidate.
-        entry: SelectedNakedOptionEntry,
-    },
+}
+
+/// Action mode for a selected entry candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryMode {
+    /// Submit the entry to the broker.
+    Submit,
+    /// Record the candidate without broker submission.
+    DryRun,
+}
+
+impl EntryMode {
+    fn action(self) -> &'static str {
+        match self {
+            Self::Submit => "submit",
+            Self::DryRun => "dry_run",
+        }
+    }
+
+    fn is_submit(self) -> bool {
+        self == Self::Submit
+    }
 }
 
 /// Account-engine context passed to hosted strategies for one iteration.
@@ -315,23 +301,14 @@ fn selected_strategy_decision(
     config: &OptionsEngineConfig,
     selected: SelectedOptionsEntry,
 ) -> StrategyDecision {
-    match selected {
-        SelectedOptionsEntry::Credit(entry) if config.credit_submit_enabled(entry.kind) => {
-            StrategyDecision::SubmitOpen { entry }
-        }
-        SelectedOptionsEntry::Credit(entry) => StrategyDecision::DryRun { entry },
-        SelectedOptionsEntry::IronCondor(entry) if config.iron_condor_submit_enabled() => {
-            StrategyDecision::SubmitIronCondorOpen { entry }
-        }
-        SelectedOptionsEntry::IronCondor(entry) => StrategyDecision::DryRunIronCondor { entry },
-        SelectedOptionsEntry::Debit(entry) if config.debit_submit_enabled(entry.kind) => {
-            StrategyDecision::SubmitDebitOpen { entry }
-        }
-        SelectedOptionsEntry::Debit(entry) => StrategyDecision::DryRunDebit { entry },
-        SelectedOptionsEntry::NakedOption(entry) if config.naked_submit_enabled(entry.kind) => {
-            StrategyDecision::SubmitNakedOptionOpen { entry }
-        }
-        SelectedOptionsEntry::NakedOption(entry) => StrategyDecision::DryRunNakedOption { entry },
+    let mode = if selected_submit_enabled(config, &selected) {
+        EntryMode::Submit
+    } else {
+        EntryMode::DryRun
+    };
+    StrategyDecision::Selected {
+        entry: selected,
+        mode,
     }
 }
 
@@ -1000,569 +977,8 @@ async fn apply_strategy_decision(
             );
             Ok(false)
         }
-        StrategyDecision::SubmitOpen { entry } => {
-            let order_list_id = order_list_id(trade_date, &entry.underlying);
-            let (candidate_identity_key, candidate_alert_payload) =
-                selected_credit_alert_payload(&entry, trade_date, "submit", Some(&order_list_id));
-            println!(
-                "decision: submit underlying={} short={} long={} credit={:.2} ror={:.1}% score={:.1} order_list_id={}",
-                entry.underlying,
-                entry.candidate.short.symbol,
-                entry.candidate.long.symbol,
-                entry.candidate.credit,
-                entry.candidate.return_on_risk * 100.0,
-                entry.candidate.score,
-                order_list_id,
-            );
-            record_decision_event(
-                config,
-                trade_date,
-                json!({
-                    "action": "submit",
-                    "underlying": &entry.underlying,
-                    "strategy": strategy_name(entry.kind),
-                    "short_symbol": &entry.candidate.short.symbol,
-                    "long_symbol": &entry.candidate.long.symbol,
-                    "credit": entry.candidate.credit,
-                    "return_on_risk": entry.candidate.return_on_risk,
-                    "score": entry.candidate.score,
-                    "order_list_id": &order_list_id,
-                    "trade_date": trade_date,
-                }),
-            );
-            record_selected_candidate_alert(
-                config,
-                trade_date,
-                &candidate_identity_key,
-                candidate_alert_payload.clone(),
-            );
-            let outcome = submit_entry(&entry, &order_list_id, config.quantity, config).await?;
-            if outcome.accepted > 0 {
-                state.record_submission(
-                    trade_date.to_string(),
-                    entry.underlying,
-                    entry.kind,
-                    config.quantity,
-                    order_list_id,
-                    &entry.candidate,
-                    outcome.parent_order_id.clone(),
-                );
-            }
-            println!(
-                "submit_result: accepted={} rejected={}",
-                outcome.accepted, outcome.rejected
-            );
-            record_submit_result_event(
-                config,
-                trade_date,
-                json!({
-                    "accepted": outcome.accepted,
-                    "rejected": outcome.rejected,
-                    "parent_order_id": outcome.parent_order_id.clone(),
-                }),
-            );
-            if outcome.rejected > 0 {
-                record_submit_rejected_candidate_alert(
-                    config,
-                    trade_date,
-                    &candidate_identity_key,
-                    candidate_alert_payload,
-                    &outcome,
-                    None,
-                );
-            }
-            Ok(outcome.accepted > 0)
-        }
-        StrategyDecision::SubmitIronCondorOpen { entry } => {
-            let order_list_id = order_list_id(trade_date, &entry.underlying);
-            let (candidate_identity_key, candidate_alert_payload) =
-                selected_iron_condor_alert_payload(
-                    &entry,
-                    trade_date,
-                    "submit",
-                    Some(&order_list_id),
-                );
-            println!(
-                "decision: submit underlying={} short_put={} long_put={} short_call={} long_call={} credit={:.2} ror={:.1}% score={:.1} order_list_id={}",
-                entry.underlying,
-                entry.candidate.put.short.symbol,
-                entry.candidate.put.long.symbol,
-                entry.candidate.call.short.symbol,
-                entry.candidate.call.long.symbol,
-                entry.candidate.credit,
-                entry.candidate.return_on_risk * 100.0,
-                entry.candidate.score,
-                order_list_id,
-            );
-            record_decision_event(
-                config,
-                trade_date,
-                json!({
-                    "action": "submit",
-                    "underlying": &entry.underlying,
-                    "strategy": "iron_condor",
-                    "short_put_symbol": &entry.candidate.put.short.symbol,
-                    "long_put_symbol": &entry.candidate.put.long.symbol,
-                    "short_call_symbol": &entry.candidate.call.short.symbol,
-                    "long_call_symbol": &entry.candidate.call.long.symbol,
-                    "credit": entry.candidate.credit,
-                    "return_on_risk": entry.candidate.return_on_risk,
-                    "score": entry.candidate.score,
-                    "order_list_id": &order_list_id,
-                    "trade_date": trade_date,
-                }),
-            );
-            record_selected_candidate_alert(
-                config,
-                trade_date,
-                &candidate_identity_key,
-                candidate_alert_payload.clone(),
-            );
-            let outcome =
-                submit_iron_condor_entry(&entry, &order_list_id, config.quantity, config).await?;
-            if outcome.accepted > 0 {
-                state.record_iron_condor_submission(
-                    trade_date.to_string(),
-                    entry.underlying,
-                    config.quantity,
-                    order_list_id,
-                    &entry.candidate,
-                    outcome.parent_order_id.clone(),
-                );
-            }
-            println!(
-                "submit_result: accepted={} rejected={}",
-                outcome.accepted, outcome.rejected
-            );
-            record_submit_result_event(
-                config,
-                trade_date,
-                json!({
-                    "accepted": outcome.accepted,
-                    "rejected": outcome.rejected,
-                    "parent_order_id": outcome.parent_order_id.clone(),
-                }),
-            );
-            if outcome.rejected > 0 {
-                record_submit_rejected_candidate_alert(
-                    config,
-                    trade_date,
-                    &candidate_identity_key,
-                    candidate_alert_payload,
-                    &outcome,
-                    None,
-                );
-            }
-            Ok(outcome.accepted > 0)
-        }
-        StrategyDecision::SubmitDebitOpen { entry } => {
-            let order_list_id = order_list_id(trade_date, &entry.underlying);
-            let (candidate_identity_key, candidate_alert_payload) =
-                selected_debit_alert_payload(&entry, trade_date, "submit", Some(&order_list_id));
-            println!(
-                "decision: submit underlying={} long={} short={} debit={:.2} rtr={:.1}% score={:.1} order_list_id={}",
-                entry.underlying,
-                entry.candidate.long.symbol,
-                entry.candidate.short.symbol,
-                entry.candidate.debit,
-                entry.candidate.reward_to_risk * 100.0,
-                entry.candidate.score,
-                order_list_id,
-            );
-            record_decision_event(
-                config,
-                trade_date,
-                json!({
-                    "action": "submit",
-                    "underlying": &entry.underlying,
-                    "strategy": debit_spread_strategy_name(entry.kind),
-                    "long_symbol": &entry.candidate.long.symbol,
-                    "short_symbol": &entry.candidate.short.symbol,
-                    "debit": entry.candidate.debit,
-                    "reward_to_risk": entry.candidate.reward_to_risk,
-                    "score": entry.candidate.score,
-                    "order_list_id": &order_list_id,
-                    "trade_date": trade_date,
-                }),
-            );
-            record_selected_candidate_alert(
-                config,
-                trade_date,
-                &candidate_identity_key,
-                candidate_alert_payload.clone(),
-            );
-            let outcome =
-                submit_debit_entry(&entry, &order_list_id, config.quantity, config).await?;
-            if outcome.accepted > 0 {
-                state.record_debit_submission(
-                    trade_date.to_string(),
-                    entry.underlying,
-                    entry.kind,
-                    config.quantity,
-                    order_list_id,
-                    &entry.candidate,
-                    outcome.parent_order_id.clone(),
-                );
-            }
-            println!(
-                "submit_result: accepted={} rejected={}",
-                outcome.accepted, outcome.rejected
-            );
-            record_submit_result_event(
-                config,
-                trade_date,
-                json!({
-                    "accepted": outcome.accepted,
-                    "rejected": outcome.rejected,
-                    "parent_order_id": outcome.parent_order_id.clone(),
-                }),
-            );
-            if outcome.rejected > 0 {
-                record_submit_rejected_candidate_alert(
-                    config,
-                    trade_date,
-                    &candidate_identity_key,
-                    candidate_alert_payload,
-                    &outcome,
-                    None,
-                );
-            }
-            Ok(outcome.accepted > 0)
-        }
-        StrategyDecision::SubmitNakedOptionOpen { entry } => {
-            let order_list_id = order_list_id(trade_date, &entry.underlying);
-            let (candidate_identity_key, candidate_alert_payload) =
-                selected_naked_alert_payload(&entry, trade_date, "submit", Some(&order_list_id));
-            let metrics = entry.candidate.short.metrics.as_ref();
-            if let Some(metrics) = metrics {
-                println!(
-                    "decision: submit underlying={} short={} credit={:.2} delta={:.2} pop={:.1}% touch={:.1}% be_dist={:.1}% em_cov={:.2} bpr=${:.0} bp_use={} rbp={:.3}% score={:.1} order_list_id={}",
-                    entry.underlying,
-                    entry.candidate.short.symbol,
-                    entry.candidate.credit,
-                    entry.candidate.short.delta_abs,
-                    metrics.breakeven_pop * 100.0,
-                    metrics.probability_of_touch_est * 100.0,
-                    metrics.distance_to_breakeven_pct * 100.0,
-                    metrics.expected_move_coverage,
-                    entry.candidate.estimated_buying_power_requirement,
-                    format_optional_pct(entry.candidate.buying_power_usage_pct),
-                    entry.candidate.return_on_buying_power * 100.0,
-                    entry.candidate.score,
-                    order_list_id,
-                );
-            } else {
-                println!(
-                    "decision: submit underlying={} short={} credit={:.2} delta={:.2} bpr=${:.0} bp_use={} rbp={:.3}% score={:.1} order_list_id={}",
-                    entry.underlying,
-                    entry.candidate.short.symbol,
-                    entry.candidate.credit,
-                    entry.candidate.short.delta_abs,
-                    entry.candidate.estimated_buying_power_requirement,
-                    format_optional_pct(entry.candidate.buying_power_usage_pct),
-                    entry.candidate.return_on_buying_power * 100.0,
-                    entry.candidate.score,
-                    order_list_id,
-                );
-            }
-            record_decision_event(
-                config,
-                trade_date,
-                json!({
-                    "action": "submit",
-                    "underlying": &entry.underlying,
-                    "strategy": naked_option_strategy_name(entry.kind),
-                    "short_symbol": &entry.candidate.short.symbol,
-                    "credit": entry.candidate.credit,
-                    "delta_abs": entry.candidate.short.delta_abs,
-                    "dte": entry.candidate.short.dte,
-                    "strike": entry.candidate.short.strike,
-                    "spread_pct": entry.candidate.short.spread_pct,
-                    "bid_size": entry.candidate.short.bid_size,
-                    "ask_size": entry.candidate.short.ask_size,
-                    "volume": entry.candidate.short.volume,
-                    "open_interest": entry.candidate.short.open_interest,
-                    "implied_volatility": entry.candidate.short.implied_volatility,
-                    "capital_requirement_model": entry.candidate.capital_requirement_model.as_str(),
-                    "estimated_buying_power_requirement": entry.candidate.estimated_buying_power_requirement,
-                    "buying_power_usage_pct": entry.candidate.buying_power_usage_pct,
-                    "return_on_buying_power": entry.candidate.return_on_buying_power,
-                    "annualized_premium_yield": annualized_premium_yield(
-                        entry.candidate.credit,
-                        entry.candidate.short.strike,
-                        entry.candidate.short.dte,
-                    ),
-                    "underlying_price": metrics.map(|metrics| metrics.underlying_price),
-                    "breakeven": metrics.map(|metrics| metrics.breakeven),
-                    "strike_itm_probability": metrics.map(|metrics| metrics.strike_itm_probability),
-                    "delta_pop_proxy": metrics.map(|metrics| metrics.delta_pop_proxy),
-                    "breakeven_pop": metrics.map(|metrics| metrics.breakeven_pop),
-                    "probability_of_touch_est": metrics.map(|metrics| metrics.probability_of_touch_est),
-                    "expected_move": metrics.map(|metrics| metrics.expected_move),
-                    "expected_move_pct": metrics.map(|metrics| metrics.expected_move_pct),
-                    "distance_to_strike_pct": metrics.map(|metrics| metrics.distance_to_strike_pct),
-                    "distance_to_breakeven_pct": metrics.map(|metrics| metrics.distance_to_breakeven_pct),
-                    "expected_move_coverage": metrics.map(|metrics| metrics.expected_move_coverage),
-                    "model_delta_abs": metrics.map(|metrics| metrics.model_delta_abs),
-                    "model_gamma": metrics.map(|metrics| metrics.model_gamma),
-                    "model_theta": metrics.map(|metrics| metrics.model_theta),
-                    "model_vega": metrics.map(|metrics| metrics.model_vega),
-                    "score": entry.candidate.score,
-                    "order_list_id": &order_list_id,
-                    "trade_date": trade_date,
-                }),
-            );
-            record_selected_candidate_alert(
-                config,
-                trade_date,
-                &candidate_identity_key,
-                candidate_alert_payload.clone(),
-            );
-            let outcome =
-                submit_naked_option_entry(&entry, &order_list_id, config.quantity, config).await?;
-            let terminal_rejection = outcome.accepted == 0 && outcome.rejected > 0;
-            if outcome.accepted > 0 || terminal_rejection {
-                state.record_naked_option_submission(
-                    trade_date.to_string(),
-                    entry.underlying.clone(),
-                    entry.kind,
-                    config.quantity,
-                    order_list_id,
-                    &entry.candidate,
-                    outcome.parent_order_id.clone(),
-                );
-                if terminal_rejection {
-                    if let Some(entry) = state.entries.last_mut() {
-                        entry.mark_canceled();
-                        entry.close_reason = Some("entry_rejected".to_string());
-                    }
-                }
-            }
-            println!(
-                "submit_result: accepted={} rejected={}",
-                outcome.accepted, outcome.rejected
-            );
-            record_submit_result_event(
-                config,
-                trade_date,
-                json!({
-                    "accepted": outcome.accepted,
-                    "rejected": outcome.rejected,
-                    "parent_order_id": outcome.parent_order_id.clone(),
-                    "terminal_rejection_recorded": terminal_rejection,
-                }),
-            );
-            if outcome.rejected > 0 {
-                record_submit_rejected_candidate_alert(
-                    config,
-                    trade_date,
-                    &candidate_identity_key,
-                    candidate_alert_payload,
-                    &outcome,
-                    Some(terminal_rejection),
-                );
-            }
-            Ok(outcome.accepted > 0 || terminal_rejection)
-        }
-        StrategyDecision::DryRun { entry } => {
-            let (candidate_identity_key, candidate_alert_payload) =
-                selected_credit_alert_payload(&entry, trade_date, "dry_run", None);
-            println!(
-                "decision: dry_run underlying={} short={} long={} credit={:.2} ror={:.1}% score={:.1} reason=submission_disabled",
-                entry.underlying,
-                entry.candidate.short.symbol,
-                entry.candidate.long.symbol,
-                entry.candidate.credit,
-                entry.candidate.return_on_risk * 100.0,
-                entry.candidate.score,
-            );
-            record_decision_event(
-                config,
-                trade_date,
-                json!({
-                    "action": "dry_run",
-                    "reason": "submission_disabled",
-                    "underlying": &entry.underlying,
-                    "strategy": strategy_name(entry.kind),
-                    "short_symbol": &entry.candidate.short.symbol,
-                    "long_symbol": &entry.candidate.long.symbol,
-                    "credit": entry.candidate.credit,
-                    "return_on_risk": entry.candidate.return_on_risk,
-                    "score": entry.candidate.score,
-                    "trade_date": trade_date,
-                }),
-            );
-            record_selected_candidate_alert(
-                config,
-                trade_date,
-                &candidate_identity_key,
-                candidate_alert_payload,
-            );
-            Ok(false)
-        }
-        StrategyDecision::DryRunIronCondor { entry } => {
-            let (candidate_identity_key, candidate_alert_payload) =
-                selected_iron_condor_alert_payload(&entry, trade_date, "dry_run", None);
-            println!(
-                "decision: dry_run underlying={} short_put={} long_put={} short_call={} long_call={} credit={:.2} ror={:.1}% score={:.1} reason=submission_disabled",
-                entry.underlying,
-                entry.candidate.put.short.symbol,
-                entry.candidate.put.long.symbol,
-                entry.candidate.call.short.symbol,
-                entry.candidate.call.long.symbol,
-                entry.candidate.credit,
-                entry.candidate.return_on_risk * 100.0,
-                entry.candidate.score,
-            );
-            record_decision_event(
-                config,
-                trade_date,
-                json!({
-                    "action": "dry_run",
-                    "reason": "submission_disabled",
-                    "underlying": &entry.underlying,
-                    "strategy": "iron_condor",
-                    "short_put_symbol": &entry.candidate.put.short.symbol,
-                    "long_put_symbol": &entry.candidate.put.long.symbol,
-                    "short_call_symbol": &entry.candidate.call.short.symbol,
-                    "long_call_symbol": &entry.candidate.call.long.symbol,
-                    "credit": entry.candidate.credit,
-                    "return_on_risk": entry.candidate.return_on_risk,
-                    "score": entry.candidate.score,
-                    "trade_date": trade_date,
-                }),
-            );
-            record_selected_candidate_alert(
-                config,
-                trade_date,
-                &candidate_identity_key,
-                candidate_alert_payload,
-            );
-            Ok(false)
-        }
-        StrategyDecision::DryRunDebit { entry } => {
-            let (candidate_identity_key, candidate_alert_payload) =
-                selected_debit_alert_payload(&entry, trade_date, "dry_run", None);
-            println!(
-                "decision: dry_run underlying={} long={} short={} debit={:.2} rtr={:.1}% score={:.1} reason=submission_disabled",
-                entry.underlying,
-                entry.candidate.long.symbol,
-                entry.candidate.short.symbol,
-                entry.candidate.debit,
-                entry.candidate.reward_to_risk * 100.0,
-                entry.candidate.score,
-            );
-            record_decision_event(
-                config,
-                trade_date,
-                json!({
-                    "action": "dry_run",
-                    "reason": "submission_disabled",
-                    "underlying": &entry.underlying,
-                    "strategy": debit_spread_strategy_name(entry.kind),
-                    "long_symbol": &entry.candidate.long.symbol,
-                    "short_symbol": &entry.candidate.short.symbol,
-                    "debit": entry.candidate.debit,
-                    "reward_to_risk": entry.candidate.reward_to_risk,
-                    "score": entry.candidate.score,
-                    "trade_date": trade_date,
-                }),
-            );
-            record_selected_candidate_alert(
-                config,
-                trade_date,
-                &candidate_identity_key,
-                candidate_alert_payload,
-            );
-            Ok(false)
-        }
-        StrategyDecision::DryRunNakedOption { entry } => {
-            let (candidate_identity_key, candidate_alert_payload) =
-                selected_naked_alert_payload(&entry, trade_date, "dry_run", None);
-            let metrics = entry.candidate.short.metrics.as_ref();
-            if let Some(metrics) = metrics {
-                println!(
-                    "decision: dry_run underlying={} short={} credit={:.2} delta={:.2} pop={:.1}% touch={:.1}% be_dist={:.1}% em_cov={:.2} bpr=${:.0} bp_use={} rbp={:.3}% score={:.1} reason=submission_disabled",
-                    entry.underlying,
-                    entry.candidate.short.symbol,
-                    entry.candidate.credit,
-                    entry.candidate.short.delta_abs,
-                    metrics.breakeven_pop * 100.0,
-                    metrics.probability_of_touch_est * 100.0,
-                    metrics.distance_to_breakeven_pct * 100.0,
-                    metrics.expected_move_coverage,
-                    entry.candidate.estimated_buying_power_requirement,
-                    format_optional_pct(entry.candidate.buying_power_usage_pct),
-                    entry.candidate.return_on_buying_power * 100.0,
-                    entry.candidate.score,
-                );
-            } else {
-                println!(
-                    "decision: dry_run underlying={} short={} credit={:.2} delta={:.2} bpr=${:.0} bp_use={} rbp={:.3}% score={:.1} reason=submission_disabled",
-                    entry.underlying,
-                    entry.candidate.short.symbol,
-                    entry.candidate.credit,
-                    entry.candidate.short.delta_abs,
-                    entry.candidate.estimated_buying_power_requirement,
-                    format_optional_pct(entry.candidate.buying_power_usage_pct),
-                    entry.candidate.return_on_buying_power * 100.0,
-                    entry.candidate.score,
-                );
-            }
-            record_decision_event(
-                config,
-                trade_date,
-                json!({
-                    "action": "dry_run",
-                    "reason": "submission_disabled",
-                    "underlying": &entry.underlying,
-                    "strategy": naked_option_strategy_name(entry.kind),
-                    "short_symbol": &entry.candidate.short.symbol,
-                    "credit": entry.candidate.credit,
-                    "delta_abs": entry.candidate.short.delta_abs,
-                    "dte": entry.candidate.short.dte,
-                    "strike": entry.candidate.short.strike,
-                    "spread_pct": entry.candidate.short.spread_pct,
-                    "bid_size": entry.candidate.short.bid_size,
-                    "ask_size": entry.candidate.short.ask_size,
-                    "volume": entry.candidate.short.volume,
-                    "open_interest": entry.candidate.short.open_interest,
-                    "implied_volatility": entry.candidate.short.implied_volatility,
-                    "capital_requirement_model": entry.candidate.capital_requirement_model.as_str(),
-                    "estimated_buying_power_requirement": entry.candidate.estimated_buying_power_requirement,
-                    "buying_power_usage_pct": entry.candidate.buying_power_usage_pct,
-                    "return_on_buying_power": entry.candidate.return_on_buying_power,
-                    "annualized_premium_yield": annualized_premium_yield(
-                        entry.candidate.credit,
-                        entry.candidate.short.strike,
-                        entry.candidate.short.dte,
-                    ),
-                    "underlying_price": metrics.map(|metrics| metrics.underlying_price),
-                    "breakeven": metrics.map(|metrics| metrics.breakeven),
-                    "strike_itm_probability": metrics.map(|metrics| metrics.strike_itm_probability),
-                    "delta_pop_proxy": metrics.map(|metrics| metrics.delta_pop_proxy),
-                    "breakeven_pop": metrics.map(|metrics| metrics.breakeven_pop),
-                    "probability_of_touch_est": metrics.map(|metrics| metrics.probability_of_touch_est),
-                    "expected_move": metrics.map(|metrics| metrics.expected_move),
-                    "expected_move_pct": metrics.map(|metrics| metrics.expected_move_pct),
-                    "distance_to_strike_pct": metrics.map(|metrics| metrics.distance_to_strike_pct),
-                    "distance_to_breakeven_pct": metrics.map(|metrics| metrics.distance_to_breakeven_pct),
-                    "expected_move_coverage": metrics.map(|metrics| metrics.expected_move_coverage),
-                    "model_delta_abs": metrics.map(|metrics| metrics.model_delta_abs),
-                    "model_gamma": metrics.map(|metrics| metrics.model_gamma),
-                    "model_theta": metrics.map(|metrics| metrics.model_theta),
-                    "model_vega": metrics.map(|metrics| metrics.model_vega),
-                    "score": entry.candidate.score,
-                    "trade_date": trade_date,
-                }),
-            );
-            record_selected_candidate_alert(
-                config,
-                trade_date,
-                &candidate_identity_key,
-                candidate_alert_payload,
-            );
-            Ok(false)
+        StrategyDecision::Selected { entry, mode } => {
+            apply_selected_entry_decision(entry, mode, config, state, trade_date).await
         }
         StrategyDecision::NoEntry => {
             println!("decision: no_entry");
@@ -1576,6 +992,175 @@ async fn apply_strategy_decision(
             );
             Ok(false)
         }
+    }
+}
+
+async fn apply_selected_entry_decision(
+    entry: SelectedOptionsEntry,
+    mode: EntryMode,
+    config: &OptionsEngineConfig,
+    state: &mut StrategyState,
+    trade_date: &str,
+) -> anyhow::Result<bool> {
+    let order_list_id = mode
+        .is_submit()
+        .then(|| order_list_id(trade_date, entry.underlying()));
+    let (candidate_identity_key, mut candidate_alert_payload) =
+        selected_entry_alert_payload(&entry, trade_date, mode.action(), order_list_id.as_deref());
+    if mode == EntryMode::DryRun {
+        insert_string_field(
+            &mut candidate_alert_payload,
+            "reason",
+            "submission_disabled".to_string(),
+        );
+    }
+
+    println!(
+        "decision: {} underlying={} strategy={} symbols={} {}={:.2} score={:.1}{}",
+        mode.action(),
+        entry.underlying(),
+        entry.strategy_name(),
+        entry.option_symbols().join(","),
+        entry.entry_premium_kind(),
+        entry.entry_premium(),
+        entry.score(),
+        order_list_id
+            .as_ref()
+            .map(|value| format!(" order_list_id={value}"))
+            .unwrap_or_else(|| " reason=submission_disabled".to_string()),
+    );
+    record_decision_event(config, trade_date, candidate_alert_payload.clone());
+    record_selected_candidate_alert(
+        config,
+        trade_date,
+        &candidate_identity_key,
+        candidate_alert_payload.clone(),
+    );
+
+    if mode == EntryMode::DryRun {
+        return Ok(false);
+    }
+
+    let Some(order_list_id) = order_list_id else {
+        anyhow::bail!("submit mode missing order list ID");
+    };
+    let outcome = submit_selected_entry(&entry, &order_list_id, config.quantity, config).await?;
+    let terminal_rejection =
+        entry.is_naked_option() && outcome.accepted == 0 && outcome.rejected > 0;
+    if outcome.accepted > 0 || terminal_rejection {
+        state.record_entry_submission(selected_entry_state_draft(
+            &entry,
+            trade_date,
+            &order_list_id,
+            config.quantity,
+            outcome.parent_order_id.clone(),
+        ));
+        if terminal_rejection && let Some(entry) = state.entries.last_mut() {
+            entry.mark_canceled();
+            entry.close_reason = Some("entry_rejected".to_string());
+        }
+    }
+
+    println!(
+        "submit_result: accepted={} rejected={}",
+        outcome.accepted, outcome.rejected
+    );
+    let mut submit_payload = json!({
+        "accepted": outcome.accepted,
+        "rejected": outcome.rejected,
+        "parent_order_id": outcome.parent_order_id.clone(),
+        "underlying": entry.underlying(),
+        "strategy": entry.strategy_name(),
+    });
+    if entry.is_naked_option() {
+        insert_value_field(
+            &mut submit_payload,
+            "terminal_rejection_recorded",
+            Value::Bool(terminal_rejection),
+        );
+    }
+    record_submit_result_event(config, trade_date, submit_payload);
+    if outcome.rejected > 0 {
+        record_submit_rejected_candidate_alert(
+            config,
+            trade_date,
+            &candidate_identity_key,
+            candidate_alert_payload,
+            &outcome,
+            entry.is_naked_option().then_some(terminal_rejection),
+        );
+    }
+    Ok(outcome.accepted > 0 || terminal_rejection)
+}
+
+fn selected_entry_state_draft(
+    entry: &SelectedOptionsEntry,
+    trade_date: &str,
+    order_list_id: &str,
+    quantity: u64,
+    parent_order_id: Option<String>,
+) -> StrategyStateEntryDraft {
+    match entry {
+        SelectedOptionsEntry::Credit(entry) => StrategyStateEntryDraft {
+            trade_date: trade_date.to_string(),
+            underlying: entry.underlying.clone(),
+            strategy: credit_spread_strategy_name(entry.kind).to_string(),
+            order_list_id: order_list_id.to_string(),
+            short_symbol: entry.candidate.short.symbol.clone(),
+            long_symbol: entry.candidate.long.symbol.clone(),
+            short_call_symbol: None,
+            long_call_symbol: None,
+            quantity,
+            credit: entry.candidate.credit,
+            debit: None,
+            score: entry.candidate.score,
+            parent_order_id,
+        },
+        SelectedOptionsEntry::IronCondor(entry) => StrategyStateEntryDraft {
+            trade_date: trade_date.to_string(),
+            underlying: entry.underlying.clone(),
+            strategy: "iron_condor".to_string(),
+            order_list_id: order_list_id.to_string(),
+            short_symbol: entry.candidate.put.short.symbol.clone(),
+            long_symbol: entry.candidate.put.long.symbol.clone(),
+            short_call_symbol: Some(entry.candidate.call.short.symbol.clone()),
+            long_call_symbol: Some(entry.candidate.call.long.symbol.clone()),
+            quantity,
+            credit: entry.candidate.credit,
+            debit: None,
+            score: entry.candidate.score,
+            parent_order_id,
+        },
+        SelectedOptionsEntry::Debit(entry) => StrategyStateEntryDraft {
+            trade_date: trade_date.to_string(),
+            underlying: entry.underlying.clone(),
+            strategy: debit_spread_strategy_name(entry.kind).to_string(),
+            order_list_id: order_list_id.to_string(),
+            short_symbol: entry.candidate.short.symbol.clone(),
+            long_symbol: entry.candidate.long.symbol.clone(),
+            short_call_symbol: None,
+            long_call_symbol: None,
+            quantity,
+            credit: -entry.candidate.debit,
+            debit: Some(entry.candidate.debit),
+            score: entry.candidate.score,
+            parent_order_id,
+        },
+        SelectedOptionsEntry::NakedOption(entry) => StrategyStateEntryDraft {
+            trade_date: trade_date.to_string(),
+            underlying: entry.underlying.clone(),
+            strategy: naked_option_strategy_name(entry.kind).to_string(),
+            order_list_id: order_list_id.to_string(),
+            short_symbol: entry.candidate.short.symbol.clone(),
+            long_symbol: String::new(),
+            short_call_symbol: None,
+            long_call_symbol: None,
+            quantity,
+            credit: entry.candidate.credit,
+            debit: None,
+            score: entry.candidate.score,
+            parent_order_id,
+        },
     }
 }
 
@@ -2344,12 +1929,42 @@ fn emit_management_snapshot(
     );
 }
 
-async fn submit_entry(
-    entry: &SelectedEntry,
+async fn submit_selected_entry(
+    entry: &SelectedOptionsEntry,
     order_list_id: &str,
     quantity: u64,
     config: &OptionsEngineConfig,
 ) -> anyhow::Result<SubmitOutcome> {
+    match entry {
+        SelectedOptionsEntry::Credit(entry) => {
+            submit_entry(entry, order_list_id, quantity, config).await
+        }
+        SelectedOptionsEntry::IronCondor(entry) => {
+            submit_iron_condor_entry(entry, order_list_id, quantity, config).await
+        }
+        SelectedOptionsEntry::Debit(entry) => {
+            submit_debit_entry(entry, order_list_id, quantity, config).await
+        }
+        SelectedOptionsEntry::NakedOption(entry) => {
+            submit_naked_option_entry(entry, order_list_id, quantity, config).await
+        }
+    }
+}
+
+async fn submit_with_execution_session<F>(
+    order_list_id: &str,
+    expected_events: usize,
+    cancel_after_accept: bool,
+    submit: F,
+) -> anyhow::Result<SubmitOutcome>
+where
+    F: FnOnce(
+        &mut AlpacaExecutionClient,
+        TraderId,
+        Option<ClientId>,
+        StrategyId,
+    ) -> anyhow::Result<()>,
+{
     let exec_config = exec_config_from_env();
     let (tx, mut rx) = mpsc::unbounded_channel();
     replace_exec_event_sender(tx);
@@ -2373,19 +1988,11 @@ async fn submit_entry(
     client.start()?;
     client.connect().await?;
 
-    let cmd = build_submit_order_list(
-        entry,
-        order_list_id,
-        quantity,
-        trader_id,
-        Some(client_id),
-        strategy_id,
-    )?;
-    client.submit_order_list(cmd)?;
+    submit(&mut client, trader_id, Some(client_id), strategy_id)?;
 
-    let (accepted, rejected) = collect_execution_events(&mut rx, 2).await;
+    let (accepted, rejected) = collect_execution_events(&mut rx, expected_events).await;
     let parent_order_id = lookup_parent_order(&exec_config, order_list_id).await?;
-    if config.cancel_after_accept && accepted > 0 {
+    if cancel_after_accept && accepted > 0 {
         cancel_parent_order(&exec_config, parent_order_id.as_deref()).await?;
     }
 
@@ -2397,6 +2004,32 @@ async fn submit_entry(
         rejected,
         parent_order_id,
     })
+}
+
+async fn submit_entry(
+    entry: &SelectedEntry,
+    order_list_id: &str,
+    quantity: u64,
+    config: &OptionsEngineConfig,
+) -> anyhow::Result<SubmitOutcome> {
+    submit_with_execution_session(
+        order_list_id,
+        2,
+        config.cancel_after_accept,
+        |client, trader_id, client_id, strategy_id| {
+            let cmd = build_submit_order_list(
+                entry,
+                order_list_id,
+                quantity,
+                trader_id,
+                client_id,
+                strategy_id,
+            )?;
+            client.submit_order_list(cmd)?;
+            Ok(())
+        },
+    )
+    .await
 }
 
 async fn submit_iron_condor_entry(
@@ -2405,53 +2038,24 @@ async fn submit_iron_condor_entry(
     quantity: u64,
     config: &OptionsEngineConfig,
 ) -> anyhow::Result<SubmitOutcome> {
-    let exec_config = exec_config_from_env();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    replace_exec_event_sender(tx);
-
-    let cache = Rc::new(RefCell::new(Cache::default()));
-    let trader_id = TraderId::from("TRADER-001");
-    let client_id = ClientId::from(ALPACA_CLIENT_ID);
-    let account_id = AccountId::from("ALPACA-001");
-    let strategy_id = StrategyId::from(STRATEGY_FAMILY);
-    let core = ExecutionClientCore::new(
-        trader_id,
-        client_id,
-        Venue::new(ALPACA_VENUE),
-        OmsType::Netting,
-        account_id,
-        AccountType::Margin,
-        None,
-        cache,
-    );
-    let mut client = AlpacaExecutionClient::new(core, exec_config.clone())?;
-    client.start()?;
-    client.connect().await?;
-
-    let cmd = build_iron_condor_submit_order_list(
-        &entry.candidate,
+    submit_with_execution_session(
         order_list_id,
-        quantity,
-        trader_id,
-        Some(client_id),
-        strategy_id,
-    )?;
-    client.submit_order_list(cmd)?;
-
-    let (accepted, rejected) = collect_execution_events(&mut rx, 4).await;
-    let parent_order_id = lookup_parent_order(&exec_config, order_list_id).await?;
-    if config.cancel_after_accept && accepted > 0 {
-        cancel_parent_order(&exec_config, parent_order_id.as_deref()).await?;
-    }
-
-    client.disconnect().await?;
-    client.stop()?;
-
-    Ok(SubmitOutcome {
-        accepted,
-        rejected,
-        parent_order_id,
-    })
+        4,
+        config.cancel_after_accept,
+        |client, trader_id, client_id, strategy_id| {
+            let cmd = build_iron_condor_submit_order_list(
+                &entry.candidate,
+                order_list_id,
+                quantity,
+                trader_id,
+                client_id,
+                strategy_id,
+            )?;
+            client.submit_order_list(cmd)?;
+            Ok(())
+        },
+    )
+    .await
 }
 
 async fn submit_debit_entry(
@@ -2460,53 +2064,24 @@ async fn submit_debit_entry(
     quantity: u64,
     config: &OptionsEngineConfig,
 ) -> anyhow::Result<SubmitOutcome> {
-    let exec_config = exec_config_from_env();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    replace_exec_event_sender(tx);
-
-    let cache = Rc::new(RefCell::new(Cache::default()));
-    let trader_id = TraderId::from("TRADER-001");
-    let client_id = ClientId::from(ALPACA_CLIENT_ID);
-    let account_id = AccountId::from("ALPACA-001");
-    let strategy_id = StrategyId::from(STRATEGY_FAMILY);
-    let core = ExecutionClientCore::new(
-        trader_id,
-        client_id,
-        Venue::new(ALPACA_VENUE),
-        OmsType::Netting,
-        account_id,
-        AccountType::Margin,
-        None,
-        cache,
-    );
-    let mut client = AlpacaExecutionClient::new(core, exec_config.clone())?;
-    client.start()?;
-    client.connect().await?;
-
-    let cmd = build_debit_submit_order_list(
-        &entry.candidate,
+    submit_with_execution_session(
         order_list_id,
-        quantity,
-        trader_id,
-        Some(client_id),
-        strategy_id,
-    )?;
-    client.submit_order_list(cmd)?;
-
-    let (accepted, rejected) = collect_execution_events(&mut rx, 2).await;
-    let parent_order_id = lookup_parent_order(&exec_config, order_list_id).await?;
-    if config.cancel_after_accept && accepted > 0 {
-        cancel_parent_order(&exec_config, parent_order_id.as_deref()).await?;
-    }
-
-    client.disconnect().await?;
-    client.stop()?;
-
-    Ok(SubmitOutcome {
-        accepted,
-        rejected,
-        parent_order_id,
-    })
+        2,
+        config.cancel_after_accept,
+        |client, trader_id, client_id, strategy_id| {
+            let cmd = build_debit_submit_order_list(
+                &entry.candidate,
+                order_list_id,
+                quantity,
+                trader_id,
+                client_id,
+                strategy_id,
+            )?;
+            client.submit_order_list(cmd)?;
+            Ok(())
+        },
+    )
+    .await
 }
 
 async fn submit_naked_option_entry(
@@ -2515,53 +2090,24 @@ async fn submit_naked_option_entry(
     quantity: u64,
     config: &OptionsEngineConfig,
 ) -> anyhow::Result<SubmitOutcome> {
-    let exec_config = exec_config_from_env();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    replace_exec_event_sender(tx);
-
-    let cache = Rc::new(RefCell::new(Cache::default()));
-    let trader_id = TraderId::from("TRADER-001");
-    let client_id = ClientId::from(ALPACA_CLIENT_ID);
-    let account_id = AccountId::from("ALPACA-001");
-    let strategy_id = StrategyId::from(STRATEGY_FAMILY);
-    let core = ExecutionClientCore::new(
-        trader_id,
-        client_id,
-        Venue::new(ALPACA_VENUE),
-        OmsType::Netting,
-        account_id,
-        AccountType::Margin,
-        None,
-        cache,
-    );
-    let mut client = AlpacaExecutionClient::new(core, exec_config.clone())?;
-    client.start()?;
-    client.connect().await?;
-
-    let cmd = build_naked_option_submit_order(
-        &entry.candidate,
+    submit_with_execution_session(
         order_list_id,
-        quantity,
-        trader_id,
-        Some(client_id),
-        strategy_id,
-    )?;
-    client.submit_order(cmd)?;
-
-    let (accepted, rejected) = collect_execution_events(&mut rx, 1).await;
-    let parent_order_id = lookup_parent_order(&exec_config, order_list_id).await?;
-    if config.cancel_after_accept && accepted > 0 {
-        cancel_parent_order(&exec_config, parent_order_id.as_deref()).await?;
-    }
-
-    client.disconnect().await?;
-    client.stop()?;
-
-    Ok(SubmitOutcome {
-        accepted,
-        rejected,
-        parent_order_id,
-    })
+        1,
+        config.cancel_after_accept,
+        |client, trader_id, client_id, strategy_id| {
+            let cmd = build_naked_option_submit_order(
+                &entry.candidate,
+                order_list_id,
+                quantity,
+                trader_id,
+                client_id,
+                strategy_id,
+            )?;
+            client.submit_order(cmd)?;
+            Ok(())
+        },
+    )
+    .await
 }
 
 async fn submit_close_entry(
@@ -2570,62 +2116,36 @@ async fn submit_close_entry(
     order_list_id: &str,
     _config: &OptionsEngineConfig,
 ) -> anyhow::Result<SubmitOutcome> {
-    let exec_config = exec_config_from_env();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    replace_exec_event_sender(tx);
-
-    let cache = Rc::new(RefCell::new(Cache::default()));
-    let trader_id = TraderId::from("TRADER-001");
-    let client_id = ClientId::from(ALPACA_CLIENT_ID);
-    let account_id = AccountId::from("ALPACA-001");
-    let strategy_id = StrategyId::from(STRATEGY_FAMILY);
-    let core = ExecutionClientCore::new(
-        trader_id,
-        client_id,
-        Venue::new(ALPACA_VENUE),
-        OmsType::Netting,
-        account_id,
-        AccountType::Margin,
-        None,
-        cache,
-    );
-    let mut client = AlpacaExecutionClient::new(core, exec_config.clone())?;
-    client.start()?;
-    client.connect().await?;
-
-    if entry.is_naked_option() {
-        let cmd = build_naked_option_close_order(
-            entry,
-            quote,
-            order_list_id,
-            trader_id,
-            Some(client_id),
-            strategy_id,
-        )?;
-        client.submit_order(cmd)?;
-    } else {
-        let cmd = build_close_submit_order_list(
-            entry,
-            quote,
-            order_list_id,
-            trader_id,
-            Some(client_id),
-            strategy_id,
-        )?;
-        client.submit_order_list(cmd)?;
-    }
-
-    let (accepted, rejected) = collect_execution_events(&mut rx, entry.symbols().len()).await;
-    let parent_order_id = lookup_parent_order(&exec_config, order_list_id).await?;
-
-    client.disconnect().await?;
-    client.stop()?;
-
-    Ok(SubmitOutcome {
-        accepted,
-        rejected,
-        parent_order_id,
-    })
+    submit_with_execution_session(
+        order_list_id,
+        entry.symbols().len(),
+        false,
+        |client, trader_id, client_id, strategy_id| {
+            if entry.is_naked_option() {
+                let cmd = build_naked_option_close_order(
+                    entry,
+                    quote,
+                    order_list_id,
+                    trader_id,
+                    client_id,
+                    strategy_id,
+                )?;
+                client.submit_order(cmd)?;
+            } else {
+                let cmd = build_close_submit_order_list(
+                    entry,
+                    quote,
+                    order_list_id,
+                    trader_id,
+                    client_id,
+                    strategy_id,
+                )?;
+                client.submit_order_list(cmd)?;
+            }
+            Ok(())
+        },
+    )
+    .await
 }
 
 fn build_submit_order_list(
@@ -3012,13 +2532,6 @@ fn close_order_list_id(entry: &StrategyStateEntry) -> String {
 
 fn strategy_name(kind: CreditSpreadKind) -> &'static str {
     credit_spread_strategy_name(kind)
-}
-
-fn format_optional_pct(value: Option<f64>) -> String {
-    value.map_or_else(
-        || "n/a".to_string(),
-        |value| format!("{:.2}%", value * 100.0),
-    )
 }
 
 fn order_age_secs(order: &AlpacaOrder) -> Option<u64> {

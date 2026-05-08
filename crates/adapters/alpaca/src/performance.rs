@@ -22,12 +22,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::{
-    http::models::{AlpacaActivity, AlpacaOrder, AlpacaPosition},
+    config::AlpacaDataClientConfig,
+    http::{
+        client::AlpacaHttpClient,
+        models::{
+            AlpacaActivity, AlpacaOptionSnapshot, AlpacaOrder, AlpacaPosition,
+            OptionSnapshotsRequest,
+        },
+    },
+    options_runtime::OptionsEngineConfig,
     runtime::{StrategyState, StrategyStateEntry},
 };
 
@@ -36,6 +44,12 @@ pub const OPTION_CONTRACT_MULTIPLIER: f64 = 100.0;
 
 /// Current performance-ledger record schema version.
 pub const PERFORMANCE_LEDGER_SCHEMA_VERSION: u64 = 1;
+
+/// Default maximum number of candidates to track per candidate-ledger file.
+pub const DEFAULT_CANDIDATE_OUTCOME_MAX_CANDIDATES: usize = 100;
+
+/// Default maximum candidate rank to include in candidate-outcome tracking.
+pub const DEFAULT_CANDIDATE_OUTCOME_MAX_RANK: u64 = 3;
 
 /// Candidate-ledger counts used to audit opportunity history.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -136,6 +150,27 @@ pub struct CandidateOutcomeBucketSummary {
     pub average_loss: Option<f64>,
     /// Largest losing hypothetical outcome in dollars.
     pub largest_loss: Option<f64>,
+}
+
+/// Candidate-outcome tracking request.
+#[derive(Clone, Debug)]
+pub struct CandidateOutcomeTrackingRequest {
+    /// Trade date to track. `None` uses today's date in the account entry timezone.
+    pub trade_date: Option<NaiveDate>,
+    /// Maximum number of unique candidates to observe.
+    pub max_candidates: usize,
+    /// Maximum candidate rank to include.
+    pub max_rank: u64,
+}
+
+impl Default for CandidateOutcomeTrackingRequest {
+    fn default() -> Self {
+        Self {
+            trade_date: None,
+            max_candidates: DEFAULT_CANDIDATE_OUTCOME_MAX_CANDIDATES,
+            max_rank: DEFAULT_CANDIDATE_OUTCOME_MAX_RANK,
+        }
+    }
 }
 
 /// Order identifiers associated with one strategy entry.
@@ -376,6 +411,16 @@ pub fn default_performance_ledger_dir(state_path: &Path, account_id: Option<&str
         .join("performance-ledger")
 }
 
+/// Returns the default candidate-outcome directory for an account config.
+#[must_use]
+pub fn default_candidate_outcome_dir(config: &OptionsEngineConfig) -> PathBuf {
+    config
+        .candidate_ledger_dir
+        .parent()
+        .map(|path| path.join("candidate-outcomes"))
+        .unwrap_or_else(|| PathBuf::from("candidate-outcomes"))
+}
+
 /// Appends one realized-trade performance record to an append-only JSONL ledger.
 ///
 /// If the same record key already exists in the target daily file, no duplicate line is written.
@@ -390,18 +435,7 @@ pub fn append_performance_ledger_record(
     account_id: Option<&str>,
     entry: &EntryPerformance,
 ) -> anyhow::Result<PerformanceLedgerAppend> {
-    fs::create_dir_all(ledger_dir)?;
-    let ledger_path = ledger_dir.join(format!("{ledger_date}.jsonl"));
     let record_key = performance_record_key(entry);
-
-    if performance_ledger_has_key(&ledger_path, &record_key)? {
-        return Ok(PerformanceLedgerAppend {
-            path: ledger_path.display().to_string(),
-            appended: false,
-            record_key,
-        });
-    }
-
     let mut record = Map::new();
     record.insert(
         "schema_version".to_string(),
@@ -425,17 +459,12 @@ pub fn append_performance_ledger_record(
         record.extend(fields);
     }
 
-    let line = serde_json::to_string(&Value::Object(record))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&ledger_path)?;
-    writeln!(file, "{line}")?;
-
+    let append =
+        append_deduped_jsonl_record(ledger_dir, ledger_date, &record_key, Value::Object(record))?;
     Ok(PerformanceLedgerAppend {
-        path: ledger_path.display().to_string(),
-        appended: true,
-        record_key,
+        path: append.path,
+        appended: append.appended,
+        record_key: append.record_key,
     })
 }
 
@@ -453,87 +482,65 @@ pub fn summarize_performance_ledger(
         directory: directory.display().to_string(),
         ..PerformanceLedgerSummary::default()
     };
-    if !directory.exists() {
-        summary.missing = true;
-        return Ok(summary);
-    }
-
     let mut win_sum = 0.0;
     let mut loss_sum = 0.0;
     let mut bucket_stats = BucketStats::default();
     let mut strategy_stats = BTreeMap::<String, BucketStats>::new();
     let mut underlying_stats = BTreeMap::<String, BucketStats>::new();
 
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(date) = ledger_file_date(&path) else {
-            continue;
+    let scan = scan_jsonl_records(directory, since, until, |_, parsed| {
+        let Ok(record) = parsed else {
+            summary.parse_errors += 1;
+            return;
         };
-        if !date_in_range(date, since, until) {
-            continue;
+        if record.get("type").and_then(Value::as_str) != Some("realized_trade") {
+            return;
         }
-
-        summary.files += 1;
-        summary.dates.push(date.to_string());
-        for line in fs::read_to_string(&path)?.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(record) = serde_json::from_str::<Value>(line) else {
-                summary.parse_errors += 1;
-                continue;
-            };
-            if record.get("type").and_then(Value::as_str) != Some("realized_trade") {
-                continue;
-            }
-            let Some(realized_pnl) = record.get("realized_pnl").and_then(Value::as_f64) else {
-                summary.parse_errors += 1;
-                continue;
-            };
-            summary.records += 1;
-            summary.realized_pnl += realized_pnl;
-            if record
-                .get("warnings")
-                .and_then(Value::as_array)
-                .is_some_and(|warnings| !warnings.is_empty())
-            {
-                summary.records_with_warnings += 1;
-            }
-            bucket_stats.add(realized_pnl);
-            if realized_pnl > 0.0 {
-                summary.wins += 1;
-                win_sum += realized_pnl;
-            } else if realized_pnl < 0.0 {
-                summary.losses += 1;
-                loss_sum += realized_pnl;
-                summary.largest_loss = Some(
-                    summary
-                        .largest_loss
-                        .map_or(realized_pnl, |current| current.min(realized_pnl)),
-                );
-            } else {
-                summary.flats += 1;
-            }
-            if let Some(strategy) = record.get("strategy").and_then(Value::as_str) {
-                strategy_stats
-                    .entry(strategy.to_string())
-                    .or_default()
-                    .add(realized_pnl);
-            }
-            if let Some(underlying) = record.get("underlying").and_then(Value::as_str) {
-                underlying_stats
-                    .entry(underlying.to_string())
-                    .or_default()
-                    .add(realized_pnl);
-            }
+        let Some(realized_pnl) = record.get("realized_pnl").and_then(Value::as_f64) else {
+            summary.parse_errors += 1;
+            return;
+        };
+        summary.records += 1;
+        summary.realized_pnl += realized_pnl;
+        if record
+            .get("warnings")
+            .and_then(Value::as_array)
+            .is_some_and(|warnings| !warnings.is_empty())
+        {
+            summary.records_with_warnings += 1;
         }
-    }
+        bucket_stats.add(realized_pnl);
+        if realized_pnl > 0.0 {
+            summary.wins += 1;
+            win_sum += realized_pnl;
+        } else if realized_pnl < 0.0 {
+            summary.losses += 1;
+            loss_sum += realized_pnl;
+            summary.largest_loss = Some(
+                summary
+                    .largest_loss
+                    .map_or(realized_pnl, |current| current.min(realized_pnl)),
+            );
+        } else {
+            summary.flats += 1;
+        }
+        if let Some(strategy) = record.get("strategy").and_then(Value::as_str) {
+            strategy_stats
+                .entry(strategy.to_string())
+                .or_default()
+                .add(realized_pnl);
+        }
+        if let Some(underlying) = record.get("underlying").and_then(Value::as_str) {
+            underlying_stats
+                .entry(underlying.to_string())
+                .or_default()
+                .add(realized_pnl);
+        }
+    })?;
 
-    summary.dates.sort();
+    summary.missing = scan.missing;
+    summary.files = scan.files;
+    summary.dates = scan.dates;
     summary.average_win = (summary.wins > 0).then_some(win_sum / summary.wins as f64);
     summary.average_loss = (summary.losses > 0).then_some(loss_sum / summary.losses as f64);
     summary.by_strategy = strategy_stats
@@ -565,86 +572,63 @@ pub fn summarize_candidate_outcomes(
         directory: directory.display().to_string(),
         ..CandidateOutcomeSummary::default()
     };
-    if !directory.exists() {
-        summary.missing = true;
-        return Ok(summary);
-    }
-
     let mut stats = OutcomeStats::default();
     let mut bucket_stats = BTreeMap::<String, OutcomeStats>::new();
     let mut strategy_stats = BTreeMap::<String, OutcomeStats>::new();
 
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(date) = ledger_file_date(&path) else {
-            continue;
+    let scan = scan_jsonl_records(directory, since, until, |_, parsed| {
+        let Ok(record) = parsed else {
+            summary.parse_errors += 1;
+            return;
         };
-        if !date_in_range(date, since, until) {
-            continue;
+        if record.get("type").and_then(Value::as_str) != Some("candidate_outcome") {
+            return;
         }
+        let Some(hypothetical_pnl) = record.get("hypothetical_pnl").and_then(Value::as_f64) else {
+            summary.parse_errors += 1;
+            return;
+        };
 
-        summary.files += 1;
-        summary.dates.push(date.to_string());
-        for line in fs::read_to_string(&path)?.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(record) = serde_json::from_str::<Value>(line) else {
-                summary.parse_errors += 1;
-                continue;
-            };
-            if record.get("type").and_then(Value::as_str) != Some("candidate_outcome") {
-                continue;
-            }
-            let Some(hypothetical_pnl) = record.get("hypothetical_pnl").and_then(Value::as_f64)
-            else {
-                summary.parse_errors += 1;
-                continue;
-            };
+        let was_selected = record
+            .get("was_selected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let was_traded = record
+            .get("was_traded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        stats.add(hypothetical_pnl, was_selected, was_traded);
 
-            let was_selected = record
-                .get("was_selected")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let was_traded = record
-                .get("was_traded")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            stats.add(hypothetical_pnl, was_selected, was_traded);
-
-            if record
-                .get("quote_warnings")
-                .and_then(Value::as_array)
-                .is_some_and(|warnings| !warnings.is_empty())
-            {
-                summary.records_with_warnings += 1;
-            }
-            let bucket = record
-                .get("observation_bucket")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            bucket_stats.entry(bucket.to_string()).or_default().add(
-                hypothetical_pnl,
-                was_selected,
-                was_traded,
-            );
-            let strategy = record
-                .get("strategy")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            strategy_stats.entry(strategy.to_string()).or_default().add(
-                hypothetical_pnl,
-                was_selected,
-                was_traded,
-            );
+        if record
+            .get("quote_warnings")
+            .and_then(Value::as_array)
+            .is_some_and(|warnings| !warnings.is_empty())
+        {
+            summary.records_with_warnings += 1;
         }
-    }
+        let bucket = record
+            .get("observation_bucket")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        bucket_stats.entry(bucket.to_string()).or_default().add(
+            hypothetical_pnl,
+            was_selected,
+            was_traded,
+        );
+        let strategy = record
+            .get("strategy")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        strategy_stats.entry(strategy.to_string()).or_default().add(
+            hypothetical_pnl,
+            was_selected,
+            was_traded,
+        );
+    })?;
 
-    summary.dates.sort();
+    summary.missing = scan.missing;
+    summary.files = scan.files;
+    summary.dates = scan.dates;
     let aggregate = stats.into_summary();
     summary.records = aggregate.records;
     summary.selected_records = aggregate.selected_records;
@@ -667,6 +651,93 @@ pub fn summarize_candidate_outcomes(
     Ok(summary)
 }
 
+/// Tracks candidate outcomes for a candidate-ledger trade date.
+///
+/// # Errors
+///
+/// Returns an error when candidate-ledger files cannot be read, option snapshots cannot be
+/// requested, or outcome records cannot be written.
+pub async fn track_candidate_outcomes(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &OptionsEngineConfig,
+    request: &CandidateOutcomeTrackingRequest,
+) -> anyhow::Result<usize> {
+    let trade_date = request.trade_date.unwrap_or_else(|| {
+        Utc::now()
+            .with_timezone(&config.entry_timezone)
+            .date_naive()
+    });
+    let ledger_path = config
+        .candidate_ledger_dir
+        .join(format!("{trade_date}.jsonl"));
+    let records = read_jsonl_records(&ledger_path)?;
+    let selected = selected_candidate_actions(&records);
+    let mut candidates = collect_track_candidates(
+        &records,
+        &selected,
+        request.max_rank,
+        request.max_candidates,
+    );
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    let symbols = candidates
+        .iter()
+        .flat_map(|candidate| candidate.symbols.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut snapshot_request = OptionSnapshotsRequest::for_symbols(symbols);
+    snapshot_request.feed = Some(data_config.option_feed.as_str().to_string());
+    let snapshots = client.option_snapshots(&snapshot_request).await?.snapshots;
+    let outcome_dir = default_candidate_outcome_dir(config);
+    let mut appended = 0;
+    for candidate in &mut candidates {
+        let Some(outcome) = value_candidate_outcome(candidate, &snapshots) else {
+            continue;
+        };
+        for bucket in candidate_observation_buckets(candidate, config) {
+            let record_key = format!("{}|{bucket}", candidate.identity_key);
+            let payload = json!({
+                "schema_version": 1,
+                "ts_utc": Utc::now().to_rfc3339(),
+                "type": "candidate_outcome",
+                "trade_date": candidate.trade_date,
+                "account_id": config.fleet_account_id,
+                "record_key": record_key,
+                "candidate_identity_key": candidate.identity_key,
+                "observation_bucket": bucket,
+                "candidate_type": candidate.candidate_type,
+                "strategy": candidate.strategy,
+                "underlying": candidate.underlying,
+                "rank": candidate.rank,
+                "score": candidate.score,
+                "symbols": candidate.symbols,
+                "was_selected": candidate.was_selected,
+                "was_traded": candidate.was_traded,
+                "selected_action": candidate.selected_action,
+                "entry_net_premium": candidate.entry_net_premium,
+                "close_net_premium": outcome.close_net_premium,
+                "hypothetical_pnl": outcome.hypothetical_pnl,
+                "hypothetical_pnl_fraction": outcome.hypothetical_pnl_fraction,
+                "quote_warnings": outcome.warnings,
+                "candidate": candidate.record,
+            });
+            if append_deduped_jsonl_record(
+                &outcome_dir,
+                &candidate.trade_date,
+                &record_key,
+                payload,
+            )?
+            .appended
+            {
+                appended += 1;
+            }
+        }
+    }
+    Ok(appended)
+}
+
 /// Summarizes candidate-ledger JSONL files for an optional trade-date range.
 ///
 /// # Errors
@@ -681,68 +752,46 @@ pub fn summarize_candidate_ledger(
         directory: directory.display().to_string(),
         ..CandidateLedgerSummary::default()
     };
-    if !directory.exists() {
-        summary.missing = true;
-        return Ok(summary);
-    }
-
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(date) = ledger_file_date(&path) else {
-            continue;
+    let scan = scan_jsonl_records(directory, since, until, |_, parsed| {
+        summary.records += 1;
+        let Ok(record) = parsed else {
+            summary.parse_errors += 1;
+            return;
         };
-        if !date_in_range(date, since, until) {
-            continue;
-        }
-
-        summary.files += 1;
-        summary.dates.push(date.to_string());
-        for line in fs::read_to_string(&path)?.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            summary.records += 1;
-            let Ok(record) = serde_json::from_str::<Value>(line) else {
-                summary.parse_errors += 1;
-                continue;
-            };
-            let record_type = record
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string();
-            *summary.by_type.entry(record_type.clone()).or_insert(0) += 1;
-            match record_type.as_str() {
-                "candidate" => {
-                    summary.candidates += 1;
-                    if let Some(strategy) = record.get("strategy").and_then(Value::as_str) {
-                        *summary
-                            .candidates_by_strategy
-                            .entry(strategy.to_string())
-                            .or_insert(0) += 1;
-                    }
+        let record_type = record
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        *summary.by_type.entry(record_type.clone()).or_insert(0) += 1;
+        match record_type.as_str() {
+            "candidate" => {
+                summary.candidates += 1;
+                if let Some(strategy) = record.get("strategy").and_then(Value::as_str) {
+                    *summary
+                        .candidates_by_strategy
+                        .entry(strategy.to_string())
+                        .or_insert(0) += 1;
                 }
-                "scanner_result" => summary.scanner_results += 1,
-                "decision" => summary.decisions += 1,
-                "submit_result" => summary.submit_results += 1,
-                "candidate_alert" => {
-                    summary.candidate_alerts += 1;
-                    match record.get("alert_type").and_then(Value::as_str) {
-                        Some("selected_candidate") => summary.selected_candidates += 1,
-                        Some("high_score_candidate") => summary.high_score_candidates += 1,
-                        _ => {}
-                    }
-                }
-                _ => {}
             }
+            "scanner_result" => summary.scanner_results += 1,
+            "decision" => summary.decisions += 1,
+            "submit_result" => summary.submit_results += 1,
+            "candidate_alert" => {
+                summary.candidate_alerts += 1;
+                match record.get("alert_type").and_then(Value::as_str) {
+                    Some("selected_candidate") => summary.selected_candidates += 1,
+                    Some("high_score_candidate") => summary.high_score_candidates += 1,
+                    _ => {}
+                }
+            }
+            _ => {}
         }
-    }
+    })?;
 
-    summary.dates.sort();
+    summary.missing = scan.missing;
+    summary.files = scan.files;
+    summary.dates = scan.dates;
     Ok(summary)
 }
 
@@ -914,7 +963,48 @@ fn performance_record_key(entry: &EntryPerformance) -> String {
     )
 }
 
-fn performance_ledger_has_key(path: &Path, record_key: &str) -> anyhow::Result<bool> {
+#[derive(Clone, Debug)]
+struct JsonlAppend {
+    path: String,
+    appended: bool,
+    record_key: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct JsonlScanSummary {
+    missing: bool,
+    files: usize,
+    dates: Vec<String>,
+}
+
+fn append_deduped_jsonl_record(
+    directory: &Path,
+    date: &str,
+    record_key: &str,
+    payload: Value,
+) -> anyhow::Result<JsonlAppend> {
+    fs::create_dir_all(directory)?;
+    let path = directory.join(format!("{date}.jsonl"));
+    if jsonl_file_has_record_key(&path, record_key)? {
+        return Ok(JsonlAppend {
+            path: path.display().to_string(),
+            appended: false,
+            record_key: record_key.to_string(),
+        });
+    }
+
+    let line = serde_json::to_string(&payload)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    writeln!(file, "{line}")?;
+
+    Ok(JsonlAppend {
+        path: path.display().to_string(),
+        appended: true,
+        record_key: record_key.to_string(),
+    })
+}
+
+fn jsonl_file_has_record_key(path: &Path, record_key: &str) -> anyhow::Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
@@ -930,6 +1020,336 @@ fn performance_ledger_has_key(path: &Path, record_key: &str) -> anyhow::Result<b
         }
     }
     Ok(false)
+}
+
+fn scan_jsonl_records<F>(
+    directory: &Path,
+    since: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+    mut visit: F,
+) -> anyhow::Result<JsonlScanSummary>
+where
+    F: FnMut(NaiveDate, Result<Value, serde_json::Error>),
+{
+    let mut summary = JsonlScanSummary::default();
+    if !directory.exists() {
+        summary.missing = true;
+        return Ok(summary);
+    }
+
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(date) = ledger_file_date(&path) else {
+            continue;
+        };
+        if !date_in_range(date, since, until) {
+            continue;
+        }
+
+        summary.files += 1;
+        summary.dates.push(date.to_string());
+        for line in fs::read_to_string(&path)?.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            visit(date, serde_json::from_str::<Value>(line));
+        }
+    }
+    summary.dates.sort();
+    Ok(summary)
+}
+
+fn read_jsonl_records(path: &Path) -> anyhow::Result<Vec<Value>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    fs::read_to_string(path)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).map_err(Into::into))
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct TrackCandidate {
+    identity_key: String,
+    trade_date: String,
+    ts_utc: Option<DateTime<Utc>>,
+    candidate_type: String,
+    strategy: String,
+    underlying: String,
+    rank: Option<u64>,
+    score: Option<f64>,
+    symbols: Vec<String>,
+    entry_kind: CandidateEntryKind,
+    entry_net_premium: f64,
+    record: Value,
+    was_selected: bool,
+    was_traded: bool,
+    selected_action: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidateEntryKind {
+    Credit,
+    Debit,
+}
+
+#[derive(Clone, Debug)]
+struct CandidateOutcomeValue {
+    close_net_premium: f64,
+    hypothetical_pnl: f64,
+    hypothetical_pnl_fraction: Option<f64>,
+    warnings: Vec<String>,
+}
+
+fn selected_candidate_actions(records: &[Value]) -> BTreeMap<String, String> {
+    records
+        .iter()
+        .filter(|record| record_str(record, "type") == Some("candidate_alert"))
+        .filter(|record| record_str(record, "alert_type") == Some("selected_candidate"))
+        .filter_map(|record| {
+            Some((
+                record_str(record, "candidate_identity_key")?.to_string(),
+                record_str(record, "action")
+                    .unwrap_or("selected")
+                    .to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn collect_track_candidates(
+    records: &[Value],
+    selected: &BTreeMap<String, String>,
+    max_rank: u64,
+    max_candidates: usize,
+) -> Vec<TrackCandidate> {
+    let mut by_identity = BTreeMap::<String, TrackCandidate>::new();
+    for record in records {
+        if record_str(record, "type") != Some("candidate") {
+            continue;
+        }
+        if record_u64(record, "rank").unwrap_or(1) > max_rank {
+            continue;
+        }
+        let Some(candidate) = track_candidate_from_record(record, selected) else {
+            continue;
+        };
+        by_identity
+            .entry(candidate.identity_key.clone())
+            .and_modify(|current| {
+                if candidate.score.unwrap_or_default() > current.score.unwrap_or_default() {
+                    *current = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+
+    let mut candidates = by_identity.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates.truncate(max_candidates);
+    candidates
+}
+
+fn track_candidate_from_record(
+    record: &Value,
+    selected: &BTreeMap<String, String>,
+) -> Option<TrackCandidate> {
+    let strategy = record_str(record, "strategy")?.to_string();
+    let underlying = record_str(record, "underlying")?.to_string();
+    let candidate_type = record_str(record, "candidate_type")
+        .unwrap_or("unknown")
+        .to_string();
+    let symbols = candidate_symbols(record);
+    if symbols.is_empty() {
+        return None;
+    }
+    let identity_key = candidate_identity_key(&strategy, &underlying, &symbols);
+    let selected_action = selected.get(&identity_key).cloned();
+    let entry_kind = if candidate_type == "debit_spread" || strategy.contains("debit") {
+        CandidateEntryKind::Debit
+    } else {
+        CandidateEntryKind::Credit
+    };
+    let entry_net_premium = match entry_kind {
+        CandidateEntryKind::Credit => record_f64(record, "credit")?,
+        CandidateEntryKind::Debit => record_f64(record, "debit")?,
+    };
+    Some(TrackCandidate {
+        identity_key,
+        trade_date: record_str(record, "trade_date")?.to_string(),
+        ts_utc: record_ts(record),
+        candidate_type,
+        strategy,
+        underlying,
+        rank: record_u64(record, "rank"),
+        score: record_f64(record, "score"),
+        symbols,
+        entry_kind,
+        entry_net_premium,
+        record: record.clone(),
+        was_selected: selected_action.is_some(),
+        was_traded: selected_action
+            .as_deref()
+            .is_some_and(|action| action == "selected" || action == "submitted"),
+        selected_action,
+    })
+}
+
+fn candidate_symbols(record: &Value) -> Vec<String> {
+    if let (Some(short_put), Some(long_put), Some(short_call), Some(long_call)) = (
+        record_str(record, "short_put_symbol"),
+        record_str(record, "long_put_symbol"),
+        record_str(record, "short_call_symbol"),
+        record_str(record, "long_call_symbol"),
+    ) {
+        return [short_put, long_put, short_call, long_call]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+    }
+    if let Some(short) = record_str(record, "short_symbol") {
+        if let Some(long) = record_str(record, "long_symbol")
+            && !long.is_empty()
+        {
+            if record_str(record, "candidate_type") == Some("debit_spread")
+                || record_str(record, "strategy").is_some_and(|strategy| strategy.contains("debit"))
+            {
+                return vec![long.to_string(), short.to_string()];
+            }
+            return vec![short.to_string(), long.to_string()];
+        }
+        return vec![short.to_string()];
+    }
+    Vec::new()
+}
+
+fn candidate_identity_key(strategy: &str, underlying: &str, symbols: &[String]) -> String {
+    format!("{}|{}|{}", strategy, underlying, symbols.join("|"))
+}
+
+fn value_candidate_outcome(
+    candidate: &TrackCandidate,
+    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+) -> Option<CandidateOutcomeValue> {
+    let mut warnings = Vec::new();
+    let close_net_premium = if candidate.candidate_type == "iron_condor" {
+        let short_put = record_str(&candidate.record, "short_put_symbol")?;
+        let long_put = record_str(&candidate.record, "long_put_symbol")?;
+        let short_call = record_str(&candidate.record, "short_call_symbol")?;
+        let long_call = record_str(&candidate.record, "long_call_symbol")?;
+        quote_ask(snapshots, short_put, &mut warnings)?
+            - quote_bid(snapshots, long_put, &mut warnings)?
+            + quote_ask(snapshots, short_call, &mut warnings)?
+            - quote_bid(snapshots, long_call, &mut warnings)?
+    } else if candidate.entry_kind == CandidateEntryKind::Debit {
+        let long = candidate.symbols.first()?;
+        let short = candidate.symbols.get(1)?;
+        quote_bid(snapshots, long, &mut warnings)? - quote_ask(snapshots, short, &mut warnings)?
+    } else if candidate.symbols.len() == 1 {
+        quote_ask(snapshots, &candidate.symbols[0], &mut warnings)?
+    } else {
+        let short = candidate.symbols.first()?;
+        let long = candidate.symbols.get(1)?;
+        quote_ask(snapshots, short, &mut warnings)? - quote_bid(snapshots, long, &mut warnings)?
+    };
+    let pnl_per_contract = match candidate.entry_kind {
+        CandidateEntryKind::Credit => candidate.entry_net_premium - close_net_premium,
+        CandidateEntryKind::Debit => close_net_premium - candidate.entry_net_premium,
+    };
+    let hypothetical_pnl = pnl_per_contract * OPTION_CONTRACT_MULTIPLIER;
+    let hypothetical_pnl_fraction = (candidate.entry_net_premium > 0.0)
+        .then_some(pnl_per_contract / candidate.entry_net_premium);
+    Some(CandidateOutcomeValue {
+        close_net_premium,
+        hypothetical_pnl,
+        hypothetical_pnl_fraction,
+        warnings,
+    })
+}
+
+fn quote_bid(
+    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    symbol: &str,
+    warnings: &mut Vec<String>,
+) -> Option<f64> {
+    let bid = snapshots
+        .get(symbol)
+        .and_then(|snapshot| snapshot.latest_quote.as_ref())
+        .and_then(|quote| quote.bid_price)
+        .filter(|value| *value > 0.0);
+    if bid.is_none() {
+        warnings.push(format!("missing_bid:{symbol}"));
+    }
+    bid
+}
+
+fn quote_ask(
+    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    symbol: &str,
+    warnings: &mut Vec<String>,
+) -> Option<f64> {
+    let ask = snapshots
+        .get(symbol)
+        .and_then(|snapshot| snapshot.latest_quote.as_ref())
+        .and_then(|quote| quote.ask_price)
+        .filter(|value| *value > 0.0);
+    if ask.is_none() {
+        warnings.push(format!("missing_ask:{symbol}"));
+    }
+    ask
+}
+
+fn candidate_observation_buckets(
+    candidate: &TrackCandidate,
+    config: &OptionsEngineConfig,
+) -> Vec<&'static str> {
+    let mut buckets = Vec::new();
+    let now_utc = Utc::now();
+    if candidate
+        .ts_utc
+        .is_some_and(|ts| now_utc.signed_duration_since(ts) >= Duration::hours(1))
+    {
+        buckets.push("plus_1h");
+    }
+    let now_local = now_utc.with_timezone(&config.entry_timezone);
+    let Ok(trade_date) = NaiveDate::parse_from_str(&candidate.trade_date, "%Y-%m-%d") else {
+        return buckets;
+    };
+    if now_local.date_naive() == trade_date && now_local.time() >= config.close_end {
+        buckets.push("same_day_close");
+    }
+    if now_local.date_naive() > trade_date {
+        buckets.push("next_day");
+    }
+    if config.expiration_exit_days >= 0
+        && candidate_days_to_expiration(candidate)
+            .is_some_and(|days| days <= config.expiration_exit_days)
+    {
+        buckets.push("expiration_risk");
+    }
+    buckets.sort();
+    buckets.dedup();
+    buckets
+}
+
+fn candidate_days_to_expiration(candidate: &TrackCandidate) -> Option<i64> {
+    let expiration = nested_str(&candidate.record, &["short", "expiration_date"])
+        .or_else(|| nested_str(&candidate.record, &["put", "short", "expiration_date"]))
+        .or_else(|| nested_str(&candidate.record, &["call", "short", "expiration_date"]))?;
+    let expiration = NaiveDate::parse_from_str(expiration, "%Y-%m-%d").ok()?;
+    let today = Utc::now().date_naive();
+    Some((expiration - today).num_days())
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1192,6 +1612,32 @@ fn entry_status(entry: &StrategyStateEntry) -> &'static str {
     } else {
         "unknown"
     }
+}
+
+fn record_str<'a>(record: &'a Value, key: &str) -> Option<&'a str> {
+    record.get(key)?.as_str()
+}
+
+fn nested_str<'a>(record: &'a Value, path: &[&str]) -> Option<&'a str> {
+    let mut value = record;
+    for key in path {
+        value = value.get(*key)?;
+    }
+    value.as_str()
+}
+
+fn record_f64(record: &Value, key: &str) -> Option<f64> {
+    record.get(key)?.as_f64()
+}
+
+fn record_u64(record: &Value, key: &str) -> Option<u64> {
+    record.get(key)?.as_u64()
+}
+
+fn record_ts(record: &Value) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(record_str(record, "ts_utc")?)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
 fn parse_f64(value: &str) -> Option<f64> {
