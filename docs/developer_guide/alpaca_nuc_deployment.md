@@ -60,6 +60,61 @@ records from the candidate ledger, not by the trading loop. Put the webhook in
 The installer also creates `~/.config/nautilus-trader/alpaca/fleet.toml` if missing. The fleet
 registry is read-only operator metadata; credentials remain in each account env file.
 
+## Configuration Layering and Overrides
+
+The deployed runtime has three configuration layers:
+
+1. Env files carry credentials, endpoints, installed binary paths, account identity, and emergency
+   runtime gates.
+2. TOML files carry strategy, scanner, universe, risk, management, state, and ledger settings.
+3. The fleet registry carries account roles, permissions, risk budgets, service names, and
+   per-account file paths.
+
+The options engine resolves the TOML config in this order:
+
+- `ALPACA_CONFIG_PATH`, when set.
+- The current fleet account's `config_file`, when the account can be matched from
+  `NAUTILUS_ALPACA_ACCOUNT`, `NAUTILUS_ALPACA_SERVICE`, `ALPACA_CONFIG_PATH`, or
+  `NAUTILUS_ALPACA_ENV_FILE`.
+- `~/.config/nautilus-trader/alpaca/options-engine.toml`, when present.
+- Built-in runtime defaults.
+
+TOML `extends` loads the parent file first and then applies the child file. Child scalar values
+override parent scalar values, non-empty child lists override parent lists, and maps such as
+`[risk.sectors]` are merged with child keys replacing parent keys. Keep shared scanner, universe,
+sector, and management defaults in `base-options-engine.toml`; keep account identity, state paths,
+and account-level caps in the account config.
+
+Environment overrides are intentionally narrow and operational. They take precedence over TOML for
+the fields they support:
+
+- Strategy/run controls: `ALPACA_STRATEGIES`, `ALPACA_DRY_RUN_STRATEGIES`,
+  `ALPACA_MAX_ITERATIONS`, `ALPACA_INTERVAL_SECS`, `ALPACA_QTY`,
+  `ALPACA_IGNORE_ENTRY_WINDOW`.
+- Safety gates: `ALPACA_SUBMIT`, `ALPACA_MANAGE`, `ALPACA_CLOSE`, `ALPACA_KILL_SWITCH`,
+  `ALPACA_FORCE_FLATTEN`, `ALPACA_CANCEL_AFTER_ACCEPT`.
+- Account caps: `ALPACA_MAX_ACTIVE_ENTRIES`, `ALPACA_MAX_DAILY_SUBMITS`,
+  `ALPACA_MAX_OPEN_ORDERS`, `ALPACA_MAX_ACTIVE_ENTRIES_PER_UNDERLYING`,
+  `ALPACA_MAX_ACTIVE_ENTRIES_PER_SECTOR`.
+- Close management: `ALPACA_CLOSE_REGULAR_HOURS_ONLY`, `ALPACA_CLOSE_PRICE_CUSHION`,
+  `ALPACA_MAX_CLOSE_ATTEMPTS`, `ALPACA_CLOSE_REPRICE_COOLDOWN_SECS`.
+- Paths: `ALPACA_CONFIG_PATH`, `ALPACA_STATE_PATH`, `ALPACA_PERFORMANCE_LEDGER_DIR`.
+
+Not every TOML field has an env override. Scanner thresholds, sector maps, and most management
+parameters should stay in TOML so the checked config remains reviewable.
+
+Env file loading differs by intent. If `NAUTILUS_ALPACA_ENV_FILE` is unset, the runtime auto-loads
+`~/.config/nautilus-trader/alpaca/options-engine.env` when present but preserves values already in
+the process environment. If `NAUTILUS_ALPACA_ENV_FILE` is set, that file is an explicit account
+boundary: keys declared in the file override inherited values, and a missing file is an error.
+Fleet status uses an even stricter account boundary by clearing inherited `ALPACA_*` and
+`NAUTILUS_ALPACA_*` values before launching each per-account operator-status child.
+
+Fleet policy is applied after TOML and env resolution. Disabled accounts, role/permission
+mismatches, or fleet kill-switch activation force `submit_enabled=false` and `kill_switch=true`.
+Fleet account risk budgets can also tighten account limits; they should not be used to loosen the
+account TOML.
+
 ## Commands
 
 ```bash
@@ -77,6 +132,12 @@ alpaca-control alerts candidates --all --dry-run
 alpaca-control alerts candidates --all --send
 alpaca-control alerts enable
 alpaca-control alerts status
+alpaca-control performance --all
+alpaca-control performance --all --json
+alpaca-control performance --all --append-ledger --track-candidates
+alpaca-control alerts performance
+alpaca-control alerts performance-enable
+alpaca-control alerts performance-status
 alpaca-control validate
 alpaca-control deploy
 alpaca-control rollout
@@ -105,6 +166,35 @@ systemctl --user enable alpaca-options.service
 loginctl enable-linger "$USER"
 ```
 
+For direct service control:
+
+```bash
+systemctl --user start alpaca-options.service
+systemctl --user status alpaca-options.service --no-pager
+systemctl --user restart alpaca-options.service
+systemctl --user stop alpaca-options.service
+journalctl --user -u alpaca-options.service -f
+```
+
+For account-instance services:
+
+```bash
+systemctl --user start alpaca-options@paper-directional.service
+systemctl --user status alpaca-options@paper-directional.service --no-pager
+systemctl --user restart alpaca-options@paper-undefined-risk.service
+systemctl --user stop alpaca-options@paper-undefined-risk.service
+```
+
+The same controls are available through the account-aware wrapper:
+
+```bash
+alpaca-control --account paper-main start
+alpaca-control --account paper-main status
+alpaca-control --account paper-main restart
+alpaca-control --account paper-main stop
+alpaca-control --account paper-main logs
+```
+
 ## Runtime State
 
 Default state files from the env template:
@@ -113,6 +203,11 @@ Default state files from the env template:
 - Lock: `~/.local/state/nautilus_trader/locks/alpaca-options.lock`
 - Strategy state: `~/.local/state/nautilus_trader/alpaca_options_engine_state.json`
 - Candidate ledger: `~/.local/state/nautilus_trader/alpaca/<account-id>/candidate-ledger/*.jsonl`
+- Candidate-alert dedupe state:
+  `~/.local/state/nautilus_trader/alpaca/<account-id>/alerts/candidate-discord-state.json`
+- Performance ledger: `~/.local/state/nautilus_trader/alpaca/<account-id>/performance-ledger/*.jsonl`
+- Candidate outcomes:
+  `~/.local/state/nautilus_trader/alpaca/<account-id>/candidate-outcomes/*.jsonl`
 
 The runner wrapper takes an exclusive non-blocking lock. If another process already owns the lock,
 the service exits without starting another Alpaca account owner.
@@ -130,6 +225,21 @@ Account-scoped services use template-owned log and lock directories, for example
 `~/.local/state/nautilus_trader/alpaca/<account-id>/locks`. Keep each account's strategy state path
 inside its account config so one account cannot read or write another account's runtime state.
 
+Ledger meanings:
+
+- Strategy state is the engine's mutable local record of accepted entries, close attempts, close
+  status, and strategy metadata.
+- Candidate-ledger files are append-only scan evidence. Record types include `scanner_result`,
+  `candidate`, `candidate_alert`, `decision`, and `submit_result`.
+- Candidate-alert state is only a Discord dedupe file; deleting it can resend still-eligible
+  ledger alerts.
+- Performance-ledger files are append-only realized close records. Records are deduped by a stable
+  close key and store reconstructed open cashflow, close cashflow, realized PnL, warnings, and the
+  associated strategy entry.
+- Candidate-outcome files are historical opportunity observations produced by the performance
+  report. They value past scanner candidates at later observation buckets without implying the
+  candidate was traded.
+
 ## Multi-Account Foundation
 
 The existing paper account remains `alpaca-options.service` and continues to use:
@@ -142,6 +252,18 @@ roles, permissions, risk budgets, service names, env files, config files, state 
 directories, and lock directories. The account engine reads this registry on startup to enforce
 account permissions, the fleet kill switch, and fleet-level active-entry caps before submitting new
 entries.
+
+The example fleet separates paper account roles deliberately:
+
+| Account | Service | Role | Default state | Permission boundary |
+|---------|---------|------|---------------|---------------------|
+| `paper-main` | `alpaca-options.service` | `defined_risk_short_premium` | Enabled | Defined-risk credit verticals and iron condors only. |
+| `paper-directional` | `alpaca-options@paper-directional.service` | `long_premium_directional` | Disabled | Long-premium debit verticals only. |
+| `paper-undefined-risk` | `alpaca-options@paper-undefined-risk.service` | `undefined_risk_short_premium` | Disabled | Naked calls and naked puts only, behind explicit undefined-risk permissions. |
+
+Do not mix these roles casually. A strategy/role mismatch forces submission off and the kill switch
+on for that account runtime, but the operator should still keep each account's env file, TOML,
+state path, log directory, lock directory, and risk budget separate.
 
 For account-instance services, the systemd template owns account identity, service name, config
 path, log path, and lock path. The account env file should stay focused on credentials, endpoints,
@@ -261,9 +383,30 @@ tiny live canary.
 account status, open orders, positions, strategy state, the last structured scan/decision event, the
 latest broker event, and operator alerts. Use `--json` for machine-readable output.
 
+Common operator-status commands:
+
+```bash
+alpaca-control --account paper-main status
+alpaca-control --account paper-main operator --json
+alpaca-control --account paper-main health
+alpaca-control today
+alpaca-control ledger-summary --all
+alpaca-control --account paper-main ledger --lines 50
+```
+
 `alpaca-control fleet` runs `alpaca-fleet-status`, reads the fleet registry, and executes
 per-account operator status with each account's env file. It is a read-only fleet summary; it does
 not start services, submit orders, or change account state.
+
+Common fleet commands:
+
+```bash
+alpaca-control accounts
+alpaca-control fleet
+alpaca-control fleet --json
+alpaca-control fleet --include-disabled
+alpaca-fleet-status --json
+```
 
 `alpaca-control validate` runs the targeted Alpaca formatting, shell syntax, library test, and binary
 check commands used before installing runtime changes. `alpaca-control deploy` builds and installs
@@ -285,12 +428,69 @@ Scanner diagnostics include a `rejections` map keyed by filter reason, so a no-c
 attributed to liquidity, quote quality, delta range, POP/touch gates, buying-power usage, score, or
 spread-construction filters instead of only reporting a generic no-candidate result.
 
+Candidate alert commands read typed `candidate_alert` records from the candidate ledger. They do not
+run scanners or submit orders:
+
+```bash
+alpaca-control alerts candidates --all --dry-run
+alpaca-control alerts candidates --all --send
+alpaca-control alerts candidates --all --date 2026-05-08 --lookback-minutes 60 --max-rank 3
+alpaca-control alerts enable
+alpaca-control alerts status
+alpaca-control alerts disable
+```
+
+Performance report commands read strategy state, candidate ledgers, broker activities, and current
+positions. They do not submit or cancel orders:
+
+```bash
+alpaca-control performance --all
+alpaca-control performance --all --json
+alpaca-control performance --all --since 2026-05-01 --until 2026-05-08
+alpaca-control performance --all --append-ledger
+alpaca-control performance --all --track-candidates
+alpaca-control alerts performance
+alpaca-control alerts performance-enable
+alpaca-control alerts performance-status
+alpaca-control alerts performance-disable
+```
+
+Use `--append-ledger` to backfill closed entries into the immutable performance ledger. Use
+`--track-candidates` after enough time has passed to observe historical candidates; it writes
+candidate-outcome records using current option snapshots and the configured observation buckets.
+
 The command reports one engine state:
 
 - `idle`: service/account are healthy with no open broker exposure.
 - `trading`: open orders or positions exist and no critical alert is active.
 - `blocked`: the engine is intentionally blocked by kill-switch or disabled submission.
 - `broken`: account, service, state, or exposure checks need operator intervention.
+
+## Historical Opportunity and PnL Accounting
+
+The candidate ledger is the source of historical opportunity evidence. Each scanner pass can append
+ranked `candidate` records plus a `scanner_result`; selected or high-score candidates can append
+`candidate_alert` records, and submission decisions append `decision` and `submit_result` records.
+`alpaca-control ledger-summary --all` audits those records by account and trade date.
+
+`alpaca-control performance --track-candidates` replays candidate-ledger records and values the
+same option symbols from current snapshots. It writes `candidate_outcome` records under
+`candidate-outcomes` for observation buckets such as `plus_1h`, `same_day_close`, `next_day`, and
+`expiration_risk`. These records are analytical opportunity tracking; they are not broker fills and
+should not be counted as realized trading PnL.
+
+Realized close PnL comes from broker activity reconstruction. The performance report matches each
+strategy-state entry to opening and closing parent/leg order IDs, reads option activity cashflows,
+and reports `realized_pnl = open_cashflow + close_cashflow` for closed entries when both sides are
+available. Credit entries normally open with positive cashflow and close with negative cashflow;
+debit entries normally open with negative cashflow and close with positive cashflow. Missing close
+order IDs or fill activity produces warnings such as `missing_close_fills` or
+`missing_realized_pnl` instead of fabricated PnL.
+
+The engine appends realized close records during close handling when enough broker evidence is
+available. The operator can also run `alpaca-control performance --append-ledger` to append missing
+closed entries. The performance ledger is deduped by record key, so repeated backfills should not
+create duplicate realized-trade records.
 
 ## Operator Runbook
 

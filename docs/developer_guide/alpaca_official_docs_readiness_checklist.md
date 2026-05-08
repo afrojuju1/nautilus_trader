@@ -114,20 +114,20 @@ for official NautilusTrader documentation.
 
 ## Operational documentation
 
-- [ ] Document config layering and precedence.
-- [ ] Document environment override behavior.
+- [x] Document config layering and precedence.
+- [x] Document environment override behavior.
 - [x] Document kill-switch defaults.
 - [x] Document submit/manage/close gates.
-- [ ] Document systemd service installation and control commands.
-- [ ] Document account role separation for main, directional, and undefined-risk paper accounts.
-- [ ] Document operator status commands.
-- [ ] Document fleet status commands.
-- [ ] Document candidate alert commands.
-- [ ] Document performance report commands.
+- [x] Document systemd service installation and control commands.
+- [x] Document account role separation for main, directional, and undefined-risk paper accounts.
+- [x] Document operator status commands.
+- [x] Document fleet status commands.
+- [x] Document candidate alert commands.
+- [x] Document performance report commands.
 - [x] Document paper smoke-test policy.
 - [x] Document how to cancel accepted smoke-test orders.
-- [ ] Document ledger locations and meanings.
-- [ ] Document historical opportunity tracking and close-PnL accounting.
+- [x] Document ledger locations and meanings.
+- [x] Document historical opportunity tracking and close-PnL accounting.
 
 ## Strategy runtime documentation
 
@@ -157,15 +157,15 @@ for official NautilusTrader documentation.
       home.
 - [x] Add fixture tests for config and env resolution.
 - [x] Add fixture tests for endpoint selection.
-- [ ] Add fixture tests for option symbology conversion.
-- [ ] Add fixture tests for option contract parsing.
-- [ ] Add fixture tests for option snapshot parsing.
+- [x] Add fixture tests for option symbology conversion.
+- [x] Add fixture tests for option contract parsing.
+- [x] Add fixture tests for option snapshot parsing.
 - [x] Add fixture tests for order payload validation.
 - [x] Add fixture tests for multi-leg signed premium handling.
-- [ ] Add fixture tests for order status mapping.
-- [ ] Add fixture tests for fill/activity mapping.
-- [ ] Add fixture tests for partial fills.
-- [ ] Add fixture tests for rejected, canceled, expired, and replaced orders where applicable.
+- [x] Add fixture tests for order status mapping.
+- [x] Add fixture tests for fill/activity mapping.
+- [x] Add fixture tests for partial fills.
+- [x] Add fixture tests for rejected, canceled, expired, and replaced orders where applicable.
 - [ ] Add fixture tests for startup reconciliation.
 - [ ] Add fixture tests for terminal position reconciliation.
 - [x] Add docs example smoke/import tests.

@@ -142,3 +142,41 @@ chmod 600 "$HOME/.config/nautilus-trader/alpaca/options-engine.env"
 
 Do not enable `ALPACA_SUBMIT`, `ALPACA_MANAGE`, or `ALPACA_CLOSE` until paper credentials,
 endpoints, account status, open orders, positions, and risk caps have been verified.
+
+## Installed operator commands
+
+After installing the deployment helpers, use `alpaca-control` for account-aware operations:
+
+```bash
+deploy/alpaca/alpaca-options-install.sh
+
+alpaca-control --account paper-main check-config
+alpaca-control --account paper-main status
+alpaca-control fleet --json
+alpaca-control today
+alpaca-control ledger-summary --all
+alpaca-control alerts candidates --all --dry-run
+alpaca-control performance --all
+```
+
+The installed config layers are `options-engine.env`, `base-options-engine.toml`,
+`options-engine.toml`, and `fleet.toml`. `NAUTILUS_ALPACA_ENV_FILE` selects an account env file;
+`ALPACA_CONFIG_PATH` selects the account TOML; `extends = "base-options-engine.toml"` lets account
+TOML inherit shared scanner and management defaults. Operational env overrides such as
+`ALPACA_SUBMIT`, `ALPACA_MANAGE`, `ALPACA_CLOSE`, `ALPACA_KILL_SWITCH`, and
+`ALPACA_MAX_ITERATIONS` take precedence over TOML for those supported fields.
+
+Service control is available through either systemd or the wrapper:
+
+```bash
+systemctl --user start alpaca-options.service
+systemctl --user status alpaca-options.service --no-pager
+alpaca-control --account paper-main restart
+alpaca-control --account paper-main logs
+```
+
+Candidate ledgers live under
+`~/.local/state/nautilus_trader/alpaca/<account-id>/candidate-ledger/`. Performance ledgers and
+candidate-outcome ledgers live beside them under `performance-ledger/` and `candidate-outcomes/`.
+Performance reports read broker fills and local state for accounting; they do not submit or cancel
+orders.
