@@ -11,6 +11,7 @@
    :titlesonly:
    :hidden:
 
+   alpaca.md
    betfair.md
    binance.md
    bybit.md

@@ -17,8 +17,8 @@ for official NautilusTrader documentation.
 
 - [x] Add `docs/integrations/alpaca.md`.
 - [x] Add Alpaca to the integrations index.
-- [ ] Add `docs/api_reference/adapters/alpaca.md`.
-- [ ] Add Alpaca to the adapter API reference index.
+- [x] Add `docs/api_reference/adapters/alpaca.md`.
+- [x] Add Alpaca to the adapter API reference index.
 - [x] Add `examples/live/alpaca/`.
 - [x] Add a clear status box to the public integration page.
 - [x] Add links from the Alpaca production/runtime developer docs to the public integration docs.
@@ -66,15 +66,15 @@ for official NautilusTrader documentation.
 
 ## API reference readiness
 
-- [ ] Decide whether the API reference should describe only the implemented Rust/PyO3 runtime
+- [x] Decide whether the API reference should describe only the implemented Rust/PyO3 runtime
       surface or wait until the Python adapter factories work.
-- [ ] Document the available Alpaca Python package imports without implying unfinished factories
+- [x] Document the available Alpaca Python package imports without implying unfinished factories
       are usable.
-- [ ] Document the PyO3 scanner/runtime bindings that are intentionally public.
-- [ ] Document config objects and clearly mark fields that are engine-specific rather than generic
+- [x] Document the PyO3 scanner/runtime bindings that are intentionally public.
+- [x] Document config objects and clearly mark fields that are engine-specific rather than generic
       adapter configuration.
 - [ ] Confirm generated stubs include the Alpaca module as intended.
-- [ ] Run the docs build after adding the API page.
+- [x] Run the docs build after adding the API page.
 
 ## Python adapter completion
 
@@ -205,7 +205,7 @@ for official NautilusTrader documentation.
 
 - [x] Phase 1: publish experimental Alpaca docs.
 - [x] Phase 1: add public integration page with explicit limitations.
-- [ ] Phase 1: add API reference placeholder or implemented-runtime API page.
+- [x] Phase 1: add API reference placeholder or implemented-runtime API page.
 - [x] Phase 1: add safe examples.
 - [x] Phase 1: clean up stale scaffold language.
 - [ ] Phase 2: implement Python `TradingNode` adapter factories.
