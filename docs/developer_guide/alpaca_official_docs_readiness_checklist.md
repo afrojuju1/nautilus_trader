@@ -184,7 +184,7 @@ for official NautilusTrader documentation.
 
 ## Packaging and release readiness
 
-- [ ] Confirm Alpaca Python modules are included in built wheels.
+- [x] Confirm Alpaca Python modules are included in built wheels.
 - [x] Confirm the `nautilus_pyo3.alpaca` module is intentionally exposed.
 - [ ] Confirm docs references do not create broken links.
 - [x] Confirm examples do not require real credentials unless explicitly marked.
