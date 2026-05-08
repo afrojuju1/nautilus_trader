@@ -23,7 +23,7 @@ pub(super) struct JsonlScanSummary {
     pub(super) dates: Vec<String>,
 }
 
-pub(super) fn append_deduped_jsonl_record(
+pub(crate) fn append_deduped_jsonl_record(
     directory: &Path,
     date: &str,
     record_key: &str,
@@ -50,7 +50,7 @@ pub(super) fn append_deduped_jsonl_record(
     })
 }
 
-pub(super) fn scan_jsonl_records<F>(
+pub(crate) fn scan_jsonl_records<F>(
     directory: &Path,
     since: Option<NaiveDate>,
     until: Option<NaiveDate>,
@@ -91,7 +91,7 @@ where
     Ok(summary)
 }
 
-pub(super) fn read_jsonl_records(path: &Path) -> anyhow::Result<Vec<Value>> {
+pub(crate) fn read_jsonl_records(path: &Path) -> anyhow::Result<Vec<Value>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -102,7 +102,7 @@ pub(super) fn read_jsonl_records(path: &Path) -> anyhow::Result<Vec<Value>> {
         .collect()
 }
 
-pub(super) fn date_in_range(
+pub(crate) fn date_in_range(
     date: NaiveDate,
     since: Option<NaiveDate>,
     until: Option<NaiveDate>,
