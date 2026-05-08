@@ -108,7 +108,7 @@ for official NautilusTrader documentation.
 - [x] Add an option snapshot/scanner dry-run example.
 - [x] Add a multi-leg order validation example that does not submit orders.
 - [x] Add a paper-only options engine walkthrough with submission disabled by default.
-- [ ] Add a safe paper smoke-test example that cancels accepted test orders.
+- [x] Add a safe paper smoke-test example that cancels accepted test orders.
 - [ ] Add a standard `TradingNode` example after Python factories exist.
 - [ ] Add docs or tests that verify public examples import and run in dry-run mode.
 
@@ -124,8 +124,8 @@ for official NautilusTrader documentation.
 - [ ] Document fleet status commands.
 - [ ] Document candidate alert commands.
 - [ ] Document performance report commands.
-- [ ] Document paper smoke-test policy.
-- [ ] Document how to cancel accepted smoke-test orders.
+- [x] Document paper smoke-test policy.
+- [x] Document how to cancel accepted smoke-test orders.
 - [ ] Document ledger locations and meanings.
 - [ ] Document historical opportunity tracking and close-PnL accounting.
 
@@ -199,7 +199,7 @@ for official NautilusTrader documentation.
 - [x] Add a note that assignment, exercise, and expiry handling still need first-class lifecycle
       proof before being advertised as complete.
 - [x] Add a note that market-data capabilities depend on Alpaca account entitlements.
-- [ ] Add a note that real smoke tests must cancel accepted orders unless intentionally left open.
+- [x] Add a note that real smoke tests must cancel accepted orders unless intentionally left open.
 
 ## Proposed rollout
 

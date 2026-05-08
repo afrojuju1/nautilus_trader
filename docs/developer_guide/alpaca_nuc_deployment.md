@@ -91,6 +91,13 @@ forces dry-run entry decisions, disables submit/manage/close, ignores the entry 
 and raises local account caps so daily submit limits do not hide candidates. Use `run-once` when the
 goal is to execute one normal engine iteration with the account's configured runtime gates.
 
+Paper smoke tests that submit orders must be deliberate and short-lived. Keep paper endpoints in
+the env file, set `ALPACA_MAX_ITERATIONS=1`, keep quantity at `1`, and set
+`ALPACA_CANCEL_AFTER_ACCEPT=true` only for the smoke run. After the run, check account state with
+`alpaca-control --account <account> status`; if any accepted smoke order remains open, cancel it in
+the Alpaca paper dashboard or API before continuing. Do not leave accepted smoke orders working
+unless the test explicitly requires it.
+
 To enable start on user login:
 
 ```bash

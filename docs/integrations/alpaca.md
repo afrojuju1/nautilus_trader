@@ -95,10 +95,10 @@ those symbols into instrument IDs on venue `ALPACA`:
 <ALPACA_OPTION_SYMBOL>.ALPACA
 ```
 
-For example, an Alpaca option symbol such as `SPY260116P00450000` becomes:
+For example, an Alpaca option symbol such as `SPY260619P00450000` becomes:
 
 ```text
-SPY260116P00450000.ALPACA
+SPY260619P00450000.ALPACA
 ```
 
 The adapter keeps the Alpaca symbol as the raw symbol and uses the contract payload for underlying,
@@ -176,7 +176,7 @@ cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-contracts 
 cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-snapshots -- SPY
 cargo run -p nautilus-alpaca --features live --bin alpaca-dry-run-put-credit -- SPY QQQ
 cargo run -p nautilus-alpaca --features live --bin alpaca-validate-mleg-order -- \
-  SPY260116P00450000 SPY260116P00445000 0.40 1
+  SPY260619P00450000 SPY260619P00445000 0.40 1
 ```
 
 Before running the account engine, check config with submission disabled:
@@ -189,6 +189,18 @@ export ALPACA_KILL_SWITCH=true
 
 cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- --check-config
 ```
+
+Paper order smoke tests must be explicit. Use only paper endpoints, keep size small, use the
+submit/cancel harness, and verify open orders afterward:
+
+```bash
+cargo run -p nautilus-alpaca --features live --bin alpaca-paper-execution-harness -- \
+  SPY260619P00450000 SPY260619P00445000 4.95 1
+cargo run -p nautilus-alpaca --features live --bin alpaca-check-account-orders
+```
+
+The harness requests cancellation after an accepted non-terminal order. If any smoke order remains
+open, cancel it in the Alpaca paper dashboard or API before continuing.
 
 Only enable paper submission deliberately, after verifying credentials, endpoints, account status,
 open orders, positions, and risk caps.

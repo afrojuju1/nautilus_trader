@@ -39,8 +39,8 @@ cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-contracts 
 Optional expiration filters:
 
 ```bash
-export ALPACA_CONTRACTS_MIN_EXPIRATION="2026-01-16"
-export ALPACA_CONTRACTS_MAX_EXPIRATION="2026-01-23"
+export ALPACA_CONTRACTS_MIN_EXPIRATION="2026-06-19"
+export ALPACA_CONTRACTS_MAX_EXPIRATION="2026-06-26"
 cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-contracts -- SPY
 ```
 
@@ -81,8 +81,31 @@ does not submit the order.
 
 ```bash
 cargo run -p nautilus-alpaca --features live --bin alpaca-validate-mleg-order -- \
-  SPY260116P00450000 SPY260116P00445000 0.40 1
+  SPY260619P00450000 SPY260619P00445000 0.40 1
 ```
+
+## Paper submit/cancel smoke test
+
+Only run this intentionally with paper credentials. The smoke utility submits one multi-leg paper
+order and requests cancellation if Alpaca accepts it and the order is not already terminal.
+
+Use a small quantity and a conservative limit, then verify the account has no unexpected open orders
+or positions:
+
+```bash
+export ALPACA_TRADING_BASE_URL="https://paper-api.alpaca.markets"
+export ALPACA_EXECUTION_POLL_ATTEMPTS=1
+export ALPACA_EXECUTION_POST_CANCEL_POLL_ATTEMPTS=3
+
+cargo run -p nautilus-alpaca --features live --bin alpaca-paper-execution-harness -- \
+  SPY260619P00450000 SPY260619P00445000 4.95 1
+
+cargo run -p nautilus-alpaca --features live --bin alpaca-check-account-orders
+```
+
+If an accepted smoke order remains open after the harness exits, cancel it in the Alpaca paper
+dashboard or API before continuing. Do not leave smoke orders working unless that is the explicit
+test objective.
 
 ## Check the options-engine config
 
