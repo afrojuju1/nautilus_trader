@@ -153,22 +153,22 @@ for official NautilusTrader documentation.
 
 ## Tests and proof
 
-- [ ] Add `tests/integration_tests/adapters/alpaca/` fixtures or an equivalent documented test
+- [x] Add `tests/integration_tests/adapters/alpaca/` fixtures or an equivalent documented test
       home.
-- [ ] Add fixture tests for config and env resolution.
-- [ ] Add fixture tests for endpoint selection.
+- [x] Add fixture tests for config and env resolution.
+- [x] Add fixture tests for endpoint selection.
 - [ ] Add fixture tests for option symbology conversion.
 - [ ] Add fixture tests for option contract parsing.
 - [ ] Add fixture tests for option snapshot parsing.
-- [ ] Add fixture tests for order payload validation.
-- [ ] Add fixture tests for multi-leg signed premium handling.
+- [x] Add fixture tests for order payload validation.
+- [x] Add fixture tests for multi-leg signed premium handling.
 - [ ] Add fixture tests for order status mapping.
 - [ ] Add fixture tests for fill/activity mapping.
 - [ ] Add fixture tests for partial fills.
 - [ ] Add fixture tests for rejected, canceled, expired, and replaced orders where applicable.
 - [ ] Add fixture tests for startup reconciliation.
 - [ ] Add fixture tests for terminal position reconciliation.
-- [ ] Add docs example smoke/import tests.
+- [x] Add docs example smoke/import tests.
 - [ ] Keep live Alpaca credential tests out of normal CI unless explicitly configured.
 
 ## Stale documentation cleanup
@@ -210,5 +210,5 @@ for official NautilusTrader documentation.
 - [x] Phase 1: clean up stale scaffold language.
 - [ ] Phase 2: implement Python `TradingNode` adapter factories.
 - [ ] Phase 2: wire standard data/instrument provider behavior.
-- [ ] Phase 2: add adapter integration fixtures and example smoke tests.
+- [x] Phase 2: add adapter integration fixtures and example smoke tests.
 - [ ] Phase 3: broaden data, order, assignment/exercise/expiry, and historical-data support.
