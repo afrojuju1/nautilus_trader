@@ -19,20 +19,19 @@ use std::collections::{BTreeMap, HashMap};
 
 use chrono::{NaiveDate, Utc};
 use nautilus_model::data::greeks::black_scholes_greeks;
-use time::{Duration, OffsetDateTime};
 
 use crate::{
     config::AlpacaDataClientConfig,
     http::{
         client::AlpacaHttpClient,
         error::Result,
-        models::{
-            AlpacaOptionContract, AlpacaOptionSnapshot, AlpacaOptionType, OptionSnapshotsRequest,
-            StockSnapshotsRequest,
-        },
+        models::{AlpacaOptionContract, AlpacaOptionSnapshot, AlpacaOptionType},
     },
-    providers::AlpacaOptionContractProvider,
 };
+
+mod chain;
+
+use chain::{load_option_chain_snapshot, load_underlying_price};
 
 const SCANNER_RISK_FREE_RATE: f64 = 0.0425;
 const DAYS_PER_YEAR: f64 = 365.25;
@@ -721,36 +720,25 @@ pub async fn scan_credit_spread_underlying(
     kind: CreditSpreadKind,
 ) -> Result<PutCreditScanResult> {
     let underlying = underlying.into();
-    let today = OffsetDateTime::now_utc().date();
-    let min_expiration = (today + Duration::days(config.min_dte)).to_string();
-    let max_expiration = (today + Duration::days(config.max_dte)).to_string();
-    let provider = AlpacaOptionContractProvider::new(client.clone());
-
-    let contracts = provider
-        .load_active_contracts(
-            underlying.clone(),
-            min_expiration,
-            max_expiration,
-            Some(kind.option_type()),
-        )
-        .await?;
-    let symbols = contracts
-        .iter()
-        .map(|contract| contract.symbol.clone())
-        .collect::<Vec<_>>();
-    let mut snapshots_request = OptionSnapshotsRequest::for_symbols(symbols);
-    snapshots_request.feed = Some(data_config.option_feed.as_str().to_string());
-    let snapshots = client.option_snapshots(&snapshots_request).await?.snapshots;
+    let chain = load_option_chain_snapshot(
+        client,
+        data_config,
+        &underlying,
+        config.min_dte,
+        config.max_dte,
+        kind.option_type(),
+    )
+    .await?;
 
     let (scored, mut rejection_counts) =
-        score_contracts_with_rejections(&contracts, &snapshots, config);
+        score_contracts_with_rejections(&chain.contracts, &chain.snapshots, config);
     let (candidates, build_rejections) =
         build_candidates_for_kind_with_rejections(&scored, config, kind);
     merge_rejection_counts(&mut rejection_counts, &build_rejections);
     Ok(PutCreditScanResult {
         underlying,
-        contract_count: contracts.len(),
-        snapshot_count: snapshots.len(),
+        contract_count: chain.contracts.len(),
+        snapshot_count: chain.snapshots.len(),
         scoreable_count: scored.len(),
         rejection_counts,
         candidates,
@@ -770,36 +758,25 @@ pub async fn scan_debit_spread_underlying(
     kind: DebitSpreadKind,
 ) -> Result<DebitSpreadScanResult> {
     let underlying = underlying.into();
-    let today = OffsetDateTime::now_utc().date();
-    let min_expiration = (today + Duration::days(config.min_dte)).to_string();
-    let max_expiration = (today + Duration::days(config.max_dte)).to_string();
-    let provider = AlpacaOptionContractProvider::new(client.clone());
-
-    let contracts = provider
-        .load_active_contracts(
-            underlying.clone(),
-            min_expiration,
-            max_expiration,
-            Some(kind.option_type()),
-        )
-        .await?;
-    let symbols = contracts
-        .iter()
-        .map(|contract| contract.symbol.clone())
-        .collect::<Vec<_>>();
-    let mut snapshots_request = OptionSnapshotsRequest::for_symbols(symbols);
-    snapshots_request.feed = Some(data_config.option_feed.as_str().to_string());
-    let snapshots = client.option_snapshots(&snapshots_request).await?.snapshots;
+    let chain = load_option_chain_snapshot(
+        client,
+        data_config,
+        &underlying,
+        config.min_dte,
+        config.max_dte,
+        kind.option_type(),
+    )
+    .await?;
 
     let (scored, mut rejection_counts) =
-        score_debit_contracts_with_rejections(&contracts, &snapshots, config);
+        score_debit_contracts_with_rejections(&chain.contracts, &chain.snapshots, config);
     let (candidates, build_rejections) =
         build_debit_candidates_for_kind_with_rejections(&scored, config, kind);
     merge_rejection_counts(&mut rejection_counts, &build_rejections);
     Ok(DebitSpreadScanResult {
         underlying,
-        contract_count: contracts.len(),
-        snapshot_count: snapshots.len(),
+        contract_count: chain.contracts.len(),
+        snapshot_count: chain.snapshots.len(),
         scoreable_count: scored.len(),
         rejection_counts,
         candidates,
@@ -836,31 +813,20 @@ pub async fn scan_naked_option_underlying_with_capital(
     capital: Option<NakedOptionCapitalContext>,
 ) -> Result<NakedOptionScanResult> {
     let underlying = underlying.into();
-    let today = OffsetDateTime::now_utc().date();
-    let min_expiration = (today + Duration::days(config.min_dte)).to_string();
-    let max_expiration = (today + Duration::days(config.max_dte)).to_string();
-    let provider = AlpacaOptionContractProvider::new(client.clone());
-
-    let contracts = provider
-        .load_active_contracts(
-            underlying.clone(),
-            min_expiration,
-            max_expiration,
-            Some(kind.option_type()),
-        )
-        .await?;
-    let symbols = contracts
-        .iter()
-        .map(|contract| contract.symbol.clone())
-        .collect::<Vec<_>>();
-    let mut snapshots_request = OptionSnapshotsRequest::for_symbols(symbols);
-    snapshots_request.feed = Some(data_config.option_feed.as_str().to_string());
-    let snapshots = client.option_snapshots(&snapshots_request).await?.snapshots;
+    let chain = load_option_chain_snapshot(
+        client,
+        data_config,
+        &underlying,
+        config.min_dte,
+        config.max_dte,
+        kind.option_type(),
+    )
+    .await?;
     let underlying_price = load_underlying_price(client, data_config, &underlying).await?;
 
     let (scored, mut rejection_counts) = score_naked_option_contracts_with_rejections(
-        &contracts,
-        &snapshots,
+        &chain.contracts,
+        &chain.snapshots,
         config,
         kind,
         underlying_price,
@@ -870,36 +836,12 @@ pub async fn scan_naked_option_underlying_with_capital(
     merge_rejection_counts(&mut rejection_counts, &build_rejections);
     Ok(NakedOptionScanResult {
         underlying,
-        contract_count: contracts.len(),
-        snapshot_count: snapshots.len(),
+        contract_count: chain.contracts.len(),
+        snapshot_count: chain.snapshots.len(),
         scoreable_count: scored.len(),
         rejection_counts,
         candidates,
     })
-}
-
-async fn load_underlying_price(
-    client: &AlpacaHttpClient,
-    data_config: &AlpacaDataClientConfig,
-    underlying: &str,
-) -> Result<f64> {
-    let mut request = StockSnapshotsRequest::for_symbols([underlying.to_string()]);
-    request.feed = Some(data_config.stock_feed.as_str().to_string());
-    let snapshots = client.stock_snapshots(&request).await?.snapshots;
-    snapshots
-        .get(underlying)
-        .or_else(|| {
-            snapshots
-                .iter()
-                .find(|(symbol, _)| symbol.eq_ignore_ascii_case(underlying))
-                .map(|(_, snapshot)| snapshot)
-        })
-        .and_then(|snapshot| snapshot.latest_price())
-        .ok_or_else(|| {
-            crate::http::error::Error::Validation(format!(
-                "stock snapshot missing latest price for {underlying}"
-            ))
-        })
 }
 
 /// Scores contracts that have enough quote, Greek, and liquidity data.

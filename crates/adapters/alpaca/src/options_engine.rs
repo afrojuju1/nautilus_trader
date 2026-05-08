@@ -19,18 +19,13 @@
 //! `alpaca-options-engine` binary. The binary stays as a thin entrypoint so the live
 //! runtime can be tested and evolved from library code.
 
-use std::{
-    cell::RefCell, collections::BTreeSet, env, future::Future, path::PathBuf, pin::Pin, rc::Rc,
-    str::FromStr, time::Duration,
-};
+use std::{collections::BTreeSet, env, future::Future, path::PathBuf, pin::Pin, time::Duration};
 
 use crate::{
-    common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
-    config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
-    execution::{AlpacaExecutionClient, check_option_spread_entry_admission},
+    config::AlpacaDataClientConfig,
+    execution::check_option_spread_entry_admission,
     http::{
         client::AlpacaHttpClient,
-        error::Error,
         models::{
             AlpacaOrder, AlpacaPosition, ListActivitiesRequest, ListOrdersRequest,
             OptionSnapshotsRequest,
@@ -38,50 +33,36 @@ use crate::{
     },
     management::{credit_spread_close_reason, days_to_expiration, recorded_age_secs},
     options_runtime::{
-        OptionsEngineConfig, SelectedDebitEntry, SelectedEntry, SelectedIronCondorEntry,
-        SelectedNakedOptionEntry, SelectedOptionsEntry, active_sector_count,
-        active_underlying_count, candidate_alert_identity_key, candidate_alert_key,
-        credit_candidate_ledger_payload, debit_candidate_ledger_payload,
+        OptionsEngineConfig, SelectedOptionsEntry, active_sector_count, active_underlying_count,
         fleet_active_underlying_count, fleet_has_active_underlying_elsewhere,
-        fleet_sector_limit_state, iron_condor_candidate_ledger_payload,
-        naked_candidate_ledger_payload, select_options_entry,
+        fleet_sector_limit_state, select_options_entry,
     },
     performance::{
         EntryOrderIds, append_performance_ledger_record, collect_order_ids,
         default_performance_ledger_dir, entry_performance,
     },
     runtime::{
-        StrategyState, StrategyStateEntry, StrategyStateEntryDraft, credit_spread_strategy_name,
-        debit_spread_strategy_name, emit_operator_event, load_strategy_state,
-        naked_option_strategy_name, save_strategy_state_atomic,
+        StrategyState, StrategyStateEntry, credit_spread_strategy_name, emit_operator_event,
+        load_strategy_state, save_strategy_state_atomic,
     },
-    strategy::{CreditSpreadKind, DebitSpreadCandidate, IronCondorCandidate, NakedOptionCandidate},
-    submit::{
-        MlegSubmitLeg, MlegSubmitOrderListRequest, SimpleSubmitOrderRequest,
-        build_mleg_submit_order_list, build_simple_submit_order,
-    },
+    strategy::CreditSpreadKind,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use nautilus_common::{
-    cache::Cache,
-    clients::ExecutionClient,
-    live::runner::replace_exec_event_sender,
-    messages::{ExecutionEvent, execution::SubmitOrderList},
-};
-use nautilus_core::{UUID4, time::get_atomic_clock_realtime};
-use nautilus_live::ExecutionClientCore;
-use nautilus_model::{
-    enums::{AccountType, OmsType, OrderSide},
-    events::OrderEventAny,
-    identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TraderId, Venue,
-    },
-    types::{Price, Quantity},
-};
+use nautilus_core::UUID4;
 use serde_json::{Value, json};
-use tokio::{
-    sync::mpsc,
-    time::{Instant, sleep, timeout},
+use tokio::time::sleep;
+
+mod events;
+mod submission;
+
+use events::{
+    insert_string_field, insert_value_field, record_decision_event,
+    record_selected_candidate_alert, record_submit_rejected_candidate_alert,
+    record_submit_result_event, selected_entry_alert_payload,
+};
+use submission::{
+    cancel_parent_order_by_id, lookup_parent_order_snapshot, submit_close_entry,
+    submit_selected_entry,
 };
 
 const DEFAULT_EVENT_TIMEOUT_SECS: u64 = 20;
@@ -656,220 +637,6 @@ fn naked_scanner_threshold_snapshot(
     })
 }
 
-fn record_decision_event(
-    config: &OptionsEngineConfig,
-    trade_date: &str,
-    payload: serde_json::Value,
-) {
-    emit_operator_event("decision", payload.clone());
-    config.record_candidate_ledger(trade_date, "decision", payload);
-}
-
-fn record_submit_result_event(
-    config: &OptionsEngineConfig,
-    trade_date: &str,
-    payload: serde_json::Value,
-) {
-    emit_operator_event("submit_result", payload.clone());
-    config.record_candidate_ledger(trade_date, "submit_result", payload);
-}
-
-fn record_selected_candidate_alert(
-    config: &OptionsEngineConfig,
-    trade_date: &str,
-    identity_key: &str,
-    payload: Value,
-) {
-    config.record_candidate_alert_ledger(
-        trade_date,
-        SELECTED_CANDIDATE_ALERT,
-        "info",
-        candidate_alert_key(SELECTED_CANDIDATE_ALERT, identity_key),
-        payload,
-    );
-}
-
-fn record_submit_rejected_candidate_alert(
-    config: &OptionsEngineConfig,
-    trade_date: &str,
-    identity_key: &str,
-    mut payload: Value,
-    outcome: &SubmitOutcome,
-    terminal_rejection_recorded: Option<bool>,
-) {
-    insert_value_field(&mut payload, "accepted", Value::from(outcome.accepted));
-    insert_value_field(&mut payload, "rejected", Value::from(outcome.rejected));
-    insert_value_field(
-        &mut payload,
-        "parent_order_id",
-        outcome
-            .parent_order_id
-            .as_ref()
-            .map_or(Value::Null, |value| Value::String(value.clone())),
-    );
-    if let Some(recorded) = terminal_rejection_recorded {
-        insert_value_field(
-            &mut payload,
-            "terminal_rejection_recorded",
-            Value::Bool(recorded),
-        );
-    }
-    config.record_candidate_alert_ledger(
-        trade_date,
-        CANDIDATE_SUBMIT_REJECTED_ALERT,
-        "warning",
-        candidate_alert_key(CANDIDATE_SUBMIT_REJECTED_ALERT, identity_key),
-        payload,
-    );
-}
-
-fn selected_credit_alert_payload(
-    entry: &SelectedEntry,
-    trade_date: &str,
-    action: &str,
-    order_list_id: Option<&str>,
-) -> (String, Value) {
-    let strategy = strategy_name(entry.kind);
-    let identity_key = candidate_alert_identity_key(
-        strategy,
-        &entry.underlying,
-        &[&entry.candidate.short.symbol, &entry.candidate.long.symbol],
-    );
-    let mut payload =
-        credit_candidate_ledger_payload(&entry.underlying, strategy, None, &entry.candidate);
-    insert_selected_alert_fields(
-        &mut payload,
-        &identity_key,
-        action,
-        trade_date,
-        order_list_id,
-    );
-    (identity_key, payload)
-}
-
-fn selected_iron_condor_alert_payload(
-    entry: &SelectedIronCondorEntry,
-    trade_date: &str,
-    action: &str,
-    order_list_id: Option<&str>,
-) -> (String, Value) {
-    let identity_key = candidate_alert_identity_key(
-        "iron_condor",
-        &entry.underlying,
-        &[
-            &entry.candidate.put.short.symbol,
-            &entry.candidate.put.long.symbol,
-            &entry.candidate.call.short.symbol,
-            &entry.candidate.call.long.symbol,
-        ],
-    );
-    let mut payload =
-        iron_condor_candidate_ledger_payload(&entry.underlying, None, &entry.candidate);
-    insert_selected_alert_fields(
-        &mut payload,
-        &identity_key,
-        action,
-        trade_date,
-        order_list_id,
-    );
-    (identity_key, payload)
-}
-
-fn selected_debit_alert_payload(
-    entry: &SelectedDebitEntry,
-    trade_date: &str,
-    action: &str,
-    order_list_id: Option<&str>,
-) -> (String, Value) {
-    let strategy = debit_spread_strategy_name(entry.kind);
-    let identity_key = candidate_alert_identity_key(
-        strategy,
-        &entry.underlying,
-        &[&entry.candidate.long.symbol, &entry.candidate.short.symbol],
-    );
-    let mut payload =
-        debit_candidate_ledger_payload(&entry.underlying, strategy, None, &entry.candidate);
-    insert_selected_alert_fields(
-        &mut payload,
-        &identity_key,
-        action,
-        trade_date,
-        order_list_id,
-    );
-    (identity_key, payload)
-}
-
-fn selected_naked_alert_payload(
-    entry: &SelectedNakedOptionEntry,
-    trade_date: &str,
-    action: &str,
-    order_list_id: Option<&str>,
-) -> (String, Value) {
-    let strategy = naked_option_strategy_name(entry.kind);
-    let identity_key = candidate_alert_identity_key(
-        strategy,
-        &entry.underlying,
-        &[&entry.candidate.short.symbol],
-    );
-    let mut payload =
-        naked_candidate_ledger_payload(&entry.underlying, strategy, None, None, &entry.candidate);
-    insert_selected_alert_fields(
-        &mut payload,
-        &identity_key,
-        action,
-        trade_date,
-        order_list_id,
-    );
-    (identity_key, payload)
-}
-
-fn selected_entry_alert_payload(
-    entry: &SelectedOptionsEntry,
-    trade_date: &str,
-    action: &str,
-    order_list_id: Option<&str>,
-) -> (String, Value) {
-    match entry {
-        SelectedOptionsEntry::Credit(entry) => {
-            selected_credit_alert_payload(entry, trade_date, action, order_list_id)
-        }
-        SelectedOptionsEntry::IronCondor(entry) => {
-            selected_iron_condor_alert_payload(entry, trade_date, action, order_list_id)
-        }
-        SelectedOptionsEntry::Debit(entry) => {
-            selected_debit_alert_payload(entry, trade_date, action, order_list_id)
-        }
-        SelectedOptionsEntry::NakedOption(entry) => {
-            selected_naked_alert_payload(entry, trade_date, action, order_list_id)
-        }
-    }
-}
-
-fn insert_selected_alert_fields(
-    payload: &mut Value,
-    identity_key: &str,
-    action: &str,
-    trade_date: &str,
-    order_list_id: Option<&str>,
-) {
-    insert_string_field(payload, "candidate_identity_key", identity_key.to_string());
-    insert_string_field(payload, "action", action.to_string());
-    insert_string_field(payload, "trade_date", trade_date.to_string());
-    if let Some(order_list_id) = order_list_id {
-        insert_string_field(payload, "order_list_id", order_list_id.to_string());
-    }
-}
-
-fn insert_string_field(payload: &mut Value, key: &str, value: String) {
-    insert_value_field(payload, key, Value::String(value));
-}
-
-fn insert_value_field(payload: &mut Value, key: &str, value: Value) {
-    if let Value::Object(fields) = payload {
-        fields.insert(key.to_string(), value);
-    }
-}
-
 async fn apply_strategy_decision(
     decision: StrategyDecision,
     config: &OptionsEngineConfig,
@@ -1048,8 +815,7 @@ async fn apply_selected_entry_decision(
     let terminal_rejection =
         entry.is_naked_option() && outcome.accepted == 0 && outcome.rejected > 0;
     if outcome.accepted > 0 || terminal_rejection {
-        state.record_entry_submission(selected_entry_state_draft(
-            &entry,
+        state.record_entry_submission(entry.state_entry_draft(
             trade_date,
             &order_list_id,
             config.quantity,
@@ -1091,77 +857,6 @@ async fn apply_selected_entry_decision(
         );
     }
     Ok(outcome.accepted > 0 || terminal_rejection)
-}
-
-fn selected_entry_state_draft(
-    entry: &SelectedOptionsEntry,
-    trade_date: &str,
-    order_list_id: &str,
-    quantity: u64,
-    parent_order_id: Option<String>,
-) -> StrategyStateEntryDraft {
-    match entry {
-        SelectedOptionsEntry::Credit(entry) => StrategyStateEntryDraft {
-            trade_date: trade_date.to_string(),
-            underlying: entry.underlying.clone(),
-            strategy: credit_spread_strategy_name(entry.kind).to_string(),
-            order_list_id: order_list_id.to_string(),
-            short_symbol: entry.candidate.short.symbol.clone(),
-            long_symbol: entry.candidate.long.symbol.clone(),
-            short_call_symbol: None,
-            long_call_symbol: None,
-            quantity,
-            credit: entry.candidate.credit,
-            debit: None,
-            score: entry.candidate.score,
-            parent_order_id,
-        },
-        SelectedOptionsEntry::IronCondor(entry) => StrategyStateEntryDraft {
-            trade_date: trade_date.to_string(),
-            underlying: entry.underlying.clone(),
-            strategy: "iron_condor".to_string(),
-            order_list_id: order_list_id.to_string(),
-            short_symbol: entry.candidate.put.short.symbol.clone(),
-            long_symbol: entry.candidate.put.long.symbol.clone(),
-            short_call_symbol: Some(entry.candidate.call.short.symbol.clone()),
-            long_call_symbol: Some(entry.candidate.call.long.symbol.clone()),
-            quantity,
-            credit: entry.candidate.credit,
-            debit: None,
-            score: entry.candidate.score,
-            parent_order_id,
-        },
-        SelectedOptionsEntry::Debit(entry) => StrategyStateEntryDraft {
-            trade_date: trade_date.to_string(),
-            underlying: entry.underlying.clone(),
-            strategy: debit_spread_strategy_name(entry.kind).to_string(),
-            order_list_id: order_list_id.to_string(),
-            short_symbol: entry.candidate.short.symbol.clone(),
-            long_symbol: entry.candidate.long.symbol.clone(),
-            short_call_symbol: None,
-            long_call_symbol: None,
-            quantity,
-            credit: -entry.candidate.debit,
-            debit: Some(entry.candidate.debit),
-            score: entry.candidate.score,
-            parent_order_id,
-        },
-        SelectedOptionsEntry::NakedOption(entry) => StrategyStateEntryDraft {
-            trade_date: trade_date.to_string(),
-            underlying: entry.underlying.clone(),
-            strategy: naked_option_strategy_name(entry.kind).to_string(),
-            order_list_id: order_list_id.to_string(),
-            short_symbol: entry.candidate.short.symbol.clone(),
-            long_symbol: String::new(),
-            short_call_symbol: None,
-            long_call_symbol: None,
-            quantity,
-            credit: entry.candidate.credit,
-            debit: None,
-            score: entry.candidate.score,
-            parent_order_id,
-        },
-    }
 }
 
 async fn risk_gate_decision(
@@ -1929,591 +1624,6 @@ fn emit_management_snapshot(
     );
 }
 
-async fn submit_selected_entry(
-    entry: &SelectedOptionsEntry,
-    order_list_id: &str,
-    quantity: u64,
-    config: &OptionsEngineConfig,
-) -> anyhow::Result<SubmitOutcome> {
-    match entry {
-        SelectedOptionsEntry::Credit(entry) => {
-            submit_entry(entry, order_list_id, quantity, config).await
-        }
-        SelectedOptionsEntry::IronCondor(entry) => {
-            submit_iron_condor_entry(entry, order_list_id, quantity, config).await
-        }
-        SelectedOptionsEntry::Debit(entry) => {
-            submit_debit_entry(entry, order_list_id, quantity, config).await
-        }
-        SelectedOptionsEntry::NakedOption(entry) => {
-            submit_naked_option_entry(entry, order_list_id, quantity, config).await
-        }
-    }
-}
-
-async fn submit_with_execution_session<F>(
-    order_list_id: &str,
-    expected_events: usize,
-    cancel_after_accept: bool,
-    submit: F,
-) -> anyhow::Result<SubmitOutcome>
-where
-    F: FnOnce(
-        &mut AlpacaExecutionClient,
-        TraderId,
-        Option<ClientId>,
-        StrategyId,
-    ) -> anyhow::Result<()>,
-{
-    let exec_config = exec_config_from_env();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    replace_exec_event_sender(tx);
-
-    let cache = Rc::new(RefCell::new(Cache::default()));
-    let trader_id = TraderId::from("TRADER-001");
-    let client_id = ClientId::from(ALPACA_CLIENT_ID);
-    let account_id = AccountId::from("ALPACA-001");
-    let strategy_id = StrategyId::from(STRATEGY_FAMILY);
-    let core = ExecutionClientCore::new(
-        trader_id,
-        client_id,
-        Venue::new(ALPACA_VENUE),
-        OmsType::Netting,
-        account_id,
-        AccountType::Margin,
-        None,
-        cache,
-    );
-    let mut client = AlpacaExecutionClient::new(core, exec_config.clone())?;
-    client.start()?;
-    client.connect().await?;
-
-    submit(&mut client, trader_id, Some(client_id), strategy_id)?;
-
-    let (accepted, rejected) = collect_execution_events(&mut rx, expected_events).await;
-    let parent_order_id = lookup_parent_order(&exec_config, order_list_id).await?;
-    if cancel_after_accept && accepted > 0 {
-        cancel_parent_order(&exec_config, parent_order_id.as_deref()).await?;
-    }
-
-    client.disconnect().await?;
-    client.stop()?;
-
-    Ok(SubmitOutcome {
-        accepted,
-        rejected,
-        parent_order_id,
-    })
-}
-
-async fn submit_entry(
-    entry: &SelectedEntry,
-    order_list_id: &str,
-    quantity: u64,
-    config: &OptionsEngineConfig,
-) -> anyhow::Result<SubmitOutcome> {
-    submit_with_execution_session(
-        order_list_id,
-        2,
-        config.cancel_after_accept,
-        |client, trader_id, client_id, strategy_id| {
-            let cmd = build_submit_order_list(
-                entry,
-                order_list_id,
-                quantity,
-                trader_id,
-                client_id,
-                strategy_id,
-            )?;
-            client.submit_order_list(cmd)?;
-            Ok(())
-        },
-    )
-    .await
-}
-
-async fn submit_iron_condor_entry(
-    entry: &SelectedIronCondorEntry,
-    order_list_id: &str,
-    quantity: u64,
-    config: &OptionsEngineConfig,
-) -> anyhow::Result<SubmitOutcome> {
-    submit_with_execution_session(
-        order_list_id,
-        4,
-        config.cancel_after_accept,
-        |client, trader_id, client_id, strategy_id| {
-            let cmd = build_iron_condor_submit_order_list(
-                &entry.candidate,
-                order_list_id,
-                quantity,
-                trader_id,
-                client_id,
-                strategy_id,
-            )?;
-            client.submit_order_list(cmd)?;
-            Ok(())
-        },
-    )
-    .await
-}
-
-async fn submit_debit_entry(
-    entry: &SelectedDebitEntry,
-    order_list_id: &str,
-    quantity: u64,
-    config: &OptionsEngineConfig,
-) -> anyhow::Result<SubmitOutcome> {
-    submit_with_execution_session(
-        order_list_id,
-        2,
-        config.cancel_after_accept,
-        |client, trader_id, client_id, strategy_id| {
-            let cmd = build_debit_submit_order_list(
-                &entry.candidate,
-                order_list_id,
-                quantity,
-                trader_id,
-                client_id,
-                strategy_id,
-            )?;
-            client.submit_order_list(cmd)?;
-            Ok(())
-        },
-    )
-    .await
-}
-
-async fn submit_naked_option_entry(
-    entry: &SelectedNakedOptionEntry,
-    order_list_id: &str,
-    quantity: u64,
-    config: &OptionsEngineConfig,
-) -> anyhow::Result<SubmitOutcome> {
-    submit_with_execution_session(
-        order_list_id,
-        1,
-        config.cancel_after_accept,
-        |client, trader_id, client_id, strategy_id| {
-            let cmd = build_naked_option_submit_order(
-                &entry.candidate,
-                order_list_id,
-                quantity,
-                trader_id,
-                client_id,
-                strategy_id,
-            )?;
-            client.submit_order(cmd)?;
-            Ok(())
-        },
-    )
-    .await
-}
-
-async fn submit_close_entry(
-    entry: &StrategyStateEntry,
-    quote: &CloseQuote,
-    order_list_id: &str,
-    _config: &OptionsEngineConfig,
-) -> anyhow::Result<SubmitOutcome> {
-    submit_with_execution_session(
-        order_list_id,
-        entry.symbols().len(),
-        false,
-        |client, trader_id, client_id, strategy_id| {
-            if entry.is_naked_option() {
-                let cmd = build_naked_option_close_order(
-                    entry,
-                    quote,
-                    order_list_id,
-                    trader_id,
-                    client_id,
-                    strategy_id,
-                )?;
-                client.submit_order(cmd)?;
-            } else {
-                let cmd = build_close_submit_order_list(
-                    entry,
-                    quote,
-                    order_list_id,
-                    trader_id,
-                    client_id,
-                    strategy_id,
-                )?;
-                client.submit_order_list(cmd)?;
-            }
-            Ok(())
-        },
-    )
-    .await
-}
-
-fn build_submit_order_list(
-    entry: &SelectedEntry,
-    order_list_id: &str,
-    quantity: u64,
-    trader_id: TraderId,
-    client_id: Option<ClientId>,
-    strategy_id: StrategyId,
-) -> anyhow::Result<SubmitOrderList> {
-    if quantity == 0 {
-        anyhow::bail!("quantity must be positive");
-    }
-
-    let order_list_id = OrderListId::from(order_list_id);
-    let short_client_id = ClientOrderId::from(format!("{order_list_id}-short").as_str());
-    let long_client_id = ClientOrderId::from(format!("{order_list_id}-long").as_str());
-    let quantity = Quantity::new(quantity as f64, 0);
-    build_mleg_submit_order_list(MlegSubmitOrderListRequest {
-        trader_id,
-        client_id,
-        strategy_id,
-        order_list_id,
-        legs: vec![
-            MlegSubmitLeg {
-                client_order_id: short_client_id,
-                instrument_id: alpaca_instrument_id(&entry.candidate.short.symbol)?,
-                order_side: OrderSide::Sell,
-                quantity,
-                limit_price: Price::new(entry.candidate.short.bid, 2),
-                reduce_only: false,
-            },
-            MlegSubmitLeg {
-                client_order_id: long_client_id,
-                instrument_id: alpaca_instrument_id(&entry.candidate.long.symbol)?,
-                order_side: OrderSide::Buy,
-                quantity,
-                limit_price: Price::new(entry.candidate.long.ask, 2),
-                reduce_only: false,
-            },
-        ],
-        ts_init: get_atomic_clock_realtime().get_time_ns(),
-    })
-}
-
-fn build_iron_condor_submit_order_list(
-    candidate: &IronCondorCandidate,
-    order_list_id: &str,
-    quantity: u64,
-    trader_id: TraderId,
-    client_id: Option<ClientId>,
-    strategy_id: StrategyId,
-) -> anyhow::Result<SubmitOrderList> {
-    if quantity == 0 {
-        anyhow::bail!("quantity must be positive");
-    }
-
-    let order_list_id = OrderListId::from(order_list_id);
-    let quantity = Quantity::new(quantity as f64, 0);
-    build_mleg_submit_order_list(MlegSubmitOrderListRequest {
-        trader_id,
-        client_id,
-        strategy_id,
-        order_list_id,
-        legs: vec![
-            MlegSubmitLeg {
-                client_order_id: ClientOrderId::from(format!("{order_list_id}-short-put").as_str()),
-                instrument_id: alpaca_instrument_id(&candidate.put.short.symbol)?,
-                order_side: OrderSide::Sell,
-                quantity,
-                limit_price: Price::new(candidate.put.short.bid, 2),
-                reduce_only: false,
-            },
-            MlegSubmitLeg {
-                client_order_id: ClientOrderId::from(format!("{order_list_id}-long-put").as_str()),
-                instrument_id: alpaca_instrument_id(&candidate.put.long.symbol)?,
-                order_side: OrderSide::Buy,
-                quantity,
-                limit_price: Price::new(candidate.put.long.ask, 2),
-                reduce_only: false,
-            },
-            MlegSubmitLeg {
-                client_order_id: ClientOrderId::from(
-                    format!("{order_list_id}-short-call").as_str(),
-                ),
-                instrument_id: alpaca_instrument_id(&candidate.call.short.symbol)?,
-                order_side: OrderSide::Sell,
-                quantity,
-                limit_price: Price::new(candidate.call.short.bid, 2),
-                reduce_only: false,
-            },
-            MlegSubmitLeg {
-                client_order_id: ClientOrderId::from(format!("{order_list_id}-long-call").as_str()),
-                instrument_id: alpaca_instrument_id(&candidate.call.long.symbol)?,
-                order_side: OrderSide::Buy,
-                quantity,
-                limit_price: Price::new(candidate.call.long.ask, 2),
-                reduce_only: false,
-            },
-        ],
-        ts_init: get_atomic_clock_realtime().get_time_ns(),
-    })
-}
-
-fn build_debit_submit_order_list(
-    candidate: &DebitSpreadCandidate,
-    order_list_id: &str,
-    quantity: u64,
-    trader_id: TraderId,
-    client_id: Option<ClientId>,
-    strategy_id: StrategyId,
-) -> anyhow::Result<SubmitOrderList> {
-    if quantity == 0 {
-        anyhow::bail!("quantity must be positive");
-    }
-
-    let order_list_id = OrderListId::from(order_list_id);
-    let quantity = Quantity::new(quantity as f64, 0);
-    build_mleg_submit_order_list(MlegSubmitOrderListRequest {
-        trader_id,
-        client_id,
-        strategy_id,
-        order_list_id,
-        legs: vec![
-            MlegSubmitLeg {
-                client_order_id: ClientOrderId::from(format!("{order_list_id}-long").as_str()),
-                instrument_id: alpaca_instrument_id(&candidate.long.symbol)?,
-                order_side: OrderSide::Buy,
-                quantity,
-                limit_price: Price::new(candidate.long.ask, 2),
-                reduce_only: false,
-            },
-            MlegSubmitLeg {
-                client_order_id: ClientOrderId::from(format!("{order_list_id}-short").as_str()),
-                instrument_id: alpaca_instrument_id(&candidate.short.symbol)?,
-                order_side: OrderSide::Sell,
-                quantity,
-                limit_price: Price::new(candidate.short.bid, 2),
-                reduce_only: false,
-            },
-        ],
-        ts_init: get_atomic_clock_realtime().get_time_ns(),
-    })
-}
-
-fn build_naked_option_submit_order(
-    candidate: &NakedOptionCandidate,
-    client_order_id: &str,
-    quantity: u64,
-    trader_id: TraderId,
-    client_id: Option<ClientId>,
-    strategy_id: StrategyId,
-) -> anyhow::Result<nautilus_common::messages::execution::SubmitOrder> {
-    if quantity == 0 {
-        anyhow::bail!("quantity must be positive");
-    }
-
-    build_simple_submit_order(SimpleSubmitOrderRequest {
-        trader_id,
-        client_id,
-        strategy_id,
-        client_order_id: ClientOrderId::from(client_order_id),
-        instrument_id: alpaca_instrument_id(&candidate.short.symbol)?,
-        order_side: OrderSide::Sell,
-        quantity: Quantity::new(quantity as f64, 0),
-        limit_price: Price::new(candidate.short.bid, 2),
-        reduce_only: false,
-        ts_init: get_atomic_clock_realtime().get_time_ns(),
-    })
-}
-
-fn build_naked_option_close_order(
-    entry: &StrategyStateEntry,
-    quote: &CloseQuote,
-    client_order_id: &str,
-    trader_id: TraderId,
-    client_id: Option<ClientId>,
-    strategy_id: StrategyId,
-) -> anyhow::Result<nautilus_common::messages::execution::SubmitOrder> {
-    build_simple_submit_order(SimpleSubmitOrderRequest {
-        trader_id,
-        client_id,
-        strategy_id,
-        client_order_id: ClientOrderId::from(client_order_id),
-        instrument_id: alpaca_instrument_id(&entry.short_symbol)?,
-        order_side: OrderSide::Buy,
-        quantity: Quantity::new(entry.quantity as f64, 0),
-        limit_price: Price::new(quote.short_ask, 2),
-        reduce_only: true,
-        ts_init: get_atomic_clock_realtime().get_time_ns(),
-    })
-}
-
-fn build_close_submit_order_list(
-    entry: &StrategyStateEntry,
-    quote: &CloseQuote,
-    order_list_id: &str,
-    trader_id: TraderId,
-    client_id: Option<ClientId>,
-    strategy_id: StrategyId,
-) -> anyhow::Result<SubmitOrderList> {
-    let order_list_id = OrderListId::from(order_list_id);
-    let quantity = Quantity::new(entry.quantity as f64, 0);
-    let mut legs = vec![
-        MlegSubmitLeg {
-            client_order_id: ClientOrderId::from(format!("{order_list_id}-short-close").as_str()),
-            instrument_id: alpaca_instrument_id(&entry.short_symbol)?,
-            order_side: OrderSide::Buy,
-            quantity,
-            limit_price: Price::new(quote.short_ask, 2),
-            reduce_only: true,
-        },
-        MlegSubmitLeg {
-            client_order_id: ClientOrderId::from(format!("{order_list_id}-long-close").as_str()),
-            instrument_id: alpaca_instrument_id(&entry.long_symbol)?,
-            order_side: OrderSide::Sell,
-            quantity,
-            limit_price: Price::new(quote.long_bid, 2),
-            reduce_only: true,
-        },
-    ];
-    if let (
-        Some(short_call_symbol),
-        Some(long_call_symbol),
-        Some(short_call_ask),
-        Some(long_call_bid),
-    ) = (
-        entry.short_call_symbol.as_deref(),
-        entry.long_call_symbol.as_deref(),
-        quote.short_call_ask,
-        quote.long_call_bid,
-    ) {
-        legs.push(MlegSubmitLeg {
-            client_order_id: ClientOrderId::from(
-                format!("{order_list_id}-short-call-close").as_str(),
-            ),
-            instrument_id: alpaca_instrument_id(short_call_symbol)?,
-            order_side: OrderSide::Buy,
-            quantity,
-            limit_price: Price::new(short_call_ask, 2),
-            reduce_only: true,
-        });
-        legs.push(MlegSubmitLeg {
-            client_order_id: ClientOrderId::from(
-                format!("{order_list_id}-long-call-close").as_str(),
-            ),
-            instrument_id: alpaca_instrument_id(long_call_symbol)?,
-            order_side: OrderSide::Sell,
-            quantity,
-            limit_price: Price::new(long_call_bid, 2),
-            reduce_only: true,
-        });
-    }
-    build_mleg_submit_order_list(MlegSubmitOrderListRequest {
-        trader_id,
-        client_id,
-        strategy_id,
-        order_list_id,
-        legs,
-        ts_init: get_atomic_clock_realtime().get_time_ns(),
-    })
-}
-
-async fn collect_execution_events(
-    rx: &mut mpsc::UnboundedReceiver<ExecutionEvent>,
-    leg_count: usize,
-) -> (usize, usize) {
-    let mut accepted = 0;
-    let mut rejected = 0;
-    let deadline = Instant::now()
-        + Duration::from_secs(env_parse(
-            "ALPACA_EVENT_TIMEOUT_SECS",
-            DEFAULT_EVENT_TIMEOUT_SECS,
-        ));
-
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let Ok(Some(event)) = timeout(remaining, rx.recv()).await else {
-            break;
-        };
-
-        if let ExecutionEvent::Order(order_event) = event {
-            print_order_event(&order_event);
-            match order_event {
-                OrderEventAny::Accepted(_) => accepted += 1,
-                OrderEventAny::Rejected(_) => rejected += 1,
-                _ => {}
-            }
-            if accepted + rejected >= leg_count {
-                break;
-            }
-        }
-    }
-
-    (accepted, rejected)
-}
-
-fn print_order_event(order_event: &OrderEventAny) {
-    let event_type = order_event.event_type();
-    let event = order_event.clone().into_boxed();
-    println!(
-        "execution_event: order type={event_type:?} client_order_id={} instrument_id={} venue_order_id={} reason={}",
-        event.client_order_id(),
-        event.instrument_id(),
-        event
-            .venue_order_id()
-            .map_or_else(|| "None".to_string(), |value| value.to_string()),
-        event
-            .reason()
-            .map_or_else(|| "None".to_string(), |value| value.to_string()),
-    );
-}
-
-async fn lookup_parent_order(
-    config: &AlpacaExecClientConfig,
-    order_list_id: &str,
-) -> anyhow::Result<Option<String>> {
-    let client = AlpacaHttpClient::from_exec_config(config)?;
-    match client.order_by_client_order_id(order_list_id, true).await {
-        Ok(order) => Ok(order.id),
-        Err(Error::HttpStatus { status, .. }) if status == 404 => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-async fn lookup_parent_order_snapshot(
-    client: &AlpacaHttpClient,
-    order_list_id: &str,
-) -> anyhow::Result<Option<AlpacaOrder>> {
-    match client.order_by_client_order_id(order_list_id, true).await {
-        Ok(order) => Ok(Some(order)),
-        Err(Error::HttpStatus { status, .. }) if status == 404 => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-async fn cancel_parent_order(
-    config: &AlpacaExecClientConfig,
-    parent_order_id: Option<&str>,
-) -> anyhow::Result<()> {
-    let Some(parent_order_id) = parent_order_id else {
-        println!("cleanup: skipped reason=no_parent_order_id");
-        return Ok(());
-    };
-
-    let client = AlpacaHttpClient::from_exec_config(config)?;
-    client.cancel_order(parent_order_id).await?;
-    println!("cleanup: cancel_requested parent_order_id={parent_order_id}");
-    Ok(())
-}
-
-async fn cancel_parent_order_by_id(
-    client: &AlpacaHttpClient,
-    parent_order_id: Option<&str>,
-) -> anyhow::Result<()> {
-    let Some(parent_order_id) = parent_order_id else {
-        println!("cleanup: skipped reason=no_parent_order_id");
-        return Ok(());
-    };
-    client.cancel_order(parent_order_id).await?;
-    println!("cleanup: cancel_requested parent_order_id={parent_order_id}");
-    Ok(())
-}
-
-fn alpaca_instrument_id(symbol: &str) -> anyhow::Result<InstrumentId> {
-    Ok(InstrumentId::from_str(&format!("{symbol}.{ALPACA_VENUE}"))?)
-}
-
 fn order_list_id(trade_date: &str, underlying: &str) -> String {
     format!(
         "options-engine-entry-{trade_date}-{underlying}-{}",
@@ -2622,33 +1732,26 @@ fn market_trade_date(config: &OptionsEngineConfig) -> String {
         .to_string()
 }
 
-fn exec_config_from_env() -> AlpacaExecClientConfig {
-    let mut config = AlpacaExecClientConfig::default();
-    config.trading_base_url = env::var("ALPACA_TRADING_BASE_URL").ok();
-    config.trade_updates_ws_url = env::var("ALPACA_TRADE_UPDATES_WS_URL").ok();
-    config.external_order_filtering = false;
-    config
-}
-
-fn env_parse<T>(name: &str, default: T) -> T
-where
-    T: FromStr,
-{
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<T>().ok())
-        .unwrap_or(default)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, path::PathBuf};
 
     use chrono::NaiveTime;
+    use nautilus_model::{
+        enums::OrderSide,
+        identifiers::{ClientId, ClientOrderId, StrategyId, TraderId},
+        types::{Price, Quantity},
+    };
 
     use super::*;
-    use crate::strategy::{
-        DebitSpreadScannerConfig, IronCondorScannerConfig, PutCreditScannerConfig,
+    use crate::{
+        common::consts::ALPACA_CLIENT_ID,
+        options_runtime::SelectedNakedOptionEntry,
+        runtime::{debit_spread_strategy_name, naked_option_strategy_name},
+        strategy::{
+            DebitSpreadScannerConfig, IronCondorScannerConfig, NakedOptionCandidate,
+            NakedOptionKind, PutCreditScannerConfig,
+        },
     };
 
     fn config_for_gate_tests() -> OptionsEngineConfig {
@@ -2890,9 +1993,14 @@ mod tests {
         let trader_id = TraderId::from("TRADER-001");
         let client_id = ClientId::from(ALPACA_CLIENT_ID);
         let strategy_id = StrategyId::from(STRATEGY_FAMILY);
+        let selected = SelectedOptionsEntry::NakedOption(SelectedNakedOptionEntry {
+            underlying: "SPY".to_string(),
+            kind: NakedOptionKind::Put,
+            candidate: candidate.clone(),
+        });
 
-        let open = build_naked_option_submit_order(
-            &candidate,
+        let open = submission::tests_support::build_open_order(
+            &selected,
             "open-list-1",
             2,
             trader_id,
@@ -2908,7 +2016,7 @@ mod tests {
         assert_eq!(open.order_init.price, Some(Price::new(0.71, 2)));
 
         let mut entry = state_entry();
-        entry.strategy = naked_option_strategy_name(crate::strategy::NakedOptionKind::Put).into();
+        entry.strategy = naked_option_strategy_name(NakedOptionKind::Put).into();
         entry.short_symbol = candidate.short.symbol.clone();
         entry.long_symbol.clear();
         entry.quantity = 2;
@@ -2920,7 +2028,7 @@ mod tests {
             debit: 0.92,
         };
 
-        let close = build_naked_option_close_order(
+        let close = submission::tests_support::build_close_order(
             &entry,
             &quote,
             "close-list-1",

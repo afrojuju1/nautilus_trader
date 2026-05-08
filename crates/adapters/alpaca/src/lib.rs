@@ -37,6 +37,8 @@
 
 #[cfg(feature = "live")]
 pub mod candidate_ledger;
+#[cfg(feature = "live")]
+pub mod candidate_payloads;
 pub mod common;
 pub mod config;
 pub mod earnings;
@@ -51,7 +53,11 @@ pub mod management;
 #[cfg(feature = "live")]
 pub mod options_engine;
 #[cfg(feature = "live")]
+pub mod options_entry;
+#[cfg(feature = "live")]
 pub mod options_runtime;
+#[cfg(feature = "live")]
+pub mod order_plan;
 pub mod orders;
 pub mod parse;
 #[cfg(feature = "live")]
