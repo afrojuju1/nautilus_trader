@@ -28,7 +28,8 @@ cargo build --release -p nautilus-alpaca --features live \
   --bin alpaca-options-engine \
   --bin alpaca-operator-status \
   --bin alpaca-fleet-status \
-  --bin alpaca-candidate-alerts
+  --bin alpaca-candidate-alerts \
+  --bin alpaca-performance-report
 
 install -Dm755 target/release/alpaca-options-engine \
   "$HOME/.local/bin/alpaca-options-engine"
@@ -38,6 +39,8 @@ install -Dm755 target/release/alpaca-fleet-status \
   "$HOME/.local/bin/alpaca-fleet-status"
 install -Dm755 target/release/alpaca-candidate-alerts \
   "$HOME/.local/bin/alpaca-candidate-alerts"
+install -Dm755 target/release/alpaca-performance-report \
+  "$HOME/.local/bin/alpaca-performance-report"
 install -Dm755 deploy/alpaca/alpaca-options-runner.sh \
   "$HOME/.local/bin/alpaca-options-runner"
 install -Dm755 deploy/alpaca/alpaca-control.sh \
@@ -50,6 +53,10 @@ install -Dm644 deploy/alpaca/alpaca-candidate-alerts.service \
   "$HOME/.config/systemd/user/alpaca-candidate-alerts.service"
 install -Dm644 deploy/alpaca/alpaca-candidate-alerts.timer \
   "$HOME/.config/systemd/user/alpaca-candidate-alerts.timer"
+install -Dm644 deploy/alpaca/alpaca-performance-digest.service \
+  "$HOME/.config/systemd/user/alpaca-performance-digest.service"
+install -Dm644 deploy/alpaca/alpaca-performance-digest.timer \
+  "$HOME/.config/systemd/user/alpaca-performance-digest.timer"
 
 install_runtime_file deploy/alpaca/alpaca-options-engine.env.example "$ENV_FILE"
 install_runtime_file deploy/alpaca/alpaca-options-engine.base.toml.example "$BASE_CONFIG_FILE"
@@ -76,5 +83,7 @@ echo "runner=$HOME/.local/bin/alpaca-options-engine"
 echo "operator=$HOME/.local/bin/alpaca-operator-status"
 echo "fleet_operator=$HOME/.local/bin/alpaca-fleet-status"
 echo "candidate_alerts=$HOME/.local/bin/alpaca-candidate-alerts"
+echo "performance_report=$HOME/.local/bin/alpaca-performance-report"
 echo "control=$HOME/.local/bin/alpaca-control"
 echo "candidate_alerts_timer=$HOME/.config/systemd/user/alpaca-candidate-alerts.timer"
+echo "performance_digest_timer=$HOME/.config/systemd/user/alpaca-performance-digest.timer"

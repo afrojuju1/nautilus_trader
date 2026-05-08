@@ -20,8 +20,8 @@
 //! runtime can be tested and evolved from library code.
 
 use std::{
-    cell::RefCell, collections::BTreeSet, env, future::Future, pin::Pin, rc::Rc, str::FromStr,
-    time::Duration,
+    cell::RefCell, collections::BTreeSet, env, future::Future, path::PathBuf, pin::Pin, rc::Rc,
+    str::FromStr, time::Duration,
 };
 
 use crate::{
@@ -31,7 +31,10 @@ use crate::{
     http::{
         client::AlpacaHttpClient,
         error::Error,
-        models::{AlpacaOrder, AlpacaPosition, ListOrdersRequest, OptionSnapshotsRequest},
+        models::{
+            AlpacaOrder, AlpacaPosition, ListActivitiesRequest, ListOrdersRequest,
+            OptionSnapshotsRequest,
+        },
     },
     management::{credit_spread_close_reason, days_to_expiration, recorded_age_secs},
     options_runtime::{
@@ -42,6 +45,10 @@ use crate::{
         fleet_active_underlying_count, fleet_has_active_underlying_elsewhere,
         fleet_sector_limit_state, iron_condor_candidate_ledger_payload,
         naked_candidate_ledger_payload, select_options_entry,
+    },
+    performance::{
+        EntryOrderIds, append_performance_ledger_record, collect_order_ids,
+        default_performance_ledger_dir, entry_performance,
     },
     runtime::{
         StrategyState, StrategyStateEntry, credit_spread_strategy_name, debit_spread_strategy_name,
@@ -57,7 +64,7 @@ use crate::{
         build_mleg_submit_order_list, build_simple_submit_order,
     },
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
@@ -389,7 +396,7 @@ async fn submission_block_for_selected(
     }
     if context
         .state
-        .has_submitted_underlying_today(context.trade_date, underlying)
+        .has_risk_counted_submitted_underlying_today(context.trade_date, underlying)
     {
         return Ok(Some(SubmissionBlock {
             reason: "daily_duplicate_state".to_string(),
@@ -1588,12 +1595,7 @@ async fn risk_gate_decision(
     }
 
     if let Some(limit) = context.config.max_daily_submits {
-        let current = context
-            .state
-            .entries
-            .iter()
-            .filter(|entry| entry.submitted && entry.trade_date == context.trade_date)
-            .count();
+        let current = context.state.risk_counted_daily_submits(context.trade_date);
         if current >= limit {
             return Ok(RiskGateDecision::MaxDailySubmits { current, limit });
         }
@@ -1809,7 +1811,8 @@ async fn manage_existing_entries(
                     order.status.as_deref().unwrap_or("unknown"),
                 );
                 if order.status.as_deref() == Some("filled") {
-                    entry.mark_closed(order.id);
+                    entry.mark_closed(order.id.clone());
+                    record_realized_performance_ledger(client, config, entry, &order).await;
                     changed = true;
                 } else if order.is_working() {
                     let stale = config.stale_close_secs > 0
@@ -2037,6 +2040,104 @@ async fn manage_existing_entries(
     }
 
     Ok(changed)
+}
+
+async fn record_realized_performance_ledger(
+    client: &AlpacaHttpClient,
+    config: &OptionsEngineConfig,
+    entry: &StrategyStateEntry,
+    close_order: &AlpacaOrder,
+) {
+    if let Err(error) = append_realized_performance_ledger(client, config, entry, close_order).await
+    {
+        emit_operator_event(
+            "performance_ledger_error",
+            json!({
+                "reason": "append_failed",
+                "underlying": entry.underlying,
+                "strategy": entry.strategy,
+                "order_list_id": entry.order_list_id,
+                "close_order_list_id": entry.close_order_list_id,
+                "error": error.to_string(),
+            }),
+        );
+    }
+}
+
+async fn append_realized_performance_ledger(
+    client: &AlpacaHttpClient,
+    config: &OptionsEngineConfig,
+    entry: &StrategyStateEntry,
+    close_order: &AlpacaOrder,
+) -> anyhow::Result<()> {
+    let open_order = lookup_parent_order_snapshot(client, &entry.order_list_id).await?;
+    let mut order_ids = EntryOrderIds::default();
+    if let Some(order) = open_order.as_ref() {
+        collect_order_ids(order, &mut order_ids.open);
+    }
+    collect_order_ids(close_order, &mut order_ids.close);
+    add_state_order_id(entry.parent_order_id.as_deref(), &mut order_ids.open);
+    add_state_order_id(entry.close_parent_order_id.as_deref(), &mut order_ids.close);
+
+    let mut request = ListActivitiesRequest::option_reconciliation();
+    request.direction = Some("asc".to_string());
+    request.after = Some(performance_activity_after_timestamp(entry));
+    let activities = client.account_activities_all(&request).await?;
+    let performance = entry_performance(entry, &order_ids, &activities, &[]);
+    let ledger_date = Utc::now()
+        .with_timezone(&config.entry_timezone)
+        .date_naive()
+        .to_string();
+    let append = append_performance_ledger_record(
+        &performance_ledger_dir(config),
+        &ledger_date,
+        config.fleet_account_id.as_deref(),
+        &performance,
+    )?;
+
+    emit_operator_event(
+        "performance_ledger",
+        json!({
+            "ledger_path": append.path,
+            "appended": append.appended,
+            "record_key": append.record_key,
+            "underlying": performance.underlying,
+            "strategy": performance.strategy,
+            "status": performance.status,
+            "realized_pnl": performance.realized_pnl,
+            "open_cashflow": performance.open.cashflow,
+            "close_cashflow": performance.close.cashflow,
+            "warnings": performance.warnings,
+        }),
+    );
+
+    Ok(())
+}
+
+fn add_state_order_id(order_id: Option<&str>, order_ids: &mut BTreeSet<String>) {
+    if let Some(order_id) = order_id.filter(|value| !value.trim().is_empty()) {
+        order_ids.insert(order_id.to_string());
+    }
+}
+
+fn performance_activity_after_timestamp(entry: &StrategyStateEntry) -> String {
+    DateTime::parse_from_rfc3339(&entry.recorded_at_utc)
+        .ok()
+        .and_then(|recorded| {
+            recorded
+                .with_timezone(&Utc)
+                .checked_sub_signed(ChronoDuration::days(1))
+        })
+        .unwrap_or_else(|| Utc::now() - ChronoDuration::days(30))
+        .to_rfc3339()
+}
+
+fn performance_ledger_dir(config: &OptionsEngineConfig) -> PathBuf {
+    env::var("ALPACA_PERFORMANCE_LEDGER_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            default_performance_ledger_dir(&config.state_path, config.fleet_account_id.as_deref())
+        })
 }
 
 #[derive(Clone, Copy, Debug)]

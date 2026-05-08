@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Nautilus Alpaca post-market performance digest
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 15:20:00
+Persistent=true
+Unit=alpaca-performance-digest.service
+
+[Install]
+WantedBy=timers.target

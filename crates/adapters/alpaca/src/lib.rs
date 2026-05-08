@@ -54,6 +54,8 @@ pub mod options_engine;
 pub mod options_runtime;
 pub mod orders;
 pub mod parse;
+#[cfg(feature = "live")]
+pub mod performance;
 pub mod providers;
 #[cfg(feature = "python")]
 pub mod python;

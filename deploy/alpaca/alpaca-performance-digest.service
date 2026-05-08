@@ -1,0 +1,9 @@
+[Unit]
+Description=Nautilus Alpaca post-market performance digest
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=NAUTILUS_ALPACA_ALERTS_ENV_FILE=%h/.config/nautilus-trader/alpaca/alerts.env
+ExecStart=%h/.local/bin/alpaca-control alerts performance

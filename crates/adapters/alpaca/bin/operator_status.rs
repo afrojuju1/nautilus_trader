@@ -444,11 +444,7 @@ fn build_status(
         trade_date: config.trade_date.clone(),
         active_entries: strategy_state.active_entries,
         max_active_entries: config.max_active_entries,
-        daily_submits: state
-            .entries
-            .iter()
-            .filter(|entry| entry.submitted && entry.trade_date == config.trade_date)
-            .count(),
+        daily_submits: state.risk_counted_daily_submits(&config.trade_date),
         max_daily_submits: config.max_daily_submits,
         open_orders: orders_status.open,
         max_open_orders: config.max_open_orders,

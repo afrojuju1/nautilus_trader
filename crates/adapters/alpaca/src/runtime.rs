@@ -29,6 +29,8 @@ use crate::strategy::{
     NakedOptionCandidate, NakedOptionKind, SpreadCandidate,
 };
 
+const CANCELED_DEBIT_REPLACEMENT_EXEMPTIONS_PER_DAY: usize = 1;
+
 /// Persisted state for the Alpaca index credit runner.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StrategyState {
@@ -59,6 +61,60 @@ impl StrategyState {
         self.entries.iter().any(|entry| {
             entry.submitted && entry.trade_date == trade_date && entry.underlying == underlying
         })
+    }
+
+    /// Returns the same-day submit count used by risk gates.
+    ///
+    /// One canceled long-premium debit entry is exempt so a no-fill directional order can be
+    /// replaced once after broker reconciliation confirms it no longer represents exposure.
+    #[must_use]
+    pub fn risk_counted_daily_submits(&self, trade_date: &str) -> usize {
+        let submitted = self
+            .entries
+            .iter()
+            .filter(|entry| entry.submitted && entry.trade_date == trade_date)
+            .count();
+        let replacement_exemptions = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.submitted
+                    && entry.trade_date == trade_date
+                    && entry.is_canceled_debit_replacement_candidate()
+            })
+            .count()
+            .min(CANCELED_DEBIT_REPLACEMENT_EXEMPTIONS_PER_DAY);
+
+        submitted.saturating_sub(replacement_exemptions)
+    }
+
+    /// Returns `true` when a same-day underlying entry should block another entry by risk policy.
+    #[must_use]
+    pub fn has_risk_counted_submitted_underlying_today(
+        &self,
+        trade_date: &str,
+        underlying: &str,
+    ) -> bool {
+        let submitted = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.submitted && entry.trade_date == trade_date && entry.underlying == underlying
+            })
+            .count();
+        let replacement_exemptions = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.submitted
+                    && entry.trade_date == trade_date
+                    && entry.underlying == underlying
+                    && entry.is_canceled_debit_replacement_candidate()
+            })
+            .count()
+            .min(CANCELED_DEBIT_REPLACEMENT_EXEMPTIONS_PER_DAY);
+
+        submitted.saturating_sub(replacement_exemptions) > 0
     }
 
     /// Appends one submitted spread entry to the state.
@@ -294,6 +350,12 @@ impl StrategyStateEntry {
     #[must_use]
     pub fn is_debit_spread(&self) -> bool {
         self.debit.is_some() || self.strategy.contains("_debit_")
+    }
+
+    /// Returns `true` when this entry can be exempted from one same-day replacement limit.
+    #[must_use]
+    pub fn is_canceled_debit_replacement_candidate(&self) -> bool {
+        self.canceled && !self.closed && self.is_debit_spread()
     }
 
     /// Returns `true` when this entry stores one naked short option.
@@ -590,6 +652,60 @@ mod tests {
         assert!(entry.long_symbol.is_empty());
     }
 
+    #[test]
+    fn risk_daily_submits_exempts_one_canceled_debit_replacement() {
+        let mut state = StrategyState::default();
+        let mut canceled_debit = debit_state_entry("open-list-1");
+        canceled_debit.mark_canceled();
+        state.entries.push(canceled_debit);
+
+        assert_eq!(state.risk_counted_daily_submits("2026-05-04"), 0);
+        assert!(!state.has_risk_counted_submitted_underlying_today("2026-05-04", "SLV"));
+        assert!(state.has_submitted_underlying_today("2026-05-04", "SLV"));
+
+        let mut second_canceled_debit = debit_state_entry("open-list-2");
+        second_canceled_debit.mark_canceled();
+        state.entries.push(second_canceled_debit);
+
+        assert_eq!(state.risk_counted_daily_submits("2026-05-04"), 1);
+        assert!(state.has_risk_counted_submitted_underlying_today("2026-05-04", "SLV"));
+    }
+
+    #[test]
+    fn risk_daily_submits_counts_closed_credit_entries() {
+        let mut state = StrategyState::default();
+        let mut credit = StrategyStateEntry {
+            trade_date: "2026-05-04".to_string(),
+            underlying: "SPY".to_string(),
+            strategy: credit_spread_strategy_name(CreditSpreadKind::Put).to_string(),
+            order_list_id: "open-list-1".to_string(),
+            short_symbol: "SPY260512P00708000".to_string(),
+            long_symbol: "SPY260512P00705000".to_string(),
+            short_call_symbol: None,
+            long_call_symbol: None,
+            quantity: 1,
+            credit: 0.50,
+            debit: None,
+            score: 60.0,
+            parent_order_id: Some("open-parent-1".to_string()),
+            close_order_list_id: None,
+            close_parent_order_id: None,
+            close_reason: None,
+            close_attempts: 0,
+            last_close_submitted_at_utc: None,
+            submitted: true,
+            canceled: false,
+            closed: false,
+            recorded_at_utc: "2026-05-04T14:00:00Z".to_string(),
+            closed_at_utc: None,
+        };
+        credit.mark_closed(Some("close-parent-1".to_string()));
+        state.entries.push(credit);
+
+        assert_eq!(state.risk_counted_daily_submits("2026-05-04"), 1);
+        assert!(state.has_risk_counted_submitted_underlying_today("2026-05-04", "SPY"));
+    }
+
     fn iron_condor_candidate() -> IronCondorCandidate {
         IronCondorCandidate {
             put: SpreadCandidate {
@@ -633,6 +749,34 @@ mod tests {
             open_interest: 1_000,
             implied_volatility: Some(0.2),
             metrics: None,
+        }
+    }
+
+    fn debit_state_entry(order_list_id: &str) -> StrategyStateEntry {
+        StrategyStateEntry {
+            trade_date: "2026-05-04".to_string(),
+            underlying: "SLV".to_string(),
+            strategy: debit_spread_strategy_name(DebitSpreadKind::Call).to_string(),
+            order_list_id: order_list_id.to_string(),
+            short_symbol: "SLV260529C00075000".to_string(),
+            long_symbol: "SLV260529C00073000".to_string(),
+            short_call_symbol: None,
+            long_call_symbol: None,
+            quantity: 1,
+            credit: -0.88,
+            debit: Some(0.88),
+            score: 74.5,
+            parent_order_id: Some("open-parent-1".to_string()),
+            close_order_list_id: None,
+            close_parent_order_id: None,
+            close_reason: None,
+            close_attempts: 0,
+            last_close_submitted_at_utc: None,
+            submitted: true,
+            canceled: false,
+            closed: false,
+            recorded_at_utc: "2026-05-04T14:00:00Z".to_string(),
+            closed_at_utc: None,
         }
     }
 

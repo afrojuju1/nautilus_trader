@@ -14,6 +14,7 @@ ENGINE_BIN="${NAUTILUS_ALPACA_RUNNER_BIN:-$HOME/.local/bin/alpaca-options-engine
 OPERATOR_BIN="${NAUTILUS_ALPACA_OPERATOR_BIN:-$HOME/.local/bin/alpaca-operator-status}"
 FLEET_BIN="${NAUTILUS_ALPACA_FLEET_BIN:-$HOME/.local/bin/alpaca-fleet-status}"
 CANDIDATE_ALERTS_BIN="${NAUTILUS_ALPACA_CANDIDATE_ALERTS_BIN:-$HOME/.local/bin/alpaca-candidate-alerts}"
+PERFORMANCE_BIN="${NAUTILUS_ALPACA_PERFORMANCE_BIN:-$HOME/.local/bin/alpaca-performance-report}"
 ALERTS_ENV_FILE="${NAUTILUS_ALPACA_ALERTS_ENV_FILE:-$ALPACA_CONFIG_HOME/alerts.env}"
 OVERRIDE_ENV_FILE=""
 
@@ -41,8 +42,13 @@ Commands:
   health                         lightweight service/account health check
   today [--date YYYY-MM-DD]      compact fleet and candidate-ledger status
   ledger-summary [--all]         summarize candidate-ledger records and latest decisions
+  performance [--all] [ARGS...]  summarize opportunity history and broker-fill PnL
   alerts candidates [ARGS...]    send or dry-run Discord candidate alerts from candidate ledger
+  alerts performance [ARGS...]   send post-market Discord performance digest
   alerts enable|disable|status   control automatic Discord candidate alerts timer
+  alerts performance-enable      enable automatic post-market performance digest timer
+  alerts performance-disable     disable automatic post-market performance digest timer
+  alerts performance-status      show post-market performance digest timer status
   check-config                   print resolved account config
   validate                       run Alpaca formatting, shell, test, and check commands
   deploy                         build and install local Alpaca runtime files
@@ -63,9 +69,12 @@ Examples:
   $(basename "$0") --account paper-main ledger --lines 20
   $(basename "$0") today
   $(basename "$0") ledger-summary --all
+  $(basename "$0") performance --all
   $(basename "$0") alerts candidates --all --dry-run
   $(basename "$0") alerts candidates --all --send
+  $(basename "$0") alerts performance
   $(basename "$0") alerts enable
+  $(basename "$0") alerts performance-enable
   $(basename "$0") rollout
 EOF
 }
@@ -685,6 +694,55 @@ run_today() {
   done
 }
 
+run_performance() {
+  local account all
+  local -a report_args
+  account="$ACCOUNT"
+  all="false"
+  report_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all)
+        all="true"
+        shift
+        ;;
+      --account|-a)
+        account="$(normalize_account "${2:-}")"
+        shift 2
+        ;;
+      *)
+        report_args+=("$1")
+        shift
+        ;;
+    esac
+  done
+  require_executable "$PERFORMANCE_BIN" "performance report binary"
+  if [[ "$all" == "true" ]]; then
+    for account in $(known_accounts | sort -u); do
+      run_performance_for_account "$account" "${report_args[@]}"
+    done
+  else
+    run_performance_for_account "$account" "${report_args[@]}"
+  fi
+}
+
+run_performance_for_account() {
+  local account arg json_output
+  account="$(normalize_account "$1")"
+  shift
+  json_output="false"
+  for arg in "$@"; do
+    if [[ "$arg" == "--json" ]]; then
+      json_output="true"
+    fi
+  done
+  setup_account_env "$account"
+  if [[ "$json_output" != "true" ]]; then
+    echo "performance account=$account"
+  fi
+  "$PERFORMANCE_BIN" "$@"
+}
+
 run_alerts() {
   local subcommand
   subcommand="${1:-}"
@@ -694,6 +752,9 @@ run_alerts() {
   case "$subcommand" in
     candidates|candidate)
       run_candidate_alerts "$@"
+      ;;
+    performance|digest)
+      run_performance_digest "$@"
       ;;
     enable)
       systemctl --user enable --now alpaca-candidate-alerts.timer
@@ -706,11 +767,27 @@ run_alerts() {
       systemctl --user status alpaca-candidate-alerts.timer --no-pager || true
       systemctl --user status alpaca-candidate-alerts.service --no-pager || true
       ;;
+    performance-enable|digest-enable)
+      systemctl --user enable --now alpaca-performance-digest.timer
+      systemctl --user list-timers alpaca-performance-digest.timer --no-pager
+      ;;
+    performance-disable|digest-disable)
+      systemctl --user disable --now alpaca-performance-digest.timer
+      ;;
+    performance-status|digest-status)
+      systemctl --user status alpaca-performance-digest.timer --no-pager || true
+      systemctl --user status alpaca-performance-digest.service --no-pager || true
+      ;;
     *)
-      echo "usage: $(basename "$0") alerts candidates [--all] [--send|--dry-run] [ARGS...] | alerts enable|disable|status" >&2
+      echo "usage: $(basename "$0") alerts candidates [--all] [--send|--dry-run] [ARGS...] | alerts performance [ARGS...] | alerts enable|disable|status|performance-enable|performance-disable|performance-status" >&2
       exit 2
       ;;
   esac
+}
+
+run_performance_digest() {
+  export NAUTILUS_ALPACA_ALERTS_ENV_FILE="$ALERTS_ENV_FILE"
+  run_performance --all --append-ledger --track-candidates --send-discord "$@"
 }
 
 run_candidate_alerts() {
@@ -864,6 +941,9 @@ case "$COMMAND" in
     ;;
   ledger-summary)
     run_ledger_summary "$@"
+    ;;
+  performance)
+    run_performance "$@"
     ;;
   alerts)
     run_alerts "$@"
