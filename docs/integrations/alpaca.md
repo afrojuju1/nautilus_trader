@@ -14,7 +14,7 @@ be presented as a full Python live adapter alongside the stable integrations.
 ## Examples
 
 Safe live examples are available in
-[`examples/live/alpaca/`](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/alpaca/).
+[`examples/live/alpaca/`](../../examples/live/alpaca/README.md).
 
 The examples start with read-only account, option contract, option snapshot, dry-run scanner, and
 multi-leg payload validation commands. They do not submit orders by default.

@@ -186,7 +186,7 @@ for official NautilusTrader documentation.
 
 - [x] Confirm Alpaca Python modules are included in built wheels.
 - [x] Confirm the `nautilus_pyo3.alpaca` module is intentionally exposed.
-- [ ] Confirm docs references do not create broken links.
+- [x] Confirm docs references do not create broken links.
 - [x] Confirm examples do not require real credentials unless explicitly marked.
 - [x] Confirm secrets guidance is present and no real credentials are committed.
 - [x] Confirm public docs describe paper trading before live trading.
