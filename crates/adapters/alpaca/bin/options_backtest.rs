@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, anyhow, bail};
-use chrono::{Duration, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use nautilus_alpaca::{
     config::AlpacaDataClientConfig,
     http::{
@@ -59,8 +59,30 @@ struct Args {
     sweep_short_delta_min: Vec<f64>,
     sweep_short_delta_max: Vec<f64>,
     sweep_min_return_on_risk: Vec<f64>,
+    breakdown_period: BreakdownPeriod,
     quantity: Option<u64>,
     json_output: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BreakdownPeriod {
+    Day,
+    Week,
+    Month,
+    Quarter,
+    Year,
+}
+
+impl BreakdownPeriod {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+            Self::Quarter => "quarter",
+            Self::Year => "year",
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +90,7 @@ struct BacktestReport {
     variant: String,
     start: String,
     end: String,
+    breakdown_period: &'static str,
     entry_time: String,
     exit_time: String,
     timeframe: String,
@@ -97,6 +120,7 @@ struct BacktestSummary {
     average_pnl: f64,
     win_rate: f64,
     by_strategy: BTreeMap<String, StrategySummary>,
+    by_period: BTreeMap<String, PeriodSummary>,
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -107,6 +131,19 @@ struct StrategySummary {
     total_pnl: f64,
     average_pnl: f64,
     win_rate: f64,
+}
+
+#[derive(Default, Debug, Serialize)]
+struct PeriodSummary {
+    scan_days: usize,
+    evaluated_underlying_days: usize,
+    selected_trades: usize,
+    closed_trades: usize,
+    winning_trades: usize,
+    total_pnl: f64,
+    average_pnl: f64,
+    win_rate: f64,
+    by_strategy: BTreeMap<String, StrategySummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -274,11 +311,12 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
         }
     }
 
-    let summary = summarize(&days);
+    let summary = summarize(&days, args.breakdown_period);
     Ok(BacktestReport {
         variant: variant.label,
         start: args.start.to_string(),
         end: args.end.to_string(),
+        breakdown_period: args.breakdown_period.as_str(),
         entry_time: entry_time.format("%H:%M:%S").to_string(),
         exit_time: exit_time.format("%H:%M:%S").to_string(),
         timeframe: args.timeframe,
@@ -1546,36 +1584,62 @@ async fn load_trading_dates(
     Ok(dates)
 }
 
-fn summarize(days: &[BacktestDay]) -> BacktestSummary {
+fn summarize(days: &[BacktestDay], breakdown_period: BreakdownPeriod) -> BacktestSummary {
     let mut summary = BacktestSummary {
         scan_days: days
             .iter()
             .map(|day| day.trade_date.clone())
-            .collect::<std::collections::BTreeSet<_>>()
+            .collect::<BTreeSet<_>>()
             .len(),
         evaluated_underlying_days: days.len(),
         ..BacktestSummary::default()
     };
+    let mut period_scan_dates = BTreeMap::<String, BTreeSet<String>>::new();
 
     for day in days {
+        let period = period_key(&day.trade_date, breakdown_period);
+        let period_summary = summary.by_period.entry(period.clone()).or_default();
+        period_summary.evaluated_underlying_days += 1;
+        period_scan_dates
+            .entry(period)
+            .or_default()
+            .insert(day.trade_date.clone());
+
         let Some(trade) = day.selected.as_ref() else {
             continue;
         };
         summary.selected_trades += 1;
+        period_summary.selected_trades += 1;
         let strategy = summary.by_strategy.entry(trade.strategy.clone()).or_default();
         strategy.selected_trades += 1;
+        let period_strategy = period_summary
+            .by_strategy
+            .entry(trade.strategy.clone())
+            .or_default();
+        period_strategy.selected_trades += 1;
         if let Some(pnl) = trade.pnl {
             summary.closed_trades += 1;
             strategy.closed_trades += 1;
+            period_summary.closed_trades += 1;
+            period_strategy.closed_trades += 1;
             summary.total_pnl += pnl;
             strategy.total_pnl += pnl;
+            period_summary.total_pnl += pnl;
+            period_strategy.total_pnl += pnl;
             if pnl > 0.0 {
                 summary.winning_trades += 1;
                 strategy.winning_trades += 1;
+                period_summary.winning_trades += 1;
+                period_strategy.winning_trades += 1;
             }
         }
     }
 
+    for (period, scan_dates) in period_scan_dates {
+        if let Some(period_summary) = summary.by_period.get_mut(&period) {
+            period_summary.scan_days = scan_dates.len();
+        }
+    }
     if summary.closed_trades > 0 {
         summary.average_pnl = summary.total_pnl / summary.closed_trades as f64;
         summary.win_rate = summary.winning_trades as f64 / summary.closed_trades as f64;
@@ -1586,7 +1650,38 @@ fn summarize(days: &[BacktestDay]) -> BacktestSummary {
             strategy.win_rate = strategy.winning_trades as f64 / strategy.closed_trades as f64;
         }
     }
+    for period in summary.by_period.values_mut() {
+        if period.closed_trades > 0 {
+            period.average_pnl = period.total_pnl / period.closed_trades as f64;
+            period.win_rate = period.winning_trades as f64 / period.closed_trades as f64;
+        }
+        for strategy in period.by_strategy.values_mut() {
+            if strategy.closed_trades > 0 {
+                strategy.average_pnl = strategy.total_pnl / strategy.closed_trades as f64;
+                strategy.win_rate = strategy.winning_trades as f64 / strategy.closed_trades as f64;
+            }
+        }
+    }
     summary
+}
+
+fn period_key(trade_date: &str, breakdown_period: BreakdownPeriod) -> String {
+    let Ok(date) = NaiveDate::parse_from_str(trade_date, "%Y-%m-%d") else {
+        return trade_date.to_string();
+    };
+    match breakdown_period {
+        BreakdownPeriod::Day => date.to_string(),
+        BreakdownPeriod::Week => {
+            let week = date.iso_week();
+            format!("{:04}-W{:02}", week.year(), week.week())
+        }
+        BreakdownPeriod::Month => format!("{:04}-{:02}", date.year(), date.month()),
+        BreakdownPeriod::Quarter => {
+            let quarter = ((date.month() - 1) / 3) + 1;
+            format!("{:04}-Q{quarter}", date.year())
+        }
+        BreakdownPeriod::Year => date.year().to_string(),
+    }
 }
 
 fn sweep_variants(args: &Args) -> Vec<SweepVariant> {
@@ -1800,6 +1895,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut sweep_short_delta_min = Vec::new();
     let mut sweep_short_delta_max = Vec::new();
     let mut sweep_min_return_on_risk = Vec::new();
+    let mut breakdown_period = BreakdownPeriod::Month;
     let mut quantity = None;
     let mut json_output = false;
 
@@ -1875,6 +1971,10 @@ fn parse_args() -> anyhow::Result<Args> {
                 sweep_min_return_on_risk =
                     parse_float_csv(next_value(&mut iter, "--sweep-min-return-on-risk")?)?;
             }
+            "--breakdown-period" => {
+                breakdown_period =
+                    parse_breakdown_period(&next_value(&mut iter, "--breakdown-period")?)?;
+            }
             "--quantity" | "--qty" => {
                 quantity = Some(
                     next_value(&mut iter, "--quantity")?
@@ -1911,6 +2011,7 @@ fn parse_args() -> anyhow::Result<Args> {
         sweep_short_delta_min,
         sweep_short_delta_max,
         sweep_min_return_on_risk,
+        breakdown_period,
         quantity,
         json_output,
     })
@@ -1925,6 +2026,17 @@ fn parse_time(value: &str) -> anyhow::Result<NaiveTime> {
     NaiveTime::parse_from_str(value, "%H:%M:%S")
         .or_else(|_| NaiveTime::parse_from_str(value, "%H:%M"))
         .with_context(|| format!("invalid time {value}; expected HH:MM or HH:MM:SS"))
+}
+
+fn parse_breakdown_period(value: &str) -> anyhow::Result<BreakdownPeriod> {
+    match value.to_ascii_lowercase().as_str() {
+        "day" | "daily" => Ok(BreakdownPeriod::Day),
+        "week" | "weekly" => Ok(BreakdownPeriod::Week),
+        "month" | "monthly" => Ok(BreakdownPeriod::Month),
+        "quarter" | "quarterly" => Ok(BreakdownPeriod::Quarter),
+        "year" | "yearly" | "annual" | "annually" => Ok(BreakdownPeriod::Year),
+        _ => bail!("--breakdown-period must be one of day, week, month, quarter, year"),
+    }
 }
 
 fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<String> {
@@ -1957,10 +2069,11 @@ fn parse_float_csv(value: String) -> anyhow::Result<Vec<f64>> {
 
 fn print_report(report: &BacktestReport) {
     println!(
-        "Alpaca options strategy backtest variant={} {} -> {} entry={} exit={} strategies={} underlyings={} mark_source={}",
+        "Alpaca options strategy backtest variant={} {} -> {} period={} entry={} exit={} strategies={} underlyings={} mark_source={}",
         report.variant,
         report.start,
         report.end,
+        report.breakdown_period,
         report.entry_time,
         report.exit_time,
         report.strategies.join(","),
@@ -1982,6 +2095,20 @@ fn print_report(report: &BacktestReport) {
         println!(
             "strategy={} selected={} closed={} wins={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2}",
             strategy,
+            summary.selected_trades,
+            summary.closed_trades,
+            summary.winning_trades,
+            summary.win_rate * 100.0,
+            summary.total_pnl,
+            summary.average_pnl,
+        );
+    }
+    for (period, summary) in &report.summary.by_period {
+        println!(
+            "period={} scan_days={} underlying_days={} selected={} closed={} wins={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2}",
+            period,
+            summary.scan_days,
+            summary.evaluated_underlying_days,
             summary.selected_trades,
             summary.closed_trades,
             summary.winning_trades,
@@ -2027,11 +2154,25 @@ fn print_sweep_report(reports: &[BacktestReport]) {
             report.summary.total_pnl,
             report.summary.average_pnl,
         );
+        for (period, summary) in &report.summary.by_period {
+            if summary.selected_trades == 0 && summary.closed_trades == 0 {
+                continue;
+            }
+            println!(
+                "  period={} selected={} closed={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2}",
+                period,
+                summary.selected_trades,
+                summary.closed_trades,
+                summary.win_rate * 100.0,
+                summary.total_pnl,
+                summary.average_pnl,
+            );
+        }
     }
 }
 
 fn print_usage() {
     println!(
-        "Usage: alpaca-options-backtest --start YYYY-MM-DD --end YYYY-MM-DD [--entry-time HH:MM] [--exit-time HH:MM] [--underlyings SPY,QQQ] [--strategies put_credit,call_credit,iron_condor,call_debit,put_debit,naked_call,naked_put] [--timeframe 1Min] [--option-feed indicative] [--stock-feed iex] [--assumed-iv 0.35] [--synthetic-spread-pct 0.05] [--entry-mark-window-mins 10] [--historical-min-open-interest 0] [--missing-open-interest 0] [--historical-max-leg-spread-pct 0.80] [--sweep-synthetic-spread-pct 0.03,0.05,0.08] [--sweep-short-delta-min 0.10,0.15] [--sweep-short-delta-max 0.20,0.25] [--sweep-min-return-on-risk 0.04,0.08,0.13] [--quantity 1] [--json]"
+        "Usage: alpaca-options-backtest --start YYYY-MM-DD --end YYYY-MM-DD [--entry-time HH:MM] [--exit-time HH:MM] [--underlyings SPY,QQQ] [--strategies put_credit,call_credit,iron_condor,call_debit,put_debit,naked_call,naked_put] [--timeframe 1Min] [--option-feed indicative] [--stock-feed iex] [--assumed-iv 0.35] [--synthetic-spread-pct 0.05] [--entry-mark-window-mins 10] [--historical-min-open-interest 0] [--missing-open-interest 0] [--historical-max-leg-spread-pct 0.80] [--sweep-synthetic-spread-pct 0.03,0.05,0.08] [--sweep-short-delta-min 0.10,0.15] [--sweep-short-delta-max 0.20,0.25] [--sweep-min-return-on-risk 0.04,0.08,0.13] [--breakdown-period day|week|month|quarter|year] [--quantity 1] [--json]"
     );
 }
