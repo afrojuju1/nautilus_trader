@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, env};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+};
 
 use anyhow::{Context, anyhow, bail};
 use chrono::{Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
@@ -342,7 +345,7 @@ async fn backtest_underlying_day(
             simulate_selected_entry(
                 client,
                 entry,
-                config.quantity,
+                config,
                 trade_date,
                 &entry_timestamp,
                 &exit_timestamp,
@@ -518,7 +521,7 @@ fn select_historical_entry(
 async fn simulate_selected_entry(
     client: &AlpacaHttpClient,
     entry: SelectedOptionsEntry,
-    quantity: u64,
+    config: &OptionsEngineConfig,
     trade_date: NaiveDate,
     entry_timestamp: &str,
     exit_timestamp: &str,
@@ -540,40 +543,26 @@ async fn simulate_selected_entry(
     }
 
     let symbols = legs.iter().map(|leg| leg.symbol.clone()).collect::<Vec<_>>();
-    let exit_bars = load_option_bars(
+    let path_bars = load_option_bars(
         client,
         storage,
         account_id,
         symbols,
         timeframe,
         option_feed,
-        exit_timestamp,
+        entry_timestamp,
         exit_end,
     )
     .await?;
-    let exit_trades = load_option_trades(
+    let path_trades = load_option_trades(
         client,
         storage,
         account_id,
         legs.iter().map(|leg| leg.symbol.clone()).collect(),
-        exit_timestamp,
+        entry_timestamp,
         exit_end,
     )
     .await?;
-
-    let mut exit_net_cashflow = 0.0;
-    let mut missing_exit = false;
-    for leg in &mut legs {
-        if let Some(mark) = historical_mark(&leg.symbol, &exit_bars, &exit_trades) {
-            leg.exit_close = Some(mark.price);
-            leg.exit_source = Some(mark.source.to_string());
-        }
-        if let Some(exit_close) = leg.exit_close {
-            exit_net_cashflow += leg.side.exit_sign() * exit_close;
-        } else {
-            missing_exit = true;
-        }
-    }
 
     let entry_net_cashflow = match descriptor.premium_kind.as_str() {
         "credit" => descriptor.premium,
@@ -583,16 +572,50 @@ async fn simulate_selected_entry(
             .filter_map(|leg| leg.entry_close.map(|price| leg.side.entry_sign() * price))
             .sum(),
     };
+    let exit_plan = select_exit_plan(
+        &legs,
+        &path_bars,
+        &path_trades,
+        entry_timestamp,
+        exit_timestamp,
+        entry_net_cashflow,
+        descriptor.premium_kind.as_str(),
+        config,
+    );
+
+    let mut exit_net_cashflow = 0.0;
+    let mut missing_exit = false;
+    let mut resolved_exit_timestamp = exit_timestamp.to_string();
+    let mut exit_status = "missing_exit_bar".to_string();
+    if let Some(exit_plan) = exit_plan {
+        resolved_exit_timestamp = exit_plan.timestamp;
+        exit_status = exit_plan.reason;
+        for leg in &mut legs {
+            if let Some(mark) = exit_plan.marks.get(&leg.symbol) {
+                leg.exit_close = Some(mark.price);
+                leg.exit_source = Some(mark.source.to_string());
+            }
+        }
+    }
+    for leg in &legs {
+        if let Some(exit_close) = leg.exit_close {
+            exit_net_cashflow += leg.side.exit_sign() * exit_close;
+        } else {
+            missing_exit = true;
+        }
+    }
+
     let pnl_per_contract = entry_net_cashflow + exit_net_cashflow;
-    let pnl = (!missing_exit).then_some(pnl_per_contract * OPTION_CONTRACT_MULTIPLIER * quantity as f64);
+    let pnl =
+        (!missing_exit).then_some(pnl_per_contract * OPTION_CONTRACT_MULTIPLIER * config.quantity as f64);
 
     Ok(TradeBacktest {
         strategy: descriptor.strategy.to_string(),
         underlying: descriptor.underlying,
         trade_date: trade_date.to_string(),
         entry_timestamp: entry_timestamp.to_string(),
-        exit_timestamp: exit_timestamp.to_string(),
-        quantity,
+        exit_timestamp: resolved_exit_timestamp,
+        quantity: config.quantity,
         score: descriptor.score,
         premium_kind: descriptor.premium_kind.as_str().to_string(),
         entry_premium: descriptor.premium,
@@ -600,8 +623,157 @@ async fn simulate_selected_entry(
         exit_net_cashflow: (!missing_exit).then_some(exit_net_cashflow),
         pnl,
         legs,
-        exit_status: if missing_exit { "missing_exit_bar" } else { "closed" }.to_string(),
+        exit_status: if missing_exit {
+            "missing_exit_bar".to_string()
+        } else {
+            exit_status
+        },
     })
+}
+
+#[derive(Clone, Debug)]
+struct ExitPlan {
+    timestamp: String,
+    reason: String,
+    marks: BTreeMap<String, HistoricalMark>,
+}
+
+fn select_exit_plan(
+    legs: &[BacktestLeg],
+    path_bars: &BTreeMap<String, Vec<AlpacaOptionBar>>,
+    _path_trades: &BTreeMap<String, Vec<AlpacaOptionTrade>>,
+    entry_timestamp: &str,
+    fallback_exit_timestamp: &str,
+    entry_net_cashflow: f64,
+    premium_kind: &str,
+    config: &OptionsEngineConfig,
+) -> Option<ExitPlan> {
+    let mut fallback = None;
+    for timestamp in common_bar_timestamps(legs, path_bars) {
+        if timestamp.as_str() < entry_timestamp || timestamp.as_str() > fallback_exit_timestamp {
+            continue;
+        }
+        let marks = bar_marks_at_timestamp(legs, path_bars, &timestamp)?;
+        let exit_net_cashflow = exit_cashflow_from_marks(legs, &marks)?;
+        let reason = management_exit_reason(
+            entry_timestamp,
+            &timestamp,
+            entry_net_cashflow,
+            exit_net_cashflow,
+            premium_kind,
+            config,
+        );
+        let plan = ExitPlan {
+            timestamp,
+            reason: reason.unwrap_or("fixed_exit").to_string(),
+            marks,
+        };
+        if reason.is_some() {
+            return Some(plan);
+        }
+        fallback = Some(plan);
+    }
+    fallback
+}
+
+fn common_bar_timestamps(
+    legs: &[BacktestLeg],
+    path_bars: &BTreeMap<String, Vec<AlpacaOptionBar>>,
+) -> Vec<String> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for leg in legs {
+        let mut timestamps = BTreeSet::new();
+        if let Some(bars) = path_bars.get(&leg.symbol) {
+            for bar in bars {
+                if bar.close.is_some_and(|value| value > 0.0) {
+                    if let Some(timestamp) = bar.timestamp.as_ref() {
+                        timestamps.insert(timestamp.clone());
+                    }
+                }
+            }
+        }
+        for timestamp in timestamps {
+            *counts.entry(timestamp).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter_map(|(timestamp, count)| (count == legs.len()).then_some(timestamp))
+        .collect()
+}
+
+fn bar_marks_at_timestamp(
+    legs: &[BacktestLeg],
+    path_bars: &BTreeMap<String, Vec<AlpacaOptionBar>>,
+    timestamp: &str,
+) -> Option<BTreeMap<String, HistoricalMark>> {
+    let mut marks = BTreeMap::new();
+    for leg in legs {
+        let bar = path_bars.get(&leg.symbol)?.iter().find(|bar| {
+            bar.timestamp.as_deref() == Some(timestamp)
+                && bar.close.is_some_and(|value| value > 0.0)
+        })?;
+        marks.insert(
+            leg.symbol.clone(),
+            HistoricalMark {
+                price: bar.close?,
+                timestamp: bar.timestamp.clone(),
+                source: "bar_management",
+                volume: bar.volume,
+            },
+        );
+    }
+    Some(marks)
+}
+
+fn exit_cashflow_from_marks(
+    legs: &[BacktestLeg],
+    marks: &BTreeMap<String, HistoricalMark>,
+) -> Option<f64> {
+    let mut cashflow = 0.0;
+    for leg in legs {
+        cashflow += leg.side.exit_sign() * marks.get(&leg.symbol)?.price;
+    }
+    Some(cashflow)
+}
+
+fn management_exit_reason(
+    entry_timestamp: &str,
+    timestamp: &str,
+    entry_net_cashflow: f64,
+    exit_net_cashflow: f64,
+    premium_kind: &str,
+    config: &OptionsEngineConfig,
+) -> Option<&'static str> {
+    if premium_kind == "credit" && entry_net_cashflow > 0.0 {
+        let close_debit = -exit_net_cashflow;
+        if close_debit > 0.0
+            && close_debit <= entry_net_cashflow * config.profit_target_close_fraction
+        {
+            return Some("profit_target");
+        }
+        if config.stop_loss_close_multiple > 0.0
+            && close_debit >= entry_net_cashflow * config.stop_loss_close_multiple
+        {
+            return Some("stop_loss");
+        }
+    }
+
+    if config.max_hold_secs > 0 {
+        if let Some(age_secs) = timestamp_age_secs(entry_timestamp, timestamp) {
+            if age_secs >= config.max_hold_secs as i64 {
+                return Some("max_hold");
+            }
+        }
+    }
+
+    None
+}
+
+fn timestamp_age_secs(entry_timestamp: &str, timestamp: &str) -> Option<i64> {
+    let entry = chrono::DateTime::parse_from_rfc3339(entry_timestamp).ok()?;
+    let current = chrono::DateTime::parse_from_rfc3339(timestamp).ok()?;
+    Some(current.signed_duration_since(entry).num_seconds())
 }
 
 async fn load_contracts(
