@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{Duration, NaiveDate};
 
 use crate::{
     config::AlpacaDataClientConfig,
@@ -21,26 +21,6 @@ use crate::{
 pub(super) struct OptionChainSnapshot {
     pub(super) contracts: Vec<AlpacaOptionContract>,
     pub(super) snapshots: BTreeMap<String, AlpacaOptionSnapshot>,
-}
-
-pub(super) async fn load_option_chain_snapshot(
-    client: &AlpacaHttpClient,
-    data_config: &AlpacaDataClientConfig,
-    underlying: &str,
-    min_dte: i64,
-    max_dte: i64,
-    option_type: AlpacaOptionType,
-) -> Result<OptionChainSnapshot> {
-    load_option_chain_snapshot_at(
-        client,
-        data_config,
-        underlying,
-        min_dte,
-        max_dte,
-        option_type,
-        Utc::now().date_naive(),
-    )
-    .await
 }
 
 pub(super) async fn load_option_chain_snapshot_at(

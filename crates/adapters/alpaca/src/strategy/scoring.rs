@@ -1052,10 +1052,6 @@ fn strike_key(strike: f64) -> i64 {
     (strike * 1_000.0).round() as i64
 }
 
-fn days_to_expiration(expiration_date: &str) -> Option<i64> {
-    days_to_expiration_from(expiration_date, Utc::now().date_naive())
-}
-
 fn days_to_expiration_from(expiration_date: &str, scan_date: NaiveDate) -> Option<i64> {
     let expiration = NaiveDate::parse_from_str(expiration_date, "%Y-%m-%d").ok()?;
     Some(expiration.signed_duration_since(scan_date).num_days())
