@@ -119,6 +119,13 @@ doc = false
 test = false
 
 [[bin]]
+name = "alpaca-options-backtest"
+path = "bin/options_backtest.rs"
+required-features = ["live"]
+doc = false
+test = false
+
+[[bin]]
 name = "alpaca-check-account-orders"
 path = "bin/check_account_orders.rs"
 required-features = ["live"]

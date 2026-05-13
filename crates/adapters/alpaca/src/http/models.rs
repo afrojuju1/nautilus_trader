@@ -181,6 +181,85 @@ impl OptionSnapshotsRequest {
     }
 }
 
+/// Request parameters for historical option bars.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptionBarsRequest {
+    /// Option contract symbols.
+    pub symbols: Vec<String>,
+    /// Bar timeframe, for example `1Min`.
+    pub timeframe: String,
+    /// Inclusive start timestamp in RFC3339 format.
+    pub start: String,
+    /// Exclusive end timestamp in RFC3339 format.
+    pub end: Option<String>,
+    /// Option data feed.
+    pub feed: Option<String>,
+    /// Page size.
+    pub limit: usize,
+    /// Sort order.
+    pub sort: Option<String>,
+    /// Optional page token.
+    pub page_token: Option<String>,
+}
+
+impl OptionBarsRequest {
+    /// Creates a historical bars request for the given symbols.
+    #[must_use]
+    pub fn for_symbols(
+        symbols: impl IntoIterator<Item = impl Into<String>>,
+        timeframe: impl Into<String>,
+        start: impl Into<String>,
+    ) -> Self {
+        Self {
+            symbols: symbols.into_iter().map(Into::into).collect(),
+            timeframe: timeframe.into(),
+            start: start.into(),
+            end: None,
+            feed: None,
+            limit: 10_000,
+            sort: Some("asc".to_string()),
+            page_token: None,
+        }
+    }
+
+    /// Returns a copy of this request with the symbols and page token replaced.
+    #[must_use]
+    pub fn with_symbols_and_page(
+        &self,
+        symbols: impl IntoIterator<Item = impl Into<String>>,
+        page_token: Option<String>,
+    ) -> Self {
+        Self {
+            symbols: symbols.into_iter().map(Into::into).collect(),
+            page_token,
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn query_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = Vec::new();
+        if !self.symbols.is_empty() {
+            pairs.push(("symbols", self.symbols.join(",")));
+        }
+        pairs.push(("timeframe", self.timeframe.clone()));
+        pairs.push(("start", self.start.clone()));
+        if let Some(value) = &self.end {
+            pairs.push(("end", value.clone()));
+        }
+        if let Some(value) = &self.feed {
+            pairs.push(("feed", value.clone()));
+        }
+        pairs.push(("limit", self.limit.to_string()));
+        if let Some(value) = &self.sort {
+            pairs.push(("sort", value.clone()));
+        }
+        if let Some(value) = &self.page_token {
+            pairs.push(("page_token", value.clone()));
+        }
+        pairs
+    }
+}
+
 /// Request parameters for stock snapshots.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StockSnapshotsRequest {
@@ -632,6 +711,26 @@ impl OptionSnapshotsResponse {
         self.next_page_token
             .clone()
             .or_else(|| self.page_token.clone())
+            .filter(|value| !value.trim().is_empty())
+    }
+}
+
+/// Response from Alpaca's historical option bars endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OptionBarsResponse {
+    /// Bars grouped by option symbol.
+    #[serde(default)]
+    pub bars: BTreeMap<String, Vec<AlpacaOptionBar>>,
+    /// Next page token, if more records are available.
+    pub next_page_token: Option<String>,
+}
+
+impl OptionBarsResponse {
+    /// Returns the next token from Alpaca's response.
+    #[must_use]
+    pub fn next_token(&self) -> Option<String> {
+        self.next_page_token
+            .clone()
             .filter(|value| !value.trim().is_empty())
     }
 }

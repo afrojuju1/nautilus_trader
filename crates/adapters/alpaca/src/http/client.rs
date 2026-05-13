@@ -31,8 +31,9 @@ use crate::{
         error::{Error, Result},
         models::{
             AlpacaAccount, AlpacaActivity, AlpacaOrder, AlpacaPosition, ListActivitiesRequest,
-            ListOptionContractsRequest, ListOrdersRequest, OptionContractsResponse,
-            OptionSnapshotsRequest, OptionSnapshotsResponse, ReplaceOrderRequest,
+            ListOptionContractsRequest, ListOrdersRequest, OptionBarsRequest, OptionBarsResponse,
+            OptionContractsResponse, OptionSnapshotsRequest, OptionSnapshotsResponse,
+            ReplaceOrderRequest,
             StockSnapshotsRequest, StockSnapshotsResponse,
         },
     },
@@ -219,6 +220,52 @@ impl AlpacaHttpClient {
             snapshots,
             next_page_token: None,
             page_token: None,
+        })
+    }
+
+    /// Lists one page of historical option bars from Alpaca's Market Data API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be decoded.
+    pub async fn option_bars_page(
+        &self,
+        request: &OptionBarsRequest,
+    ) -> Result<OptionBarsResponse> {
+        self.get_data_json("/v1beta1/options/bars", &request.query_pairs())
+            .await
+    }
+
+    /// Lists historical option bars for all symbols in the request, batching at Alpaca's 100-symbol cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any request fails or cannot be decoded.
+    pub async fn option_bars(&self, request: &OptionBarsRequest) -> Result<OptionBarsResponse> {
+        let mut bars = std::collections::BTreeMap::new();
+
+        for symbol_batch in request.symbols.chunks(100) {
+            let mut page_token = request.page_token.clone();
+
+            loop {
+                let page_request =
+                    request.with_symbols_and_page(symbol_batch.iter().cloned(), page_token.clone());
+                let page = self.option_bars_page(&page_request).await?;
+                page_token = page.next_token();
+
+                for (symbol, mut symbol_bars) in page.bars {
+                    bars.entry(symbol).or_default().append(&mut symbol_bars);
+                }
+
+                if page_token.is_none() {
+                    break;
+                }
+            }
+        }
+
+        Ok(OptionBarsResponse {
+            bars,
+            next_page_token: None,
         })
     }
 
