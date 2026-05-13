@@ -328,6 +328,7 @@ async fn backtest_underlying_day(
     normalize_historical_open_interest(&mut contracts, missing_open_interest);
     let symbols = contracts
         .iter()
+        .filter(|contract| is_standard_alpaca_option_symbol(&contract.symbol))
         .map(|contract| contract.symbol.clone())
         .collect::<Vec<_>>();
 
@@ -888,6 +889,34 @@ fn normalize_historical_open_interest(
     }
 }
 
+fn is_standard_alpaca_option_symbol(symbol: &str) -> bool {
+    if symbol.starts_with(|value: char| value.is_ascii_digit()) {
+        return false;
+    }
+    if symbol.len() < 16 || symbol.len() > 20 {
+        return false;
+    }
+    let side_index = symbol.len() - 9;
+    let side = symbol.as_bytes()[side_index] as char;
+    if !matches!(side, 'C' | 'P') {
+        return false;
+    }
+    let (prefix, strike_with_side) = symbol.split_at(side_index);
+    let strike = &strike_with_side[1..];
+    if strike.len() != 8 || !strike.chars().all(|value| value.is_ascii_digit()) {
+        return false;
+    }
+    if prefix.len() < 7 || prefix.len() > 12 {
+        return false;
+    }
+    let root_len = prefix.len() - 6;
+    let (root, expiration) = prefix.split_at(root_len);
+    !root.is_empty()
+        && root.len() <= 5
+        && root.chars().all(|value| value.is_ascii_uppercase())
+        && expiration.chars().all(|value| value.is_ascii_digit())
+}
+
 async fn load_option_bars(
     client: &AlpacaHttpClient,
     storage: Option<&StorageRepository>,
@@ -901,7 +930,7 @@ async fn load_option_bars(
     if symbols.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let cache_key = market_data_cache_key(&symbols, &[timeframe, start, end]);
+    let cache_key = market_data_cache_key(&symbols, &["standard-v2", timeframe, start, end]);
     if let Some(cached) = read_cache(storage, account_id, "option_bars", &cache_key).await? {
         return Ok(cached);
     }
@@ -923,7 +952,7 @@ async fn load_option_trades(
     if symbols.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let cache_key = market_data_cache_key(&symbols, &[start, end]);
+    let cache_key = market_data_cache_key(&symbols, &["standard-v2", start, end]);
     if let Some(cached) = read_cache(storage, account_id, "option_trades", &cache_key).await? {
         return Ok(cached);
     }
