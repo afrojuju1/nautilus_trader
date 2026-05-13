@@ -8,8 +8,8 @@ use nautilus_alpaca::{
         client::AlpacaHttpClient,
         models::{
             AlpacaOptionBar, AlpacaOptionContract, AlpacaOptionGreeks, AlpacaOptionQuote,
-            AlpacaOptionSnapshot, AlpacaStockBar, ListOptionContractsRequest, OptionBarsRequest,
-            StockBarsRequest,
+            AlpacaOptionSnapshot, AlpacaOptionTrade, AlpacaStockBar, ListOptionContractsRequest,
+            OptionBarsRequest, OptionTradesRequest, StockBarsRequest,
         },
     },
     options_runtime::{
@@ -23,6 +23,7 @@ use nautilus_alpaca::{
         scan_iron_condor_snapshots_at, scan_naked_option_snapshot_at,
     },
 };
+use nautilus_model::data::greeks::black_scholes_greeks;
 use serde::Serialize;
 
 const DAYS_PER_YEAR: f64 = 365.25;
@@ -132,6 +133,8 @@ struct BacktestLeg {
     side: LegSide,
     entry_close: Option<f64>,
     exit_close: Option<f64>,
+    entry_source: Option<String>,
+    exit_source: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -216,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
         timeframe: args.timeframe,
         option_feed,
         stock_feed,
-        mark_source: "historical_bar_close_with_synthetic_quote",
+        mark_source: "historical_trade_or_bar_with_synthetic_quote",
         assumed_iv: args.assumed_iv,
         synthetic_spread_pct: args.synthetic_spread_pct,
         underlyings: config.underlyings,
@@ -282,9 +285,21 @@ async fn backtest_underlying_day(
         )
         .await?
     };
+    let option_trades = if symbols.is_empty() {
+        BTreeMap::new()
+    } else {
+        load_option_trades(
+            client,
+            symbols.clone(),
+            &entry_timestamp,
+            &entry_end,
+        )
+        .await?
+    };
     let snapshots = build_snapshot_map(
         &contracts,
         &option_bars,
+        &option_trades,
         trade_date,
         underlying_price,
         assumed_iv,
@@ -315,6 +330,7 @@ async fn backtest_underlying_day(
                 timeframe,
                 option_feed,
                 &option_bars,
+                &option_trades,
             )
             .await?,
         ),
@@ -488,13 +504,15 @@ async fn simulate_selected_entry(
     timeframe: &str,
     option_feed: &str,
     entry_bars: &BTreeMap<String, Vec<AlpacaOptionBar>>,
+    entry_trades: &BTreeMap<String, Vec<AlpacaOptionTrade>>,
 ) -> anyhow::Result<TradeBacktest> {
     let descriptor = entry.descriptor();
     let mut legs = selected_legs(&entry);
     for leg in &mut legs {
-        leg.entry_close = entry_bars
-            .get(&leg.symbol)
-            .and_then(|bars| first_bar_close(bars));
+        if let Some(mark) = historical_mark(&leg.symbol, entry_bars, entry_trades) {
+            leg.entry_close = Some(mark.price);
+            leg.entry_source = Some(mark.source.to_string());
+        }
     }
 
     let symbols = legs.iter().map(|leg| leg.symbol.clone()).collect::<Vec<_>>();
@@ -507,13 +525,21 @@ async fn simulate_selected_entry(
         exit_end,
     )
     .await?;
+    let exit_trades = load_option_trades(
+        client,
+        legs.iter().map(|leg| leg.symbol.clone()).collect(),
+        exit_timestamp,
+        exit_end,
+    )
+    .await?;
 
     let mut exit_net_cashflow = 0.0;
     let mut missing_exit = false;
     for leg in &mut legs {
-        leg.exit_close = exit_bars
-            .get(&leg.symbol)
-            .and_then(|bars| first_bar_close(bars));
+        if let Some(mark) = historical_mark(&leg.symbol, &exit_bars, &exit_trades) {
+            leg.exit_close = Some(mark.price);
+            leg.exit_source = Some(mark.source.to_string());
+        }
         if let Some(exit_close) = leg.exit_close {
             exit_net_cashflow += leg.side.exit_sign() * exit_close;
         } else {
@@ -595,6 +621,20 @@ async fn load_option_bars(
     Ok(client.option_bars(&request).await?.bars)
 }
 
+async fn load_option_trades(
+    client: &AlpacaHttpClient,
+    symbols: Vec<String>,
+    start: &str,
+    end: &str,
+) -> anyhow::Result<BTreeMap<String, Vec<AlpacaOptionTrade>>> {
+    if symbols.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut request = OptionTradesRequest::for_symbols(symbols, start.to_string());
+    request.end = Some(end.to_string());
+    Ok(client.option_trades(&request).await?.trades)
+}
+
 async fn load_underlying_price_at(
     client: &AlpacaHttpClient,
     symbol: &str,
@@ -616,6 +656,7 @@ async fn load_underlying_price_at(
 fn build_snapshot_map(
     contracts: &[AlpacaOptionContract],
     bars_by_symbol: &BTreeMap<String, Vec<AlpacaOptionBar>>,
+    trades_by_symbol: &BTreeMap<String, Vec<AlpacaOptionTrade>>,
     scan_date: NaiveDate,
     underlying_price: Option<f64>,
     assumed_iv: f64,
@@ -623,19 +664,19 @@ fn build_snapshot_map(
 ) -> BTreeMap<String, AlpacaOptionSnapshot> {
     let mut snapshots = BTreeMap::new();
     for contract in contracts {
-        let Some(bar) = bars_by_symbol
-            .get(&contract.symbol)
-            .and_then(|bars| first_option_bar(bars))
+        let Some(mark) = historical_mark(&contract.symbol, bars_by_symbol, trades_by_symbol)
         else {
             continue;
         };
-        let Some(close) = bar.close.filter(|value| *value > 0.0) else {
-            continue;
-        };
         let half_spread = (synthetic_spread_pct.max(0.0) / 2.0).min(0.49);
-        let bid = (close * (1.0 - half_spread)).max(0.01);
-        let ask = (close * (1.0 + half_spread)).max(bid);
-        let delta = underlying_price.and_then(|price| estimated_delta(contract, scan_date, price, assumed_iv));
+        let bid = (mark.price * (1.0 - half_spread)).max(0.01);
+        let ask = (mark.price * (1.0 + half_spread)).max(bid);
+        let implied_volatility = underlying_price
+            .and_then(|price| implied_volatility_from_mark(contract, scan_date, price, mark.price))
+            .unwrap_or(assumed_iv);
+        let greeks = underlying_price.and_then(|price| {
+            calculated_greeks(contract, scan_date, price, implied_volatility)
+        });
         snapshots.insert(
             contract.symbol.clone(),
             AlpacaOptionSnapshot {
@@ -644,47 +685,153 @@ fn build_snapshot_map(
                     ask_size: Some(10),
                     bid_price: Some(bid),
                     bid_size: Some(10),
-                    timestamp: bar.timestamp.clone(),
+                    timestamp: mark.timestamp.clone(),
                 }),
                 latest_trade: None,
-                minute_bar: Some(bar.clone()),
-                daily_bar: Some(bar.clone()),
+                minute_bar: bars_by_symbol
+                    .get(&contract.symbol)
+                    .and_then(|bars| first_option_bar(bars))
+                    .cloned(),
+                daily_bar: bars_by_symbol
+                    .get(&contract.symbol)
+                    .and_then(|bars| first_option_bar(bars))
+                    .cloned(),
                 prev_daily_bar: None,
-                greeks: Some(AlpacaOptionGreeks {
-                    delta,
-                    gamma: None,
-                    rho: None,
-                    theta: None,
-                    vega: None,
-                }),
-                implied_volatility: Some(assumed_iv),
+                greeks,
+                implied_volatility: Some(implied_volatility),
             },
         );
     }
     snapshots
 }
 
-fn estimated_delta(
+#[derive(Clone, Debug)]
+struct HistoricalMark {
+    price: f64,
+    timestamp: Option<String>,
+    source: &'static str,
+}
+
+fn historical_mark(
+    symbol: &str,
+    bars_by_symbol: &BTreeMap<String, Vec<AlpacaOptionBar>>,
+    trades_by_symbol: &BTreeMap<String, Vec<AlpacaOptionTrade>>,
+) -> Option<HistoricalMark> {
+    if let Some(trade) = trades_by_symbol
+        .get(symbol)
+        .and_then(|trades| first_option_trade(trades))
+    {
+        return Some(HistoricalMark {
+            price: trade.price?,
+            timestamp: trade.timestamp.clone(),
+            source: "trade",
+        });
+    }
+
+    let bar = bars_by_symbol
+        .get(symbol)
+        .and_then(|bars| first_option_bar(bars))?;
+    Some(HistoricalMark {
+        price: bar.close?,
+        timestamp: bar.timestamp.clone(),
+        source: "bar",
+    })
+}
+
+fn implied_volatility_from_mark(
     contract: &AlpacaOptionContract,
     scan_date: NaiveDate,
     underlying_price: f64,
-    assumed_iv: f64,
+    option_price: f64,
 ) -> Option<f64> {
     let strike = contract.strike_price.parse::<f64>().ok()?;
-    let expiration = NaiveDate::parse_from_str(&contract.expiration_date, "%Y-%m-%d").ok()?;
-    let dte = expiration.signed_duration_since(scan_date).num_days().max(1) as f64;
-    let years = dte / DAYS_PER_YEAR;
-    if underlying_price <= 0.0 || strike <= 0.0 || assumed_iv <= 0.0 || years <= 0.0 {
+    let years = years_to_expiration(contract, scan_date)?;
+    if underlying_price <= 0.0 || strike <= 0.0 || option_price <= 0.0 || years <= 0.0 {
         return None;
     }
-    let d1 = ((underlying_price / strike).ln()
-        + (SCANNER_RISK_FREE_RATE + 0.5 * assumed_iv * assumed_iv) * years)
-        / (assumed_iv * years.sqrt());
-    let call_delta = normal_cdf(d1);
-    if contract.option_type.eq_ignore_ascii_case("call") {
-        Some(call_delta)
+
+    let is_call = contract.option_type.eq_ignore_ascii_case("call");
+    let intrinsic = if is_call {
+        (underlying_price - strike).max(0.0)
     } else {
-        Some(call_delta - 1.0)
+        (strike - underlying_price).max(0.0)
+    };
+    if option_price < intrinsic {
+        return None;
+    }
+
+    let mut low = 0.0001;
+    let mut high = 5.0;
+    for _ in 0..80 {
+        let mid = (low + high) / 2.0;
+        let model = black_scholes_price(underlying_price, strike, years, mid, is_call);
+        if model > option_price {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+
+    Some(((low + high) / 2.0).clamp(0.0001, 5.0))
+}
+
+fn calculated_greeks(
+    contract: &AlpacaOptionContract,
+    scan_date: NaiveDate,
+    underlying_price: f64,
+    implied_volatility: f64,
+) -> Option<AlpacaOptionGreeks> {
+    let strike = contract.strike_price.parse::<f64>().ok()?;
+    let years = years_to_expiration(contract, scan_date)?;
+    if underlying_price <= 0.0 || strike <= 0.0 || implied_volatility <= 0.0 || years <= 0.0 {
+        return None;
+    }
+    let is_call = contract.option_type.eq_ignore_ascii_case("call");
+    let greeks = black_scholes_greeks(
+        underlying_price,
+        SCANNER_RISK_FREE_RATE,
+        SCANNER_RISK_FREE_RATE,
+        implied_volatility,
+        is_call,
+        strike,
+        years,
+    );
+
+    Some(AlpacaOptionGreeks {
+        delta: Some(greeks.delta),
+        gamma: Some(greeks.gamma),
+        rho: Some(greeks.rho),
+        theta: Some(greeks.theta),
+        vega: Some(greeks.vega),
+    })
+}
+
+fn years_to_expiration(contract: &AlpacaOptionContract, scan_date: NaiveDate) -> Option<f64> {
+    let expiration = NaiveDate::parse_from_str(&contract.expiration_date, "%Y-%m-%d").ok()?;
+    let dte = expiration.signed_duration_since(scan_date).num_days().max(1) as f64;
+    Some(dte / DAYS_PER_YEAR)
+}
+
+fn black_scholes_price(
+    underlying_price: f64,
+    strike: f64,
+    years: f64,
+    implied_volatility: f64,
+    is_call: bool,
+) -> f64 {
+    let volatility_sqrt_time = implied_volatility * years.sqrt();
+    if volatility_sqrt_time <= 0.0 {
+        return 0.0;
+    }
+    let d1 = ((underlying_price / strike).ln()
+        + (SCANNER_RISK_FREE_RATE + 0.5 * implied_volatility * implied_volatility) * years)
+        / volatility_sqrt_time;
+    let d2 = d1 - volatility_sqrt_time;
+    let discounted_strike = strike * (-SCANNER_RISK_FREE_RATE * years).exp();
+    if is_call {
+        underlying_price * normal_cdf(d1) - discounted_strike * normal_cdf(d2)
+    } else {
+        discounted_strike * normal_cdf(-d2) - underlying_price * normal_cdf(-d1)
     }
 }
 
@@ -700,12 +847,16 @@ fn selected_legs(entry: &SelectedOptionsEntry) -> Vec<BacktestLeg> {
                 side: LegSide::Short,
                 entry_close: None,
                 exit_close: None,
+                entry_source: None,
+                exit_source: None,
             },
             BacktestLeg {
                 symbol: entry.candidate.long.symbol.clone(),
                 side: LegSide::Long,
                 entry_close: None,
                 exit_close: None,
+                entry_source: None,
+                exit_source: None,
             },
         ],
         SelectedOptionsEntry::IronCondor(entry) => vec![
@@ -714,24 +865,32 @@ fn selected_legs(entry: &SelectedOptionsEntry) -> Vec<BacktestLeg> {
                 side: LegSide::Short,
                 entry_close: None,
                 exit_close: None,
+                entry_source: None,
+                exit_source: None,
             },
             BacktestLeg {
                 symbol: entry.candidate.put.long.symbol.clone(),
                 side: LegSide::Long,
                 entry_close: None,
                 exit_close: None,
+                entry_source: None,
+                exit_source: None,
             },
             BacktestLeg {
                 symbol: entry.candidate.call.short.symbol.clone(),
                 side: LegSide::Short,
                 entry_close: None,
                 exit_close: None,
+                entry_source: None,
+                exit_source: None,
             },
             BacktestLeg {
                 symbol: entry.candidate.call.long.symbol.clone(),
                 side: LegSide::Long,
                 entry_close: None,
                 exit_close: None,
+                entry_source: None,
+                exit_source: None,
             },
         ],
         SelectedOptionsEntry::Debit(entry) => vec![
@@ -740,12 +899,16 @@ fn selected_legs(entry: &SelectedOptionsEntry) -> Vec<BacktestLeg> {
                 side: LegSide::Long,
                 entry_close: None,
                 exit_close: None,
+                entry_source: None,
+                exit_source: None,
             },
             BacktestLeg {
                 symbol: entry.candidate.short.symbol.clone(),
                 side: LegSide::Short,
                 entry_close: None,
                 exit_close: None,
+                entry_source: None,
+                exit_source: None,
             },
         ],
         SelectedOptionsEntry::NakedOption(entry) => vec![BacktestLeg {
@@ -753,6 +916,8 @@ fn selected_legs(entry: &SelectedOptionsEntry) -> Vec<BacktestLeg> {
             side: LegSide::Short,
             entry_close: None,
             exit_close: None,
+            entry_source: None,
+            exit_source: None,
         }],
     }
 }
@@ -771,8 +936,11 @@ fn first_option_bar(bars: &[AlpacaOptionBar]) -> Option<&AlpacaOptionBar> {
         .min_by(|left, right| left.timestamp.cmp(&right.timestamp))
 }
 
-fn first_bar_close(bars: &[AlpacaOptionBar]) -> Option<f64> {
-    first_option_bar(bars).and_then(|bar| bar.close)
+fn first_option_trade(trades: &[AlpacaOptionTrade]) -> Option<&AlpacaOptionTrade> {
+    trades
+        .iter()
+        .filter(|trade| trade.price.is_some_and(|value| value > 0.0))
+        .min_by(|left, right| left.timestamp.cmp(&right.timestamp))
 }
 
 fn first_stock_bar_close(bars: &[AlpacaStockBar]) -> Option<f64> {
