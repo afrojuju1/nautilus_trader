@@ -488,11 +488,17 @@ pub fn load_strategy_state(path: &Path) -> anyhow::Result<StrategyState> {
 
 #[cfg(feature = "live")]
 pub async fn load_strategy_state_with_storage(
-    _path: &Path,
+    path: &Path,
     storage: &StorageRepository,
     account_id: &str,
 ) -> anyhow::Result<StrategyState> {
-    crate::storage::load_strategy_state(storage, account_id).await
+    if let Some(state) = crate::storage::load_strategy_state_record(storage, account_id).await? {
+        return Ok(state);
+    }
+
+    let state = load_strategy_state(path)?;
+    crate::storage::save_strategy_state(storage, account_id, &state).await?;
+    Ok(state)
 }
 
 /// Saves strategy state through a same-directory temp file followed by atomic rename.

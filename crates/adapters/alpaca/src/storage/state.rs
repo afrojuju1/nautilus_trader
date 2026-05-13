@@ -9,6 +9,15 @@ pub async fn load_strategy_state(
     storage: &StorageRepository,
     account_id: &str,
 ) -> anyhow::Result<StrategyState> {
+    Ok(load_strategy_state_record(storage, account_id)
+        .await?
+        .unwrap_or_default())
+}
+
+pub async fn load_strategy_state_record(
+    storage: &StorageRepository,
+    account_id: &str,
+) -> anyhow::Result<Option<StrategyState>> {
     let query = format!(
         "SELECT state FROM \"{}\".strategy_state WHERE account_id = $1",
         storage.schema()
@@ -20,10 +29,10 @@ pub async fn load_strategy_state(
         .await?;
 
     let Some(row) = row else {
-        return Ok(StrategyState::default());
+        return Ok(None);
     };
 
-    Ok(serde_json::from_value(row.0)?)
+    Ok(Some(serde_json::from_value(row.0)?))
 }
 
 pub async fn save_strategy_state(

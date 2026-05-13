@@ -279,7 +279,8 @@ impl OptionsEngineConfig {
             .unwrap_or(storage::STORAGE_ACCOUNT_ID_DEFAULT)
     }
 
-    /// Loads state from Postgres when configured, otherwise from local JSONL state file.
+    /// Loads state from Postgres when configured, bootstrapping from the local JSON state file when
+    /// the account has no stored DB row.
     pub async fn load_strategy_state(&self) -> anyhow::Result<StrategyState> {
         if let Some(storage) = &self.storage_repository {
             crate::runtime::load_strategy_state_with_storage(
@@ -293,7 +294,7 @@ impl OptionsEngineConfig {
         }
     }
 
-    /// Saves state to Postgres when configured, otherwise to local JSONL state file.
+    /// Saves state to Postgres when configured, otherwise to the local JSON state file.
     pub async fn save_strategy_state(&self, state: &StrategyState) -> anyhow::Result<()> {
         if let Some(storage) = &self.storage_repository {
             crate::runtime::save_strategy_state_with_storage(

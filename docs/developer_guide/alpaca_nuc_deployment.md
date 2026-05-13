@@ -49,6 +49,8 @@ limits. TOML `runtime.max_iterations = 0` is continuous service mode. Set
 Candidate-ledger evidence is enabled by default with `runtime.candidate_ledger_enabled = true`.
 Live runtime state, candidate ledgers, performance ledgers, and candidate outcomes are stored in
 Postgres through `ALPACA_STORAGE_DATABASE_URL`.
+If an account has no Postgres `strategy_state` row yet, the runtime bootstraps that row from the
+configured local strategy-state JSON file once, then continues from Postgres.
 `runtime.candidate_ledger_max_candidates` controls how many ranked candidates per scanner result
 are persisted; `0` records all ranked candidates.
 
