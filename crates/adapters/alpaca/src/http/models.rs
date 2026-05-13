@@ -803,6 +803,30 @@ impl AlpacaOrder {
     }
 }
 
+/// Request parameters for Alpaca's market calendar endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketCalendarRequest {
+    /// Start date in YYYY-MM-DD format.
+    pub start: String,
+    /// End date in YYYY-MM-DD format.
+    pub end: String,
+}
+
+impl MarketCalendarRequest {
+    /// Creates a market-calendar request.
+    #[must_use]
+    pub fn new(start: impl Into<String>, end: impl Into<String>) -> Self {
+        Self {
+            start: start.into(),
+            end: end.into(),
+        }
+    }
+
+    pub(crate) fn query_pairs(&self) -> Vec<(&'static str, String)> {
+        vec![("start", self.start.clone()), ("end", self.end.clone())]
+    }
+}
+
 /// Alpaca account activity model.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AlpacaActivity {
@@ -837,6 +861,21 @@ pub struct AlpacaActivity {
     pub cusip: Option<String>,
     /// Per-share amount.
     pub per_share_amount: Option<String>,
+}
+
+/// Alpaca market calendar day.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AlpacaMarketCalendarDay {
+    /// Trading date in YYYY-MM-DD format.
+    pub date: String,
+    /// Regular session open time.
+    pub open: Option<String>,
+    /// Regular session close time.
+    pub close: Option<String>,
+    /// Extended session open time.
+    pub session_open: Option<String>,
+    /// Extended session close time.
+    pub session_close: Option<String>,
 }
 
 /// Response from Alpaca's option snapshots endpoint.

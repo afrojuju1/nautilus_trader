@@ -32,9 +32,10 @@ use crate::{
         error::{Error, Result},
         models::{
             AlpacaAccount, AlpacaActivity, AlpacaOrder, AlpacaPosition, ListActivitiesRequest,
-            ListOptionContractsRequest, ListOrdersRequest, OptionBarsRequest, OptionBarsResponse,
-            OptionContractsResponse, OptionSnapshotsRequest, OptionSnapshotsResponse,
-            OptionTradesRequest, OptionTradesResponse, ReplaceOrderRequest,
+            ListOptionContractsRequest, ListOrdersRequest, MarketCalendarRequest,
+            AlpacaMarketCalendarDay, OptionBarsRequest, OptionBarsResponse, OptionContractsResponse,
+            OptionSnapshotsRequest, OptionSnapshotsResponse, OptionTradesRequest,
+            OptionTradesResponse, ReplaceOrderRequest,
             StockBarsRequest, StockBarsResponse, StockSnapshotsRequest, StockSnapshotsResponse,
         },
     },
@@ -385,6 +386,19 @@ impl AlpacaHttpClient {
     /// Returns an error if the request fails or the response cannot be decoded.
     pub async fn account(&self) -> Result<AlpacaAccount> {
         self.get_trading_json("/v2/account", &[]).await
+    }
+
+    /// Returns Alpaca market calendar days for a date range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be decoded.
+    pub async fn market_calendar(
+        &self,
+        request: &MarketCalendarRequest,
+    ) -> Result<Vec<AlpacaMarketCalendarDay>> {
+        self.get_trading_json("/v2/calendar", &request.query_pairs())
+            .await
     }
 
     /// Lists open positions for the current Alpaca trading account.

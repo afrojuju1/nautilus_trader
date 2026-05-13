@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, anyhow, bail};
-use chrono::{Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
+use chrono::{Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use nautilus_alpaca::{
     config::AlpacaDataClientConfig,
     http::{
@@ -13,7 +13,7 @@ use nautilus_alpaca::{
         models::{
             AlpacaOptionBar, AlpacaOptionContract, AlpacaOptionGreeks, AlpacaOptionQuote,
             AlpacaOptionSnapshot, AlpacaOptionTrade, AlpacaStockBar, ListOptionContractsRequest,
-            OptionBarsRequest, OptionTradesRequest, StockBarsRequest,
+            MarketCalendarRequest, OptionBarsRequest, OptionTradesRequest, StockBarsRequest,
         },
     },
     options_runtime::{
@@ -51,6 +51,10 @@ struct Args {
     stock_feed: Option<String>,
     assumed_iv: f64,
     synthetic_spread_pct: f64,
+    entry_mark_window_mins: i64,
+    historical_min_open_interest: u64,
+    missing_open_interest: u64,
+    historical_max_leg_spread_pct: f64,
     sweep_synthetic_spread_pct: Vec<f64>,
     sweep_short_delta_min: Vec<f64>,
     sweep_short_delta_max: Vec<f64>,
@@ -71,6 +75,10 @@ struct BacktestReport {
     mark_source: &'static str,
     assumed_iv: f64,
     synthetic_spread_pct: f64,
+    entry_mark_window_mins: i64,
+    historical_min_open_interest: u64,
+    missing_open_interest: u64,
+    historical_max_leg_spread_pct: f64,
     underlyings: Vec<String>,
     strategies: Vec<String>,
     summary: BacktestSummary,
@@ -215,6 +223,7 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
     let mut config = OptionsEngineConfig::from_runtime_env_with_storage().await?;
     apply_backtest_overrides(&mut config, &args)?;
     apply_sweep_variant(&mut config, &variant);
+    apply_historical_scanner_overrides(&mut config, &args);
     let account_id = config
         .storage_account_id
         .clone()
@@ -236,9 +245,10 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
     let entry_time = args.entry_time.unwrap_or(config.entry_start);
     let exit_time = args.exit_time.unwrap_or(config.close_end);
     let client = AlpacaHttpClient::from_data_config(&data_config)?;
+    let trade_dates = load_trading_dates(&client, args.start, args.end).await?;
 
     let mut days = Vec::new();
-    for trade_date in trading_dates(args.start, args.end) {
+    for trade_date in trade_dates {
         for underlying in config.underlyings.clone() {
             let result = backtest_underlying_day(
                 &client,
@@ -252,6 +262,8 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
                 &stock_feed,
                 args.assumed_iv,
                 args.synthetic_spread_pct,
+                args.entry_mark_window_mins,
+                args.missing_open_interest,
                 config.storage_repository.as_deref(),
                 &account_id,
             )
@@ -273,6 +285,10 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
         mark_source: "historical_trade_or_bar_with_synthetic_quote",
         assumed_iv: args.assumed_iv,
         synthetic_spread_pct: args.synthetic_spread_pct,
+        entry_mark_window_mins: args.entry_mark_window_mins,
+        historical_min_open_interest: args.historical_min_open_interest,
+        missing_open_interest: args.missing_open_interest,
+        historical_max_leg_spread_pct: args.historical_max_leg_spread_pct,
         underlyings: config.underlyings.clone(),
         strategies: enabled_strategy_names(&config),
         summary,
@@ -292,18 +308,22 @@ async fn backtest_underlying_day(
     stock_feed: &str,
     assumed_iv: f64,
     synthetic_spread_pct: f64,
+    entry_mark_window_mins: i64,
+    missing_open_interest: u64,
     storage: Option<&StorageRepository>,
     account_id: &str,
 ) -> anyhow::Result<BacktestDay> {
     let entry_timestamp = timestamp_for(config, trade_date, entry_time)?;
     let exit_timestamp = timestamp_for(config, trade_date, exit_time)?;
-    let entry_end = timestamp_plus_minutes(config, trade_date, entry_time, 1)?;
+    let entry_start = timestamp_plus_minutes(config, trade_date, entry_time, -entry_mark_window_mins)?;
+    let entry_end = timestamp_plus_minutes(config, trade_date, entry_time, entry_mark_window_mins + 1)?;
     let exit_end = timestamp_plus_minutes(config, trade_date, exit_time, 1)?;
     let (min_dte, max_dte) = scanner_dte_window(config);
 
-    let contracts =
+    let mut contracts =
         load_contracts(client, storage, account_id, underlying, trade_date, min_dte, max_dte)
             .await?;
+    normalize_historical_open_interest(&mut contracts, missing_open_interest);
     let symbols = contracts
         .iter()
         .map(|contract| contract.symbol.clone())
@@ -316,8 +336,9 @@ async fn backtest_underlying_day(
         underlying,
         timeframe,
         stock_feed,
-        &entry_timestamp,
+        &entry_start,
         &entry_end,
+        &entry_timestamp,
     )
     .await?;
 
@@ -331,7 +352,7 @@ async fn backtest_underlying_day(
             symbols.clone(),
             timeframe,
             option_feed,
-            &entry_timestamp,
+            &entry_start,
             &entry_end,
         )
         .await?
@@ -344,7 +365,7 @@ async fn backtest_underlying_day(
             storage,
             account_id,
             symbols.clone(),
-            &entry_timestamp,
+            &entry_start,
             &entry_end,
         )
         .await?
@@ -357,6 +378,7 @@ async fn backtest_underlying_day(
         underlying_price,
         assumed_iv,
         synthetic_spread_pct,
+        &entry_timestamp,
     );
 
     let mut diagnostics = Vec::new();
@@ -566,7 +588,9 @@ async fn simulate_selected_entry(
     let descriptor = entry.descriptor();
     let mut legs = selected_legs(&entry);
     for leg in &mut legs {
-        if let Some(mark) = historical_mark(&leg.symbol, entry_bars, entry_trades) {
+        if let Some(mark) =
+            historical_mark_near(&leg.symbol, entry_bars, entry_trades, entry_timestamp)
+        {
             leg.entry_close = Some(mark.price);
             leg.entry_source = Some(mark.source.to_string());
         }
@@ -851,6 +875,17 @@ async fn load_contracts(
     Ok(contracts)
 }
 
+fn normalize_historical_open_interest(
+    contracts: &mut [AlpacaOptionContract],
+    missing_open_interest: u64,
+) {
+    for contract in contracts {
+        if contract.open_interest.is_none() {
+            contract.open_interest = Some(missing_open_interest.to_string());
+        }
+    }
+}
+
 async fn load_option_bars(
     client: &AlpacaHttpClient,
     storage: Option<&StorageRepository>,
@@ -906,6 +941,7 @@ async fn load_underlying_price_at(
     feed: &str,
     start: &str,
     end: &str,
+    target_timestamp: &str,
 ) -> anyhow::Result<Option<f64>> {
     let symbols = [symbol.to_string()];
     let cache_key = market_data_cache_key(&symbols, &[timeframe, feed, start, end]);
@@ -920,7 +956,7 @@ async fn load_underlying_price_at(
     {
         return Ok(cached
             .get(symbol)
-            .and_then(|bars| first_stock_bar_close(bars)));
+            .and_then(|bars| stock_bar_close_near(bars, target_timestamp)));
     }
     let mut request = StockBarsRequest::for_symbols([symbol.to_string()], timeframe.to_string(), start.to_string());
     request.end = Some(end.to_string());
@@ -937,7 +973,7 @@ async fn load_underlying_price_at(
     Ok(response
         .bars
         .get(symbol)
-        .and_then(|bars| first_stock_bar_close(bars)))
+        .and_then(|bars| stock_bar_close_near(bars, target_timestamp)))
 }
 
 async fn read_cache<T>(
@@ -989,10 +1025,12 @@ fn build_snapshot_map(
     underlying_price: Option<f64>,
     assumed_iv: f64,
     synthetic_spread_pct: f64,
+    target_timestamp: &str,
 ) -> BTreeMap<String, AlpacaOptionSnapshot> {
     let mut snapshots = BTreeMap::new();
     for contract in contracts {
-        let Some(mark) = historical_mark(&contract.symbol, bars_by_symbol, trades_by_symbol)
+        let Some(mark) =
+            historical_mark_near(&contract.symbol, bars_by_symbol, trades_by_symbol, target_timestamp)
         else {
             continue;
         };
@@ -1046,14 +1084,15 @@ struct HistoricalMark {
     volume: Option<u64>,
 }
 
-fn historical_mark(
+fn historical_mark_near(
     symbol: &str,
     bars_by_symbol: &BTreeMap<String, Vec<AlpacaOptionBar>>,
     trades_by_symbol: &BTreeMap<String, Vec<AlpacaOptionTrade>>,
+    target_timestamp: &str,
 ) -> Option<HistoricalMark> {
     if let Some(trade) = trades_by_symbol
         .get(symbol)
-        .and_then(|trades| first_option_trade(trades))
+        .and_then(|trades| nearest_option_trade(trades, target_timestamp))
     {
         return Some(HistoricalMark {
             price: trade.price?,
@@ -1065,7 +1104,7 @@ fn historical_mark(
 
     let bar = bars_by_symbol
         .get(symbol)
-        .and_then(|bars| first_option_bar(bars))?;
+        .and_then(|bars| nearest_option_bar(bars, target_timestamp))?;
     Some(HistoricalMark {
         price: bar.close?,
         timestamp: bar.timestamp.clone(),
@@ -1368,18 +1407,44 @@ fn first_option_bar(bars: &[AlpacaOptionBar]) -> Option<&AlpacaOptionBar> {
         .min_by(|left, right| left.timestamp.cmp(&right.timestamp))
 }
 
-fn first_option_trade(trades: &[AlpacaOptionTrade]) -> Option<&AlpacaOptionTrade> {
+fn nearest_option_bar<'a>(
+    bars: &'a [AlpacaOptionBar],
+    target_timestamp: &str,
+) -> Option<&'a AlpacaOptionBar> {
+    bars.iter()
+        .filter(|bar| bar.close.is_some_and(|value| value > 0.0))
+        .filter_map(|bar| timestamp_distance_secs(bar.timestamp.as_deref()?, target_timestamp).map(|distance| (distance, bar)))
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, bar)| bar)
+}
+
+fn nearest_option_trade<'a>(
+    trades: &'a [AlpacaOptionTrade],
+    target_timestamp: &str,
+) -> Option<&'a AlpacaOptionTrade> {
     trades
         .iter()
         .filter(|trade| trade.price.is_some_and(|value| value > 0.0))
-        .min_by(|left, right| left.timestamp.cmp(&right.timestamp))
+        .filter_map(|trade| timestamp_distance_secs(trade.timestamp.as_deref()?, target_timestamp).map(|distance| (distance, trade)))
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, trade)| trade)
 }
 
-fn first_stock_bar_close(bars: &[AlpacaStockBar]) -> Option<f64> {
+fn stock_bar_close_near(bars: &[AlpacaStockBar], target_timestamp: &str) -> Option<f64> {
     bars.iter()
-        .filter_map(|bar| bar.close.filter(|value| *value > 0.0).map(|close| (bar.timestamp.clone(), close)))
-        .min_by(|left, right| left.0.cmp(&right.0))
+        .filter_map(|bar| {
+            let close = bar.close.filter(|value| *value > 0.0)?;
+            let distance = timestamp_distance_secs(bar.timestamp.as_deref()?, target_timestamp)?;
+            Some((distance, close))
+        })
+        .min_by_key(|(distance, _)| *distance)
         .map(|(_, close)| close)
+}
+
+fn timestamp_distance_secs(timestamp: &str, target_timestamp: &str) -> Option<i64> {
+    let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp).ok()?;
+    let target = chrono::DateTime::parse_from_rfc3339(target_timestamp).ok()?;
+    Some((timestamp - target).num_seconds().abs())
 }
 
 fn scanner_dte_window(config: &OptionsEngineConfig) -> (i64, i64) {
@@ -1433,16 +1498,21 @@ fn timestamp_plus_minutes(
     Ok(timestamp.with_timezone(&Utc).to_rfc3339())
 }
 
-fn trading_dates(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
-    let mut dates = Vec::new();
-    let mut date = start;
-    while date <= end {
-        if !matches!(date.weekday(), Weekday::Sat | Weekday::Sun) {
-            dates.push(date);
-        }
-        date += Duration::days(1);
-    }
-    dates
+async fn load_trading_dates(
+    client: &AlpacaHttpClient,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> anyhow::Result<Vec<NaiveDate>> {
+    let request = MarketCalendarRequest::new(start.to_string(), end.to_string());
+    let mut dates = client
+        .market_calendar(&request)
+        .await?
+        .into_iter()
+        .filter_map(|day| NaiveDate::parse_from_str(&day.date, "%Y-%m-%d").ok())
+        .collect::<Vec<_>>();
+    dates.sort();
+    dates.dedup();
+    Ok(dates)
 }
 
 fn summarize(days: &[BacktestDay]) -> BacktestSummary {
@@ -1533,6 +1603,20 @@ fn sweep_variants(args: &Args) -> Vec<SweepVariant> {
         variants[0].label = "base".to_string();
     }
     variants
+}
+
+fn apply_historical_scanner_overrides(config: &mut OptionsEngineConfig, args: &Args) {
+    config.scanner.min_open_interest = args.historical_min_open_interest;
+    config.iron_condor_scanner.credit.min_open_interest = args.historical_min_open_interest;
+    config.debit_scanner.min_open_interest = args.historical_min_open_interest;
+    config.naked_scanner.min_open_interest = args.historical_min_open_interest;
+    config.naked_1_3dte_scanner.min_open_interest = args.historical_min_open_interest;
+
+    config.scanner.max_leg_spread_pct = args.historical_max_leg_spread_pct;
+    config.iron_condor_scanner.credit.max_leg_spread_pct = args.historical_max_leg_spread_pct;
+    config.debit_scanner.max_leg_spread_pct = args.historical_max_leg_spread_pct;
+    config.naked_scanner.max_spread_pct = args.historical_max_leg_spread_pct;
+    config.naked_1_3dte_scanner.max_spread_pct = args.historical_max_leg_spread_pct;
 }
 
 fn apply_sweep_variant(config: &mut OptionsEngineConfig, variant: &SweepVariant) {
@@ -1656,6 +1740,10 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut stock_feed = None;
     let mut assumed_iv = 0.35;
     let mut synthetic_spread_pct = 0.05;
+    let mut entry_mark_window_mins = 10;
+    let mut historical_min_open_interest = 0;
+    let mut missing_open_interest = 0;
+    let mut historical_max_leg_spread_pct = 0.80;
     let mut sweep_synthetic_spread_pct = Vec::new();
     let mut sweep_short_delta_min = Vec::new();
     let mut sweep_short_delta_max = Vec::new();
@@ -1688,6 +1776,34 @@ fn parse_args() -> anyhow::Result<Args> {
                     .context("--synthetic-spread-pct must be a decimal")?;
                 if synthetic_spread_pct < 0.0 {
                     bail!("--synthetic-spread-pct cannot be negative");
+                }
+            }
+            "--entry-mark-window-mins" => {
+                entry_mark_window_mins = next_value(&mut iter, "--entry-mark-window-mins")?
+                    .parse::<i64>()
+                    .context("--entry-mark-window-mins must be a non-negative integer")?;
+                if entry_mark_window_mins < 0 {
+                    bail!("--entry-mark-window-mins cannot be negative");
+                }
+            }
+            "--historical-min-open-interest" => {
+                historical_min_open_interest =
+                    next_value(&mut iter, "--historical-min-open-interest")?
+                        .parse::<u64>()
+                        .context("--historical-min-open-interest must be a non-negative integer")?;
+            }
+            "--missing-open-interest" => {
+                missing_open_interest = next_value(&mut iter, "--missing-open-interest")?
+                    .parse::<u64>()
+                    .context("--missing-open-interest must be a non-negative integer")?;
+            }
+            "--historical-max-leg-spread-pct" => {
+                historical_max_leg_spread_pct =
+                    next_value(&mut iter, "--historical-max-leg-spread-pct")?
+                        .parse::<f64>()
+                        .context("--historical-max-leg-spread-pct must be a decimal")?;
+                if historical_max_leg_spread_pct <= 0.0 {
+                    bail!("--historical-max-leg-spread-pct must be greater than zero");
                 }
             }
             "--sweep-synthetic-spread-pct" => {
@@ -1730,6 +1846,10 @@ fn parse_args() -> anyhow::Result<Args> {
         stock_feed,
         assumed_iv,
         synthetic_spread_pct,
+        entry_mark_window_mins,
+        historical_min_open_interest,
+        missing_open_interest,
+        historical_max_leg_spread_pct,
         sweep_synthetic_spread_pct,
         sweep_short_delta_min,
         sweep_short_delta_max,
@@ -1854,6 +1974,6 @@ fn print_sweep_report(reports: &[BacktestReport]) {
 
 fn print_usage() {
     println!(
-        "Usage: alpaca-options-backtest --start YYYY-MM-DD --end YYYY-MM-DD [--entry-time HH:MM] [--exit-time HH:MM] [--underlyings SPY,QQQ] [--strategies put_credit,call_credit,iron_condor,call_debit,put_debit,naked_call,naked_put] [--timeframe 1Min] [--option-feed indicative] [--stock-feed iex] [--assumed-iv 0.35] [--synthetic-spread-pct 0.05] [--sweep-synthetic-spread-pct 0.03,0.05,0.08] [--sweep-short-delta-min 0.10,0.15] [--sweep-short-delta-max 0.20,0.25] [--quantity 1] [--json]"
+        "Usage: alpaca-options-backtest --start YYYY-MM-DD --end YYYY-MM-DD [--entry-time HH:MM] [--exit-time HH:MM] [--underlyings SPY,QQQ] [--strategies put_credit,call_credit,iron_condor,call_debit,put_debit,naked_call,naked_put] [--timeframe 1Min] [--option-feed indicative] [--stock-feed iex] [--assumed-iv 0.35] [--synthetic-spread-pct 0.05] [--entry-mark-window-mins 10] [--historical-min-open-interest 0] [--missing-open-interest 0] [--historical-max-leg-spread-pct 0.80] [--sweep-synthetic-spread-pct 0.03,0.05,0.08] [--sweep-short-delta-min 0.10,0.15] [--sweep-short-delta-max 0.20,0.25] [--quantity 1] [--json]"
     );
 }
