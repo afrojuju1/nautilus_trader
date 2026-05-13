@@ -16,6 +16,7 @@ FLEET_BIN="${NAUTILUS_ALPACA_FLEET_BIN:-$HOME/.local/bin/alpaca-fleet-status}"
 CANDIDATE_ALERTS_BIN="${NAUTILUS_ALPACA_CANDIDATE_ALERTS_BIN:-$HOME/.local/bin/alpaca-candidate-alerts}"
 PERFORMANCE_BIN="${NAUTILUS_ALPACA_PERFORMANCE_BIN:-$HOME/.local/bin/alpaca-performance-report}"
 ALERTS_ENV_FILE="${NAUTILUS_ALPACA_ALERTS_ENV_FILE:-$ALPACA_CONFIG_HOME/alerts.env}"
+PROFILE_MANIFEST_FILE="${NAUTILUS_ALPACA_PROFILE_MANIFEST:-}"
 OVERRIDE_ENV_FILE=""
 
 cleanup() {
@@ -43,6 +44,7 @@ Commands:
   fleet [ARGS...]                run alpaca-fleet-status
   health                         lightweight service/account health check
   today                          compact fleet status
+  strategy-report [ARGS...]      DB-backed strategy attribution and profile alignment report
   performance [--all] [ARGS...]  summarize opportunity history and broker-fill PnL
   alerts candidates [ARGS...]    send or dry-run Discord candidate alerts from Postgres
   alerts performance [ARGS...]   send post-market Discord performance digest
@@ -68,6 +70,8 @@ Examples:
   $(basename "$0") --account paper-call-credit-qqq check-config
   $(basename "$0") --account paper-undefined-risk scan naked GDX,SLV
   $(basename "$0") --account paper-directional scan credit SPY,QQQ
+  $(basename "$0") strategy-report
+  $(basename "$0") strategy-report --tomorrow
   $(basename "$0") today
   $(basename "$0") performance --all
   $(basename "$0") alerts candidates --all --dry-run
@@ -157,6 +161,16 @@ known_accounts() {
     find "$ACCOUNT_ENV_DIR" -maxdepth 1 -type f -name '*.env' -printf '%f\n' \
       | sed 's/\.env$//' \
       | sort
+  fi
+}
+
+profile_manifest_file() {
+  if [[ -n "$PROFILE_MANIFEST_FILE" ]]; then
+    printf '%s\n' "$PROFILE_MANIFEST_FILE"
+  elif [[ -f "$ALPACA_CONFIG_HOME/paper-profiles.tsv" ]]; then
+    printf '%s\n' "$ALPACA_CONFIG_HOME/paper-profiles.tsv"
+  else
+    printf '%s\n' "$REPO/deploy/alpaca/alpaca-paper-profiles.tsv"
   fi
 }
 
@@ -564,6 +578,424 @@ run_performance_for_account() {
   "$PERFORMANCE_BIN" "$@"
 }
 
+env_value_from_file() {
+  local file key
+  file="$1"
+  key="$2"
+  [[ -f "$file" ]] || return 0
+  awk -v key="$key" '
+    /^[[:space:]]*($|#)/ { next }
+    {
+      line = $0
+      sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+      if (line ~ "^[[:space:]]*" key "[[:space:]]*=") {
+        sub(/^[^=]*=/, "", line)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+        if ((line ~ /^".*"$/) || (line ~ /^\047.*\047$/)) {
+          line = substr(line, 2, length(line) - 2)
+        }
+        print line
+        exit
+      }
+    }
+  ' "$file"
+}
+
+report_env_value() {
+  local account key account_env value
+  account="$(normalize_account "$1")"
+  key="$2"
+  account_env="$(account_env_file "$account")"
+  value="$(env_value_from_file "$account_env" "$key")"
+  if [[ -z "$value" && "$account_env" != "$DEFAULT_ENV_FILE" ]]; then
+    value="$(env_value_from_file "$DEFAULT_ENV_FILE" "$key")"
+  fi
+  printf '%s\n' "$value"
+}
+
+run_profile_alignment() {
+  local account_filter manifest
+  account_filter="$1"
+  manifest="$(profile_manifest_file)"
+  if [[ ! -f "$manifest" ]]; then
+    echo "profile_alignment status=missing_manifest path=$manifest"
+    return
+  fi
+  require_command python3
+  python3 - "$manifest" "$ALPACA_CONFIG_HOME" "$ACCOUNT_CONFIG_DIR" "$REPO" "$account_filter" <<'PY'
+import csv
+import pathlib
+import sys
+import tomllib
+
+manifest = pathlib.Path(sys.argv[1])
+config_home = pathlib.Path(sys.argv[2])
+account_config_dir = pathlib.Path(sys.argv[3])
+repo = pathlib.Path(sys.argv[4])
+account_filter = sys.argv[5]
+
+def split_csv(value):
+    value = (value or "").strip()
+    if not value or value == "-":
+        return []
+    if value == "*":
+        return ["*"]
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+def expected_bool(value):
+    value = (value or "").strip().lower()
+    if value in ("true", "1", "yes", "on"):
+        return True
+    if value in ("false", "0", "no", "off"):
+        return False
+    return None
+
+def field_path(config, section, field):
+    return config.get(section, {}).get(field)
+
+def compare(name, expected, actual, issues):
+    if expected in ("", "-"):
+        return
+    if str(actual) != expected:
+        issues.append(f"{name}:expected={expected}:actual={actual}")
+
+def compare_list(name, expected_value, actual, issues):
+    expected = split_csv(expected_value)
+    if expected == ["*"] or not expected:
+        return
+    actual = actual or []
+    if list(actual) != expected:
+        issues.append(f"{name}:expected={','.join(expected)}:actual={','.join(map(str, actual))}")
+
+def compare_bool(name, expected_value, actual, issues):
+    expected = expected_bool(expected_value)
+    if expected is None:
+        return
+    if bool(actual) != expected:
+        issues.append(f"{name}:expected={str(expected).lower()}:actual={str(bool(actual)).lower()}")
+
+def compare_float(name, expected_value, actual, issues):
+    expected_value = (expected_value or "").strip()
+    if not expected_value or expected_value == "-":
+        return
+    try:
+        expected = float(expected_value)
+        actual_float = float(actual)
+    except (TypeError, ValueError):
+        issues.append(f"{name}:expected={expected_value}:actual={actual}")
+        return
+    if abs(expected - actual_float) > 1e-9:
+        issues.append(f"{name}:expected={expected_value}:actual={actual}")
+
+def config_path_for(row):
+    account = row["account_id"]
+    if account == "paper-main":
+        live = config_home / "options-engine.toml"
+    else:
+        live = account_config_dir / f"{account}-options-engine.toml"
+    if live.exists():
+        return live, "live"
+    template = repo / "deploy" / "alpaca" / row["template"]
+    return template, "template"
+
+def merge_config(parent, child):
+    merged = dict(parent)
+    for key, value in child.items():
+        if key == "extends":
+            continue
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_config(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+def load_config(path, seen=None):
+    seen = seen or set()
+    path = path.resolve()
+    if path in seen:
+        raise RuntimeError(f"circular config inheritance at {path}")
+    seen.add(path)
+    config = tomllib.loads(path.read_text())
+    parent_ref = config.get("extends")
+    if not parent_ref:
+        return config
+    parent_path = pathlib.Path(parent_ref)
+    if not parent_path.is_absolute():
+        parent_path = path.parent / parent_path
+    parent = load_config(parent_path, seen)
+    return merge_config(parent, config)
+
+with manifest.open(newline="") as file:
+    rows = list(csv.DictReader(file, delimiter="\t"))
+
+for row in rows:
+    account = row["account_id"]
+    if account_filter and account != account_filter:
+        continue
+    path, source = config_path_for(row)
+    if not path.exists():
+        print(
+            f"profile_alignment account={account} profile={row['profile_id']} "
+            f"backtest={row['backtest_profile']} status=missing_config path={path}"
+        )
+        continue
+    try:
+        config = load_config(path)
+    except Exception as exc:
+        print(
+            f"profile_alignment account={account} profile={row['profile_id']} "
+            f"backtest={row['backtest_profile']} status=parse_error path={path} error={exc}"
+        )
+        continue
+
+    issues = []
+    compare_list("strategies", row["strategies"], field_path(config, "runtime", "strategies"), issues)
+    compare_list(
+        "dry_run_strategies",
+        row["dry_run_strategies"],
+        field_path(config, "runtime", "dry_run_strategies"),
+        issues,
+    )
+    compare_bool("submit", row["submit"], field_path(config, "runtime", "submit"), issues)
+    compare_bool("manage", row["manage"], field_path(config, "runtime", "manage"), issues)
+    compare_bool("close", row["close"], field_path(config, "runtime", "close"), issues)
+    compare_bool("kill_switch", row["kill_switch"], field_path(config, "runtime", "kill_switch"), issues)
+    compare_list("underlyings", row["underlyings"], field_path(config, "universe", "underlyings"), issues)
+    compare("entry_start", row["entry_start"], field_path(config, "universe", "entry_start"), issues)
+    compare("entry_end", row["entry_end"], field_path(config, "universe", "entry_end"), issues)
+    compare_float(
+        "min_return_on_risk",
+        row["min_return_on_risk"],
+        field_path(config, "scanner", "min_return_on_risk"),
+        issues,
+    )
+    for field in (
+        "max_active_entries",
+        "max_daily_submits",
+        "max_open_orders",
+        "max_active_entries_per_underlying",
+        "max_active_entries_per_sector",
+    ):
+        compare(field, row[field], field_path(config, "risk", field), issues)
+
+    runtime = config.get("runtime", {})
+    universe = config.get("universe", {})
+    status = "ok" if not issues else "mismatch"
+    issue_text = "none" if not issues else ";".join(issues)
+    gates = (
+        f"submit={runtime.get('submit')} manage={runtime.get('manage')} "
+        f"close={runtime.get('close')} kill_switch={runtime.get('kill_switch')}"
+    )
+    window = f"{universe.get('entry_start', '-')}-{universe.get('entry_end', '-')}"
+    print(
+        f"profile_alignment account={account} profile={row['profile_id']} "
+        f"backtest={row['backtest_profile']} status={status} source={source} "
+        f"window={window} {gates} issues={issue_text}"
+    )
+PY
+}
+
+run_strategy_report_sql() {
+  local account_filter since until database_url schema db_container db_user db_name
+  local -a psql_cmd
+  account_filter="$1"
+  since="$2"
+  until="$3"
+  database_url="$4"
+  schema="$5"
+  if command -v psql >/dev/null 2>&1; then
+    psql_cmd=(psql -X -q -v ON_ERROR_STOP=1 -v schema="$schema" -v since="$since" -v until="$until" -v account="$account_filter" "$database_url")
+  elif command -v docker >/dev/null 2>&1; then
+    db_container="${NAUTILUS_ALPACA_DB_CONTAINER:-nautilus-database}"
+    if docker ps --format '{{.Names}}' | grep -qx "$db_container"; then
+      db_user="${NAUTILUS_ALPACA_DB_USER:-nautilus}"
+      db_name="${NAUTILUS_ALPACA_DB_NAME:-nautilus}"
+      psql_cmd=(docker exec -i "$db_container" psql -U "$db_user" -d "$db_name" -X -q -v ON_ERROR_STOP=1 -v schema="$schema" -v since="$since" -v until="$until" -v account="$account_filter")
+    else
+      echo "strategy_report storage=unavailable reason=missing_psql_and_container container=$db_container" >&2
+      return 127
+    fi
+  else
+    echo "strategy_report storage=unavailable reason=missing_psql_and_docker" >&2
+    return 127
+  fi
+  "${psql_cmd[@]}" <<'SQL'
+\pset pager off
+\pset tuples_only on
+\pset format unaligned
+\pset fieldsep ' | '
+\echo strategy_activity
+SELECT
+  account_id,
+  trade_date,
+  COALESCE(NULLIF(payload->>'strategy', ''), 'all') AS strategy,
+  COUNT(*) FILTER (WHERE record_type = 'candidate') AS candidates,
+  COUNT(*) FILTER (WHERE record_type = 'candidate_alert' AND alert_type = 'high_score_candidate') AS high_score,
+  COUNT(*) FILTER (WHERE record_type = 'candidate_alert' AND alert_type = 'selected_candidate') AS selected,
+  COUNT(*) FILTER (WHERE record_type = 'decision') AS decisions,
+  COUNT(*) FILTER (WHERE record_type = 'submit_result') AS submit_results,
+  COALESCE(SUM(
+    CASE
+      WHEN record_type = 'submit_result' AND COALESCE(payload->>'accepted', '') ~ '^[0-9]+$'
+        THEN (payload->>'accepted')::integer
+      ELSE 0
+    END
+  ), 0) AS accepted,
+  COALESCE(SUM(
+    CASE
+      WHEN record_type = 'submit_result' AND COALESCE(payload->>'rejected', '') ~ '^[0-9]+$'
+        THEN (payload->>'rejected')::integer
+      ELSE 0
+    END
+  ), 0) AS rejected
+FROM :"schema".candidate_ledger
+WHERE trade_date >= :'since'::date
+  AND trade_date <= :'until'::date
+  AND (:'account' = '' OR account_id = :'account')
+GROUP BY account_id, trade_date, COALESCE(NULLIF(payload->>'strategy', ''), 'all')
+ORDER BY account_id, trade_date, strategy;
+\echo blocked_or_skipped_decisions
+SELECT
+  account_id,
+  trade_date,
+  COALESCE(NULLIF(payload->>'strategy', ''), 'all') AS strategy,
+  COALESCE(NULLIF(payload->>'action', ''), 'unknown') AS action,
+  COALESCE(NULLIF(payload->>'reason', ''), 'none') AS reason,
+  COUNT(*) AS records
+FROM :"schema".candidate_ledger
+WHERE trade_date >= :'since'::date
+  AND trade_date <= :'until'::date
+  AND record_type = 'decision'
+  AND (:'account' = '' OR account_id = :'account')
+GROUP BY account_id, trade_date, strategy, action, reason
+ORDER BY account_id, trade_date, records DESC, strategy, action, reason;
+\echo closed_performance
+SELECT
+  account_id,
+  ledger_date,
+  COALESCE(NULLIF(payload->>'strategy', ''), 'unknown') AS strategy,
+  COUNT(*) AS closed_trades,
+  COALESCE(SUM((payload->>'realized_pnl')::numeric), 0) AS realized_pnl,
+  COUNT(*) FILTER (WHERE (payload->>'realized_pnl')::numeric > 0) AS wins,
+  COUNT(*) FILTER (WHERE (payload->>'realized_pnl')::numeric < 0) AS losses,
+  COUNT(*) FILTER (WHERE (payload->>'realized_pnl')::numeric = 0) AS flats
+FROM :"schema".performance_ledger
+WHERE ledger_date >= :'since'::date
+  AND ledger_date <= :'until'::date
+  AND (payload->>'type') = 'realized_trade'
+  AND (:'account' = '' OR account_id = :'account')
+GROUP BY account_id, ledger_date, strategy
+ORDER BY account_id, ledger_date, strategy;
+\echo open_positions
+SELECT
+  state.account_id,
+  COALESCE(NULLIF(entry->>'strategy', ''), 'unknown') AS strategy,
+  COALESCE(NULLIF(entry->>'underlying', ''), 'unknown') AS underlying,
+  COUNT(*) AS active_entries,
+  COALESCE(MIN(entry->>'trade_date'), '-') AS oldest_trade_date,
+  COALESCE(MAX(entry->>'score'), '-') AS max_score
+FROM :"schema".strategy_state AS state
+CROSS JOIN LATERAL jsonb_array_elements(state.state::jsonb->'entries') AS entry
+WHERE COALESCE((entry->>'submitted')::boolean, false)
+  AND NOT COALESCE((entry->>'canceled')::boolean, false)
+  AND NOT COALESCE((entry->>'closed')::boolean, false)
+  AND (:'account' = '' OR state.account_id = :'account')
+GROUP BY state.account_id, strategy, underlying
+ORDER BY state.account_id, strategy, underlying;
+\echo latest_decisions
+SELECT DISTINCT ON (account_id)
+  account_id,
+  ts_utc,
+  COALESCE(NULLIF(payload->>'action', ''), 'unknown') AS action,
+  COALESCE(NULLIF(payload->>'reason', ''), 'none') AS reason,
+  COALESCE(NULLIF(payload->>'strategy', ''), 'all') AS strategy,
+  COALESCE(NULLIF(payload->>'underlying', ''), '-') AS underlying
+FROM :"schema".candidate_ledger
+WHERE record_type = 'decision'
+  AND trade_date >= :'since'::date
+  AND trade_date <= :'until'::date
+  AND (:'account' = '' OR account_id = :'account')
+ORDER BY account_id, ts_utc DESC;
+\echo entry_window_validation_0945_1015_et
+SELECT
+  account_id,
+  trade_date,
+  COUNT(*) FILTER (WHERE record_type = 'scan_started') AS scans,
+  COUNT(*) FILTER (WHERE record_type = 'scanner_result') AS scanner_results,
+  COUNT(*) FILTER (WHERE record_type = 'candidate') AS candidates,
+  COUNT(*) FILTER (WHERE record_type = 'candidate_alert' AND alert_type = 'selected_candidate') AS selected,
+  COUNT(*) FILTER (WHERE record_type = 'submit_result') AS submit_results,
+  COUNT(*) FILTER (WHERE record_type = 'decision' AND payload->>'action' = 'selected_but_blocked') AS blocked,
+  COUNT(*) FILTER (WHERE record_type = 'decision' AND payload->>'action' = 'skipped') AS skipped
+FROM :"schema".candidate_ledger
+WHERE trade_date >= :'since'::date
+  AND trade_date <= :'until'::date
+  AND ((ts_utc AT TIME ZONE 'America/New_York')::time >= TIME '09:45')
+  AND ((ts_utc AT TIME ZONE 'America/New_York')::time <= TIME '10:15')
+  AND (:'account' = '' OR account_id = :'account')
+GROUP BY account_id, trade_date
+ORDER BY account_id, trade_date;
+SQL
+}
+
+run_strategy_report() {
+  local account since until database_account database_url schema
+  account=""
+  since="$(date +%F)"
+  until="$since"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --account|-a)
+        account="$(normalize_account "${2:-}")"
+        shift 2
+        ;;
+      --all)
+        account=""
+        shift
+        ;;
+      --date)
+        since="${2:-}"
+        until="$since"
+        shift 2
+        ;;
+      --tomorrow)
+        since="$(date -d tomorrow +%F)"
+        until="$since"
+        shift
+        ;;
+      --since)
+        since="${2:-}"
+        shift 2
+        ;;
+      --until)
+        until="${2:-}"
+        shift 2
+        ;;
+      --help|-h)
+        echo "usage: $(basename "$0") strategy-report [--all] [--account ACCOUNT] [--date YYYY-MM-DD|--tomorrow|--since YYYY-MM-DD --until YYYY-MM-DD]" >&2
+        return 0
+        ;;
+      *)
+        echo "unexpected strategy-report argument: $1" >&2
+        exit 2
+        ;;
+    esac
+  done
+  until="${until:-$since}"
+  echo "strategy_report since=$since until=$until account=${account:-all}"
+  echo "profile_alignment"
+  run_profile_alignment "$account"
+  database_account="${account:-paper-main}"
+  database_url="$(report_env_value "$database_account" "ALPACA_STORAGE_DATABASE_URL")"
+  schema="$(report_env_value "$database_account" "ALPACA_STORAGE_SCHEMA")"
+  schema="${schema:-alpaca}"
+  if [[ -z "$database_url" ]]; then
+    echo "strategy_report storage=missing key=ALPACA_STORAGE_DATABASE_URL account=$database_account"
+    return
+  fi
+  run_strategy_report_sql "$account" "$since" "$until" "$database_url" "$schema"
+}
+
 run_alerts() {
   local subcommand
   subcommand="${1:-}"
@@ -759,6 +1191,9 @@ case "$COMMAND" in
     ;;
   today)
     run_today "$@"
+    ;;
+  strategy-report)
+    run_strategy_report "$@"
     ;;
   performance)
     run_performance "$@"

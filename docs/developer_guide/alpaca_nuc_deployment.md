@@ -10,6 +10,8 @@ uses a file lock so only one runner can own a given Alpaca account workflow.
   emergency override template.
 - `deploy/alpaca/alpaca-options-engine.account.env.example`: account-scoped env template for future
   supervised account instances.
+- `deploy/alpaca/alpaca-paper-profiles.tsv`: checked profile manifest linking paper accounts,
+  runtime config expectations, and backtest profile IDs.
 - `deploy/alpaca/alpaca-options-engine.base.toml.example`: shared strategy universe, scanner, sector,
   and management defaults inherited by account configs.
 - `deploy/alpaca/alpaca-options-engine.toml.example`: strategy/scanner/management config template.
@@ -19,6 +21,8 @@ uses a file lock so only one runner can own a given Alpaca account workflow.
   put-credit account config template.
 - `deploy/alpaca/alpaca-options-engine.paper-call-credit-qqq.toml.example`: isolated QQQ
   call-credit account config template.
+- `deploy/alpaca/alpaca-options-engine.paper-undefined-risk.toml.example`: isolated undefined-risk
+  account config template.
 - `deploy/alpaca/alpaca-fleet.toml.example`: read-only fleet registry template.
 - `deploy/alpaca/alpaca-options-install.sh`: builds release binaries and installs user files.
 - `deploy/alpaca/alpaca-options-runner.sh`: `flock`-guarded runner wrapper.
@@ -136,6 +140,8 @@ alpaca-control --account paper-undefined-risk status
 alpaca-control --account paper-undefined-risk check-config
 alpaca-control --account paper-undefined-risk scan naked GDX,SLV
 alpaca-control --account paper-directional scan credit SPY,QQQ
+alpaca-control strategy-report
+alpaca-control strategy-report --tomorrow
 alpaca-control alerts candidates --all --dry-run
 alpaca-control alerts candidates --all --send
 alpaca-control alerts enable
@@ -295,6 +301,13 @@ Accounts with credit verticals or iron condors require `defined_risk = true` in 
 Accounts with debit verticals require `long_premium = true`. A mismatch forces
 `submit_enabled=false` and `kill_switch=true` for that runtime while leaving management/close gates
 available for existing tracked exposure.
+
+The paper profile manifest is the operator source of truth for strategy attribution checks. It maps
+each paper account to the expected runtime TOML fields, entry window, risk caps, and backtest
+profile ID where one exists. `alpaca-control strategy-report` compares live account configs against
+that manifest before printing DB-backed candidate, decision, submission, open-position, and closed
+PnL summaries. `alpaca-control strategy-report --tomorrow` prints the same report shell for the next
+trade date so the `09:45-10:15 ET` entry-window evidence is easy to review after the morning scan.
 
 Future account env files should live under:
 

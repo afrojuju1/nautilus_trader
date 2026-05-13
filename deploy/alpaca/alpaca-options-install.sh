@@ -11,6 +11,7 @@ FLEET_CONFIG_FILE="${NAUTILUS_ALPACA_FLEET_CONFIG:-$ALPACA_CONFIG_HOME/fleet.tom
 ACCOUNT_ENV_DIR="${NAUTILUS_ALPACA_ACCOUNT_ENV_DIR:-$ALPACA_CONFIG_HOME/accounts}"
 ACCOUNT_CONFIG_DIR="${NAUTILUS_ALPACA_ACCOUNT_CONFIG_DIR:-$ALPACA_CONFIG_HOME/configs}"
 ALERTS_ENV_FILE="${NAUTILUS_ALPACA_ALERTS_ENV_FILE:-$ALPACA_CONFIG_HOME/alerts.env}"
+PROFILE_MANIFEST_FILE="${NAUTILUS_ALPACA_PROFILE_MANIFEST:-$ALPACA_CONFIG_HOME/paper-profiles.tsv}"
 
 install_runtime_file() {
   local source target
@@ -68,6 +69,7 @@ install -d -m 700 "$ACCOUNT_ENV_DIR" "$ACCOUNT_CONFIG_DIR"
 if [[ ! -f "$ALERTS_ENV_FILE" ]]; then
   install -Dm600 deploy/alpaca/alpaca-alerts.env.example "$ALERTS_ENV_FILE"
 fi
+install_runtime_file deploy/alpaca/alpaca-paper-profiles.tsv "$PROFILE_MANIFEST_FILE"
 install_runtime_file deploy/alpaca/alpaca-options-engine.account.env.example "$ACCOUNT_ENV_DIR/paper-directional.env"
 install_runtime_file deploy/alpaca/alpaca-options-engine.account.env.example "$ACCOUNT_ENV_DIR/paper-put-credit-spy.env"
 install_runtime_file deploy/alpaca/alpaca-options-engine.account.env.example "$ACCOUNT_ENV_DIR/paper-call-credit-qqq.env"
@@ -75,6 +77,7 @@ install_runtime_file deploy/alpaca/alpaca-options-engine.account.env.example "$A
 install_runtime_file deploy/alpaca/alpaca-options-engine.paper-directional.toml.example "$ACCOUNT_CONFIG_DIR/paper-directional-options-engine.toml"
 install_runtime_file deploy/alpaca/alpaca-options-engine.paper-put-credit-spy.toml.example "$ACCOUNT_CONFIG_DIR/paper-put-credit-spy-options-engine.toml"
 install_runtime_file deploy/alpaca/alpaca-options-engine.paper-call-credit-qqq.toml.example "$ACCOUNT_CONFIG_DIR/paper-call-credit-qqq-options-engine.toml"
+install_runtime_file deploy/alpaca/alpaca-options-engine.paper-undefined-risk.toml.example "$ACCOUNT_CONFIG_DIR/paper-undefined-risk-options-engine.toml"
 
 systemctl --user daemon-reload
 
@@ -84,6 +87,7 @@ echo "base_config_file=$BASE_CONFIG_FILE"
 echo "config_file=$CONFIG_FILE"
 echo "fleet_config_file=$FLEET_CONFIG_FILE"
 echo "alerts_env_file=$ALERTS_ENV_FILE"
+echo "profile_manifest_file=$PROFILE_MANIFEST_FILE"
 echo "account_env_dir=$ACCOUNT_ENV_DIR"
 echo "account_config_dir=$ACCOUNT_CONFIG_DIR"
 echo "runner=$HOME/.local/bin/alpaca-options-engine"

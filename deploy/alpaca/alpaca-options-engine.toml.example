@@ -1,5 +1,6 @@
 # Copy to ~/.config/nautilus-trader/alpaca/options-engine.toml before running the base service.
 # Shared scanner, universe, sector, and management defaults live in base-options-engine.toml.
+# Profile manifest: deploy/alpaca/alpaca-paper-profiles.tsv profile_id=iron_condor_watchlist backtest_profile=iron_condor_spy_sweep.
 # This base account keeps iron condors in watchlist mode while still managing existing state.
 
 extends = "base-options-engine.toml"
