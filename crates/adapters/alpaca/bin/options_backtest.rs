@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
+    hash::{DefaultHasher, Hash, Hasher},
 };
 
 use anyhow::{Context, anyhow, bail};
@@ -272,7 +273,7 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
         mark_source: "historical_trade_or_bar_with_synthetic_quote",
         assumed_iv: args.assumed_iv,
         synthetic_spread_pct: args.synthetic_spread_pct,
-        underlyings: config.underlyings,
+        underlyings: config.underlyings.clone(),
         strategies: enabled_strategy_names(&config),
         summary,
         days,
@@ -856,20 +857,19 @@ async fn load_option_bars(
     account_id: &str,
     symbols: Vec<String>,
     timeframe: &str,
-    feed: &str,
+    _feed: &str,
     start: &str,
     end: &str,
 ) -> anyhow::Result<BTreeMap<String, Vec<AlpacaOptionBar>>> {
     if symbols.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let cache_key = market_data_cache_key(&symbols, &[timeframe, feed, start, end]);
+    let cache_key = market_data_cache_key(&symbols, &[timeframe, start, end]);
     if let Some(cached) = read_cache(storage, account_id, "option_bars", &cache_key).await? {
         return Ok(cached);
     }
     let mut request = OptionBarsRequest::for_symbols(symbols, timeframe.to_string(), start.to_string());
     request.end = Some(end.to_string());
-    request.feed = Some(feed.to_string());
     let bars = client.option_bars(&request).await?.bars;
     write_cache(storage, account_id, "option_bars", &cache_key, &bars).await?;
     Ok(bars)
@@ -975,7 +975,10 @@ fn market_data_cache_key(symbols: &[String], parts: &[&str]) -> String {
     let mut symbols = symbols.to_vec();
     symbols.sort();
     symbols.dedup();
-    format!("{}|{}", parts.join("|"), symbols.join(","))
+    let raw = format!("{}|{}", parts.join("|"), symbols.join(","));
+    let mut hasher = DefaultHasher::new();
+    raw.hash(&mut hasher);
+    format!("{}|{:016x}", parts.join("|"), hasher.finish())
 }
 
 fn build_snapshot_map(
@@ -1229,7 +1232,7 @@ fn calculated_greeks(
     Some(AlpacaOptionGreeks {
         delta: Some(greeks.delta),
         gamma: Some(greeks.gamma),
-        rho: Some(greeks.rho),
+        rho: None,
         theta: Some(greeks.theta),
         vega: Some(greeks.vega),
     })
