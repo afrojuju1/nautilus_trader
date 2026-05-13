@@ -33,22 +33,23 @@ use nautilus_alpaca::{
     performance::{
         CandidateOutcomeTrackingRequest, DEFAULT_CANDIDATE_OUTCOME_MAX_CANDIDATES,
         DEFAULT_CANDIDATE_OUTCOME_MAX_RANK, EntryOrderIds, EntryPerformance, PerformanceReport,
-        append_performance_ledger_record, collect_order_ids, default_candidate_outcome_dir,
-        default_performance_ledger_dir, earliest_entry_timestamp, entry_in_date_range,
-        entry_performance, summarize_candidate_ledger, summarize_candidate_outcomes,
-        summarize_performance, summarize_performance_ledger, track_candidate_outcomes,
+        collect_order_ids, earliest_entry_timestamp, entry_in_date_range, entry_performance,
+        summarize_performance, track_candidate_outcomes,
     },
-    runtime::{StrategyStateEntry, load_strategy_state},
+    runtime::StrategyStateEntry,
+    storage::{
+        append_performance_ledger_record as append_storage_performance_ledger_record,
+        summarize_candidate_ledger_records, summarize_candidate_outcomes_records,
+        summarize_performance_ledger_records,
+    },
 };
 use serde_json::json;
 
 #[derive(Debug, Default)]
 struct Args {
     json_output: bool,
-    append_ledger: bool,
     send_discord: bool,
     alerts_env_file: Option<PathBuf>,
-    track_candidates: bool,
     track_date: Option<NaiveDate>,
     track_max_candidates: usize,
     track_max_rank: u64,
@@ -59,8 +60,11 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = parse_args()?;
-    let config = OptionsEngineConfig::from_runtime_env()?;
-    let state = load_strategy_state(&config.state_path)?;
+    let config = OptionsEngineConfig::from_runtime_env_with_storage().await?;
+    if config.storage_repository.is_none() {
+        anyhow::bail!("ALPACA_STORAGE_DATABASE_URL is required for alpaca-performance-report");
+    }
+    let state = config.load_strategy_state().await?;
     let entries = state
         .entries
         .iter()
@@ -111,33 +115,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if args.append_ledger {
-        append_closed_entries_to_performance_ledger(&config, &report_entries, &mut warnings)?;
-    }
-    if args.track_candidates {
-        let tracked = track_candidate_outcomes(
-            &client,
-            &data_config,
-            &config,
-            &CandidateOutcomeTrackingRequest {
-                trade_date: args.track_date,
-                max_candidates: args.track_max_candidates,
-                max_rank: args.track_max_rank,
-            },
-        )
-        .await?;
-        warnings.push(format!("candidate_outcomes_appended={tracked}"));
-    }
+    append_closed_entries_to_performance_ledger(&config, &report_entries, &mut warnings).await?;
+    let tracked = track_candidate_outcomes(
+        &client,
+        &data_config,
+        &config,
+        &CandidateOutcomeTrackingRequest {
+            trade_date: args.track_date,
+            max_candidates: args.track_max_candidates,
+            max_rank: args.track_max_rank,
+        },
+    )
+    .await?;
+    warnings.push(format!("candidate_outcomes_appended={tracked}"));
 
-    let opportunities =
-        summarize_candidate_ledger(&config.candidate_ledger_dir, args.since, args.until)?;
+    let opportunities = summarize_candidate_ledger_records(&config, args.since, args.until).await?;
     let ledger_summary =
-        summarize_performance_ledger(&performance_ledger_dir(&config), args.since, args.until)?;
-    let candidate_outcomes = summarize_candidate_outcomes(
-        &default_candidate_outcome_dir(&config),
-        args.since,
-        args.until,
-    )?;
+        summarize_performance_ledger_records(&config, args.since, args.until).await?;
+    let candidate_outcomes =
+        summarize_candidate_outcomes_records(&config, args.since, args.until).await?;
     let summary = summarize_performance(&report_entries);
     let report = PerformanceReport {
         checked_at_utc: Utc::now().to_rfc3339(),
@@ -175,7 +171,6 @@ fn parse_args() -> anyhow::Result<Args> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--json" => args.json_output = true,
-            "--append-ledger" => args.append_ledger = true,
             "--send-discord" => args.send_discord = true,
             "--alerts-env-file" => {
                 args.alerts_env_file = Some(PathBuf::from(parse_string_arg(
@@ -183,7 +178,6 @@ fn parse_args() -> anyhow::Result<Args> {
                     iter.next(),
                 )?));
             }
-            "--track-candidates" => args.track_candidates = true,
             "--track-date" => {
                 args.track_date = Some(parse_date_arg("--track-date", iter.next())?);
             }
@@ -229,7 +223,7 @@ fn parse_string_arg(name: &str, value: Option<String>) -> anyhow::Result<String>
 
 fn print_usage() {
     eprintln!(
-        "usage: alpaca-performance-report [--json] [--append-ledger] [--send-discord] [--track-candidates] [--since YYYY-MM-DD] [--until YYYY-MM-DD]"
+        "usage: alpaca-performance-report [--json] [--send-discord] [--since YYYY-MM-DD] [--until YYYY-MM-DD]"
     );
 }
 
@@ -313,20 +307,24 @@ fn add_state_order_id(order_id: Option<&str>, order_ids: &mut BTreeSet<String>) 
     }
 }
 
-fn append_closed_entries_to_performance_ledger(
+async fn append_closed_entries_to_performance_ledger(
     config: &OptionsEngineConfig,
     entries: &[EntryPerformance],
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<()> {
-    let ledger_dir = performance_ledger_dir(config);
+    let Some(storage) = &config.storage_repository else {
+        return Ok(());
+    };
     for entry in entries.iter().filter(|entry| entry.status == "closed") {
         let ledger_date = performance_ledger_date(entry, config);
-        let append = append_performance_ledger_record(
-            &ledger_dir,
+        let append = append_storage_performance_ledger_record(
+            storage,
+            config.storage_account_id(),
             &ledger_date,
-            config.fleet_account_id.as_deref(),
             entry,
-        )?;
+            None,
+        )
+        .await?;
         if append.appended {
             warnings.push(format!(
                 "performance_ledger_appended path={} record_key={}",
@@ -335,14 +333,6 @@ fn append_closed_entries_to_performance_ledger(
         }
     }
     Ok(())
-}
-
-fn performance_ledger_dir(config: &OptionsEngineConfig) -> PathBuf {
-    env::var("ALPACA_PERFORMANCE_LEDGER_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            default_performance_ledger_dir(&config.state_path, config.fleet_account_id.as_deref())
-        })
 }
 
 fn performance_ledger_date(entry: &EntryPerformance, config: &OptionsEngineConfig) -> String {

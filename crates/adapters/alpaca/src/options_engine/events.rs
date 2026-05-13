@@ -16,40 +16,46 @@ use super::{
     CANDIDATE_SUBMIT_REJECTED_ALERT, SELECTED_CANDIDATE_ALERT, SubmitOutcome, strategy_name,
 };
 
-pub(super) fn record_decision_event(
+pub(super) async fn record_decision_event(
     config: &OptionsEngineConfig,
     trade_date: &str,
     payload: serde_json::Value,
 ) {
     emit_operator_event("decision", payload.clone());
-    config.record_candidate_ledger(trade_date, "decision", payload);
+    config
+        .record_candidate_ledger(trade_date, "decision", payload)
+        .await;
 }
 
-pub(super) fn record_submit_result_event(
+pub(super) async fn record_submit_result_event(
     config: &OptionsEngineConfig,
     trade_date: &str,
     payload: serde_json::Value,
 ) {
     emit_operator_event("submit_result", payload.clone());
-    config.record_candidate_ledger(trade_date, "submit_result", payload);
+    config
+        .record_candidate_ledger(trade_date, "submit_result", payload)
+        .await;
 }
 
-pub(super) fn record_selected_candidate_alert(
+pub(super) async fn record_selected_candidate_alert(
     config: &OptionsEngineConfig,
     trade_date: &str,
     identity_key: &str,
     payload: Value,
 ) {
-    config.record_candidate_alert_ledger(
-        trade_date,
-        SELECTED_CANDIDATE_ALERT,
-        "info",
-        candidate_alert_key(SELECTED_CANDIDATE_ALERT, identity_key),
-        payload,
-    );
+    config
+        .record_candidate_alert_ledger(
+            trade_date,
+            SELECTED_CANDIDATE_ALERT,
+            "info",
+            candidate_alert_key(SELECTED_CANDIDATE_ALERT, identity_key),
+            payload,
+        )
+        .await;
 }
 
-pub(super) fn record_submit_rejected_candidate_alert(
+pub(super) async fn record_submit_rejected_candidate_alert(
     config: &OptionsEngineConfig,
     trade_date: &str,
     identity_key: &str,
@@ -74,13 +80,15 @@ pub(super) fn record_submit_rejected_candidate_alert(
             Value::Bool(recorded),
         );
     }
-    config.record_candidate_alert_ledger(
-        trade_date,
-        CANDIDATE_SUBMIT_REJECTED_ALERT,
-        "warning",
-        candidate_alert_key(CANDIDATE_SUBMIT_REJECTED_ALERT, identity_key),
-        payload,
-    );
+    config
+        .record_candidate_alert_ledger(
+            trade_date,
+            CANDIDATE_SUBMIT_REJECTED_ALERT,
+            "warning",
+            candidate_alert_key(CANDIDATE_SUBMIT_REJECTED_ALERT, identity_key),
+            payload,
+        )
+        .await;
 }
 
 pub(super) fn selected_entry_alert_payload(

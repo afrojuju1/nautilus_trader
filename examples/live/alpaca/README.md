@@ -175,8 +175,7 @@ alpaca-control --account paper-main restart
 alpaca-control --account paper-main logs
 ```
 
-Candidate ledgers live under
-`~/.local/state/nautilus_trader/alpaca/<account-id>/candidate-ledger/`. Performance ledgers and
-candidate-outcome ledgers live beside them under `performance-ledger/` and `candidate-outcomes/`.
-Performance reports read broker fills and local state for accounting; they do not submit or cancel
-orders.
+Candidate ledgers, performance ledgers, and candidate outcomes are stored in Postgres through
+`ALPACA_STORAGE_DATABASE_URL`. Performance reports read broker fills and persisted state for
+accounting; they do not submit or cancel orders. Legacy JSONL ledgers can be imported with
+`alpaca-migrate-jsonl-storage`.

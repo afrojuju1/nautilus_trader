@@ -15,6 +15,7 @@ use crate::{
     candidate_ledger::default_candidate_ledger_dir,
     fleet::load_fleet_config_from_env,
     runtime::StrategyState,
+    storage::STORAGE_SCHEMA_DEFAULT,
     strategy::{
         CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
         NakedOptionKind, NakedOptionScannerConfig, PutCreditScannerConfig,
@@ -560,6 +561,10 @@ pub(super) fn build_options_engine_config(
         fleet,
         fleet_account_id: None,
         fleet_policy_blocks: Vec::new(),
+        storage_database_url: None,
+        storage_repository: None,
+        storage_schema: STORAGE_SCHEMA_DEFAULT.to_string(),
+        storage_account_id: None,
     };
     apply_fleet_policy(&mut config);
     if config.candidate_ledger_dir.as_os_str().is_empty() {

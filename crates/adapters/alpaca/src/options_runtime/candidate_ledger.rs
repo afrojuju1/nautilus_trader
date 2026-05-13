@@ -18,15 +18,17 @@ use super::{
     OptionsEngineConfig,
 };
 
-pub(super) fn record_scanner_ledger_result(
+pub(super) async fn record_scanner_ledger_result(
     config: &OptionsEngineConfig,
     trade_date: &str,
     payload: Value,
 ) {
-    config.record_candidate_ledger(trade_date, "scanner_result", payload);
+    config
+        .record_candidate_ledger(trade_date, "scanner_result", payload)
+        .await;
 }
 
-pub(super) fn record_credit_candidate_ledger(
+pub(super) async fn record_credit_candidate_ledger(
     config: &OptionsEngineConfig,
     trade_date: &str,
     underlying: &str,
@@ -40,7 +42,9 @@ pub(super) fn record_credit_candidate_ledger(
     {
         let payload =
             credit_candidate_ledger_payload(underlying, strategy, Some(index + 1), candidate);
-        config.record_candidate_ledger(trade_date, "candidate", payload.clone());
+        config
+            .record_candidate_ledger(trade_date, "candidate", payload.clone())
+            .await;
         record_high_score_candidate_alert(
             config,
             trade_date,
@@ -50,11 +54,12 @@ pub(super) fn record_credit_candidate_ledger(
             &[&candidate.short.symbol, &candidate.long.symbol],
             candidate.score,
             payload,
-        );
+        )
+        .await;
     }
 }
 
-pub(super) fn record_debit_candidate_ledger(
+pub(super) async fn record_debit_candidate_ledger(
     config: &OptionsEngineConfig,
     trade_date: &str,
     underlying: &str,
@@ -68,7 +73,9 @@ pub(super) fn record_debit_candidate_ledger(
     {
         let payload =
             debit_candidate_ledger_payload(underlying, strategy, Some(index + 1), candidate);
-        config.record_candidate_ledger(trade_date, "candidate", payload.clone());
+        config
+            .record_candidate_ledger(trade_date, "candidate", payload.clone())
+            .await;
         record_high_score_candidate_alert(
             config,
             trade_date,
@@ -78,11 +85,12 @@ pub(super) fn record_debit_candidate_ledger(
             &[&candidate.long.symbol, &candidate.short.symbol],
             candidate.score,
             payload,
-        );
+        )
+        .await;
     }
 }
 
-pub(super) fn record_iron_condor_candidate_ledger(
+pub(super) async fn record_iron_condor_candidate_ledger(
     config: &OptionsEngineConfig,
     trade_date: &str,
     underlying: &str,
@@ -94,7 +102,9 @@ pub(super) fn record_iron_condor_candidate_ledger(
         .enumerate()
     {
         let payload = iron_condor_candidate_ledger_payload(underlying, Some(index + 1), candidate);
-        config.record_candidate_ledger(trade_date, "candidate", payload.clone());
+        config
+            .record_candidate_ledger(trade_date, "candidate", payload.clone())
+            .await;
         record_high_score_candidate_alert(
             config,
             trade_date,
@@ -109,11 +119,12 @@ pub(super) fn record_iron_condor_candidate_ledger(
             ],
             candidate.score,
             payload,
-        );
+        )
+        .await;
     }
 }
 
-pub(super) fn record_naked_candidate_ledger(
+pub(super) async fn record_naked_candidate_ledger(
     config: &OptionsEngineConfig,
     trade_date: &str,
     underlying: &str,
@@ -133,7 +144,9 @@ pub(super) fn record_naked_candidate_ledger(
             Some(index + 1),
             candidate,
         );
-        config.record_candidate_ledger(trade_date, "candidate", payload.clone());
+        config
+            .record_candidate_ledger(trade_date, "candidate", payload.clone())
+            .await;
         record_high_score_candidate_alert(
             config,
             trade_date,
@@ -143,11 +156,12 @@ pub(super) fn record_naked_candidate_ledger(
             &[&candidate.short.symbol],
             candidate.score,
             payload,
-        );
+        )
+        .await;
     }
 }
 
-fn record_high_score_candidate_alert(
+async fn record_high_score_candidate_alert(
     config: &OptionsEngineConfig,
     trade_date: &str,
     strategy: &str,
@@ -172,13 +186,15 @@ fn record_high_score_candidate_alert(
         "primary_symbol",
         primary_symbol.to_string(),
     );
-    config.record_candidate_alert_ledger(
-        trade_date,
-        HIGH_SCORE_CANDIDATE_ALERT,
-        "info",
-        candidate_alert_key(HIGH_SCORE_CANDIDATE_ALERT, &identity_key),
-        alert_payload,
-    );
+    config
+        .record_candidate_alert_ledger(
+            trade_date,
+            HIGH_SCORE_CANDIDATE_ALERT,
+            "info",
+            candidate_alert_key(HIGH_SCORE_CANDIDATE_ALERT, &identity_key),
+            alert_payload,
+        )
+        .await;
 }
 
 fn high_score_candidate_alert_threshold(strategy: &str, candidate_type: Option<&str>) -> f64 {

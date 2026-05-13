@@ -39,7 +39,6 @@ use crate::{
     },
     runtime::{
         StrategyState, StrategyStateEntry, credit_spread_strategy_name, emit_operator_event,
-        load_strategy_state, save_strategy_state_atomic,
     },
     strategy::CreditSpreadKind,
 };
@@ -470,8 +469,8 @@ impl RiskGateDecision {
 /// Returns an error if configuration parsing, broker I/O, selection, submission, cancellation,
 /// state persistence, or execution-client lifecycle operations fail.
 pub async fn run_options_engine() -> anyhow::Result<()> {
-    let config = OptionsEngineConfig::from_env()?;
-    let mut state = load_strategy_state(&config.state_path)?;
+    let config = OptionsEngineConfig::from_env_with_storage().await?;
+    let mut state = config.load_strategy_state().await?;
     let strategy = OptionsRuntimeStrategy;
 
     println!(
@@ -525,7 +524,7 @@ pub async fn run_options_engine() -> anyhow::Result<()> {
     let http_client = AlpacaHttpClient::from_data_config(&data_config)?;
 
     if reconcile_strategy_state(&http_client, &mut state).await? {
-        save_strategy_state_atomic(&config.state_path, &state)?;
+        config.save_strategy_state(&state).await?;
     }
 
     let mut iteration = 1_u64;
@@ -539,10 +538,10 @@ pub async fn run_options_engine() -> anyhow::Result<()> {
                 "trade_date": trade_date,
             }),
         );
-        record_scan_started(&config, &trade_date, iteration, strategy.name());
+        record_scan_started(&config, &trade_date, iteration, strategy.name()).await;
 
         if manage_existing_entries(&http_client, &data_config, &config, &mut state).await? {
-            save_strategy_state_atomic(&config.state_path, &state)?;
+            config.save_strategy_state(&state).await?;
         }
 
         let decision = strategy
@@ -555,7 +554,7 @@ pub async fn run_options_engine() -> anyhow::Result<()> {
             ))
             .await?;
         if apply_strategy_decision(decision, &config, &mut state, &trade_date).await? {
-            save_strategy_state_atomic(&config.state_path, &state)?;
+            config.save_strategy_state(&state).await?;
         }
 
         if config.max_iterations != 0 && iteration >= config.max_iterations {
@@ -569,34 +568,38 @@ pub async fn run_options_engine() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn record_scan_started(
+async fn record_scan_started(
     config: &OptionsEngineConfig,
     trade_date: &str,
     iteration: u64,
     hosted_strategy: &str,
 ) {
-    config.record_candidate_ledger(
-        trade_date,
-        "scan_started",
-        json!({
-            "iteration": iteration,
-            "hosted_strategy": hosted_strategy,
-            "underlyings": &config.underlyings,
-            "strategies": config.enabled_strategy_names(),
-            "dry_run_strategies": config.dry_run_strategy_names(),
-            "entry_window": {
-                "start": config.entry_start.to_string(),
-                "end": config.entry_end.to_string(),
-                "timezone": config.entry_timezone.to_string(),
-                "ignore": config.ignore_entry_window,
-            },
-        }),
-    );
-    config.record_candidate_ledger(
-        trade_date,
-        "threshold_snapshot",
-        candidate_ledger_threshold_snapshot(config),
-    );
+    config
+        .record_candidate_ledger(
+            trade_date,
+            "scan_started",
+            json!({
+                "iteration": iteration,
+                "hosted_strategy": hosted_strategy,
+                "underlyings": &config.underlyings,
+                "strategies": config.enabled_strategy_names(),
+                "dry_run_strategies": config.dry_run_strategy_names(),
+                "entry_window": {
+                    "start": config.entry_start.to_string(),
+                    "end": config.entry_end.to_string(),
+                    "timezone": config.entry_timezone.to_string(),
+                    "ignore": config.ignore_entry_window,
+                },
+            }),
+        )
+        .await;
+    config
+        .record_candidate_ledger(
+            trade_date,
+            "threshold_snapshot",
+            candidate_ledger_threshold_snapshot(config),
+        )
+        .await;
 }
 
 fn candidate_ledger_threshold_snapshot(config: &OptionsEngineConfig) -> serde_json::Value {
@@ -701,7 +704,8 @@ async fn apply_strategy_decision(
                     "timezone": config.entry_timezone.to_string(),
                     "trade_date": trade_date,
                 }),
-            );
+            )
+            .await;
             Ok(false)
         }
         StrategyDecision::Skip { reason } => {
@@ -714,7 +718,8 @@ async fn apply_strategy_decision(
                     "reason": reason,
                     "trade_date": trade_date,
                 }),
-            );
+            )
+            .await;
             Ok(false)
         }
         StrategyDecision::RiskBlocked {
@@ -733,7 +738,8 @@ async fn apply_strategy_decision(
                     "limit": limit,
                     "trade_date": trade_date,
                 }),
-            );
+            )
+            .await;
             Ok(false)
         }
         StrategyDecision::SelectedBlocked {
@@ -774,13 +780,14 @@ async fn apply_strategy_decision(
                 },
                 entry.score(),
             );
-            record_decision_event(config, trade_date, candidate_alert_payload.clone());
+            record_decision_event(config, trade_date, candidate_alert_payload.clone()).await;
             record_selected_candidate_alert(
                 config,
                 trade_date,
                 &candidate_identity_key,
                 candidate_alert_payload,
-            );
+            )
+            .await;
             Ok(false)
         }
         StrategyDecision::Selected { entry, mode } => {
@@ -795,7 +802,8 @@ async fn apply_strategy_decision(
                     "action": "no_entry",
                     "trade_date": trade_date,
                 }),
-            );
+            )
+            .await;
             Ok(false)
         }
     }
@@ -835,13 +843,14 @@ async fn apply_selected_entry_decision(
             .map(|value| format!(" order_list_id={value}"))
             .unwrap_or_else(|| " reason=submission_disabled".to_string()),
     );
-    record_decision_event(config, trade_date, candidate_alert_payload.clone());
+    record_decision_event(config, trade_date, candidate_alert_payload.clone()).await;
     record_selected_candidate_alert(
         config,
         trade_date,
         &candidate_identity_key,
         candidate_alert_payload.clone(),
-    );
+    )
+    .await;
 
     if mode == EntryMode::DryRun {
         return Ok(false);
@@ -884,7 +893,7 @@ async fn apply_selected_entry_decision(
             Value::Bool(terminal_rejection),
         );
     }
-    record_submit_result_event(config, trade_date, submit_payload);
+    record_submit_result_event(config, trade_date, submit_payload).await;
     if outcome.rejected > 0 {
         record_submit_rejected_candidate_alert(
             config,
@@ -893,7 +902,8 @@ async fn apply_selected_entry_decision(
             candidate_alert_payload,
             &outcome,
             entry.is_naked_option().then_some(terminal_rejection),
-        );
+        )
+        .await;
     }
     Ok(outcome.accepted > 0 || terminal_rejection)
 }
@@ -989,6 +999,24 @@ async fn manage_existing_entries(
                     entry.clear_close_submission();
                     changed = true;
                 }
+            } else {
+                println!(
+                    "manage: close_order_missing order_list_id={}",
+                    close_order_list_id
+                );
+                emit_operator_event(
+                    "management_block",
+                    json!({
+                        "action": "close_blocked",
+                        "reason": "close_order_missing",
+                        "underlying": entry.underlying,
+                        "strategy": entry.strategy,
+                        "order_list_id": entry.order_list_id,
+                        "close_order_list_id": close_order_list_id,
+                    }),
+                );
+                entry.clear_close_submission();
+                changed = true;
             }
             continue;
         }
@@ -1240,12 +1268,23 @@ async fn append_realized_performance_ledger(
         .with_timezone(&config.entry_timezone)
         .date_naive()
         .to_string();
-    let append = append_performance_ledger_record(
-        &performance_ledger_dir(config),
-        &ledger_date,
-        config.fleet_account_id.as_deref(),
-        &performance,
-    )?;
+    let append = if let Some(storage) = &config.storage_repository {
+        crate::storage::append_performance_ledger_record(
+            storage,
+            config.storage_account_id(),
+            &ledger_date,
+            &performance,
+            None,
+        )
+        .await?
+    } else {
+        append_performance_ledger_record(
+            &performance_ledger_dir(config),
+            &ledger_date,
+            config.fleet_account_id.as_deref(),
+            &performance,
+        )?
+    };
 
     emit_operator_event(
         "performance_ledger",

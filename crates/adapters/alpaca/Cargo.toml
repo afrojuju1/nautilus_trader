@@ -40,6 +40,7 @@ live = [
   "dep:nautilus-common",
   "dep:nautilus-live",
   "dep:nautilus-network",
+  "dep:sqlx",
   "dep:rust_decimal",
   "dep:toml",
   "dep:tokio-tungstenite",
@@ -79,6 +80,7 @@ reqwest = { workspace = true }
 rust_decimal = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sqlx = { workspace = true, optional = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, optional = true }
@@ -154,6 +156,13 @@ test = false
 [[bin]]
 name = "alpaca-performance-report"
 path = "bin/performance_report.rs"
+required-features = ["live"]
+doc = false
+test = false
+
+[[bin]]
+name = "alpaca-migrate-jsonl-storage"
+path = "bin/migrate_jsonl_storage.rs"
 required-features = ["live"]
 doc = false
 test = false

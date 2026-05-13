@@ -24,6 +24,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+#[cfg(feature = "live")]
+use crate::storage::StorageRepository;
+
 use crate::strategy::{
     CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, IronCondorCandidate,
     NakedOptionCandidate, NakedOptionKind, SpreadCandidate,
@@ -483,6 +486,15 @@ pub fn load_strategy_state(path: &Path) -> anyhow::Result<StrategyState> {
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 
+#[cfg(feature = "live")]
+pub async fn load_strategy_state_with_storage(
+    _path: &Path,
+    storage: &StorageRepository,
+    account_id: &str,
+) -> anyhow::Result<StrategyState> {
+    crate::storage::load_strategy_state(storage, account_id).await
+}
+
 /// Saves strategy state through a same-directory temp file followed by atomic rename.
 ///
 /// # Errors
@@ -500,6 +512,16 @@ pub fn save_strategy_state_atomic(path: &Path, state: &StrategyState) -> anyhow:
     fs::write(&tmp_path, serde_json::to_string_pretty(state)?)?;
     fs::rename(tmp_path, path)?;
     Ok(())
+}
+
+#[cfg(feature = "live")]
+pub async fn save_strategy_state_with_storage(
+    _path: &Path,
+    storage: &StorageRepository,
+    state: &StrategyState,
+    account_id: &str,
+) -> anyhow::Result<()> {
+    crate::storage::save_strategy_state(storage, account_id, state).await
 }
 
 /// Emits one structured operator event to stdout.

@@ -33,10 +33,10 @@ use crate::{
 mod candidate_outcomes;
 mod jsonl;
 
-use candidate_outcomes::performance_record_key;
 pub use candidate_outcomes::{
     collect_order_ids, earliest_entry_timestamp, entry_in_date_range, entry_performance,
-    summarize_candidate_ledger, summarize_performance, track_candidate_outcomes,
+    performance_record_key, summarize_candidate_ledger, summarize_performance,
+    track_candidate_outcomes,
 };
 use jsonl::{append_deduped_jsonl_record, scan_jsonl_records};
 

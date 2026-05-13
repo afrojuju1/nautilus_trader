@@ -19,6 +19,9 @@ use crate::{
     },
     options_runtime::OptionsEngineConfig,
     runtime::{StrategyState, StrategyStateEntry},
+    storage::{
+        CandidateLedgerSummaryFilters, append_candidate_outcome, read_candidate_ledger_records,
+    },
 };
 
 use super::{
@@ -40,10 +43,22 @@ pub async fn track_candidate_outcomes(
             .with_timezone(&config.entry_timezone)
             .date_naive()
     });
-    let ledger_path = config
-        .candidate_ledger_dir
-        .join(format!("{trade_date}.jsonl"));
-    let records = read_jsonl_records(&ledger_path)?;
+    let records = if let Some(storage) = &config.storage_repository {
+        read_candidate_ledger_records(
+            storage,
+            config.storage_account_id(),
+            CandidateLedgerSummaryFilters {
+                since: Some(trade_date),
+                until: Some(trade_date),
+            },
+        )
+        .await?
+    } else {
+        let ledger_path = config
+            .candidate_ledger_dir
+            .join(format!("{trade_date}.jsonl"));
+        read_jsonl_records(&ledger_path)?
+    };
     let selected = selected_candidate_actions(&records);
     let mut candidates = collect_track_candidates(
         &records,
@@ -63,6 +78,11 @@ pub async fn track_candidate_outcomes(
     snapshot_request.feed = Some(data_config.option_feed.as_str().to_string());
     let snapshots = client.option_snapshots(&snapshot_request).await?.snapshots;
     let outcome_dir = default_candidate_outcome_dir(config);
+    let payload_account_id = if config.storage_repository.is_some() {
+        Some(config.storage_account_id().to_string())
+    } else {
+        config.fleet_account_id.clone()
+    };
     let mut appended = 0;
     for candidate in &mut candidates {
         let Some(outcome) = value_candidate_outcome(candidate, &snapshots) else {
@@ -75,7 +95,7 @@ pub async fn track_candidate_outcomes(
                 "ts_utc": Utc::now().to_rfc3339(),
                 "type": "candidate_outcome",
                 "trade_date": candidate.trade_date,
-                "account_id": config.fleet_account_id,
+                "account_id": payload_account_id.clone(),
                 "record_key": record_key,
                 "candidate_identity_key": candidate.identity_key,
                 "observation_bucket": bucket,
@@ -95,14 +115,25 @@ pub async fn track_candidate_outcomes(
                 "quote_warnings": outcome.warnings,
                 "candidate": candidate.record,
             });
-            if append_deduped_jsonl_record(
-                &outcome_dir,
-                &candidate.trade_date,
-                &record_key,
-                payload,
-            )?
-            .appended
-            {
+            let appended_record = if let Some(storage) = &config.storage_repository {
+                append_candidate_outcome(
+                    storage,
+                    config.storage_account_id(),
+                    &candidate.trade_date,
+                    &record_key,
+                    &payload,
+                )
+                .await?
+            } else {
+                append_deduped_jsonl_record(
+                    &outcome_dir,
+                    &candidate.trade_date,
+                    &record_key,
+                    payload,
+                )?
+                .appended
+            };
+            if appended_record {
                 appended += 1;
             }
         }
@@ -324,7 +355,7 @@ pub fn collect_order_ids(order: &AlpacaOrder, ids: &mut BTreeSet<String>) {
     }
 }
 
-pub(super) fn performance_record_key(entry: &EntryPerformance) -> String {
+pub fn performance_record_key(entry: &EntryPerformance) -> String {
     format!(
         "{}|{}|{}|{}|{}",
         entry.trade_date,

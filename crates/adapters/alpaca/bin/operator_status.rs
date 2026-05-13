@@ -30,7 +30,7 @@ use nautilus_alpaca::{
         models::{AlpacaAccount, AlpacaActivity, AlpacaOrder, AlpacaPosition, ListOrdersRequest},
     },
     options_runtime::OptionsEngineConfig,
-    runtime::{StrategyState, load_strategy_state, read_operator_events},
+    runtime::{StrategyState, read_operator_events},
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -205,7 +205,7 @@ enum AlertSeverity {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = OperatorConfig::from_env()?;
+    let config = OperatorConfig::from_env().await?;
     let mut data_config = AlpacaDataClientConfig::default();
     data_config.trading_base_url = env::var("ALPACA_TRADING_BASE_URL").ok();
     data_config.data_base_url = env::var("ALPACA_DATA_BASE_URL").ok();
@@ -216,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
     let open_orders = client.orders(&open_orders_request()).await?;
     let recent_orders = client.orders(&recent_orders_request()).await?;
     let activities = latest_activities(&client).await.unwrap_or_default();
-    let state = load_strategy_state(&config.state_path)?;
+    let state = config.options_state().await?;
     let events = read_operator_events(&config.log_path);
 
     let status = build_status(
@@ -244,8 +244,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 impl OperatorConfig {
-    fn from_env() -> anyhow::Result<Self> {
-        let strategy_config = OptionsEngineConfig::from_runtime_env()?;
+    async fn from_env() -> anyhow::Result<Self> {
+        let strategy_config = OptionsEngineConfig::from_runtime_env_with_storage().await?;
         let account_defaults = strategy_config.fleet.as_ref().and_then(|fleet| {
             fleet
                 .current_account()
@@ -316,6 +316,11 @@ impl OperatorConfig {
             fleet_policy_blocks: strategy_config.fleet_policy_blocks,
             json_output: env::args().any(|arg| arg == "--json"),
         })
+    }
+
+    async fn options_state(&self) -> anyhow::Result<StrategyState> {
+        let strategy_config = OptionsEngineConfig::from_runtime_env_with_storage().await?;
+        strategy_config.load_strategy_state().await
     }
 }
 

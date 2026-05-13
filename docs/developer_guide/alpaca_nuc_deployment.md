@@ -47,8 +47,8 @@ limits. TOML `runtime.max_iterations = 0` is continuous service mode. Set
 `ALPACA_MAX_ITERATIONS=1` only for a manual one-shot smoke test override.
 
 Candidate-ledger evidence is enabled by default with `runtime.candidate_ledger_enabled = true`.
-When `runtime.candidate_ledger_dir` is omitted, each account writes JSONL records under
-`~/.local/state/nautilus_trader/alpaca/<account-id>/candidate-ledger/<trade-date>.jsonl`.
+Live runtime state, candidate ledgers, performance ledgers, and candidate outcomes are stored in
+Postgres through `ALPACA_STORAGE_DATABASE_URL`.
 `runtime.candidate_ledger_max_candidates` controls how many ranked candidates per scanner result
 are persisted; `0` records all ranked candidates.
 
@@ -134,7 +134,6 @@ alpaca-control alerts enable
 alpaca-control alerts status
 alpaca-control performance --all
 alpaca-control performance --all --json
-alpaca-control performance --all --append-ledger --track-candidates
 alpaca-control alerts performance
 alpaca-control alerts performance-enable
 alpaca-control alerts performance-status
@@ -202,12 +201,11 @@ Default state files from the env template:
 - Logs: `~/.local/state/nautilus_trader/logs/alpaca-options.log`
 - Lock: `~/.local/state/nautilus_trader/locks/alpaca-options.lock`
 - Strategy state: `~/.local/state/nautilus_trader/alpaca_options_engine_state.json`
-- Candidate ledger: `~/.local/state/nautilus_trader/alpaca/<account-id>/candidate-ledger/*.jsonl`
+- Candidate ledger: Postgres `alpaca.candidate_ledger`
 - Candidate-alert dedupe state:
   `~/.local/state/nautilus_trader/alpaca/<account-id>/alerts/candidate-discord-state.json`
-- Performance ledger: `~/.local/state/nautilus_trader/alpaca/<account-id>/performance-ledger/*.jsonl`
-- Candidate outcomes:
-  `~/.local/state/nautilus_trader/alpaca/<account-id>/candidate-outcomes/*.jsonl`
+- Performance ledger: Postgres `alpaca.performance_ledger`
+- Candidate outcomes: Postgres `alpaca.candidate_outcome`
 
 The runner wrapper takes an exclusive non-blocking lock. If another process already owns the lock,
 the service exits without starting another Alpaca account owner.
@@ -447,17 +445,15 @@ positions. They do not submit or cancel orders:
 alpaca-control performance --all
 alpaca-control performance --all --json
 alpaca-control performance --all --since 2026-05-01 --until 2026-05-08
-alpaca-control performance --all --append-ledger
-alpaca-control performance --all --track-candidates
 alpaca-control alerts performance
 alpaca-control alerts performance-enable
 alpaca-control alerts performance-status
 alpaca-control alerts performance-disable
 ```
 
-Use `--append-ledger` to backfill closed entries into the immutable performance ledger. Use
-`--track-candidates` after enough time has passed to observe historical candidates; it writes
-candidate-outcome records using current option snapshots and the configured observation buckets.
+When Postgres storage is configured, performance commands automatically append missing closed-entry
+performance records and track candidate outcomes using current option snapshots and the configured
+observation buckets.
 
 The command reports one engine state:
 
@@ -473,11 +469,10 @@ ranked `candidate` records plus a `scanner_result`; selected or high-score candi
 `candidate_alert` records, and submission decisions append `decision` and `submit_result` records.
 `alpaca-control ledger-summary --all` audits those records by account and trade date.
 
-`alpaca-control performance --track-candidates` replays candidate-ledger records and values the
-same option symbols from current snapshots. It writes `candidate_outcome` records under
-`candidate-outcomes` for observation buckets such as `plus_1h`, `same_day_close`, `next_day`, and
-`expiration_risk`. These records are analytical opportunity tracking; they are not broker fills and
-should not be counted as realized trading PnL.
+`alpaca-control performance` replays candidate-ledger records and values the same option symbols
+from current snapshots. It writes Postgres `candidate_outcome` records for observation buckets such
+as `plus_1h`, `same_day_close`, `next_day`, and `expiration_risk`. These records are analytical
+opportunity tracking; they are not broker fills and should not be counted as realized trading PnL.
 
 Realized close PnL comes from broker activity reconstruction. The performance report matches each
 strategy-state entry to opening and closing parent/leg order IDs, reads option activity cashflows,
@@ -488,9 +483,18 @@ order IDs or fill activity produces warnings such as `missing_close_fills` or
 `missing_realized_pnl` instead of fabricated PnL.
 
 The engine appends realized close records during close handling when enough broker evidence is
-available. The operator can also run `alpaca-control performance --append-ledger` to append missing
-closed entries. The performance ledger is deduped by record key, so repeated backfills should not
-create duplicate realized-trade records.
+available. The operator can also run `alpaca-control performance` to append missing closed entries.
+The performance ledger is deduped by record key, so repeated backfills should not create duplicate
+realized-trade records.
+
+Legacy JSONL ledgers can be imported once into Postgres with:
+
+```bash
+alpaca-migrate-jsonl-storage
+```
+
+The importer scans `~/.local/state/nautilus_trader/alpaca/<account-id>/` by default and is
+idempotent. Set `ALPACA_JSONL_MIGRATION_ROOT` only when importing from a non-standard legacy root.
 
 ## Operator Runbook
 
