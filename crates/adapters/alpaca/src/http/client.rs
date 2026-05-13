@@ -33,7 +33,7 @@ use crate::{
             AlpacaAccount, AlpacaActivity, AlpacaOrder, AlpacaPosition, ListActivitiesRequest,
             ListOptionContractsRequest, ListOrdersRequest, OptionBarsRequest, OptionBarsResponse,
             OptionContractsResponse, OptionSnapshotsRequest, OptionSnapshotsResponse,
-            ReplaceOrderRequest,
+            OptionTradesRequest, OptionTradesResponse, ReplaceOrderRequest,
             StockBarsRequest, StockBarsResponse, StockSnapshotsRequest, StockSnapshotsResponse,
         },
     },
@@ -265,6 +265,55 @@ impl AlpacaHttpClient {
 
         Ok(OptionBarsResponse {
             bars,
+            next_page_token: None,
+        })
+    }
+
+    /// Lists one page of historical option trades from Alpaca's Market Data API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be decoded.
+    pub async fn option_trades_page(
+        &self,
+        request: &OptionTradesRequest,
+    ) -> Result<OptionTradesResponse> {
+        self.get_data_json("/v1beta1/options/trades", &request.query_pairs())
+            .await
+    }
+
+    /// Lists historical option trades for all symbols in the request, batching at Alpaca's 100-symbol cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any request fails or cannot be decoded.
+    pub async fn option_trades(
+        &self,
+        request: &OptionTradesRequest,
+    ) -> Result<OptionTradesResponse> {
+        let mut trades = std::collections::BTreeMap::new();
+
+        for symbol_batch in request.symbols.chunks(100) {
+            let mut page_token = request.page_token.clone();
+
+            loop {
+                let page_request =
+                    request.with_symbols_and_page(symbol_batch.iter().cloned(), page_token.clone());
+                let page = self.option_trades_page(&page_request).await?;
+                page_token = page.next_token();
+
+                for (symbol, mut symbol_trades) in page.trades {
+                    trades.entry(symbol).or_default().append(&mut symbol_trades);
+                }
+
+                if page_token.is_none() {
+                    break;
+                }
+            }
+        }
+
+        Ok(OptionTradesResponse {
+            trades,
             next_page_token: None,
         })
     }
