@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    fs::File,
+    fs::{self, File},
     hash::{DefaultHasher, Hash, Hasher},
     io::Write,
 };
@@ -34,12 +34,14 @@ use nautilus_alpaca::{
     },
 };
 use nautilus_model::data::greeks::black_scholes_greeks;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::time::{Duration as TokioDuration, sleep};
 
 const DAYS_PER_YEAR: f64 = 365.25;
 const SCANNER_RISK_FREE_RATE: f64 = 0.0425;
 const OPTION_CONTRACT_MULTIPLIER: f64 = 100.0;
 const EXIT_FALLBACK_MAX_DISTANCE_SECS: i64 = 30 * 60;
+const CONTRACT_LIST_MAX_ATTEMPTS: usize = 5;
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -137,6 +139,7 @@ struct BacktestReport {
     historical_max_leg_spread_pct: f64,
     underlyings: Vec<String>,
     strategies: Vec<String>,
+    candidate_card: CandidateCard,
     summary: BacktestSummary,
     days: Vec<BacktestDay>,
 }
@@ -156,6 +159,7 @@ struct BacktestSummary {
     by_strategy: BTreeMap<String, StrategySummary>,
     by_period: BTreeMap<String, PeriodSummary>,
     by_exit_status: BTreeMap<String, usize>,
+    by_data_quality_rejection: BTreeMap<String, usize>,
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -185,6 +189,29 @@ struct PeriodSummary {
     accounted: RiskMetrics,
     by_strategy: BTreeMap<String, StrategySummary>,
     by_exit_status: BTreeMap<String, usize>,
+    by_data_quality_rejection: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct CandidateCard {
+    variant: String,
+    strategies: Vec<String>,
+    underlyings: Vec<String>,
+    selected_trades: usize,
+    closed_trades: usize,
+    unclosed_trades: usize,
+    data_quality_rejections: usize,
+    accounted_pnl: f64,
+    average_pnl: f64,
+    win_rate: f64,
+    profit_factor: Option<f64>,
+    max_drawdown: f64,
+    worst_trade: Option<f64>,
+    active_periods: usize,
+    positive_periods: usize,
+    negative_periods: usize,
+    verdict: String,
+    verdict_reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -360,6 +387,41 @@ struct SweepVariant {
     max_hold_secs: Option<u64>,
 }
 
+#[derive(Default, Debug, Deserialize)]
+struct BacktestProfilePatch {
+    start: Option<String>,
+    end: Option<String>,
+    entry_time: Option<String>,
+    exit_time: Option<String>,
+    underlyings: Option<Vec<String>>,
+    strategies: Option<Vec<String>>,
+    timeframe: Option<String>,
+    option_feed: Option<String>,
+    stock_feed: Option<String>,
+    assumed_iv: Option<f64>,
+    synthetic_spread_pct: Option<f64>,
+    entry_mark_window_mins: Option<i64>,
+    historical_min_open_interest: Option<u64>,
+    missing_open_interest: Option<u64>,
+    historical_max_leg_spread_pct: Option<f64>,
+    sweep_synthetic_spread_pct: Option<Vec<f64>>,
+    sweep_short_delta_min: Option<Vec<f64>>,
+    sweep_short_delta_max: Option<Vec<f64>>,
+    sweep_min_return_on_risk: Option<Vec<f64>>,
+    profit_target_close_fraction: Option<f64>,
+    stop_loss_close_multiple: Option<f64>,
+    max_hold_mins: Option<u64>,
+    max_hold_secs: Option<u64>,
+    sweep_profit_target_close_fraction: Option<Vec<f64>>,
+    sweep_stop_loss_close_multiple: Option<Vec<f64>>,
+    sweep_max_hold_mins: Option<Vec<u64>>,
+    breakdown_period: Option<String>,
+    unclosed_valuation: Option<String>,
+    min_exit_leg_bars: Option<usize>,
+    require_exit_common_timestamp: Option<bool>,
+    quantity: Option<u64>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     load_options_env_file()?;
@@ -427,8 +489,32 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
     let trade_dates = load_trading_dates(&client, args.start, args.end).await?;
 
     let mut days = Vec::new();
+    let total_underlying_days = trade_dates.len() * config.underlyings.len();
+    let mut evaluated_underlying_days = 0_usize;
+    eprintln!(
+        "backtest start variant={} strategies={} underlyings={} trading_days={} underlying_days={}",
+        variant.label,
+        enabled_strategy_names(&config).join(","),
+        config.underlyings.join(","),
+        trade_dates.len(),
+        total_underlying_days,
+    );
     for trade_date in trade_dates {
         for underlying in config.underlyings.clone() {
+            evaluated_underlying_days += 1;
+            if evaluated_underlying_days == 1
+                || evaluated_underlying_days % 50 == 0
+                || evaluated_underlying_days == total_underlying_days
+            {
+                eprintln!(
+                    "backtest progress variant={} {}/{} date={} underlying={}",
+                    variant.label,
+                    evaluated_underlying_days,
+                    total_underlying_days,
+                    trade_date,
+                    underlying,
+                );
+            }
             let result = backtest_underlying_day(
                 &client,
                 &config,
@@ -454,6 +540,13 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
     }
 
     let summary = summarize(&days, args.breakdown_period, args.unclosed_valuation);
+    let strategies = enabled_strategy_names(&config);
+    let candidate_card = build_candidate_card(
+        &variant.label,
+        config.underlyings.clone(),
+        strategies.clone(),
+        &summary,
+    );
     Ok(BacktestReport {
         variant: variant.label,
         start: args.start.to_string(),
@@ -473,7 +566,8 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
         missing_open_interest: args.missing_open_interest,
         historical_max_leg_spread_pct: args.historical_max_leg_spread_pct,
         underlyings: config.underlyings.clone(),
-        strategies: enabled_strategy_names(&config),
+        strategies,
+        candidate_card,
         summary,
         days,
     })
@@ -1301,10 +1395,13 @@ async fn load_contracts(
         request.status = status.to_string();
         request.expiration_date_gte = Some(min_expiration.clone());
         request.expiration_date_lte = Some(max_expiration.clone());
-        let mut response = client
-            .list_option_contracts(&request)
-            .await
-            .with_context(|| format!("failed to load {status} contracts for {underlying}"))?;
+        let mut response = list_option_contracts_with_retry(
+            client,
+            &request,
+            underlying,
+            status,
+        )
+        .await?;
         contracts.append(&mut response.option_contracts);
     }
 
@@ -1319,6 +1416,56 @@ async fn load_contracts(
     )
     .await?;
     Ok(contracts)
+}
+
+async fn list_option_contracts_with_retry(
+    client: &AlpacaHttpClient,
+    request: &ListOptionContractsRequest,
+    underlying: &str,
+    status: &str,
+) -> anyhow::Result<nautilus_alpaca::http::models::OptionContractsResponse> {
+    let mut last_error = None;
+    for attempt in 1..=CONTRACT_LIST_MAX_ATTEMPTS {
+        match client.list_option_contracts(request).await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                let message = error.to_string();
+                if !is_retryable_alpaca_error(&message) || attempt == CONTRACT_LIST_MAX_ATTEMPTS {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to load {status} contracts for {underlying} after {attempt} attempt(s)"
+                        )
+                    });
+                }
+                last_error = Some(message);
+                let delay_ms = 500_u64 * 2_u64.pow((attempt - 1) as u32);
+                eprintln!(
+                    "retrying option contracts underlying={} status={} attempt={}/{} delay_ms={}",
+                    underlying,
+                    status,
+                    attempt + 1,
+                    CONTRACT_LIST_MAX_ATTEMPTS,
+                    delay_ms,
+                );
+                sleep(TokioDuration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+    bail!(
+        "failed to load {status} contracts for {underlying}; last error={}",
+        last_error.unwrap_or_else(|| "unknown".to_string())
+    )
+}
+
+fn is_retryable_alpaca_error(message: &str) -> bool {
+    message.contains("HTTP 429")
+        || message.contains("HTTP 500")
+        || message.contains("HTTP 502")
+        || message.contains("HTTP 503")
+        || message.contains("HTTP 504")
+        || message.contains("internal server error")
+        || message.contains("timed out")
+        || message.contains("connection")
 }
 
 fn normalize_historical_open_interest(
@@ -2013,6 +2160,16 @@ fn summarize(
             .entry(period)
             .or_default()
             .insert(day.trade_date.clone());
+        if let Some(reason) = day.data_quality_rejection.as_ref() {
+            *summary
+                .by_data_quality_rejection
+                .entry(reason.clone())
+                .or_insert(0) += 1;
+            *period_summary
+                .by_data_quality_rejection
+                .entry(reason.clone())
+                .or_insert(0) += 1;
+        }
 
         let Some(trade) = day.selected.as_ref() else {
             continue;
@@ -2102,6 +2259,68 @@ fn summarize(
     }
     finalize_risk_metrics(&mut summary.accounted);
     summary
+}
+
+fn build_candidate_card(
+    variant: &str,
+    underlyings: Vec<String>,
+    strategies: Vec<String>,
+    summary: &BacktestSummary,
+) -> CandidateCard {
+    let data_quality_rejections = summary.by_data_quality_rejection.values().sum();
+    let active_periods = summary
+        .by_period
+        .values()
+        .filter(|period| period.selected_trades > 0)
+        .count();
+    let positive_periods = summary
+        .by_period
+        .values()
+        .filter(|period| period.accounted.total_pnl > 0.0)
+        .count();
+    let negative_periods = summary
+        .by_period
+        .values()
+        .filter(|period| period.accounted.total_pnl < 0.0)
+        .count();
+    let profit_factor = summary.accounted.profit_factor.unwrap_or(f64::INFINITY);
+    let (verdict, verdict_reason) = if summary.selected_trades >= 20
+        && summary.unclosed_trades == 0
+        && summary.accounted.total_pnl > 0.0
+        && profit_factor >= 1.5
+        && summary.accounted.max_drawdown <= 100.0
+        && negative_periods <= positive_periods
+    {
+        ("candidate", "passes sample, PnL, drawdown, profit-factor, and data-closure checks")
+    } else if summary.selected_trades >= 10
+        && summary.unclosed_trades == 0
+        && summary.accounted.total_pnl > 0.0
+    {
+        ("watchlist", "positive but misses one or more candidate thresholds")
+    } else {
+        ("reject", "insufficient sample, negative expectancy, unresolved exits, or weak risk metrics")
+    };
+
+    CandidateCard {
+        variant: variant.to_string(),
+        strategies,
+        underlyings,
+        selected_trades: summary.selected_trades,
+        closed_trades: summary.closed_trades,
+        unclosed_trades: summary.unclosed_trades,
+        data_quality_rejections,
+        accounted_pnl: summary.accounted.total_pnl,
+        average_pnl: summary.accounted.average_pnl,
+        win_rate: summary.accounted.win_rate,
+        profit_factor: summary.accounted.profit_factor,
+        max_drawdown: summary.accounted.max_drawdown,
+        worst_trade: summary.accounted.worst_trade,
+        active_periods,
+        positive_periods,
+        negative_periods,
+        verdict: verdict.to_string(),
+        verdict_reason: verdict_reason.to_string(),
+    }
 }
 
 fn accounted_pnl_for_trade(trade: &TradeBacktest, unclosed_valuation: UnclosedValuation) -> f64 {
@@ -2434,6 +2653,242 @@ fn naked_strategy_name(kind: NakedOptionKind) -> &'static str {
     }
 }
 
+fn expanded_cli_args() -> anyhow::Result<Vec<String>> {
+    let raw = env::args().skip(1).collect::<Vec<_>>();
+    let mut profile = None;
+    let mut profile_file = None;
+    let mut filtered = Vec::new();
+    let mut index = 0;
+    while index < raw.len() {
+        match raw[index].as_str() {
+            "--profile" => {
+                let value = raw
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow!("--profile requires a value"))?;
+                profile = Some(value.clone());
+                index += 2;
+            }
+            "--profile-file" => {
+                let value = raw
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow!("--profile-file requires a value"))?;
+                profile_file = Some(value.clone());
+                index += 2;
+            }
+            _ => {
+                filtered.push(raw[index].clone());
+                index += 1;
+            }
+        }
+    }
+
+    let mut expanded = Vec::new();
+    if let Some(profile) = profile {
+        expanded.extend(builtin_profile_args(&profile)?);
+    }
+    if let Some(path) = profile_file {
+        expanded.extend(profile_file_args(&path)?);
+    }
+    expanded.extend(filtered);
+    Ok(expanded)
+}
+
+fn builtin_profile_args(name: &str) -> anyhow::Result<Vec<String>> {
+    let mut args = common_profile_args();
+    match name {
+        "put_credit_spy_strict" => {
+            push_arg(&mut args, "--underlyings", "SPY");
+            push_arg(&mut args, "--strategies", "put_credit");
+            push_arg(&mut args, "--synthetic-spread-pct", "0.05");
+            push_arg(&mut args, "--sweep-min-return-on-risk", "0.16");
+        }
+        "call_credit_qqq_strict" => {
+            push_arg(&mut args, "--underlyings", "QQQ");
+            push_arg(&mut args, "--strategies", "call_credit");
+            push_arg(&mut args, "--synthetic-spread-pct", "0.03");
+            push_arg(&mut args, "--sweep-min-return-on-risk", "0.20");
+        }
+        "iron_condor_spy_sweep" => {
+            push_arg(&mut args, "--underlyings", "SPY");
+            push_arg(&mut args, "--strategies", "iron_condor");
+            push_arg(&mut args, "--sweep-synthetic-spread-pct", "0.03,0.05,0.08");
+            push_arg(&mut args, "--sweep-min-return-on-risk", "0.13,0.16,0.20");
+        }
+        "call_debit_spy_sweep" => {
+            push_arg(&mut args, "--underlyings", "SPY");
+            push_arg(&mut args, "--strategies", "call_debit");
+            push_arg(&mut args, "--sweep-synthetic-spread-pct", "0.03,0.05,0.08");
+        }
+        "put_debit_spy_sweep" => {
+            push_arg(&mut args, "--underlyings", "SPY");
+            push_arg(&mut args, "--strategies", "put_debit");
+            push_arg(&mut args, "--sweep-synthetic-spread-pct", "0.03,0.05,0.08");
+        }
+        "debit_spreads_spy_sweep" => {
+            push_arg(&mut args, "--underlyings", "SPY");
+            push_arg(&mut args, "--strategies", "call_debit,put_debit");
+            push_arg(&mut args, "--sweep-synthetic-spread-pct", "0.03,0.05,0.08");
+        }
+        other => bail!("unknown backtest profile {other}"),
+    }
+    Ok(args)
+}
+
+fn common_profile_args() -> Vec<String> {
+    let mut args = Vec::new();
+    push_arg(&mut args, "--start", "2024-02-01");
+    push_arg(&mut args, "--end", "2026-02-28");
+    push_arg(&mut args, "--entry-time", "09:45");
+    push_arg(&mut args, "--exit-time", "15:45");
+    push_arg(&mut args, "--profit-target-close-fraction", "0.50");
+    push_arg(&mut args, "--stop-loss-close-multiple", "2.00");
+    push_arg(&mut args, "--max-hold-mins", "240");
+    push_arg(&mut args, "--breakdown-period", "month");
+    push_arg(&mut args, "--unclosed-valuation", "worst_observed");
+    args.push("--require-exit-common-timestamp".to_string());
+    args
+}
+
+fn profile_file_args(path: &str) -> anyhow::Result<Vec<String>> {
+    let raw = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let profile = serde_json::from_str::<BacktestProfilePatch>(&raw)
+        .with_context(|| format!("failed to parse JSON profile {path}"))?;
+    Ok(profile_patch_args(profile))
+}
+
+fn profile_patch_args(profile: BacktestProfilePatch) -> Vec<String> {
+    let mut args = Vec::new();
+    push_opt_arg(&mut args, "--start", profile.start);
+    push_opt_arg(&mut args, "--end", profile.end);
+    push_opt_arg(&mut args, "--entry-time", profile.entry_time);
+    push_opt_arg(&mut args, "--exit-time", profile.exit_time);
+    push_opt_csv(&mut args, "--underlyings", profile.underlyings);
+    push_opt_csv(&mut args, "--strategies", profile.strategies);
+    push_opt_arg(&mut args, "--timeframe", profile.timeframe);
+    push_opt_arg(&mut args, "--option-feed", profile.option_feed);
+    push_opt_arg(&mut args, "--stock-feed", profile.stock_feed);
+    push_opt_arg(&mut args, "--assumed-iv", profile.assumed_iv.map(|value| value.to_string()));
+    push_opt_arg(
+        &mut args,
+        "--synthetic-spread-pct",
+        profile.synthetic_spread_pct.map(|value| value.to_string()),
+    );
+    push_opt_arg(
+        &mut args,
+        "--entry-mark-window-mins",
+        profile.entry_mark_window_mins.map(|value| value.to_string()),
+    );
+    push_opt_arg(
+        &mut args,
+        "--historical-min-open-interest",
+        profile.historical_min_open_interest.map(|value| value.to_string()),
+    );
+    push_opt_arg(
+        &mut args,
+        "--missing-open-interest",
+        profile.missing_open_interest.map(|value| value.to_string()),
+    );
+    push_opt_arg(
+        &mut args,
+        "--historical-max-leg-spread-pct",
+        profile.historical_max_leg_spread_pct.map(|value| value.to_string()),
+    );
+    push_opt_float_csv(
+        &mut args,
+        "--sweep-synthetic-spread-pct",
+        profile.sweep_synthetic_spread_pct,
+    );
+    push_opt_float_csv(&mut args, "--sweep-short-delta-min", profile.sweep_short_delta_min);
+    push_opt_float_csv(&mut args, "--sweep-short-delta-max", profile.sweep_short_delta_max);
+    push_opt_float_csv(
+        &mut args,
+        "--sweep-min-return-on-risk",
+        profile.sweep_min_return_on_risk,
+    );
+    push_opt_arg(
+        &mut args,
+        "--profit-target-close-fraction",
+        profile.profit_target_close_fraction.map(|value| value.to_string()),
+    );
+    push_opt_arg(
+        &mut args,
+        "--stop-loss-close-multiple",
+        profile.stop_loss_close_multiple.map(|value| value.to_string()),
+    );
+    push_opt_arg(
+        &mut args,
+        "--max-hold-mins",
+        profile.max_hold_mins.map(|value| value.to_string()),
+    );
+    push_opt_arg(
+        &mut args,
+        "--max-hold-secs",
+        profile.max_hold_secs.map(|value| value.to_string()),
+    );
+    push_opt_float_csv(
+        &mut args,
+        "--sweep-profit-target-close-fraction",
+        profile.sweep_profit_target_close_fraction,
+    );
+    push_opt_float_csv(
+        &mut args,
+        "--sweep-stop-loss-close-multiple",
+        profile.sweep_stop_loss_close_multiple,
+    );
+    push_opt_u64_csv(&mut args, "--sweep-max-hold-mins", profile.sweep_max_hold_mins);
+    push_opt_arg(&mut args, "--breakdown-period", profile.breakdown_period);
+    push_opt_arg(&mut args, "--unclosed-valuation", profile.unclosed_valuation);
+    push_opt_arg(
+        &mut args,
+        "--min-exit-leg-bars",
+        profile.min_exit_leg_bars.map(|value| value.to_string()),
+    );
+    push_opt_arg(&mut args, "--quantity", profile.quantity.map(|value| value.to_string()));
+    if profile.require_exit_common_timestamp.unwrap_or(false) {
+        args.push("--require-exit-common-timestamp".to_string());
+    }
+    args
+}
+
+fn push_arg(args: &mut Vec<String>, flag: &str, value: &str) {
+    args.push(flag.to_string());
+    args.push(value.to_string());
+}
+
+fn push_opt_arg(args: &mut Vec<String>, flag: &str, value: Option<String>) {
+    if let Some(value) = value {
+        push_arg(args, flag, &value);
+    }
+}
+
+fn push_opt_csv(args: &mut Vec<String>, flag: &str, values: Option<Vec<String>>) {
+    if let Some(values) = values {
+        push_arg(args, flag, &values.join(","));
+    }
+}
+
+fn push_opt_float_csv(args: &mut Vec<String>, flag: &str, values: Option<Vec<f64>>) {
+    if let Some(values) = values {
+        let value = values
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        push_arg(args, flag, &value);
+    }
+}
+
+fn push_opt_u64_csv(args: &mut Vec<String>, flag: &str, values: Option<Vec<u64>>) {
+    if let Some(values) = values {
+        let value = values
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        push_arg(args, flag, &value);
+    }
+}
+
 fn parse_args() -> anyhow::Result<Args> {
     let mut start = None;
     let mut end = None;
@@ -2469,7 +2924,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut quantity = None;
     let mut json_output = false;
 
-    let mut iter = env::args().skip(1);
+    let mut iter = expanded_cli_args()?.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--start" => start = Some(parse_date(&next_value(&mut iter, "--start")?)?),
@@ -2934,6 +3389,23 @@ fn print_report(report: &BacktestReport) {
     for (status, count) in &report.summary.by_exit_status {
         println!("exit_status={} count={}", status, count);
     }
+    for (reason, count) in &report.summary.by_data_quality_rejection {
+        println!("data_quality_rejection={} count={}", reason, count);
+    }
+    println!(
+        "candidate verdict={} pnl={:.2} pf={} max_dd={:.2} trades={} rejected={} reason={}",
+        report.candidate_card.verdict,
+        report.candidate_card.accounted_pnl,
+        report
+            .candidate_card
+            .profit_factor
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "inf".to_string()),
+        report.candidate_card.max_drawdown,
+        report.candidate_card.selected_trades,
+        report.candidate_card.data_quality_rejections,
+        report.candidate_card.verdict_reason,
+    );
     for (period, summary) in &report.summary.by_period {
         println!(
             "period={} scan_days={} underlying_days={} selected={} closed={} unclosed={} wins={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2} accounted_pnl={:.2} max_dd={:.2}",
@@ -2975,8 +3447,9 @@ fn print_sweep_report(reports: &[BacktestReport]) {
     ranked.sort_by(|left, right| {
         right
             .summary
+            .accounted
             .total_pnl
-            .partial_cmp(&left.summary.total_pnl)
+            .partial_cmp(&left.summary.accounted.total_pnl)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     for report in ranked {
@@ -3015,10 +3488,50 @@ fn print_sweep_report(reports: &[BacktestReport]) {
             );
         }
     }
+
+    println!("Candidate cards ranked by accounted PnL:");
+    let mut cards = reports.iter().collect::<Vec<_>>();
+    cards.sort_by(|left, right| {
+        right
+            .candidate_card
+            .accounted_pnl
+            .partial_cmp(&left.candidate_card.accounted_pnl)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for report in cards {
+        let card = &report.candidate_card;
+        println!(
+            "card verdict={} variant={} strategies={} underlyings={} trades={} closed={} unclosed={} rejected={} pnl={:.2} avg={:.2} win_rate={:.1}% pf={} max_dd={:.2} worst={} active_periods={} pos_periods={} neg_periods={} reason={}",
+            card.verdict,
+            card.variant,
+            card.strategies.join(","),
+            card.underlyings.join(","),
+            card.selected_trades,
+            card.closed_trades,
+            card.unclosed_trades,
+            card.data_quality_rejections,
+            card.accounted_pnl,
+            card.average_pnl,
+            card.win_rate * 100.0,
+            card
+                .profit_factor
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "inf".to_string()),
+            card.max_drawdown,
+            card
+                .worst_trade
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
+            card.active_periods,
+            card.positive_periods,
+            card.negative_periods,
+            card.verdict_reason,
+        );
+    }
 }
 
 fn print_usage() {
     println!(
-        "Usage: alpaca-options-backtest --start YYYY-MM-DD --end YYYY-MM-DD [--entry-time HH:MM] [--exit-time HH:MM] [--underlyings SPY,QQQ] [--strategies put_credit,call_credit,iron_condor,call_debit,put_debit,naked_call,naked_put] [--timeframe 1Min] [--option-feed indicative] [--stock-feed iex] [--assumed-iv 0.35] [--synthetic-spread-pct 0.05] [--entry-mark-window-mins 10] [--historical-min-open-interest 0] [--missing-open-interest 0] [--historical-max-leg-spread-pct 0.80] [--profit-target-close-fraction 0.50] [--stop-loss-close-multiple 2.00] [--max-hold-mins 180] [--sweep-synthetic-spread-pct 0.03,0.05,0.08] [--sweep-short-delta-min 0.10,0.15] [--sweep-short-delta-max 0.20,0.25] [--sweep-min-return-on-risk 0.04,0.08,0.13] [--sweep-profit-target-close-fraction 0.35,0.50] [--sweep-stop-loss-close-multiple 1.50,2.00] [--sweep-max-hold-mins 120,240] [--breakdown-period day|week|month|quarter|year] [--unclosed-valuation ignore|conservative|worst_observed] [--min-exit-leg-bars 10] [--require-exit-common-timestamp] [--trade-export-csv trades.csv] [--trade-export-json trades.json] [--quantity 1] [--json]"
+        "Usage: alpaca-options-backtest [--profile name] [--profile-file profile.json] --start YYYY-MM-DD --end YYYY-MM-DD [--entry-time HH:MM] [--exit-time HH:MM] [--underlyings SPY,QQQ] [--strategies put_credit,call_credit,iron_condor,call_debit,put_debit,naked_call,naked_put] [--timeframe 1Min] [--option-feed indicative] [--stock-feed iex] [--assumed-iv 0.35] [--synthetic-spread-pct 0.05] [--entry-mark-window-mins 10] [--historical-min-open-interest 0] [--missing-open-interest 0] [--historical-max-leg-spread-pct 0.80] [--profit-target-close-fraction 0.50] [--stop-loss-close-multiple 2.00] [--max-hold-mins 180] [--sweep-synthetic-spread-pct 0.03,0.05,0.08] [--sweep-short-delta-min 0.10,0.15] [--sweep-short-delta-max 0.20,0.25] [--sweep-min-return-on-risk 0.04,0.08,0.13] [--sweep-profit-target-close-fraction 0.35,0.50] [--sweep-stop-loss-close-multiple 1.50,2.00] [--sweep-max-hold-mins 120,240] [--breakdown-period day|week|month|quarter|year] [--unclosed-valuation ignore|conservative|worst_observed] [--min-exit-leg-bars 10] [--require-exit-common-timestamp] [--trade-export-csv trades.csv] [--trade-export-json trades.json] [--quantity 1] [--json]"
     );
 }
