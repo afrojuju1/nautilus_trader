@@ -1,7 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
+    fs::File,
     hash::{DefaultHasher, Hash, Hasher},
+    io::Write,
 };
 
 use anyhow::{Context, anyhow, bail};
@@ -37,6 +39,7 @@ use serde::{Serialize, de::DeserializeOwned};
 const DAYS_PER_YEAR: f64 = 365.25;
 const SCANNER_RISK_FREE_RATE: f64 = 0.0425;
 const OPTION_CONTRACT_MULTIPLIER: f64 = 100.0;
+const EXIT_FALLBACK_MAX_DISTANCE_SECS: i64 = 30 * 60;
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -59,9 +62,37 @@ struct Args {
     sweep_short_delta_min: Vec<f64>,
     sweep_short_delta_max: Vec<f64>,
     sweep_min_return_on_risk: Vec<f64>,
+    profit_target_close_fraction: Option<f64>,
+    stop_loss_close_multiple: Option<f64>,
+    max_hold_secs: Option<u64>,
+    sweep_profit_target_close_fraction: Vec<f64>,
+    sweep_stop_loss_close_multiple: Vec<f64>,
+    sweep_max_hold_mins: Vec<u64>,
     breakdown_period: BreakdownPeriod,
+    unclosed_valuation: UnclosedValuation,
+    min_exit_leg_bars: usize,
+    require_exit_common_timestamp: bool,
+    trade_export_csv: Option<String>,
+    trade_export_json: Option<String>,
     quantity: Option<u64>,
     json_output: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum UnclosedValuation {
+    Ignore,
+    Conservative,
+    WorstObserved,
+}
+
+impl UnclosedValuation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ignore => "ignore",
+            Self::Conservative => "conservative",
+            Self::WorstObserved => "worst_observed",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -91,6 +122,7 @@ struct BacktestReport {
     start: String,
     end: String,
     breakdown_period: &'static str,
+    unclosed_valuation: &'static str,
     entry_time: String,
     exit_time: String,
     timeframe: String,
@@ -115,22 +147,28 @@ struct BacktestSummary {
     evaluated_underlying_days: usize,
     selected_trades: usize,
     closed_trades: usize,
+    unclosed_trades: usize,
     winning_trades: usize,
     total_pnl: f64,
     average_pnl: f64,
     win_rate: f64,
+    accounted: RiskMetrics,
     by_strategy: BTreeMap<String, StrategySummary>,
     by_period: BTreeMap<String, PeriodSummary>,
+    by_exit_status: BTreeMap<String, usize>,
 }
 
 #[derive(Default, Debug, Serialize)]
 struct StrategySummary {
     selected_trades: usize,
     closed_trades: usize,
+    unclosed_trades: usize,
     winning_trades: usize,
     total_pnl: f64,
     average_pnl: f64,
     win_rate: f64,
+    accounted: RiskMetrics,
+    by_exit_status: BTreeMap<String, usize>,
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -139,11 +177,57 @@ struct PeriodSummary {
     evaluated_underlying_days: usize,
     selected_trades: usize,
     closed_trades: usize,
+    unclosed_trades: usize,
     winning_trades: usize,
     total_pnl: f64,
     average_pnl: f64,
     win_rate: f64,
+    accounted: RiskMetrics,
     by_strategy: BTreeMap<String, StrategySummary>,
+    by_exit_status: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct RiskMetrics {
+    trades: usize,
+    winning_trades: usize,
+    losing_trades: usize,
+    gross_profit: f64,
+    gross_loss: f64,
+    total_pnl: f64,
+    average_pnl: f64,
+    win_rate: f64,
+    profit_factor: Option<f64>,
+    expectancy: f64,
+    best_trade: Option<f64>,
+    worst_trade: Option<f64>,
+    max_drawdown: f64,
+    #[serde(skip)]
+    equity: f64,
+    #[serde(skip)]
+    peak_equity: f64,
+}
+
+impl Default for RiskMetrics {
+    fn default() -> Self {
+        Self {
+            trades: 0,
+            winning_trades: 0,
+            losing_trades: 0,
+            gross_profit: 0.0,
+            gross_loss: 0.0,
+            total_pnl: 0.0,
+            average_pnl: 0.0,
+            win_rate: 0.0,
+            profit_factor: None,
+            expectancy: 0.0,
+            best_trade: None,
+            worst_trade: None,
+            max_drawdown: 0.0,
+            equity: 0.0,
+            peak_equity: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -155,6 +239,7 @@ struct BacktestDay {
     underlying_price: Option<f64>,
     diagnostics: Vec<ScannerDiagnostic>,
     selected: Option<TradeBacktest>,
+    data_quality_rejection: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,8 +266,17 @@ struct TradeBacktest {
     entry_net_cashflow: f64,
     exit_net_cashflow: Option<f64>,
     pnl: Option<f64>,
+    conservative_pnl: Option<f64>,
+    conservative_status: Option<String>,
+    worst_observed_pnl: Option<f64>,
+    worst_observed_status: Option<String>,
+    closed: bool,
     legs: Vec<BacktestLeg>,
     exit_status: String,
+    exit_diagnostic: String,
+    exit_missing_leg_symbols: Vec<String>,
+    exit_bar_counts: BTreeMap<String, usize>,
+    exit_common_timestamps: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -195,6 +289,35 @@ struct BacktestLeg {
     exit_source: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct TradeExportRecord {
+    variant: String,
+    strategy: String,
+    underlying: String,
+    trade_date: String,
+    entry_timestamp: String,
+    exit_timestamp: String,
+    quantity: u64,
+    score: f64,
+    premium_kind: String,
+    entry_premium: f64,
+    entry_net_cashflow: f64,
+    exit_net_cashflow: Option<f64>,
+    pnl: Option<f64>,
+    conservative_pnl: Option<f64>,
+    conservative_status: Option<String>,
+    worst_observed_pnl: Option<f64>,
+    worst_observed_status: Option<String>,
+    accounted_pnl: f64,
+    closed: bool,
+    exit_status: String,
+    exit_diagnostic: String,
+    exit_missing_leg_symbols: Vec<String>,
+    exit_bar_counts: BTreeMap<String, usize>,
+    exit_common_timestamps: usize,
+    legs: Vec<BacktestLeg>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum LegSide {
@@ -203,6 +326,13 @@ enum LegSide {
 }
 
 impl LegSide {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Long => "long",
+            Self::Short => "short",
+        }
+    }
+
     const fn entry_sign(self) -> f64 {
         match self {
             Self::Long => -1.0,
@@ -225,6 +355,9 @@ struct SweepVariant {
     short_delta_min: Option<f64>,
     short_delta_max: Option<f64>,
     min_return_on_risk: Option<f64>,
+    profit_target_close_fraction: Option<f64>,
+    stop_loss_close_multiple: Option<f64>,
+    max_hold_secs: Option<u64>,
 }
 
 #[tokio::main]
@@ -240,6 +373,13 @@ async fn main() -> anyhow::Result<()> {
     let mut reports = Vec::new();
     for variant in variants {
         reports.push(run_backtest(args.clone(), variant).await?);
+    }
+
+    if let Some(path) = args.trade_export_csv.as_deref() {
+        write_trade_csv_export(path, &reports)?;
+    }
+    if let Some(path) = args.trade_export_json.as_deref() {
+        write_trade_json_export(path, &reports)?;
     }
 
     if args.json_output {
@@ -303,6 +443,8 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
                 args.synthetic_spread_pct,
                 args.entry_mark_window_mins,
                 args.missing_open_interest,
+                args.min_exit_leg_bars,
+                args.require_exit_common_timestamp,
                 config.storage_repository.as_deref(),
                 &account_id,
             )
@@ -311,12 +453,13 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
         }
     }
 
-    let summary = summarize(&days, args.breakdown_period);
+    let summary = summarize(&days, args.breakdown_period, args.unclosed_valuation);
     Ok(BacktestReport {
         variant: variant.label,
         start: args.start.to_string(),
         end: args.end.to_string(),
         breakdown_period: args.breakdown_period.as_str(),
+        unclosed_valuation: args.unclosed_valuation.as_str(),
         entry_time: entry_time.format("%H:%M:%S").to_string(),
         exit_time: exit_time.format("%H:%M:%S").to_string(),
         timeframe: args.timeframe,
@@ -350,6 +493,8 @@ async fn backtest_underlying_day(
     synthetic_spread_pct: f64,
     entry_mark_window_mins: i64,
     missing_open_interest: u64,
+    min_exit_leg_bars: usize,
+    require_exit_common_timestamp: bool,
     storage: Option<&StorageRepository>,
     account_id: &str,
 ) -> anyhow::Result<BacktestDay> {
@@ -433,9 +578,9 @@ async fn backtest_underlying_day(
         &mut diagnostics,
     );
 
-    let selected = match selected {
-        Some(entry) => Some(
-            simulate_selected_entry(
+    let (selected, data_quality_rejection) = match selected {
+        Some(entry) => {
+            let trade = simulate_selected_entry(
                 client,
                 entry,
                 config,
@@ -450,9 +595,16 @@ async fn backtest_underlying_day(
                 storage,
                 account_id,
             )
-            .await?,
-        ),
-        None => None,
+            .await?;
+            if let Some(reason) =
+                data_quality_rejection(&trade, min_exit_leg_bars, require_exit_common_timestamp)
+            {
+                (None, Some(reason))
+            } else {
+                (Some(trade), None)
+            }
+        }
+        None => (None, None),
     };
 
     Ok(BacktestDay {
@@ -463,7 +615,30 @@ async fn backtest_underlying_day(
         underlying_price,
         diagnostics,
         selected,
+        data_quality_rejection,
     })
+}
+
+fn data_quality_rejection(
+    trade: &TradeBacktest,
+    min_exit_leg_bars: usize,
+    require_exit_common_timestamp: bool,
+) -> Option<String> {
+    if min_exit_leg_bars > 0 {
+        if let Some((symbol, count)) = trade
+            .exit_bar_counts
+            .iter()
+            .find(|(_, count)| **count < min_exit_leg_bars)
+        {
+            return Some(format!(
+                "exit_leg_bars_below_min symbol={symbol} count={count} min={min_exit_leg_bars}"
+            ));
+        }
+    }
+    if require_exit_common_timestamp && trade.exit_common_timestamps == 0 {
+        return Some("missing_common_exit_timestamp".to_string());
+    }
+    None
 }
 
 fn select_historical_entry(
@@ -658,6 +833,8 @@ async fn simulate_selected_entry(
         exit_end,
     )
     .await?;
+    let exit_common_timestamps =
+        common_bar_timestamps_in_window(&legs, &path_bars, entry_timestamp, exit_timestamp).len();
 
     let entry_net_cashflow = match descriptor.premium_kind.as_str() {
         "credit" => descriptor.premium,
@@ -681,10 +858,28 @@ async fn simulate_selected_entry(
     let mut exit_net_cashflow = 0.0;
     let mut missing_exit = false;
     let mut resolved_exit_timestamp = exit_timestamp.to_string();
-    let mut exit_status = "missing_exit_bar".to_string();
+    let exit_bar_counts = exit_bar_counts_by_leg(&legs, &path_bars, entry_timestamp, exit_timestamp);
+    let mut exit_missing_leg_symbols = exit_bar_counts
+        .iter()
+        .filter_map(|(symbol, count)| (*count == 0).then_some(symbol.clone()))
+        .collect::<Vec<_>>();
+    let mut exit_status = if exit_missing_leg_symbols.is_empty() {
+        "missing_common_exit_timestamp".to_string()
+    } else {
+        "missing_exit_leg_bar".to_string()
+    };
+    let mut exit_diagnostic = if exit_missing_leg_symbols.is_empty() {
+        "no common exit timestamp across all legs before fallback exit".to_string()
+    } else {
+        format!(
+            "missing usable exit bars for {} leg(s)",
+            exit_missing_leg_symbols.len()
+        )
+    };
     if let Some(exit_plan) = exit_plan {
         resolved_exit_timestamp = exit_plan.timestamp;
         exit_status = exit_plan.reason;
+        exit_diagnostic = "closed from complete leg marks".to_string();
         for leg in &mut legs {
             if let Some(mark) = exit_plan.marks.get(&leg.symbol) {
                 leg.exit_close = Some(mark.price);
@@ -699,10 +894,58 @@ async fn simulate_selected_entry(
             missing_exit = true;
         }
     }
+    if missing_exit {
+        let missing_exit_prices = legs
+            .iter()
+            .filter_map(|leg| leg.exit_close.is_none().then_some(leg.symbol.clone()))
+            .collect::<Vec<_>>();
+        if exit_missing_leg_symbols.is_empty() {
+            exit_missing_leg_symbols = missing_exit_prices;
+        }
+    } else {
+        exit_missing_leg_symbols.clear();
+    }
 
     let pnl_per_contract = entry_net_cashflow + exit_net_cashflow;
     let pnl =
         (!missing_exit).then_some(pnl_per_contract * OPTION_CONTRACT_MULTIPLIER * config.quantity as f64);
+    let closed = !missing_exit;
+    let conservative_pnl = if closed {
+        pnl
+    } else {
+        conservative_unclosed_pnl(
+            &legs,
+            entry_net_cashflow,
+            descriptor.premium_kind.as_str(),
+            config.quantity,
+        )
+    };
+    let conservative_status = (!closed).then(|| {
+        if conservative_pnl.is_some() {
+            "max_loss".to_string()
+        } else {
+            "unvalued".to_string()
+        }
+    });
+    let worst_observed_pnl = if closed {
+        pnl
+    } else {
+        worst_observed_unclosed_pnl(
+            &legs,
+            &path_bars,
+            entry_net_cashflow,
+            descriptor.premium_kind.as_str(),
+            config.quantity,
+        )
+        .or(conservative_pnl)
+    };
+    let worst_observed_status = (!closed).then(|| {
+        if worst_observed_pnl.is_some() {
+            "worst_observed_or_max_loss".to_string()
+        } else {
+            "unvalued".to_string()
+        }
+    });
 
     Ok(TradeBacktest {
         strategy: descriptor.strategy.to_string(),
@@ -717,12 +960,21 @@ async fn simulate_selected_entry(
         entry_net_cashflow,
         exit_net_cashflow: (!missing_exit).then_some(exit_net_cashflow),
         pnl,
+        conservative_pnl,
+        conservative_status,
+        worst_observed_pnl,
+        worst_observed_status,
+        closed,
         legs,
         exit_status: if missing_exit {
-            "missing_exit_bar".to_string()
+            exit_status
         } else {
             exit_status
         },
+        exit_diagnostic,
+        exit_missing_leg_symbols,
+        exit_bar_counts,
+        exit_common_timestamps,
     })
 }
 
@@ -733,10 +985,96 @@ struct ExitPlan {
     marks: BTreeMap<String, HistoricalMark>,
 }
 
+fn conservative_unclosed_pnl(
+    legs: &[BacktestLeg],
+    entry_net_cashflow: f64,
+    premium_kind: &str,
+    quantity: u64,
+) -> Option<f64> {
+    match premium_kind {
+        "credit" => conservative_credit_spread_pnl(legs, entry_net_cashflow, quantity),
+        "debit" => Some(entry_net_cashflow * OPTION_CONTRACT_MULTIPLIER * quantity as f64),
+        _ => None,
+    }
+}
+
+fn conservative_credit_spread_pnl(
+    legs: &[BacktestLeg],
+    entry_net_cashflow: f64,
+    quantity: u64,
+) -> Option<f64> {
+    if legs.len() != 2 {
+        return None;
+    }
+    let mut strikes = legs
+        .iter()
+        .filter_map(|leg| option_strike_from_symbol(&leg.symbol))
+        .collect::<Vec<_>>();
+    if strikes.len() != 2 {
+        return None;
+    }
+    strikes.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let width = strikes[1] - strikes[0];
+    if width <= 0.0 {
+        return None;
+    }
+    let max_loss_per_contract = (width - entry_net_cashflow).max(0.0);
+    Some(-max_loss_per_contract * OPTION_CONTRACT_MULTIPLIER * quantity as f64)
+}
+
+fn option_strike_from_symbol(symbol: &str) -> Option<f64> {
+    let strike = symbol.get(symbol.len().checked_sub(8)?..)?;
+    let strike = strike.parse::<u64>().ok()?;
+    Some(strike as f64 / 1000.0)
+}
+
+fn worst_observed_unclosed_pnl(
+    legs: &[BacktestLeg],
+    path_bars: &BTreeMap<String, Vec<AlpacaOptionBar>>,
+    entry_net_cashflow: f64,
+    premium_kind: &str,
+    quantity: u64,
+) -> Option<f64> {
+    if premium_kind != "credit" || legs.len() != 2 {
+        return None;
+    }
+    let short_leg = legs.iter().find(|leg| matches!(leg.side, LegSide::Short))?;
+    let long_leg = legs.iter().find(|leg| matches!(leg.side, LegSide::Long))?;
+    let short_high = observed_high_close(&short_leg.symbol, path_bars)?;
+    let long_low = observed_low_close(&long_leg.symbol, path_bars)?;
+    let worst_close_debit = (short_high - long_low).max(0.0);
+    let observed_pnl =
+        (entry_net_cashflow - worst_close_debit) * OPTION_CONTRACT_MULTIPLIER * quantity as f64;
+    let max_loss_pnl = conservative_credit_spread_pnl(legs, entry_net_cashflow, quantity)?;
+    Some(observed_pnl.max(max_loss_pnl))
+}
+
+fn observed_high_close(
+    symbol: &str,
+    path_bars: &BTreeMap<String, Vec<AlpacaOptionBar>>,
+) -> Option<f64> {
+    path_bars
+        .get(symbol)?
+        .iter()
+        .filter_map(|bar| bar.close.filter(|value| *value > 0.0))
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+fn observed_low_close(
+    symbol: &str,
+    path_bars: &BTreeMap<String, Vec<AlpacaOptionBar>>,
+) -> Option<f64> {
+    path_bars
+        .get(symbol)?
+        .iter()
+        .filter_map(|bar| bar.close.filter(|value| *value > 0.0))
+        .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+}
+
 fn select_exit_plan(
     legs: &[BacktestLeg],
     path_bars: &BTreeMap<String, Vec<AlpacaOptionBar>>,
-    _path_trades: &BTreeMap<String, Vec<AlpacaOptionTrade>>,
+    path_trades: &BTreeMap<String, Vec<AlpacaOptionTrade>>,
     entry_timestamp: &str,
     fallback_exit_timestamp: &str,
     entry_net_cashflow: f64,
@@ -768,7 +1106,32 @@ fn select_exit_plan(
         }
         fallback = Some(plan);
     }
-    fallback
+    fallback.or_else(|| {
+        nearest_exit_fallback_plan(legs, path_bars, path_trades, fallback_exit_timestamp)
+    })
+}
+
+fn nearest_exit_fallback_plan(
+    legs: &[BacktestLeg],
+    path_bars: &BTreeMap<String, Vec<AlpacaOptionBar>>,
+    path_trades: &BTreeMap<String, Vec<AlpacaOptionTrade>>,
+    fallback_exit_timestamp: &str,
+) -> Option<ExitPlan> {
+    let mut marks = BTreeMap::new();
+    for leg in legs {
+        let mark = historical_mark_near(&leg.symbol, path_bars, path_trades, fallback_exit_timestamp)?;
+        let timestamp = mark.timestamp.as_deref()?;
+        let distance = timestamp_distance_secs(timestamp, fallback_exit_timestamp)?;
+        if distance > EXIT_FALLBACK_MAX_DISTANCE_SECS {
+            return None;
+        }
+        marks.insert(leg.symbol.clone(), mark);
+    }
+    Some(ExitPlan {
+        timestamp: fallback_exit_timestamp.to_string(),
+        reason: "nearest_exit_fallback".to_string(),
+        marks,
+    })
 }
 
 fn common_bar_timestamps(
@@ -795,6 +1158,48 @@ fn common_bar_timestamps(
         .into_iter()
         .filter_map(|(timestamp, count)| (count == legs.len()).then_some(timestamp))
         .collect()
+}
+
+fn common_bar_timestamps_in_window(
+    legs: &[BacktestLeg],
+    path_bars: &BTreeMap<String, Vec<AlpacaOptionBar>>,
+    entry_timestamp: &str,
+    fallback_exit_timestamp: &str,
+) -> Vec<String> {
+    common_bar_timestamps(legs, path_bars)
+        .into_iter()
+        .filter(|timestamp| {
+            timestamp.as_str() >= entry_timestamp && timestamp.as_str() <= fallback_exit_timestamp
+        })
+        .collect()
+}
+
+fn exit_bar_counts_by_leg(
+    legs: &[BacktestLeg],
+    path_bars: &BTreeMap<String, Vec<AlpacaOptionBar>>,
+    entry_timestamp: &str,
+    fallback_exit_timestamp: &str,
+) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for leg in legs {
+        let count = path_bars
+            .get(&leg.symbol)
+            .map(|bars| {
+                bars.iter()
+                    .filter(|bar| {
+                        bar.timestamp
+                            .as_deref()
+                            .is_some_and(|timestamp| {
+                                timestamp >= entry_timestamp && timestamp <= fallback_exit_timestamp
+                            })
+                            && bar.close.is_some_and(|value| value > 0.0)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        counts.insert(leg.symbol.clone(), count);
+    }
+    counts
 }
 
 fn bar_marks_at_timestamp(
@@ -1584,7 +1989,11 @@ async fn load_trading_dates(
     Ok(dates)
 }
 
-fn summarize(days: &[BacktestDay], breakdown_period: BreakdownPeriod) -> BacktestSummary {
+fn summarize(
+    days: &[BacktestDay],
+    breakdown_period: BreakdownPeriod,
+    unclosed_valuation: UnclosedValuation,
+) -> BacktestSummary {
     let mut summary = BacktestSummary {
         scan_days: days
             .iter()
@@ -1608,15 +2017,36 @@ fn summarize(days: &[BacktestDay], breakdown_period: BreakdownPeriod) -> Backtes
         let Some(trade) = day.selected.as_ref() else {
             continue;
         };
+        let accounted_pnl = accounted_pnl_for_trade(trade, unclosed_valuation);
         summary.selected_trades += 1;
         period_summary.selected_trades += 1;
+        update_risk_metrics(&mut summary.accounted, accounted_pnl);
+        update_risk_metrics(&mut period_summary.accounted, accounted_pnl);
+        *summary
+            .by_exit_status
+            .entry(trade.exit_status.clone())
+            .or_insert(0) += 1;
+        *period_summary
+            .by_exit_status
+            .entry(trade.exit_status.clone())
+            .or_insert(0) += 1;
         let strategy = summary.by_strategy.entry(trade.strategy.clone()).or_default();
         strategy.selected_trades += 1;
+        update_risk_metrics(&mut strategy.accounted, accounted_pnl);
+        *strategy
+            .by_exit_status
+            .entry(trade.exit_status.clone())
+            .or_insert(0) += 1;
         let period_strategy = period_summary
             .by_strategy
             .entry(trade.strategy.clone())
             .or_default();
         period_strategy.selected_trades += 1;
+        update_risk_metrics(&mut period_strategy.accounted, accounted_pnl);
+        *period_strategy
+            .by_exit_status
+            .entry(trade.exit_status.clone())
+            .or_insert(0) += 1;
         if let Some(pnl) = trade.pnl {
             summary.closed_trades += 1;
             strategy.closed_trades += 1;
@@ -1632,6 +2062,11 @@ fn summarize(days: &[BacktestDay], breakdown_period: BreakdownPeriod) -> Backtes
                 period_summary.winning_trades += 1;
                 period_strategy.winning_trades += 1;
             }
+        } else {
+            summary.unclosed_trades += 1;
+            strategy.unclosed_trades += 1;
+            period_summary.unclosed_trades += 1;
+            period_strategy.unclosed_trades += 1;
         }
     }
 
@@ -1649,20 +2084,71 @@ fn summarize(days: &[BacktestDay], breakdown_period: BreakdownPeriod) -> Backtes
             strategy.average_pnl = strategy.total_pnl / strategy.closed_trades as f64;
             strategy.win_rate = strategy.winning_trades as f64 / strategy.closed_trades as f64;
         }
+        finalize_risk_metrics(&mut strategy.accounted);
     }
     for period in summary.by_period.values_mut() {
         if period.closed_trades > 0 {
             period.average_pnl = period.total_pnl / period.closed_trades as f64;
             period.win_rate = period.winning_trades as f64 / period.closed_trades as f64;
         }
+        finalize_risk_metrics(&mut period.accounted);
         for strategy in period.by_strategy.values_mut() {
             if strategy.closed_trades > 0 {
                 strategy.average_pnl = strategy.total_pnl / strategy.closed_trades as f64;
                 strategy.win_rate = strategy.winning_trades as f64 / strategy.closed_trades as f64;
             }
+            finalize_risk_metrics(&mut strategy.accounted);
         }
     }
+    finalize_risk_metrics(&mut summary.accounted);
     summary
+}
+
+fn accounted_pnl_for_trade(trade: &TradeBacktest, unclosed_valuation: UnclosedValuation) -> f64 {
+    if let Some(pnl) = trade.pnl {
+        return pnl;
+    }
+    match unclosed_valuation {
+        UnclosedValuation::Ignore => 0.0,
+        UnclosedValuation::Conservative => trade.conservative_pnl.unwrap_or(0.0),
+        UnclosedValuation::WorstObserved => trade
+            .worst_observed_pnl
+            .or(trade.conservative_pnl)
+            .unwrap_or(0.0),
+    }
+}
+
+fn update_risk_metrics(metrics: &mut RiskMetrics, pnl: f64) {
+    metrics.trades += 1;
+    metrics.total_pnl += pnl;
+    if pnl > 0.0 {
+        metrics.winning_trades += 1;
+        metrics.gross_profit += pnl;
+    } else if pnl < 0.0 {
+        metrics.losing_trades += 1;
+        metrics.gross_loss += -pnl;
+    }
+    metrics.best_trade = Some(metrics.best_trade.map_or(pnl, |value| value.max(pnl)));
+    metrics.worst_trade = Some(metrics.worst_trade.map_or(pnl, |value| value.min(pnl)));
+    metrics.equity += pnl;
+    metrics.peak_equity = metrics.peak_equity.max(metrics.equity);
+    metrics.max_drawdown = metrics.max_drawdown.max(metrics.peak_equity - metrics.equity);
+}
+
+fn finalize_risk_metrics(metrics: &mut RiskMetrics) {
+    if metrics.trades == 0 {
+        return;
+    }
+    metrics.average_pnl = metrics.total_pnl / metrics.trades as f64;
+    metrics.expectancy = metrics.average_pnl;
+    metrics.win_rate = metrics.winning_trades as f64 / metrics.trades as f64;
+    metrics.profit_factor = if metrics.gross_loss > 0.0 {
+        Some(metrics.gross_profit / metrics.gross_loss)
+    } else if metrics.gross_profit > 0.0 {
+        None
+    } else {
+        Some(0.0)
+    };
 }
 
 fn period_key(trade_date: &str, breakdown_period: BreakdownPeriod) -> String {
@@ -1709,29 +2195,75 @@ fn sweep_variants(args: &Args) -> Vec<SweepVariant> {
             .map(Some)
             .collect()
     };
+    let profit_target_close_fractions = if args.sweep_profit_target_close_fraction.is_empty() {
+        vec![args.profit_target_close_fraction]
+    } else {
+        args.sweep_profit_target_close_fraction
+            .iter()
+            .copied()
+            .map(Some)
+            .collect()
+    };
+    let stop_loss_close_multiples = if args.sweep_stop_loss_close_multiple.is_empty() {
+        vec![args.stop_loss_close_multiple]
+    } else {
+        args.sweep_stop_loss_close_multiple
+            .iter()
+            .copied()
+            .map(Some)
+            .collect()
+    };
+    let max_hold_secs_values = if args.sweep_max_hold_mins.is_empty() {
+        vec![args.max_hold_secs]
+    } else {
+        args.sweep_max_hold_mins
+            .iter()
+            .copied()
+            .map(|value| Some(value * 60))
+            .collect()
+    };
 
     let mut variants = Vec::new();
     for synthetic_spread_pct in synthetic_spreads {
         for short_delta_min in &short_delta_mins {
             for short_delta_max in &short_delta_maxes {
                 for min_return_on_risk in &min_return_on_risks {
-                    let mut label_parts = vec![format!("spread={synthetic_spread_pct:.4}")];
-                    if let Some(value) = short_delta_min {
-                        label_parts.push(format!("short_delta_min={value:.3}"));
+                    for profit_target_close_fraction in &profit_target_close_fractions {
+                        for stop_loss_close_multiple in &stop_loss_close_multiples {
+                            for max_hold_secs in &max_hold_secs_values {
+                                let mut label_parts =
+                                    vec![format!("spread={synthetic_spread_pct:.4}")];
+                                if let Some(value) = short_delta_min {
+                                    label_parts.push(format!("short_delta_min={value:.3}"));
+                                }
+                                if let Some(value) = short_delta_max {
+                                    label_parts.push(format!("short_delta_max={value:.3}"));
+                                }
+                                if let Some(value) = min_return_on_risk {
+                                    label_parts.push(format!("min_ror={value:.3}"));
+                                }
+                                if let Some(value) = profit_target_close_fraction {
+                                    label_parts.push(format!("profit={value:.3}"));
+                                }
+                                if let Some(value) = stop_loss_close_multiple {
+                                    label_parts.push(format!("stop={value:.3}"));
+                                }
+                                if let Some(value) = max_hold_secs {
+                                    label_parts.push(format!("max_hold_mins={}", value / 60));
+                                }
+                                variants.push(SweepVariant {
+                                    label: label_parts.join(","),
+                                    synthetic_spread_pct,
+                                    short_delta_min: *short_delta_min,
+                                    short_delta_max: *short_delta_max,
+                                    min_return_on_risk: *min_return_on_risk,
+                                    profit_target_close_fraction: *profit_target_close_fraction,
+                                    stop_loss_close_multiple: *stop_loss_close_multiple,
+                                    max_hold_secs: *max_hold_secs,
+                                });
+                            }
+                        }
                     }
-                    if let Some(value) = short_delta_max {
-                        label_parts.push(format!("short_delta_max={value:.3}"));
-                    }
-                    if let Some(value) = min_return_on_risk {
-                        label_parts.push(format!("min_ror={value:.3}"));
-                    }
-                    variants.push(SweepVariant {
-                        label: label_parts.join(","),
-                        synthetic_spread_pct,
-                        short_delta_min: *short_delta_min,
-                        short_delta_max: *short_delta_max,
-                        min_return_on_risk: *min_return_on_risk,
-                    });
                 }
             }
         }
@@ -1741,6 +2273,9 @@ fn sweep_variants(args: &Args) -> Vec<SweepVariant> {
         && args.sweep_short_delta_min.is_empty()
         && args.sweep_short_delta_max.is_empty()
         && args.sweep_min_return_on_risk.is_empty()
+        && args.sweep_profit_target_close_fraction.is_empty()
+        && args.sweep_stop_loss_close_multiple.is_empty()
+        && args.sweep_max_hold_mins.is_empty()
     {
         variants[0].label = "base".to_string();
     }
@@ -1779,6 +2314,15 @@ fn apply_sweep_variant(config: &mut OptionsEngineConfig, variant: &SweepVariant)
         config.iron_condor_scanner.credit.min_return_on_risk = value;
         config.iron_condor_scanner.min_return_on_risk = value;
     }
+    if let Some(value) = variant.profit_target_close_fraction {
+        config.profit_target_close_fraction = value;
+    }
+    if let Some(value) = variant.stop_loss_close_multiple {
+        config.stop_loss_close_multiple = value;
+    }
+    if let Some(value) = variant.max_hold_secs {
+        config.max_hold_secs = value;
+    }
 }
 
 fn apply_backtest_overrides(config: &mut OptionsEngineConfig, args: &Args) -> anyhow::Result<()> {
@@ -1793,6 +2337,21 @@ fn apply_backtest_overrides(config: &mut OptionsEngineConfig, args: &Args) -> an
             bail!("--quantity must be greater than zero");
         }
         config.quantity = quantity;
+    }
+    if let Some(value) = args.profit_target_close_fraction {
+        if value <= 0.0 {
+            bail!("--profit-target-close-fraction must be greater than zero");
+        }
+        config.profit_target_close_fraction = value;
+    }
+    if let Some(value) = args.stop_loss_close_multiple {
+        if value < 0.0 {
+            bail!("--stop-loss-close-multiple cannot be negative");
+        }
+        config.stop_loss_close_multiple = value;
+    }
+    if let Some(value) = args.max_hold_secs {
+        config.max_hold_secs = value;
     }
     if let Some(strategies) = args.strategies.as_ref() {
         config.spread_kinds.clear();
@@ -1895,7 +2454,18 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut sweep_short_delta_min = Vec::new();
     let mut sweep_short_delta_max = Vec::new();
     let mut sweep_min_return_on_risk = Vec::new();
+    let mut profit_target_close_fraction = None;
+    let mut stop_loss_close_multiple = None;
+    let mut max_hold_secs = None;
+    let mut sweep_profit_target_close_fraction = Vec::new();
+    let mut sweep_stop_loss_close_multiple = Vec::new();
+    let mut sweep_max_hold_mins = Vec::new();
     let mut breakdown_period = BreakdownPeriod::Month;
+    let mut unclosed_valuation = UnclosedValuation::Ignore;
+    let mut min_exit_leg_bars = 0;
+    let mut require_exit_common_timestamp = false;
+    let mut trade_export_csv = None;
+    let mut trade_export_json = None;
     let mut quantity = None;
     let mut json_output = false;
 
@@ -1971,9 +2541,74 @@ fn parse_args() -> anyhow::Result<Args> {
                 sweep_min_return_on_risk =
                     parse_float_csv(next_value(&mut iter, "--sweep-min-return-on-risk")?)?;
             }
+            "--profit-target-close-fraction" => {
+                let value = next_value(&mut iter, "--profit-target-close-fraction")?
+                    .parse::<f64>()
+                    .context("--profit-target-close-fraction must be a decimal")?;
+                if value <= 0.0 {
+                    bail!("--profit-target-close-fraction must be greater than zero");
+                }
+                profit_target_close_fraction = Some(value);
+            }
+            "--stop-loss-close-multiple" => {
+                let value = next_value(&mut iter, "--stop-loss-close-multiple")?
+                    .parse::<f64>()
+                    .context("--stop-loss-close-multiple must be a decimal")?;
+                if value < 0.0 {
+                    bail!("--stop-loss-close-multiple cannot be negative");
+                }
+                stop_loss_close_multiple = Some(value);
+            }
+            "--max-hold-mins" => {
+                max_hold_secs = Some(
+                    next_value(&mut iter, "--max-hold-mins")?
+                        .parse::<u64>()
+                        .context("--max-hold-mins must be a non-negative integer")?
+                        * 60,
+                );
+            }
+            "--max-hold-secs" => {
+                max_hold_secs = Some(
+                    next_value(&mut iter, "--max-hold-secs")?
+                        .parse::<u64>()
+                        .context("--max-hold-secs must be a non-negative integer")?,
+                );
+            }
+            "--sweep-profit-target-close-fraction" => {
+                sweep_profit_target_close_fraction = parse_float_csv(next_value(
+                    &mut iter,
+                    "--sweep-profit-target-close-fraction",
+                )?)?;
+            }
+            "--sweep-stop-loss-close-multiple" => {
+                sweep_stop_loss_close_multiple =
+                    parse_float_csv(next_value(&mut iter, "--sweep-stop-loss-close-multiple")?)?;
+            }
+            "--sweep-max-hold-mins" => {
+                sweep_max_hold_mins =
+                    parse_u64_csv(next_value(&mut iter, "--sweep-max-hold-mins")?)?;
+            }
             "--breakdown-period" => {
                 breakdown_period =
                     parse_breakdown_period(&next_value(&mut iter, "--breakdown-period")?)?;
+            }
+            "--unclosed-valuation" | "--unresolved-exit-policy" => {
+                unclosed_valuation =
+                    parse_unclosed_valuation(&next_value(&mut iter, "--unclosed-valuation")?)?;
+            }
+            "--min-exit-leg-bars" => {
+                min_exit_leg_bars = next_value(&mut iter, "--min-exit-leg-bars")?
+                    .parse::<usize>()
+                    .context("--min-exit-leg-bars must be a non-negative integer")?;
+            }
+            "--require-exit-common-timestamp" => {
+                require_exit_common_timestamp = true;
+            }
+            "--trade-export" | "--trade-export-csv" => {
+                trade_export_csv = Some(next_value(&mut iter, "--trade-export-csv")?);
+            }
+            "--trade-export-json" => {
+                trade_export_json = Some(next_value(&mut iter, "--trade-export-json")?);
             }
             "--quantity" | "--qty" => {
                 quantity = Some(
@@ -2011,7 +2646,18 @@ fn parse_args() -> anyhow::Result<Args> {
         sweep_short_delta_min,
         sweep_short_delta_max,
         sweep_min_return_on_risk,
+        profit_target_close_fraction,
+        stop_loss_close_multiple,
+        max_hold_secs,
+        sweep_profit_target_close_fraction,
+        sweep_stop_loss_close_multiple,
+        sweep_max_hold_mins,
         breakdown_period,
+        unclosed_valuation,
+        min_exit_leg_bars,
+        require_exit_common_timestamp,
+        trade_export_csv,
+        trade_export_json,
         quantity,
         json_output,
     })
@@ -2036,6 +2682,17 @@ fn parse_breakdown_period(value: &str) -> anyhow::Result<BreakdownPeriod> {
         "quarter" | "quarterly" => Ok(BreakdownPeriod::Quarter),
         "year" | "yearly" | "annual" | "annually" => Ok(BreakdownPeriod::Year),
         _ => bail!("--breakdown-period must be one of day, week, month, quarter, year"),
+    }
+}
+
+fn parse_unclosed_valuation(value: &str) -> anyhow::Result<UnclosedValuation> {
+    match value.to_ascii_lowercase().as_str() {
+        "ignore" | "none" => Ok(UnclosedValuation::Ignore),
+        "conservative" | "max_loss" | "max-loss" | "pessimistic" => {
+            Ok(UnclosedValuation::Conservative)
+        }
+        "worst_observed" | "worst-observed" | "observed" => Ok(UnclosedValuation::WorstObserved),
+        _ => bail!("--unclosed-valuation must be one of ignore, conservative, worst_observed"),
     }
 }
 
@@ -2067,13 +2724,166 @@ fn parse_float_csv(value: String) -> anyhow::Result<Vec<f64>> {
         .collect()
 }
 
+fn parse_u64_csv(value: String) -> anyhow::Result<Vec<u64>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .with_context(|| format!("invalid integer sweep value {value}"))
+        })
+        .collect()
+}
+
+fn trade_export_records(reports: &[BacktestReport]) -> Vec<TradeExportRecord> {
+    let mut records = Vec::new();
+    for report in reports {
+        for day in &report.days {
+            let Some(trade) = day.selected.as_ref() else {
+                continue;
+            };
+            records.push(TradeExportRecord {
+                variant: report.variant.clone(),
+                strategy: trade.strategy.clone(),
+                underlying: trade.underlying.clone(),
+                trade_date: trade.trade_date.clone(),
+                entry_timestamp: trade.entry_timestamp.clone(),
+                exit_timestamp: trade.exit_timestamp.clone(),
+                quantity: trade.quantity,
+                score: trade.score,
+                premium_kind: trade.premium_kind.clone(),
+                entry_premium: trade.entry_premium,
+                entry_net_cashflow: trade.entry_net_cashflow,
+                exit_net_cashflow: trade.exit_net_cashflow,
+                pnl: trade.pnl,
+                conservative_pnl: trade.conservative_pnl,
+                conservative_status: trade.conservative_status.clone(),
+                worst_observed_pnl: trade.worst_observed_pnl,
+                worst_observed_status: trade.worst_observed_status.clone(),
+                accounted_pnl: accounted_pnl_for_trade(trade, report_unclosed_valuation(report)),
+                closed: trade.closed,
+                exit_status: trade.exit_status.clone(),
+                exit_diagnostic: trade.exit_diagnostic.clone(),
+                exit_missing_leg_symbols: trade.exit_missing_leg_symbols.clone(),
+                exit_bar_counts: trade.exit_bar_counts.clone(),
+                exit_common_timestamps: trade.exit_common_timestamps,
+                legs: trade.legs.clone(),
+            });
+        }
+    }
+    records
+}
+
+fn report_unclosed_valuation(report: &BacktestReport) -> UnclosedValuation {
+    match report.unclosed_valuation {
+        "conservative" => UnclosedValuation::Conservative,
+        "worst_observed" => UnclosedValuation::WorstObserved,
+        _ => UnclosedValuation::Ignore,
+    }
+}
+
+fn write_trade_json_export(path: &str, reports: &[BacktestReport]) -> anyhow::Result<()> {
+    let records = trade_export_records(reports);
+    let file = File::create(path).with_context(|| format!("failed to create {path}"))?;
+    serde_json::to_writer_pretty(file, &records)
+        .with_context(|| format!("failed to write JSON trade export {path}"))
+}
+
+fn write_trade_csv_export(path: &str, reports: &[BacktestReport]) -> anyhow::Result<()> {
+    let records = trade_export_records(reports);
+    let mut file = File::create(path).with_context(|| format!("failed to create {path}"))?;
+    writeln!(
+        file,
+        "variant,strategy,underlying,trade_date,entry_timestamp,exit_timestamp,quantity,score,premium_kind,entry_premium,entry_net_cashflow,exit_net_cashflow,pnl,conservative_pnl,conservative_status,worst_observed_pnl,worst_observed_status,accounted_pnl,closed,exit_status,exit_diagnostic,exit_missing_leg_symbols,exit_bar_counts,exit_common_timestamps,legs"
+    )?;
+    for record in records {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{:.4},{},{:.4},{:.4},{},{},{},{},{},{:.2},{},{},{},{},{},{},{},{}",
+            csv_cell(&record.variant),
+            csv_cell(&record.strategy),
+            csv_cell(&record.underlying),
+            csv_cell(&record.trade_date),
+            csv_cell(&record.entry_timestamp),
+            csv_cell(&record.exit_timestamp),
+            record.quantity,
+            record.score,
+            csv_cell(&record.premium_kind),
+            record.entry_premium,
+            record.entry_net_cashflow,
+            record
+                .exit_net_cashflow
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_default(),
+            record.pnl.map(|value| format!("{value:.2}")).unwrap_or_default(),
+            record
+                .conservative_pnl
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_default(),
+            csv_cell(record.conservative_status.as_deref().unwrap_or_default()),
+            record
+                .worst_observed_pnl
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_default(),
+            csv_cell(record.worst_observed_status.as_deref().unwrap_or_default()),
+            record.accounted_pnl,
+            record.closed,
+            csv_cell(&record.exit_status),
+            csv_cell(&record.exit_diagnostic),
+            csv_cell(&record.exit_missing_leg_symbols.join("|")),
+            csv_cell(&format_exit_bar_counts(&record.exit_bar_counts)),
+            record.exit_common_timestamps,
+            csv_cell(&format_legs(&record.legs)),
+        )?;
+    }
+    Ok(())
+}
+
+fn format_exit_bar_counts(counts: &BTreeMap<String, usize>) -> String {
+    counts
+        .iter()
+        .map(|(symbol, count)| format!("{symbol}:{count}"))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn format_legs(legs: &[BacktestLeg]) -> String {
+    legs.iter()
+        .map(|leg| {
+            format!(
+                "{}:{}:entry={}:exit={}",
+                leg.symbol,
+                leg.side.as_str(),
+                leg.entry_close
+                    .map(|value| format!("{value:.4}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                leg.exit_close
+                    .map(|value| format!("{value:.4}"))
+                    .unwrap_or_else(|| "-".to_string()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn csv_cell(value: &str) -> String {
+    if value.contains(|ch| matches!(ch, ',' | '"' | '\n' | '\r')) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 fn print_report(report: &BacktestReport) {
     println!(
-        "Alpaca options strategy backtest variant={} {} -> {} period={} entry={} exit={} strategies={} underlyings={} mark_source={}",
+        "Alpaca options strategy backtest variant={} {} -> {} period={} unclosed_valuation={} entry={} exit={} strategies={} underlyings={} mark_source={}",
         report.variant,
         report.start,
         report.end,
         report.breakdown_period,
+        report.unclosed_valuation,
         report.entry_time,
         report.exit_time,
         report.strategies.join(","),
@@ -2081,46 +2891,70 @@ fn print_report(report: &BacktestReport) {
         report.mark_source,
     );
     println!(
-        "summary scan_days={} underlying_days={} selected={} closed={} wins={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2}",
+        "summary scan_days={} underlying_days={} selected={} closed={} unclosed={} wins={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2} accounted_pnl={:.2} accounted_avg={:.2} accounted_win_rate={:.1}% profit_factor={} max_dd={:.2} worst_trade={}",
         report.summary.scan_days,
         report.summary.evaluated_underlying_days,
         report.summary.selected_trades,
         report.summary.closed_trades,
+        report.summary.unclosed_trades,
         report.summary.winning_trades,
         report.summary.win_rate * 100.0,
         report.summary.total_pnl,
         report.summary.average_pnl,
+        report.summary.accounted.total_pnl,
+        report.summary.accounted.average_pnl,
+        report.summary.accounted.win_rate * 100.0,
+        report
+            .summary
+            .accounted
+            .profit_factor
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "inf".to_string()),
+        report.summary.accounted.max_drawdown,
+        report
+            .summary
+            .accounted
+            .worst_trade
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "-".to_string()),
     );
     for (strategy, summary) in &report.summary.by_strategy {
         println!(
-            "strategy={} selected={} closed={} wins={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2}",
+            "strategy={} selected={} closed={} unclosed={} wins={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2}",
             strategy,
             summary.selected_trades,
             summary.closed_trades,
+            summary.unclosed_trades,
             summary.winning_trades,
             summary.win_rate * 100.0,
             summary.total_pnl,
             summary.average_pnl,
         );
     }
+    for (status, count) in &report.summary.by_exit_status {
+        println!("exit_status={} count={}", status, count);
+    }
     for (period, summary) in &report.summary.by_period {
         println!(
-            "period={} scan_days={} underlying_days={} selected={} closed={} wins={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2}",
+            "period={} scan_days={} underlying_days={} selected={} closed={} unclosed={} wins={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2} accounted_pnl={:.2} max_dd={:.2}",
             period,
             summary.scan_days,
             summary.evaluated_underlying_days,
             summary.selected_trades,
             summary.closed_trades,
+            summary.unclosed_trades,
             summary.winning_trades,
             summary.win_rate * 100.0,
             summary.total_pnl,
             summary.average_pnl,
+            summary.accounted.total_pnl,
+            summary.accounted.max_drawdown,
         );
     }
     for day in &report.days {
         if let Some(trade) = &day.selected {
             println!(
-                "trade date={} underlying={} strategy={} score={:.1} premium={} {:.2} pnl={} status={}",
+                "trade date={} underlying={} strategy={} score={:.1} premium={} {:.2} pnl={} status={} diagnostic={}",
                 trade.trade_date,
                 trade.underlying,
                 trade.strategy,
@@ -2129,6 +2963,7 @@ fn print_report(report: &BacktestReport) {
                 trade.entry_premium,
                 trade.pnl.map(|pnl| format!("{pnl:.2}")).unwrap_or_else(|| "-".to_string()),
                 trade.exit_status,
+                trade.exit_diagnostic,
             );
         }
     }
@@ -2146,26 +2981,37 @@ fn print_sweep_report(reports: &[BacktestReport]) {
     });
     for report in ranked {
         println!(
-            "variant={} selected={} closed={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2}",
+            "variant={} selected={} closed={} unclosed={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2} accounted_pnl={:.2} profit_factor={} max_dd={:.2}",
             report.variant,
             report.summary.selected_trades,
             report.summary.closed_trades,
+            report.summary.unclosed_trades,
             report.summary.win_rate * 100.0,
             report.summary.total_pnl,
             report.summary.average_pnl,
+            report.summary.accounted.total_pnl,
+            report
+                .summary
+                .accounted
+                .profit_factor
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "inf".to_string()),
+            report.summary.accounted.max_drawdown,
         );
         for (period, summary) in &report.summary.by_period {
             if summary.selected_trades == 0 && summary.closed_trades == 0 {
                 continue;
             }
             println!(
-                "  period={} selected={} closed={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2}",
+                "  period={} selected={} closed={} unclosed={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2} accounted_pnl={:.2}",
                 period,
                 summary.selected_trades,
                 summary.closed_trades,
+                summary.unclosed_trades,
                 summary.win_rate * 100.0,
                 summary.total_pnl,
                 summary.average_pnl,
+                summary.accounted.total_pnl,
             );
         }
     }
@@ -2173,6 +3019,6 @@ fn print_sweep_report(reports: &[BacktestReport]) {
 
 fn print_usage() {
     println!(
-        "Usage: alpaca-options-backtest --start YYYY-MM-DD --end YYYY-MM-DD [--entry-time HH:MM] [--exit-time HH:MM] [--underlyings SPY,QQQ] [--strategies put_credit,call_credit,iron_condor,call_debit,put_debit,naked_call,naked_put] [--timeframe 1Min] [--option-feed indicative] [--stock-feed iex] [--assumed-iv 0.35] [--synthetic-spread-pct 0.05] [--entry-mark-window-mins 10] [--historical-min-open-interest 0] [--missing-open-interest 0] [--historical-max-leg-spread-pct 0.80] [--sweep-synthetic-spread-pct 0.03,0.05,0.08] [--sweep-short-delta-min 0.10,0.15] [--sweep-short-delta-max 0.20,0.25] [--sweep-min-return-on-risk 0.04,0.08,0.13] [--breakdown-period day|week|month|quarter|year] [--quantity 1] [--json]"
+        "Usage: alpaca-options-backtest --start YYYY-MM-DD --end YYYY-MM-DD [--entry-time HH:MM] [--exit-time HH:MM] [--underlyings SPY,QQQ] [--strategies put_credit,call_credit,iron_condor,call_debit,put_debit,naked_call,naked_put] [--timeframe 1Min] [--option-feed indicative] [--stock-feed iex] [--assumed-iv 0.35] [--synthetic-spread-pct 0.05] [--entry-mark-window-mins 10] [--historical-min-open-interest 0] [--missing-open-interest 0] [--historical-max-leg-spread-pct 0.80] [--profit-target-close-fraction 0.50] [--stop-loss-close-multiple 2.00] [--max-hold-mins 180] [--sweep-synthetic-spread-pct 0.03,0.05,0.08] [--sweep-short-delta-min 0.10,0.15] [--sweep-short-delta-max 0.20,0.25] [--sweep-min-return-on-risk 0.04,0.08,0.13] [--sweep-profit-target-close-fraction 0.35,0.50] [--sweep-stop-loss-close-multiple 1.50,2.00] [--sweep-max-hold-mins 120,240] [--breakdown-period day|week|month|quarter|year] [--unclosed-valuation ignore|conservative|worst_observed] [--min-exit-leg-bars 10] [--require-exit-common-timestamp] [--trade-export-csv trades.csv] [--trade-export-json trades.json] [--quantity 1] [--json]"
     );
 }
