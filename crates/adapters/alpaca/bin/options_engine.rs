@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     if args.iter().any(|arg| arg == "--check-config") {
         let config = OptionsEngineConfig::from_runtime_env()?;
         println!(
-            "alpaca_options_engine_config: underlyings={} strategies={} dry_run_strategies={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_dir={} candidate_ledger_max_candidates={}",
+            "alpaca_options_engine_config: underlyings={} strategies={} dry_run_strategies={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_max_candidates={}",
             config.underlyings.join(","),
             config.enabled_strategy_names().join(","),
             config.dry_run_strategy_names().join(","),
@@ -60,7 +60,6 @@ async fn main() -> anyhow::Result<()> {
             config.interval_secs,
             config.state_path.display(),
             config.candidate_ledger_enabled,
-            config.candidate_ledger_dir.display(),
             config.candidate_ledger_max_candidates,
         );
         return Ok(());

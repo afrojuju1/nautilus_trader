@@ -24,7 +24,6 @@ use serde_json::{Map, Value, json};
 #[cfg(feature = "live")]
 use crate::storage::{self, StorageRepository};
 use crate::{
-    candidate_ledger::append_candidate_ledger_record,
     config::AlpacaDataClientConfig,
     fleet::ResolvedFleetConfig,
     http::client::AlpacaHttpClient,
@@ -166,8 +165,6 @@ pub struct OptionsEngineConfig {
     pub state_path: PathBuf,
     /// Whether scanner evidence should be written to the candidate ledger.
     pub candidate_ledger_enabled: bool,
-    /// Directory for append-only candidate-ledger JSONL files.
-    pub candidate_ledger_dir: PathBuf,
     /// Maximum ranked candidates to write per scanner result. `0` means all candidates.
     pub candidate_ledger_max_candidates: usize,
     /// Credit scanner config.
@@ -232,7 +229,7 @@ impl OptionsEngineConfig {
         Ok(config)
     }
 
-    /// Builds config from TOML config, CLI underlyings, and optional Postgres persistence.
+    /// Builds config from TOML config, CLI underlyings, and required Postgres persistence.
     ///
     /// # Errors
     ///
@@ -243,7 +240,7 @@ impl OptionsEngineConfig {
         Ok(config)
     }
 
-    /// Builds config without positional CLI underlyings and optional Postgres persistence.
+    /// Builds config without positional CLI underlyings and required Postgres persistence.
     ///
     /// # Errors
     ///
@@ -255,9 +252,8 @@ impl OptionsEngineConfig {
     }
 
     async fn connect_storage_from_env(&mut self) -> anyhow::Result<()> {
-        let Some(database_url) = env::var("ALPACA_STORAGE_DATABASE_URL").ok() else {
-            return Ok(());
-        };
+        let database_url = env::var("ALPACA_STORAGE_DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("ALPACA_STORAGE_DATABASE_URL is required"))?;
         let schema = env::var("ALPACA_STORAGE_SCHEMA")
             .unwrap_or_else(|_| storage::STORAGE_SCHEMA_DEFAULT.to_string());
         let repository = Arc::new(
@@ -334,43 +330,32 @@ impl OptionsEngineConfig {
         if !self.candidate_ledger_enabled {
             return;
         }
-        if let Some(storage) = &self.storage_repository {
-            if let Err(error) = storage::append_candidate_ledger_record(
-                storage,
-                self.storage_account_id(),
-                trade_date,
-                record_type,
-                payload,
-            )
-            .await
-            {
-                emit_operator_event(
-                    "candidate_ledger_error",
-                    json!({
-                        "reason": "append_failed",
-                        "record_type": record_type,
-                        "trade_date": trade_date,
-                        "ledger_dir": self.candidate_ledger_dir.display().to_string(),
-                        "error": error.to_string(),
-                    }),
-                );
-            }
+        let Some(storage) = &self.storage_repository else {
+            emit_operator_event(
+                "candidate_ledger_error",
+                json!({
+                    "reason": "storage_not_connected",
+                    "record_type": record_type,
+                    "trade_date": trade_date,
+                }),
+            );
             return;
-        }
-        if let Err(error) = append_candidate_ledger_record(
-            &self.candidate_ledger_dir,
+        };
+        if let Err(error) = storage::append_candidate_ledger_record(
+            storage,
+            self.storage_account_id(),
             trade_date,
-            self.fleet_account_id.as_deref(),
             record_type,
             payload,
-        ) {
+        )
+        .await
+        {
             emit_operator_event(
                 "candidate_ledger_error",
                 json!({
                     "reason": "append_failed",
                     "record_type": record_type,
                     "trade_date": trade_date,
-                    "ledger_dir": self.candidate_ledger_dir.display().to_string(),
                     "error": error.to_string(),
                 }),
             );

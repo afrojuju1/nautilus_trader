@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Alpaca options performance report from strategy state, candidate ledgers, and broker fills.
+//! Alpaca options performance report from strategy state, Postgres candidate ledgers, and broker fills.
 
 use std::{
     collections::BTreeSet,
@@ -139,7 +139,6 @@ async fn main() -> anyhow::Result<()> {
         checked_at_utc: Utc::now().to_rfc3339(),
         account_id: config.fleet_account_id.clone(),
         state_path: config.state_path.display().to_string(),
-        candidate_ledger_dir: config.candidate_ledger_dir.display().to_string(),
         opportunities,
         ledger_summary,
         candidate_outcomes,

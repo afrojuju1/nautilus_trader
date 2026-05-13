@@ -12,7 +12,6 @@ use chrono_tz::Tz;
 use serde::Deserialize;
 
 use crate::{
-    candidate_ledger::default_candidate_ledger_dir,
     fleet::load_fleet_config_from_env,
     runtime::StrategyState,
     storage::STORAGE_SCHEMA_DEFAULT,
@@ -82,7 +81,6 @@ struct RuntimeSection {
     ignore_entry_window: Option<bool>,
     state_path: Option<PathBuf>,
     candidate_ledger_enabled: Option<bool>,
-    candidate_ledger_dir: Option<PathBuf>,
     candidate_ledger_max_candidates: Option<usize>,
 }
 
@@ -104,7 +102,6 @@ impl RuntimeSection {
             candidate_ledger_enabled: self
                 .candidate_ledger_enabled
                 .or(parent.candidate_ledger_enabled),
-            candidate_ledger_dir: self.candidate_ledger_dir.or(parent.candidate_ledger_dir),
             candidate_ledger_max_candidates: self
                 .candidate_ledger_max_candidates
                 .or(parent.candidate_ledger_max_candidates),
@@ -551,7 +548,6 @@ pub(super) fn build_options_engine_config(
             .or(file.runtime.state_path)
             .unwrap_or_else(default_state_path),
         candidate_ledger_enabled: file.runtime.candidate_ledger_enabled.unwrap_or(true),
-        candidate_ledger_dir: file.runtime.candidate_ledger_dir.unwrap_or_default(),
         candidate_ledger_max_candidates: file.runtime.candidate_ledger_max_candidates.unwrap_or(10),
         iron_condor_scanner: iron_condor_scanner_config_from_file(&scanner, &file.iron_condor),
         debit_scanner: debit_scanner_config_from_file(&file.debit_scanner),
@@ -567,10 +563,6 @@ pub(super) fn build_options_engine_config(
         storage_account_id: None,
     };
     apply_fleet_policy(&mut config);
-    if config.candidate_ledger_dir.as_os_str().is_empty() {
-        config.candidate_ledger_dir =
-            default_candidate_ledger_dir(&config.state_path, config.fleet_account_id.as_deref());
-    }
     Ok(config)
 }
 
@@ -1224,7 +1216,6 @@ close = true
 kill_switch = true
 state_path = "/tmp/alpaca-state.json"
 candidate_ledger_enabled = true
-candidate_ledger_dir = "/tmp/candidate-ledger"
 candidate_ledger_max_candidates = 7
 
 [universe]
@@ -1337,10 +1328,6 @@ expiration_exit_days = 2
         assert_eq!(config.runtime.strategies, vec!["put", "iron_condor"]);
         assert_eq!(config.runtime.dry_run_strategies, vec!["iron_condor"]);
         assert_eq!(config.runtime.candidate_ledger_enabled, Some(true));
-        assert_eq!(
-            config.runtime.candidate_ledger_dir,
-            Some(PathBuf::from("/tmp/candidate-ledger")),
-        );
         assert_eq!(config.runtime.candidate_ledger_max_candidates, Some(7));
         assert_eq!(config.universe.underlyings, vec!["SPY", "QQQ"]);
         assert_eq!(config.scanner.widths, Some(vec![2.0, 5.0]));

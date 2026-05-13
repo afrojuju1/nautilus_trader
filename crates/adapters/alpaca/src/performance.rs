@@ -15,30 +15,22 @@
 
 //! Alpaca options performance accounting from local strategy state and broker fills.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use serde::Serialize;
-use serde_json::{Map, Value};
 
 use crate::{
     http::models::{AlpacaActivity, AlpacaPosition},
-    options_runtime::OptionsEngineConfig,
     runtime::StrategyStateEntry,
 };
 
 mod candidate_outcomes;
-mod jsonl;
 
 pub use candidate_outcomes::{
     collect_order_ids, earliest_entry_timestamp, entry_in_date_range, entry_performance,
-    performance_record_key, summarize_candidate_ledger, summarize_performance,
-    track_candidate_outcomes,
+    performance_record_key, summarize_performance, track_candidate_outcomes,
 };
-use jsonl::{append_deduped_jsonl_record, scan_jsonl_records};
 
 /// Standard OCC equity-option contract multiplier.
 pub const OPTION_CONTRACT_MULTIPLIER: f64 = 100.0;
@@ -46,7 +38,7 @@ pub const OPTION_CONTRACT_MULTIPLIER: f64 = 100.0;
 /// Current performance-ledger record schema version.
 pub const PERFORMANCE_LEDGER_SCHEMA_VERSION: u64 = 1;
 
-/// Default maximum number of candidates to track per candidate-ledger file.
+/// Default maximum number of candidates to track per candidate-ledger scan result.
 pub const DEFAULT_CANDIDATE_OUTCOME_MAX_CANDIDATES: usize = 100;
 
 /// Default maximum candidate rank to include in candidate-outcome tracking.
@@ -55,11 +47,11 @@ pub const DEFAULT_CANDIDATE_OUTCOME_MAX_RANK: u64 = 3;
 /// Candidate-ledger counts used to audit opportunity history.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CandidateLedgerSummary {
-    /// Whether the candidate-ledger directory is missing.
+    /// Whether the candidate-ledger storage is missing.
     pub missing: bool,
-    /// Candidate-ledger directory.
+    /// Candidate-ledger storage location.
     pub directory: String,
-    /// Number of JSONL files included.
+    /// Number of trade dates included.
     pub files: usize,
     /// Trade dates included.
     pub dates: Vec<String>,
@@ -79,7 +71,7 @@ pub struct CandidateLedgerSummary {
     pub selected_candidates: usize,
     /// High-score candidate-alert records.
     pub high_score_candidates: usize,
-    /// JSON parse errors encountered while reading ledger lines.
+    /// Parse errors encountered while reading ledger records.
     pub parse_errors: usize,
     /// Record counts by `type`.
     pub by_type: BTreeMap<String, usize>,
@@ -90,11 +82,11 @@ pub struct CandidateLedgerSummary {
 /// Candidate-outcome counts used to evaluate opportunities after observation.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CandidateOutcomeSummary {
-    /// Whether the candidate-outcome directory is missing.
+    /// Whether the candidate-outcome storage is missing.
     pub missing: bool,
-    /// Candidate-outcome directory.
+    /// Candidate-outcome storage location.
     pub directory: String,
-    /// Number of JSONL files included.
+    /// Number of trade dates included.
     pub files: usize,
     /// Trade dates included.
     pub dates: Vec<String>,
@@ -118,7 +110,7 @@ pub struct CandidateOutcomeSummary {
     pub average_loss: Option<f64>,
     /// Largest losing hypothetical outcome in dollars.
     pub largest_loss: Option<f64>,
-    /// JSON parse errors encountered while reading outcome lines.
+    /// Parse errors encountered while reading outcome records.
     pub parse_errors: usize,
     /// Records containing quote warnings.
     pub records_with_warnings: usize,
@@ -304,8 +296,6 @@ pub struct PerformanceReport {
     pub account_id: Option<String>,
     /// Strategy state path.
     pub state_path: String,
-    /// Candidate-ledger directory.
-    pub candidate_ledger_dir: String,
     /// Candidate-ledger opportunity summary.
     pub opportunities: CandidateLedgerSummary,
     /// Immutable realized-trade ledger summary.
@@ -323,7 +313,7 @@ pub struct PerformanceReport {
 /// Result from appending a performance-ledger record.
 #[derive(Clone, Debug, Serialize)]
 pub struct PerformanceLedgerAppend {
-    /// File path for the ledger date.
+    /// Storage path for the ledger record.
     pub path: String,
     /// Whether a new line was appended.
     pub appended: bool,
@@ -331,14 +321,14 @@ pub struct PerformanceLedgerAppend {
     pub record_key: String,
 }
 
-/// Aggregate realized-trade performance from immutable performance-ledger files.
+/// Aggregate realized-trade performance from immutable performance-ledger records.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct PerformanceLedgerSummary {
-    /// Whether the performance-ledger directory is missing.
+    /// Whether the performance-ledger storage is missing.
     pub missing: bool,
-    /// Performance-ledger directory.
+    /// Performance-ledger storage location.
     pub directory: String,
-    /// Number of JSONL files included.
+    /// Number of ledger dates included.
     pub files: usize,
     /// Ledger dates included.
     pub dates: Vec<String>,
@@ -358,7 +348,7 @@ pub struct PerformanceLedgerSummary {
     pub average_loss: Option<f64>,
     /// Largest losing trade in dollars.
     pub largest_loss: Option<f64>,
-    /// JSON parse errors encountered while reading ledger lines.
+    /// Parse errors encountered while reading ledger records.
     pub parse_errors: usize,
     /// Records containing warnings.
     pub records_with_warnings: usize,
@@ -387,376 +377,6 @@ pub struct PerformanceLedgerBucketSummary {
     pub average_loss: Option<f64>,
     /// Largest losing trade in dollars.
     pub largest_loss: Option<f64>,
-}
-
-/// Returns the default performance-ledger directory for a strategy state file.
-#[must_use]
-pub fn default_performance_ledger_dir(state_path: &Path, account_id: Option<&str>) -> PathBuf {
-    let parent = state_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-
-    let Some(account_id) = account_id else {
-        return parent.join("performance-ledger");
-    };
-    if parent.file_name().and_then(|name| name.to_str()) == Some(account_id) {
-        return parent.join("performance-ledger");
-    }
-    if parent.file_name().and_then(|name| name.to_str()) == Some("alpaca") {
-        return parent.join(account_id).join("performance-ledger");
-    }
-    parent
-        .join("alpaca")
-        .join(account_id)
-        .join("performance-ledger")
-}
-
-/// Returns the default candidate-outcome directory for an account config.
-#[must_use]
-pub fn default_candidate_outcome_dir(config: &OptionsEngineConfig) -> PathBuf {
-    config
-        .candidate_ledger_dir
-        .parent()
-        .map(|path| path.join("candidate-outcomes"))
-        .unwrap_or_else(|| PathBuf::from("candidate-outcomes"))
-}
-
-/// Appends one realized-trade performance record to an append-only JSONL ledger.
-///
-/// If the same record key already exists in the target daily file, no duplicate line is written.
-///
-/// # Errors
-///
-/// Returns an error if the ledger directory cannot be created, an existing file cannot be read,
-/// or the record cannot be serialized or written.
-pub fn append_performance_ledger_record(
-    ledger_dir: &Path,
-    ledger_date: &str,
-    account_id: Option<&str>,
-    entry: &EntryPerformance,
-) -> anyhow::Result<PerformanceLedgerAppend> {
-    let record_key = performance_record_key(entry);
-    let mut record = Map::new();
-    record.insert(
-        "schema_version".to_string(),
-        Value::from(PERFORMANCE_LEDGER_SCHEMA_VERSION),
-    );
-    record.insert("ts_utc".to_string(), Value::String(Utc::now().to_rfc3339()));
-    record.insert(
-        "type".to_string(),
-        Value::String("realized_trade".to_string()),
-    );
-    record.insert(
-        "ledger_date".to_string(),
-        Value::String(ledger_date.to_string()),
-    );
-    record.insert(
-        "account_id".to_string(),
-        account_id.map_or(Value::Null, |id| Value::String(id.to_string())),
-    );
-    record.insert("record_key".to_string(), Value::String(record_key.clone()));
-    if let Value::Object(fields) = serde_json::to_value(entry)? {
-        record.extend(fields);
-    }
-
-    let append =
-        append_deduped_jsonl_record(ledger_dir, ledger_date, &record_key, Value::Object(record))?;
-    Ok(PerformanceLedgerAppend {
-        path: append.path,
-        appended: append.appended,
-        record_key: append.record_key,
-    })
-}
-
-/// Summarizes immutable performance-ledger JSONL files for an optional date range.
-///
-/// # Errors
-///
-/// Returns an error if a ledger directory entry or file cannot be read.
-pub fn summarize_performance_ledger(
-    directory: &Path,
-    since: Option<NaiveDate>,
-    until: Option<NaiveDate>,
-) -> anyhow::Result<PerformanceLedgerSummary> {
-    let mut summary = PerformanceLedgerSummary {
-        directory: directory.display().to_string(),
-        ..PerformanceLedgerSummary::default()
-    };
-    let mut win_sum = 0.0;
-    let mut loss_sum = 0.0;
-    let mut bucket_stats = BucketStats::default();
-    let mut strategy_stats = BTreeMap::<String, BucketStats>::new();
-    let mut underlying_stats = BTreeMap::<String, BucketStats>::new();
-
-    let scan = scan_jsonl_records(directory, since, until, |_, parsed| {
-        let Ok(record) = parsed else {
-            summary.parse_errors += 1;
-            return;
-        };
-        if record.get("type").and_then(Value::as_str) != Some("realized_trade") {
-            return;
-        }
-        let Some(realized_pnl) = record.get("realized_pnl").and_then(Value::as_f64) else {
-            summary.parse_errors += 1;
-            return;
-        };
-        summary.records += 1;
-        summary.realized_pnl += realized_pnl;
-        if record
-            .get("warnings")
-            .and_then(Value::as_array)
-            .is_some_and(|warnings| !warnings.is_empty())
-        {
-            summary.records_with_warnings += 1;
-        }
-        bucket_stats.add(realized_pnl);
-        if realized_pnl > 0.0 {
-            summary.wins += 1;
-            win_sum += realized_pnl;
-        } else if realized_pnl < 0.0 {
-            summary.losses += 1;
-            loss_sum += realized_pnl;
-            summary.largest_loss = Some(
-                summary
-                    .largest_loss
-                    .map_or(realized_pnl, |current| current.min(realized_pnl)),
-            );
-        } else {
-            summary.flats += 1;
-        }
-        if let Some(strategy) = record.get("strategy").and_then(Value::as_str) {
-            strategy_stats
-                .entry(strategy.to_string())
-                .or_default()
-                .add(realized_pnl);
-        }
-        if let Some(underlying) = record.get("underlying").and_then(Value::as_str) {
-            underlying_stats
-                .entry(underlying.to_string())
-                .or_default()
-                .add(realized_pnl);
-        }
-    })?;
-
-    summary.missing = scan.missing;
-    summary.files = scan.files;
-    summary.dates = scan.dates;
-    summary.average_win = (summary.wins > 0).then_some(win_sum / summary.wins as f64);
-    summary.average_loss = (summary.losses > 0).then_some(loss_sum / summary.losses as f64);
-    summary.by_strategy = strategy_stats
-        .into_iter()
-        .map(|(key, stats)| (key, stats.into_summary()))
-        .collect();
-    summary.by_underlying = underlying_stats
-        .into_iter()
-        .map(|(key, stats)| (key, stats.into_summary()))
-        .collect();
-    let all = bucket_stats.into_summary();
-    if summary.records > 0 {
-        summary.largest_loss = all.largest_loss;
-    }
-    Ok(summary)
-}
-
-/// Summarizes candidate-outcome JSONL files for an optional trade-date range.
-///
-/// # Errors
-///
-/// Returns an error if an outcome directory entry or file cannot be read.
-pub fn summarize_candidate_outcomes(
-    directory: &Path,
-    since: Option<NaiveDate>,
-    until: Option<NaiveDate>,
-) -> anyhow::Result<CandidateOutcomeSummary> {
-    let mut summary = CandidateOutcomeSummary {
-        directory: directory.display().to_string(),
-        ..CandidateOutcomeSummary::default()
-    };
-    let mut stats = OutcomeStats::default();
-    let mut bucket_stats = BTreeMap::<String, OutcomeStats>::new();
-    let mut strategy_stats = BTreeMap::<String, OutcomeStats>::new();
-
-    let scan = scan_jsonl_records(directory, since, until, |_, parsed| {
-        let Ok(record) = parsed else {
-            summary.parse_errors += 1;
-            return;
-        };
-        if record.get("type").and_then(Value::as_str) != Some("candidate_outcome") {
-            return;
-        }
-        let Some(hypothetical_pnl) = record.get("hypothetical_pnl").and_then(Value::as_f64) else {
-            summary.parse_errors += 1;
-            return;
-        };
-
-        let was_selected = record
-            .get("was_selected")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let was_traded = record
-            .get("was_traded")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        stats.add(hypothetical_pnl, was_selected, was_traded);
-
-        if record
-            .get("quote_warnings")
-            .and_then(Value::as_array)
-            .is_some_and(|warnings| !warnings.is_empty())
-        {
-            summary.records_with_warnings += 1;
-        }
-        let bucket = record
-            .get("observation_bucket")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        bucket_stats.entry(bucket.to_string()).or_default().add(
-            hypothetical_pnl,
-            was_selected,
-            was_traded,
-        );
-        let strategy = record
-            .get("strategy")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        strategy_stats.entry(strategy.to_string()).or_default().add(
-            hypothetical_pnl,
-            was_selected,
-            was_traded,
-        );
-    })?;
-
-    summary.missing = scan.missing;
-    summary.files = scan.files;
-    summary.dates = scan.dates;
-    let aggregate = stats.into_summary();
-    summary.records = aggregate.records;
-    summary.selected_records = aggregate.selected_records;
-    summary.traded_records = aggregate.traded_records;
-    summary.wins = aggregate.wins;
-    summary.losses = aggregate.losses;
-    summary.flats = aggregate.flats;
-    summary.hypothetical_pnl = aggregate.hypothetical_pnl;
-    summary.average_win = aggregate.average_win;
-    summary.average_loss = aggregate.average_loss;
-    summary.largest_loss = aggregate.largest_loss;
-    summary.by_bucket = bucket_stats
-        .into_iter()
-        .map(|(key, stats)| (key, stats.into_summary()))
-        .collect();
-    summary.by_strategy = strategy_stats
-        .into_iter()
-        .map(|(key, stats)| (key, stats.into_summary()))
-        .collect();
-    Ok(summary)
-}
-
-/// Tracks candidate outcomes for a candidate-ledger trade date.
-///
-/// # Errors
-///
-/// Returns an error when candidate-ledger files cannot be read, option snapshots cannot be
-/// requested, or outcome records cannot be written.
-
-#[derive(Clone, Copy, Debug, Default)]
-struct BucketStats {
-    records: usize,
-    wins: usize,
-    losses: usize,
-    flats: usize,
-    realized_pnl: f64,
-    win_sum: f64,
-    loss_sum: f64,
-    largest_loss: Option<f64>,
-}
-
-impl BucketStats {
-    fn add(&mut self, realized_pnl: f64) {
-        self.records += 1;
-        self.realized_pnl += realized_pnl;
-        if realized_pnl > 0.0 {
-            self.wins += 1;
-            self.win_sum += realized_pnl;
-        } else if realized_pnl < 0.0 {
-            self.losses += 1;
-            self.loss_sum += realized_pnl;
-            self.largest_loss = Some(
-                self.largest_loss
-                    .map_or(realized_pnl, |current| current.min(realized_pnl)),
-            );
-        } else {
-            self.flats += 1;
-        }
-    }
-
-    fn into_summary(self) -> PerformanceLedgerBucketSummary {
-        PerformanceLedgerBucketSummary {
-            records: self.records,
-            wins: self.wins,
-            losses: self.losses,
-            flats: self.flats,
-            realized_pnl: self.realized_pnl,
-            average_win: (self.wins > 0).then_some(self.win_sum / self.wins as f64),
-            average_loss: (self.losses > 0).then_some(self.loss_sum / self.losses as f64),
-            largest_loss: self.largest_loss,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct OutcomeStats {
-    records: usize,
-    selected_records: usize,
-    traded_records: usize,
-    wins: usize,
-    losses: usize,
-    flats: usize,
-    hypothetical_pnl: f64,
-    win_sum: f64,
-    loss_sum: f64,
-    largest_loss: Option<f64>,
-}
-
-impl OutcomeStats {
-    fn add(&mut self, hypothetical_pnl: f64, was_selected: bool, was_traded: bool) {
-        self.records += 1;
-        self.hypothetical_pnl += hypothetical_pnl;
-        if was_selected {
-            self.selected_records += 1;
-        }
-        if was_traded {
-            self.traded_records += 1;
-        }
-        if hypothetical_pnl > 0.0 {
-            self.wins += 1;
-            self.win_sum += hypothetical_pnl;
-        } else if hypothetical_pnl < 0.0 {
-            self.losses += 1;
-            self.loss_sum += hypothetical_pnl;
-            self.largest_loss = Some(
-                self.largest_loss
-                    .map_or(hypothetical_pnl, |current| current.min(hypothetical_pnl)),
-            );
-        } else {
-            self.flats += 1;
-        }
-    }
-
-    fn into_summary(self) -> CandidateOutcomeBucketSummary {
-        CandidateOutcomeBucketSummary {
-            records: self.records,
-            selected_records: self.selected_records,
-            traded_records: self.traded_records,
-            wins: self.wins,
-            losses: self.losses,
-            flats: self.flats,
-            hypothetical_pnl: self.hypothetical_pnl,
-            average_win: (self.wins > 0).then_some(self.win_sum / self.wins as f64),
-            average_loss: (self.losses > 0).then_some(self.loss_sum / self.losses as f64),
-            largest_loss: self.largest_loss,
-        }
-    }
 }
 
 fn apply_entry_summary(
@@ -917,13 +537,6 @@ fn parse_f64(value: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    use serde_json::json;
-
     use super::*;
 
     #[test]
@@ -1070,111 +683,6 @@ mod tests {
         assert!(performance.warnings.is_empty());
     }
 
-    #[test]
-    fn summarize_candidate_ledger_counts_opportunities() {
-        let dir =
-            std::env::temp_dir().join(format!("nautilus-alpaca-performance-{}", unique_suffix()));
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("2026-05-07.jsonl"),
-            format!(
-                "{}\n{}\n{}\n",
-                json!({"type":"candidate","strategy":"iron_condor"}),
-                json!({"type":"candidate_alert","alert_type":"selected_candidate"}),
-                json!({"type":"submit_result","accepted":1})
-            ),
-        )
-        .unwrap();
-
-        let summary = summarize_candidate_ledger(&dir, None, None).unwrap();
-
-        assert_eq!(summary.files, 1);
-        assert_eq!(summary.records, 3);
-        assert_eq!(summary.candidates, 1);
-        assert_eq!(summary.selected_candidates, 1);
-        assert_eq!(summary.submit_results, 1);
-        assert_eq!(summary.candidates_by_strategy["iron_condor"], 1);
-    }
-
-    #[test]
-    fn summarize_candidate_outcomes_counts_hypothetical_pnl() {
-        let dir = std::env::temp_dir().join(format!(
-            "nautilus-alpaca-candidate-outcomes-{}",
-            unique_suffix()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("2026-05-07.jsonl"),
-            format!(
-                "{}\n{}\n{}\n",
-                json!({
-                    "type": "candidate_outcome",
-                    "observation_bucket": "plus_1h",
-                    "strategy": "iron_condor",
-                    "was_selected": true,
-                    "was_traded": true,
-                    "hypothetical_pnl": 12.0,
-                    "quote_warnings": [],
-                }),
-                json!({
-                    "type": "candidate_outcome",
-                    "observation_bucket": "plus_1h",
-                    "strategy": "iron_condor",
-                    "was_selected": false,
-                    "was_traded": false,
-                    "hypothetical_pnl": -8.0,
-                    "quote_warnings": ["wide_quote"],
-                }),
-                json!({
-                    "type": "candidate_outcome",
-                    "observation_bucket": "next_day",
-                    "strategy": "put_credit",
-                    "was_selected": false,
-                    "was_traded": false,
-                    "hypothetical_pnl": 0.0,
-                    "quote_warnings": [],
-                })
-            ),
-        )
-        .unwrap();
-
-        let summary = summarize_candidate_outcomes(&dir, None, None).unwrap();
-
-        assert_eq!(summary.files, 1);
-        assert_eq!(summary.records, 3);
-        assert_eq!(summary.selected_records, 1);
-        assert_eq!(summary.traded_records, 1);
-        assert_eq!(summary.wins, 1);
-        assert_eq!(summary.losses, 1);
-        assert_eq!(summary.flats, 1);
-        assert_close(summary.hypothetical_pnl, 4.0);
-        assert_eq!(summary.records_with_warnings, 1);
-        assert_eq!(summary.by_bucket["plus_1h"].records, 2);
-        assert_eq!(summary.by_strategy["iron_condor"].losses, 1);
-    }
-
-    #[test]
-    fn append_performance_ledger_record_dedupes_by_close_key() {
-        let dir = std::env::temp_dir().join(format!(
-            "nautilus-alpaca-performance-ledger-{}",
-            unique_suffix()
-        ));
-        let entry = entry_performance(&state_entry(), &EntryOrderIds::default(), &[], &[]);
-
-        let first =
-            append_performance_ledger_record(&dir, "2026-05-08", Some("paper-main"), &entry)
-                .unwrap();
-        let second =
-            append_performance_ledger_record(&dir, "2026-05-08", Some("paper-main"), &entry)
-                .unwrap();
-
-        assert!(first.appended);
-        assert!(!second.appended);
-        assert_eq!(first.record_key, second.record_key);
-        let raw = fs::read_to_string(first.path).unwrap();
-        assert_eq!(raw.lines().count(), 1);
-    }
-
     fn state_entry() -> StrategyStateEntry {
         StrategyStateEntry {
             trade_date: "2026-05-07".to_string(),
@@ -1256,13 +764,6 @@ mod tests {
             cusip: None,
             per_share_amount: None,
         }
-    }
-
-    fn unique_suffix() -> u128 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
     }
 
     fn assert_close(actual: f64, expected: f64) {

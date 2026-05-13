@@ -1,9 +1,6 @@
 //! Historical candidate-outcome tracking from candidate ledgers and option quotes.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde_json::{Value, json};
@@ -25,10 +22,8 @@ use crate::{
 };
 
 use super::{
-    CandidateLedgerSummary, CandidateOutcomeTrackingRequest, EntryOrderIds, EntryPerformance,
-    OPTION_CONTRACT_MULTIPLIER, PerformanceSummary, apply_entry_summary,
-    default_candidate_outcome_dir, entry_status, entry_symbols, fill_summary,
-    jsonl::{append_deduped_jsonl_record, date_in_range, read_jsonl_records, scan_jsonl_records},
+    CandidateOutcomeTrackingRequest, EntryOrderIds, EntryPerformance, OPTION_CONTRACT_MULTIPLIER,
+    PerformanceSummary, apply_entry_summary, entry_status, entry_symbols, fill_summary,
     open_unrealized_pnl, quoted_entry_premium,
 };
 
@@ -43,22 +38,18 @@ pub async fn track_candidate_outcomes(
             .with_timezone(&config.entry_timezone)
             .date_naive()
     });
-    let records = if let Some(storage) = &config.storage_repository {
-        read_candidate_ledger_records(
-            storage,
-            config.storage_account_id(),
-            CandidateLedgerSummaryFilters {
-                since: Some(trade_date),
-                until: Some(trade_date),
-            },
-        )
-        .await?
-    } else {
-        let ledger_path = config
-            .candidate_ledger_dir
-            .join(format!("{trade_date}.jsonl"));
-        read_jsonl_records(&ledger_path)?
+    let Some(storage) = &config.storage_repository else {
+        anyhow::bail!("storage is not connected");
     };
+    let records = read_candidate_ledger_records(
+        storage,
+        config.storage_account_id(),
+        CandidateLedgerSummaryFilters {
+            since: Some(trade_date),
+            until: Some(trade_date),
+        },
+    )
+    .await?;
     let selected = selected_candidate_actions(&records);
     let mut candidates = collect_track_candidates(
         &records,
@@ -77,12 +68,7 @@ pub async fn track_candidate_outcomes(
     let mut snapshot_request = OptionSnapshotsRequest::for_symbols(symbols);
     snapshot_request.feed = Some(data_config.option_feed.as_str().to_string());
     let snapshots = client.option_snapshots(&snapshot_request).await?.snapshots;
-    let outcome_dir = default_candidate_outcome_dir(config);
-    let payload_account_id = if config.storage_repository.is_some() {
-        Some(config.storage_account_id().to_string())
-    } else {
-        config.fleet_account_id.clone()
-    };
+    let payload_account_id = Some(config.storage_account_id().to_string());
     let mut appended = 0;
     for candidate in &mut candidates {
         let Some(outcome) = value_candidate_outcome(candidate, &snapshots) else {
@@ -115,87 +101,20 @@ pub async fn track_candidate_outcomes(
                 "quote_warnings": outcome.warnings,
                 "candidate": candidate.record,
             });
-            let appended_record = if let Some(storage) = &config.storage_repository {
-                append_candidate_outcome(
-                    storage,
-                    config.storage_account_id(),
-                    &candidate.trade_date,
-                    &record_key,
-                    &payload,
-                )
-                .await?
-            } else {
-                append_deduped_jsonl_record(
-                    &outcome_dir,
-                    &candidate.trade_date,
-                    &record_key,
-                    payload,
-                )?
-                .appended
-            };
+            let appended_record = append_candidate_outcome(
+                storage,
+                config.storage_account_id(),
+                &candidate.trade_date,
+                &record_key,
+                &payload,
+            )
+            .await?;
             if appended_record {
                 appended += 1;
             }
         }
     }
     Ok(appended)
-}
-
-/// Summarizes candidate-ledger JSONL files for an optional trade-date range.
-///
-/// # Errors
-///
-/// Returns an error if a ledger directory entry or file cannot be read.
-pub fn summarize_candidate_ledger(
-    directory: &Path,
-    since: Option<NaiveDate>,
-    until: Option<NaiveDate>,
-) -> anyhow::Result<CandidateLedgerSummary> {
-    let mut summary = CandidateLedgerSummary {
-        directory: directory.display().to_string(),
-        ..CandidateLedgerSummary::default()
-    };
-    let scan = scan_jsonl_records(directory, since, until, |_, parsed| {
-        summary.records += 1;
-        let Ok(record) = parsed else {
-            summary.parse_errors += 1;
-            return;
-        };
-        let record_type = record
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-        *summary.by_type.entry(record_type.clone()).or_insert(0) += 1;
-        match record_type.as_str() {
-            "candidate" => {
-                summary.candidates += 1;
-                if let Some(strategy) = record.get("strategy").and_then(Value::as_str) {
-                    *summary
-                        .candidates_by_strategy
-                        .entry(strategy.to_string())
-                        .or_insert(0) += 1;
-                }
-            }
-            "scanner_result" => summary.scanner_results += 1,
-            "decision" => summary.decisions += 1,
-            "submit_result" => summary.submit_results += 1,
-            "candidate_alert" => {
-                summary.candidate_alerts += 1;
-                match record.get("alert_type").and_then(Value::as_str) {
-                    Some("selected_candidate") => summary.selected_candidates += 1,
-                    Some("high_score_candidate") => summary.high_score_candidates += 1,
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    })?;
-
-    summary.missing = scan.missing;
-    summary.files = scan.files;
-    summary.dates = scan.dates;
-    Ok(summary)
 }
 
 /// Builds one performance row from a state entry, matched fill activities, and open positions.
@@ -341,6 +260,10 @@ pub fn entry_in_date_range(
     NaiveDate::parse_from_str(&entry.trade_date, "%Y-%m-%d")
         .map(|date| date_in_range(date, since, until))
         .unwrap_or(true)
+}
+
+fn date_in_range(date: NaiveDate, since: Option<NaiveDate>, until: Option<NaiveDate>) -> bool {
+    since.is_none_or(|since| date >= since) && until.is_none_or(|until| date <= until)
 }
 
 /// Collects parent and nested leg order IDs into `ids`.

@@ -40,10 +40,9 @@ Commands:
   operator [ARGS...]             run alpaca-operator-status for one account
   fleet [ARGS...]                run alpaca-fleet-status
   health                         lightweight service/account health check
-  today [--date YYYY-MM-DD]      compact fleet and candidate-ledger status
-  ledger-summary [--all]         summarize candidate-ledger records and latest decisions
+  today                          compact fleet status
   performance [--all] [ARGS...]  summarize opportunity history and broker-fill PnL
-  alerts candidates [ARGS...]    send or dry-run Discord candidate alerts from candidate ledger
+  alerts candidates [ARGS...]    send or dry-run Discord candidate alerts from Postgres
   alerts performance [ARGS...]   send post-market Discord performance digest
   alerts enable|disable|status   control automatic Discord candidate alerts timer
   alerts performance-enable      enable automatic post-market performance digest timer
@@ -57,7 +56,6 @@ Commands:
   restart-all                    restart all known account services
   scan [PROFILE] [SYMBOLS]       one-shot dry-run candidate scan; disables submit/manage/close
   run-once [SYMBOLS]             one engine iteration using account runtime gates
-  ledger                         tail one account's candidate ledger
 
 Scan profiles:
   iron-condor, put-credit, call-credit, credit, directional, naked, naked-1-3dte
@@ -66,9 +64,7 @@ Examples:
   $(basename "$0") --account paper-undefined-risk check-config
   $(basename "$0") --account paper-undefined-risk scan naked GDX,SLV
   $(basename "$0") --account paper-directional scan directional XLF,XLK
-  $(basename "$0") --account paper-main ledger --lines 20
   $(basename "$0") today
-  $(basename "$0") ledger-summary --all
   $(basename "$0") performance --all
   $(basename "$0") alerts candidates --all --dry-run
   $(basename "$0") alerts candidates --all --send
@@ -149,13 +145,6 @@ account_lock_dir() {
   else
     printf '%s\n' "$ALPACA_STATE_HOME/$account/locks"
   fi
-}
-
-candidate_ledger_file() {
-  local account date
-  account="$(normalize_account "$1")"
-  date="$2"
-  printf '%s\n' "$ALPACA_STATE_HOME/$account/candidate-ledger/$date.jsonl"
 }
 
 known_accounts() {
@@ -498,173 +487,8 @@ run_once() {
   fi
 }
 
-run_ledger() {
-  local account date lines mode path
-  account="$ACCOUNT"
-  date="$(date +%F)"
-  lines="25"
-  mode="tail"
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --account|-a)
-        account="$(normalize_account "${2:-}")"
-        shift 2
-        ;;
-      --date)
-        date="${2:-}"
-        shift 2
-        ;;
-      --lines|-n)
-        lines="${2:-}"
-        shift 2
-        ;;
-      --cat)
-        mode="cat"
-        shift
-        ;;
-      --count)
-        mode="count"
-        shift
-        ;;
-      --help|-h)
-        usage
-        exit 0
-        ;;
-      *)
-        echo "unexpected ledger argument: $1" >&2
-        exit 2
-        ;;
-    esac
-  done
-  path="$(candidate_ledger_file "$account" "$date")"
-  if [[ ! -f "$path" ]]; then
-    echo "missing candidate ledger: $path" >&2
-    exit 1
-  fi
-  case "$mode" in
-    cat)
-      cat "$path"
-      ;;
-    count)
-      wc -l "$path"
-      ;;
-    *)
-      tail -n "$lines" "$path"
-      ;;
-  esac
-}
-
-ledger_count() {
-  local account date type path
-  account="$(normalize_account "$1")"
-  date="$2"
-  type="$3"
-  path="$(candidate_ledger_file "$account" "$date")"
-  if [[ ! -f "$path" ]]; then
-    printf '%s\n' "0"
-    return
-  fi
-  jq -s --arg type "$type" '[.[] | select(.type == $type)] | length' "$path"
-}
-
-ledger_reentry_count() {
-  local account date path
-  account="$(normalize_account "$1")"
-  date="$2"
-  path="$(candidate_ledger_file "$account" "$date")"
-  if [[ ! -f "$path" ]]; then
-    printf '%s\n' "0"
-    return
-  fi
-  jq -s '[.[] | select(.type == "scanner_result" and .reason == "daily_duplicate_state")] | length' "$path"
-}
-
-run_ledger_summary_one() {
-  local account date path records
-  account="$(normalize_account "$1")"
-  date="$2"
-  path="$(candidate_ledger_file "$account" "$date")"
-  echo "ledger account=$account date=$date path=$path"
-  if [[ ! -f "$path" ]]; then
-    echo "  missing=true"
-    return
-  fi
-  records="$(wc -l < "$path" | tr -d ' ')"
-  echo "  records=$records"
-  echo "  types:"
-  jq -r '.type' "$path" | sort | uniq -c | sort -nr | sed 's/^/    /'
-  echo "  latest_submit_results:"
-  jq -c 'select(.type == "submit_result") | {ts_utc,accepted,rejected,parent_order_id}' "$path" \
-    | tail -10 \
-    | sed 's/^/    /'
-  echo "  latest_decisions:"
-  jq -c 'select(.type == "decision") | {ts_utc,action,reason,underlying,strategy,current,limit}' "$path" \
-    | tail -10 \
-    | sed 's/^/    /'
-  echo "  latest_same_day_reentry_blocks:"
-  jq -c 'select(.type == "scanner_result" and .reason == "daily_duplicate_state") | {ts_utc,underlying,reason,scope}' "$path" \
-    | tail -10 \
-    | sed 's/^/    /'
-}
-
-run_ledger_summary() {
-  local account date all
-  account="$ACCOUNT"
-  date="$(date +%F)"
-  all="false"
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --account|-a)
-        account="$(normalize_account "${2:-}")"
-        shift 2
-        ;;
-      --date)
-        date="${2:-}"
-        shift 2
-        ;;
-      --all)
-        all="true"
-        shift
-        ;;
-      --help|-h)
-        usage
-        exit 0
-        ;;
-      *)
-        echo "unexpected ledger-summary argument: $1" >&2
-        exit 2
-        ;;
-    esac
-  done
-  require_command jq
-  if [[ "$all" == "true" ]]; then
-    for account in $(known_accounts | sort -u); do
-      run_ledger_summary_one "$account" "$date"
-    done
-  else
-    run_ledger_summary_one "$account" "$date"
-  fi
-}
-
 run_today() {
-  local date fleet_json account path records candidates submit_results decisions reentry_blocks
-  date="$(date +%F)"
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --date)
-        date="${2:-}"
-        shift 2
-        ;;
-      --help|-h)
-        usage
-        exit 0
-        ;;
-      *)
-        echo "unexpected today argument: $1" >&2
-        exit 2
-        ;;
-    esac
-  done
+  local fleet_json
   require_command jq
   require_executable "$FLEET_BIN" "fleet status binary"
   fleet_json="$(mktemp "${TMPDIR:-/tmp}/nautilus-alpaca-fleet.XXXXXX")"
@@ -679,19 +503,6 @@ run_today() {
     | "account=\(.id) status=\(.status) engine=\(.engine_state) open_orders=\(.open_orders) positions=\(.positions) active_entries=\(.active_entries) unmanaged=\(.unmanaged_positions) alerts=\(.alerts) last_decision=\($action)\(if $reason == "" then "" else ":" + $reason end)"
   ' "$fleet_json"
   rm -f "$fleet_json"
-  for account in $(known_accounts | sort -u); do
-    path="$(candidate_ledger_file "$account" "$date")"
-    if [[ -f "$path" ]]; then
-      records="$(wc -l < "$path" | tr -d ' ')"
-      candidates="$(ledger_count "$account" "$date" candidate)"
-      submit_results="$(ledger_count "$account" "$date" submit_result)"
-      decisions="$(ledger_count "$account" "$date" decision)"
-      reentry_blocks="$(ledger_reentry_count "$account" "$date")"
-      echo "ledger account=$account date=$date records=$records candidates=$candidates decisions=$decisions submit_results=$submit_results same_day_reentry_blocks=$reentry_blocks"
-    else
-      echo "ledger account=$account date=$date missing=true"
-    fi
-  done
 }
 
 run_performance() {
@@ -787,7 +598,7 @@ run_alerts() {
 
 run_performance_digest() {
   export NAUTILUS_ALPACA_ALERTS_ENV_FILE="$ALERTS_ENV_FILE"
-  run_performance --all --append-ledger --track-candidates --send-discord "$@"
+  run_performance --all --send-discord "$@"
 }
 
 run_candidate_alerts() {
@@ -939,9 +750,6 @@ case "$COMMAND" in
   today)
     run_today "$@"
     ;;
-  ledger-summary)
-    run_ledger_summary "$@"
-    ;;
   performance)
     run_performance "$@"
     ;;
@@ -985,9 +793,6 @@ case "$COMMAND" in
     ;;
   run-once)
     run_once "$@"
-    ;;
-  ledger)
-    run_ledger "$@"
     ;;
   *)
     usage

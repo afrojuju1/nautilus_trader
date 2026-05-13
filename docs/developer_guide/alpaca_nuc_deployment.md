@@ -53,7 +53,7 @@ Postgres through `ALPACA_STORAGE_DATABASE_URL`.
 are persisted; `0` records all ranked candidates.
 
 Candidate Discord alerts are emitted by a sidecar command which consumes typed `candidate_alert`
-records from the candidate ledger, not by the trading loop. Put the webhook in
+records from the Postgres candidate ledger, not by the trading loop. Put the webhook in
 `~/.config/nautilus-trader/alpaca/alerts.env` as `DISCORD_WEBHOOK_URL=...`; keep the file mode at
 `600`.
 
@@ -120,14 +120,12 @@ account TOML.
 ```bash
 alpaca-control accounts
 alpaca-control today
-alpaca-control ledger-summary --all
 alpaca-control --account paper-main status
 alpaca-control --account paper-directional status
 alpaca-control --account paper-undefined-risk status
 alpaca-control --account paper-undefined-risk check-config
 alpaca-control --account paper-undefined-risk scan naked GDX,SLV
 alpaca-control --account paper-directional scan directional XLF,XLK
-alpaca-control --account paper-main ledger --lines 20
 alpaca-control alerts candidates --all --dry-run
 alpaca-control alerts candidates --all --send
 alpaca-control alerts enable
@@ -388,8 +386,6 @@ alpaca-control --account paper-main status
 alpaca-control --account paper-main operator --json
 alpaca-control --account paper-main health
 alpaca-control today
-alpaca-control ledger-summary --all
-alpaca-control --account paper-main ledger --lines 50
 ```
 
 `alpaca-control fleet` runs `alpaca-fleet-status`, reads the fleet registry, and executes
@@ -412,9 +408,8 @@ the local runtime without restarting services. `alpaca-control rollout` runs val
 restarts every configured account service, verifies service activity, and prints the compact
 `today` summary.
 
-`alpaca-control today` prints compact fleet health plus per-account candidate-ledger counts.
-`alpaca-control ledger-summary` prints record-type counts, latest submit results, latest decisions,
-and same-day re-entry blocks for one account; add `--all` for every known local account.
+`alpaca-control today` prints compact fleet health. Candidate-ledger summaries are read from
+Postgres by the performance report and alert commands.
 
 Operator status reports fleet policy blocks as critical `fleet_policy_block` alerts. It also reports
 partial fills and accepted/new orders that have not filled yet so stale order handling can be
@@ -426,8 +421,8 @@ Scanner diagnostics include a `rejections` map keyed by filter reason, so a no-c
 attributed to liquidity, quote quality, delta range, POP/touch gates, buying-power usage, score, or
 spread-construction filters instead of only reporting a generic no-candidate result.
 
-Candidate alert commands read typed `candidate_alert` records from the candidate ledger. They do not
-run scanners or submit orders:
+Candidate alert commands read typed `candidate_alert` records from Postgres. They do not run
+scanners or submit orders:
 
 ```bash
 alpaca-control alerts candidates --all --dry-run
@@ -438,7 +433,7 @@ alpaca-control alerts status
 alpaca-control alerts disable
 ```
 
-Performance report commands read strategy state, candidate ledgers, broker activities, and current
+Performance report commands read strategy state, Postgres candidate ledgers, broker activities, and current
 positions. They do not submit or cancel orders:
 
 ```bash
@@ -464,10 +459,10 @@ The command reports one engine state:
 
 ## Historical Opportunity and PnL Accounting
 
-The candidate ledger is the source of historical opportunity evidence. Each scanner pass can append
+The Postgres candidate ledger is the source of historical opportunity evidence. Each scanner pass can append
 ranked `candidate` records plus a `scanner_result`; selected or high-score candidates can append
 `candidate_alert` records, and submission decisions append `decision` and `submit_result` records.
-`alpaca-control ledger-summary --all` audits those records by account and trade date.
+`alpaca-control performance --all --json` audits those records by account and trade date.
 
 `alpaca-control performance` replays candidate-ledger records and values the same option symbols
 from current snapshots. It writes Postgres `candidate_outcome` records for observation buckets such

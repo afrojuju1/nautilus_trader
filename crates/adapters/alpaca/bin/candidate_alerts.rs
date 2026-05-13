@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Candidate-ledger Discord notifier for Alpaca scanner opportunities.
+//! Postgres candidate-ledger Discord notifier for Alpaca scanner opportunities.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,8 +21,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::{DateTime, Duration, Utc};
-use nautilus_alpaca::options_runtime::OptionsEngineConfig;
+use chrono::{DateTime, Duration, NaiveDate, Utc};
+use nautilus_alpaca::{
+    options_runtime::OptionsEngineConfig,
+    storage::{CandidateLedgerSummaryFilters, read_candidate_ledger_records},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -34,7 +37,6 @@ const DEFAULT_MAX_RANK: u64 = 3;
 struct Args {
     date: Option<String>,
     dry_run: bool,
-    ledger_path: Option<PathBuf>,
     state_path: Option<PathBuf>,
     alerts_env_file: Option<PathBuf>,
     lookback_minutes: i64,
@@ -73,30 +75,33 @@ struct AlertState {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
     load_alerts_env(args.alerts_env_file.as_deref())?;
-    let config = OptionsEngineConfig::from_runtime_env()?;
-    let account_id = config
-        .fleet_account_id
-        .clone()
-        .or_else(|| env::var("NAUTILUS_ALPACA_ACCOUNT").ok())
-        .unwrap_or_else(|| "paper-main".to_string());
+    let config = OptionsEngineConfig::from_runtime_env_with_storage().await?;
+    let Some(storage) = &config.storage_repository else {
+        anyhow::bail!("ALPACA_STORAGE_DATABASE_URL is required for alpaca-candidate-alerts");
+    };
+    let account_id = config.storage_account_id().to_string();
     let trade_date = args.date.clone().unwrap_or_else(|| {
         Utc::now()
             .with_timezone(&config.entry_timezone)
             .date_naive()
             .to_string()
     });
-    let ledger_path = args.ledger_path.clone().unwrap_or_else(|| {
-        config
-            .candidate_ledger_dir
-            .join(format!("{trade_date}.jsonl"))
-    });
+    let trade_date_filter = NaiveDate::parse_from_str(&trade_date, "%Y-%m-%d")?;
     let state_path = args
         .state_path
         .clone()
-        .unwrap_or_else(|| default_alert_state_path(&config.candidate_ledger_dir, &account_id));
+        .unwrap_or_else(|| default_alert_state_path(&account_id));
     let cutoff = Utc::now() - Duration::minutes(args.lookback_minutes.max(1));
 
-    let records = read_ledger_records(&ledger_path)?;
+    let records = read_candidate_ledger_records(
+        storage,
+        &account_id,
+        CandidateLedgerSummaryFilters {
+            since: Some(trade_date_filter),
+            until: Some(trade_date_filter),
+        },
+    )
+    .await?;
     let mut state = load_alert_state(&state_path)?;
     prune_alert_state(&mut state, args.dedupe_ttl_secs.max(60));
     let collection = collect_candidate_alerts(&records, &args, &account_id, cutoff);
@@ -109,11 +114,8 @@ async fn main() -> anyhow::Result<()> {
 
     if pending.is_empty() {
         println!(
-            "candidate_alerts account={account_id} date={trade_date} ledger={} candidate_alert_records={} filtered={} eligible={eligible} pending=0 dry_run={}",
-            ledger_path.display(),
-            collection.candidate_alert_records,
-            collection.filtered,
-            args.dry_run,
+            "candidate_alerts account={account_id} date={trade_date} storage=postgres candidate_alert_records={} filtered={} eligible={eligible} pending=0 dry_run={}",
+            collection.candidate_alert_records, collection.filtered, args.dry_run,
         );
         save_alert_state(&state_path, &state)?;
         return Ok(());
@@ -121,8 +123,7 @@ async fn main() -> anyhow::Result<()> {
 
     if args.dry_run {
         println!(
-            "candidate_alerts account={account_id} date={trade_date} ledger={} candidate_alert_records={} filtered={} eligible={eligible} pending={} dry_run=true",
-            ledger_path.display(),
+            "candidate_alerts account={account_id} date={trade_date} storage=postgres candidate_alert_records={} filtered={} eligible={eligible} pending={} dry_run=true",
             collection.candidate_alert_records,
             collection.filtered,
             pending.len(),
@@ -147,10 +148,8 @@ async fn main() -> anyhow::Result<()> {
     }
     save_alert_state(&state_path, &state)?;
     println!(
-        "candidate_alerts account={account_id} date={trade_date} ledger={} candidate_alert_records={} filtered={} eligible={eligible} sent={sent} dry_run=false",
-        ledger_path.display(),
-        collection.candidate_alert_records,
-        collection.filtered,
+        "candidate_alerts account={account_id} date={trade_date} storage=postgres candidate_alert_records={} filtered={} eligible={eligible} sent={sent} dry_run=false",
+        collection.candidate_alert_records, collection.filtered,
     );
     Ok(())
 }
@@ -160,7 +159,6 @@ impl Args {
         let mut args = Self {
             date: None,
             dry_run: true,
-            ledger_path: None,
             state_path: None,
             alerts_env_file: None,
             lookback_minutes: DEFAULT_LOOKBACK_MINUTES,
@@ -175,9 +173,6 @@ impl Args {
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--date" => args.date = Some(next_arg(&mut iter, "--date")?),
-                "--ledger-path" => {
-                    args.ledger_path = Some(PathBuf::from(next_arg(&mut iter, "--ledger-path")?));
-                }
                 "--state-path" => {
                     args.state_path = Some(PathBuf::from(next_arg(&mut iter, "--state-path")?));
                 }
@@ -275,29 +270,13 @@ fn home_dir() -> PathBuf {
     env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
-fn default_alert_state_path(ledger_dir: &Path, account_id: &str) -> PathBuf {
-    ledger_dir
-        .parent()
-        .map(|path| path.join("alerts"))
-        .unwrap_or_else(|| {
-            default_state_home()
-                .join("nautilus_trader")
-                .join("alpaca")
-                .join(account_id)
-                .join("alerts")
-        })
+fn default_alert_state_path(account_id: &str) -> PathBuf {
+    default_state_home()
+        .join("nautilus_trader")
+        .join("alpaca")
+        .join(account_id)
+        .join("alerts")
         .join("candidate-discord-state.json")
-}
-
-fn read_ledger_records(path: &Path) -> anyhow::Result<Vec<Value>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    fs::read_to_string(path)?
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).map_err(Into::into))
-        .collect()
 }
 
 fn load_alert_state(path: &Path) -> anyhow::Result<AlertState> {

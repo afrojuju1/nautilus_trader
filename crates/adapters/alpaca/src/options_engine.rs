@@ -19,7 +19,7 @@
 //! `alpaca-options-engine` binary. The binary stays as a thin entrypoint so the live
 //! runtime can be tested and evolved from library code.
 
-use std::{collections::BTreeSet, env, future::Future, path::PathBuf, pin::Pin, time::Duration};
+use std::{collections::BTreeSet, env, future::Future, pin::Pin, time::Duration};
 
 use crate::{
     config::AlpacaDataClientConfig,
@@ -33,10 +33,7 @@ use crate::{
         OptionsEngineConfig, SelectedOptionsEntry, active_sector_count, active_underlying_count,
         fleet_active_underlying_count, fleet_sector_limit_state, select_options_entry,
     },
-    performance::{
-        EntryOrderIds, append_performance_ledger_record, collect_order_ids,
-        default_performance_ledger_dir, entry_performance,
-    },
+    performance::{EntryOrderIds, collect_order_ids, entry_performance},
     runtime::{
         StrategyState, StrategyStateEntry, credit_spread_strategy_name, emit_operator_event,
     },
@@ -512,7 +509,6 @@ pub async fn run_options_engine() -> anyhow::Result<()> {
             "close_reprice_cooldown_secs": config.close_reprice_cooldown_secs,
             "state_path": config.state_path.display().to_string(),
             "candidate_ledger_enabled": config.candidate_ledger_enabled,
-            "candidate_ledger_dir": config.candidate_ledger_dir.display().to_string(),
             "candidate_ledger_max_candidates": config.candidate_ledger_max_candidates,
             "hosted_strategy": strategy.name(),
         }),
@@ -1268,23 +1264,17 @@ async fn append_realized_performance_ledger(
         .with_timezone(&config.entry_timezone)
         .date_naive()
         .to_string();
-    let append = if let Some(storage) = &config.storage_repository {
-        crate::storage::append_performance_ledger_record(
-            storage,
-            config.storage_account_id(),
-            &ledger_date,
-            &performance,
-            None,
-        )
-        .await?
-    } else {
-        append_performance_ledger_record(
-            &performance_ledger_dir(config),
-            &ledger_date,
-            config.fleet_account_id.as_deref(),
-            &performance,
-        )?
+    let Some(storage) = &config.storage_repository else {
+        anyhow::bail!("storage is not connected");
     };
+    let append = crate::storage::append_performance_ledger_record(
+        storage,
+        config.storage_account_id(),
+        &ledger_date,
+        &performance,
+        None,
+    )
+    .await?;
 
     emit_operator_event(
         "performance_ledger",
@@ -1321,14 +1311,6 @@ fn performance_activity_after_timestamp(entry: &StrategyStateEntry) -> String {
         })
         .unwrap_or_else(|| Utc::now() - ChronoDuration::days(30))
         .to_rfc3339()
-}
-
-fn performance_ledger_dir(config: &OptionsEngineConfig) -> PathBuf {
-    env::var("ALPACA_PERFORMANCE_LEDGER_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            default_performance_ledger_dir(&config.state_path, config.fleet_account_id.as_deref())
-        })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1710,7 +1692,6 @@ mod tests {
             entry_timezone: "America/New_York".parse().unwrap(),
             state_path: PathBuf::from("state.json"),
             candidate_ledger_enabled: false,
-            candidate_ledger_dir: PathBuf::from("candidate-ledger"),
             candidate_ledger_max_candidates: 10,
             scanner: PutCreditScannerConfig::default(),
             iron_condor_scanner: IronCondorScannerConfig::default(),

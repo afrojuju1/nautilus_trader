@@ -9,7 +9,6 @@ force_flatten = false
 cancel_after_accept = false
 ignore_entry_window = false
 candidate_ledger_enabled = true
-# Omit candidate_ledger_dir to derive ~/.local/state/nautilus_trader/alpaca/<account>/candidate-ledger.
 candidate_ledger_max_candidates = 10
 
 [universe]
