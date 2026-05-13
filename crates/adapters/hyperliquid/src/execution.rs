@@ -54,6 +54,7 @@ use crate::{
     common::{
         consts::HYPERLIQUID_VENUE,
         credential::Secrets,
+        enums::HyperliquidProductType,
         parse::{
             clamp_price_to_precision, client_order_id_to_cancel_request_with_asset,
             derive_limit_from_trigger, derive_market_order_price, extract_error_message,
@@ -69,7 +70,9 @@ use crate::{
             ClearinghouseState, Cloid, HyperliquidExecAction, HyperliquidExecGrouping,
             HyperliquidExecModifyOrderRequest, HyperliquidExecOrderKind, SpotClearinghouseState,
         },
+        parse::derive_outcome_settlements,
     },
+    outcome_settlement::{OutcomeSettlementTracker, build_settlement_fills},
     websocket::{
         ExecutionReport, NautilusWsMessage,
         client::HyperliquidWebSocketClient,
@@ -90,7 +93,9 @@ pub struct HyperliquidExecutionClient {
     ws_client: HyperliquidWebSocketClient,
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
     ws_stream_handle: Mutex<Option<JoinHandle<()>>>,
+    settlement_poll_handle: Mutex<Option<JoinHandle<()>>>,
     ws_dispatch_state: Arc<WsDispatchState>,
+    outcome_settlement_tracker: Arc<Mutex<OutcomeSettlementTracker>>,
 }
 
 impl HyperliquidExecutionClient {
@@ -134,58 +139,7 @@ impl HyperliquidExecutionClient {
     }
 
     fn validate_order_submission(&self, order: &OrderAny) -> anyhow::Result<()> {
-        // Check if instrument symbol is supported
-        // Hyperliquid instruments: {base}-USD-PERP or {base}-{quote}-SPOT
-        let instrument_id = order.instrument_id();
-        let symbol = instrument_id.symbol.as_str();
-        if !symbol.ends_with("-PERP") && !symbol.ends_with("-SPOT") {
-            anyhow::bail!(
-                "Unsupported instrument symbol format for Hyperliquid: {symbol} (expected -PERP or -SPOT suffix)"
-            );
-        }
-
-        // Check if order type is supported
-        match order.order_type() {
-            OrderType::Market
-            | OrderType::Limit
-            | OrderType::StopMarket
-            | OrderType::StopLimit
-            | OrderType::MarketIfTouched
-            | OrderType::LimitIfTouched => {}
-            _ => anyhow::bail!(
-                "Unsupported order type for Hyperliquid: {:?}",
-                order.order_type()
-            ),
-        }
-
-        // Check if conditional orders have trigger price
-        if matches!(
-            order.order_type(),
-            OrderType::StopMarket
-                | OrderType::StopLimit
-                | OrderType::MarketIfTouched
-                | OrderType::LimitIfTouched
-        ) && order.trigger_price().is_none()
-        {
-            anyhow::bail!(
-                "Conditional orders require a trigger price for Hyperliquid: {:?}",
-                order.order_type()
-            );
-        }
-
-        // Check if limit-based orders have price
-        if matches!(
-            order.order_type(),
-            OrderType::Limit | OrderType::StopLimit | OrderType::LimitIfTouched
-        ) && order.price().is_none()
-        {
-            anyhow::bail!(
-                "Limit orders require a limit price for Hyperliquid: {:?}",
-                order.order_type()
-            );
-        }
-
-        Ok(())
+        validate_order_for_hyperliquid(order)
     }
 
     /// Creates a new [`HyperliquidExecutionClient`].
@@ -252,7 +206,9 @@ impl HyperliquidExecutionClient {
             ws_client,
             pending_tasks: Mutex::new(Vec::new()),
             ws_stream_handle: Mutex::new(None),
+            settlement_poll_handle: Mutex::new(None),
             ws_dispatch_state: Arc::new(WsDispatchState::new()),
+            outcome_settlement_tracker: Arc::new(Mutex::new(OutcomeSettlementTracker::new())),
         })
     }
 
@@ -399,6 +355,86 @@ impl HyperliquidExecutionClient {
         tasks.push(handle);
     }
 
+    fn start_outcome_settlement_poll(&self) -> anyhow::Result<()> {
+        let poll_secs = self.config.outcome_settlement_poll_secs;
+        if poll_secs == 0 {
+            log::info!("Outcome settlement polling disabled by config");
+            return Ok(());
+        }
+
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let tracker = self.outcome_settlement_tracker.clone();
+        let account_id = self.core.account_id;
+        let account_address = self.get_account_address()?;
+        let clock = self.clock;
+
+        // Stored on a dedicated handle so this long-running loop does not block
+        // `pending_tasks_all_finished` used by tests for short-lived RPCs.
+        let handle = get_runtime().spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+
+                let meta = match http_client.get_outcome_meta().await {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        log::warn!("Outcome meta poll failed: {e}");
+                        continue;
+                    }
+                };
+
+                let settlements = derive_outcome_settlements(&meta);
+                if settlements.is_empty() {
+                    continue;
+                }
+
+                let spot_json = match http_client
+                    .info_spot_clearinghouse_state(&account_address)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(e) => {
+                        log::warn!("Settlement dispatch skipped: spot state fetch failed: {e}");
+                        continue;
+                    }
+                };
+                let spot_state: SpotClearinghouseState = match serde_json::from_value(spot_json) {
+                    Ok(state) => state,
+                    Err(e) => {
+                        log::warn!("Settlement dispatch skipped: spot state parse failed: {e}");
+                        continue;
+                    }
+                };
+
+                let ts = clock.get_time_ns();
+                let fills = {
+                    let mut guard = tracker.lock().expect(MUTEX_POISONED);
+                    build_settlement_fills(&settlements, &spot_state, &mut guard, account_id, ts)
+                };
+
+                for fill in fills {
+                    log::info!(
+                        "Dispatching outcome settlement fill: instrument={}, price={}, qty={}",
+                        fill.instrument_id,
+                        fill.last_px,
+                        fill.last_qty,
+                    );
+                    emitter.send_fill_report(fill);
+                }
+            }
+        });
+
+        let mut slot = self.settlement_poll_handle.lock().expect(MUTEX_POISONED);
+        if let Some(previous) = slot.replace(handle) {
+            previous.abort();
+        }
+
+        Ok(())
+    }
+
     fn abort_pending_tasks(&self) {
         let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
         for handle in tasks.drain(..) {
@@ -474,6 +510,15 @@ impl ExecutionClient for HyperliquidExecutionClient {
         log::info!("Stopping Hyperliquid execution client");
 
         if let Some(handle) = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take() {
+            handle.abort();
+        }
+
+        if let Some(handle) = self
+            .settlement_poll_handle
+            .lock()
+            .expect(MUTEX_POISONED)
+            .take()
+        {
             handle.abort();
         }
 
@@ -649,6 +694,12 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let mut hyperliquid_orders = Vec::new();
 
         for order in &orders {
+            if let Err(e) = validate_order_for_hyperliquid(order) {
+                self.emitter
+                    .emit_order_denied(order, &format!("Validation failed: {e}"));
+                continue;
+            }
+
             let symbol = order.instrument_id().symbol.to_string();
             let asset = match http_client.get_asset_index(&symbol) {
                 Some(a) => a,
@@ -980,8 +1031,16 @@ impl ExecutionClient for HyperliquidExecutionClient {
                     }
                 }
                 Err(e) => {
-                    log::warn!("Order modification HTTP request failed: {e}");
-                    dispatch_state.clear_pending_modify(&client_order_id);
+                    if e.is_transport_error() {
+                        // Keep pending state so WS can reconcile target qty if the modify landed
+                        log::warn!(
+                            "Order modification transport failure for {client_order_id}: {e}; \
+                             awaiting WS reconciliation",
+                        );
+                    } else {
+                        log::warn!("Order modification HTTP request failed: {e}");
+                        dispatch_state.clear_pending_modify(&client_order_id);
+                    }
                 }
             }
 
@@ -1053,14 +1112,21 @@ impl ExecutionClient for HyperliquidExecutionClient {
                     }
                 }
                 Err(e) => {
-                    emitter.emit_order_cancel_rejected_event(
-                        strategy_id,
-                        instrument_id,
-                        client_order_id,
-                        venue_order_id,
-                        &format!("Cancel HTTP request failed: {e}"),
-                        clock.get_time_ns(),
-                    );
+                    if e.is_transport_error() {
+                        log::warn!(
+                            "Cancel transport failure for {client_order_id}: {e}; \
+                             awaiting WS reconciliation",
+                        );
+                    } else {
+                        emitter.emit_order_cancel_rejected_event(
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            venue_order_id,
+                            &format!("Cancel HTTP request failed: {e}"),
+                            clock.get_time_ns(),
+                        );
+                    }
                 }
             }
 
@@ -1186,19 +1252,25 @@ impl ExecutionClient for HyperliquidExecutionClient {
                     }
                 }
                 Err(e) => {
-                    let reason = format!("Cancel-all HTTP request failed: {e}");
-                    log::warn!("{reason}");
-                    let ts = clock.get_time_ns();
-
-                    for entry in &entries {
-                        emitter.emit_order_cancel_rejected_event(
-                            entry.strategy_id,
-                            entry.instrument_id,
-                            entry.client_order_id,
-                            entry.venue_order_id,
-                            &reason,
-                            ts,
+                    if e.is_transport_error() {
+                        log::warn!(
+                            "Cancel-all transport failure: {e}; awaiting WS reconciliation",
                         );
+                    } else {
+                        let reason = format!("Cancel-all HTTP request failed: {e}");
+                        log::warn!("{reason}");
+                        let ts = clock.get_time_ns();
+
+                        for entry in &entries {
+                            emitter.emit_order_cancel_rejected_event(
+                                entry.strategy_id,
+                                entry.instrument_id,
+                                entry.client_order_id,
+                                entry.venue_order_id,
+                                &reason,
+                                ts,
+                            );
+                        }
                     }
                 }
             }
@@ -1314,19 +1386,25 @@ impl ExecutionClient for HyperliquidExecutionClient {
                     }
                 }
                 Err(e) => {
-                    let reason = format!("Batch cancel HTTP request failed: {e}");
-                    log::warn!("{reason}");
-                    let ts = clock.get_time_ns();
-
-                    for entry in &sent_entries {
-                        emitter.emit_order_cancel_rejected_event(
-                            entry.strategy_id,
-                            entry.instrument_id,
-                            entry.client_order_id,
-                            entry.venue_order_id,
-                            &reason,
-                            ts,
+                    if e.is_transport_error() {
+                        log::warn!(
+                            "Batch cancel transport failure: {e}; awaiting WS reconciliation",
                         );
+                    } else {
+                        let reason = format!("Batch cancel HTTP request failed: {e}");
+                        log::warn!("{reason}");
+                        let ts = clock.get_time_ns();
+
+                        for entry in &sent_entries {
+                            emitter.emit_order_cancel_rejected_event(
+                                entry.strategy_id,
+                                entry.instrument_id,
+                                entry.client_order_id,
+                                entry.venue_order_id,
+                                &reason,
+                                ts,
+                            );
+                        }
                     }
                 }
             }
@@ -1469,6 +1547,10 @@ impl ExecutionClient for HyperliquidExecutionClient {
             return Err(e);
         }
 
+        if let Err(e) = self.start_outcome_settlement_poll() {
+            log::warn!("Outcome settlement polling not started: {e}");
+        }
+
         self.core.set_connected();
 
         log::info!("Connected: client_id={}", self.core.client_id);
@@ -1484,6 +1566,15 @@ impl ExecutionClient for HyperliquidExecutionClient {
 
         // Disconnect WebSocket
         self.ws_client.disconnect().await?;
+
+        if let Some(handle) = self
+            .settlement_poll_handle
+            .lock()
+            .expect(MUTEX_POISONED)
+            .take()
+        {
+            handle.abort();
+        }
 
         // Abort any pending tasks
         self.abort_pending_tasks();
@@ -1850,6 +1941,81 @@ fn register_order_identity_into(state: &WsDispatchState, order: &OrderAny) {
     );
 }
 
+/// Validates that an order is acceptable for submission to Hyperliquid.
+///
+/// Checks symbol format, order type support, and HIP-4-specific restrictions
+/// (no reduce-only, no trigger order types on outcome side tokens).
+///
+/// # Errors
+///
+/// Returns an error describing the first validation failure encountered.
+pub fn validate_order_for_hyperliquid(order: &OrderAny) -> anyhow::Result<()> {
+    let instrument_id = order.instrument_id();
+    let symbol = instrument_id.symbol.as_str();
+    let product_type = HyperliquidProductType::from_symbol(symbol).map_err(|_| {
+        anyhow::anyhow!(
+            "Unsupported instrument symbol format for Hyperliquid: {symbol} \
+             (expected -PERP, -SPOT, or HIP-4 outcome `+E`/`#E`)"
+        )
+    })?;
+
+    match order.order_type() {
+        OrderType::Market
+        | OrderType::Limit
+        | OrderType::StopMarket
+        | OrderType::StopLimit
+        | OrderType::MarketIfTouched
+        | OrderType::LimitIfTouched => {}
+        _ => anyhow::bail!(
+            "Unsupported order type for Hyperliquid: {:?}",
+            order.order_type()
+        ),
+    }
+
+    // HIP-4 outcomes are fully-collateralized side tokens with no margin,
+    // funding, or trigger machinery. Reject features that don't apply.
+    if product_type == HyperliquidProductType::Outcome {
+        if order.is_reduce_only() {
+            anyhow::bail!("Reduce-only is not supported for Hyperliquid HIP-4 outcomes: {symbol}");
+        }
+
+        if !matches!(order.order_type(), OrderType::Market | OrderType::Limit) {
+            anyhow::bail!(
+                "Trigger order types are not supported for Hyperliquid HIP-4 outcomes: \
+                 {symbol} (received {:?})",
+                order.order_type()
+            );
+        }
+    }
+
+    if matches!(
+        order.order_type(),
+        OrderType::StopMarket
+            | OrderType::StopLimit
+            | OrderType::MarketIfTouched
+            | OrderType::LimitIfTouched
+    ) && order.trigger_price().is_none()
+    {
+        anyhow::bail!(
+            "Conditional orders require a trigger price for Hyperliquid: {:?}",
+            order.order_type()
+        );
+    }
+
+    if matches!(
+        order.order_type(),
+        OrderType::Limit | OrderType::StopLimit | OrderType::LimitIfTouched
+    ) && order.price().is_none()
+    {
+        anyhow::bail!(
+            "Limit orders require a limit price for Hyperliquid: {:?}",
+            order.order_type()
+        );
+    }
+
+    Ok(())
+}
+
 /// Routes a single execution report through the two-tier dispatch.
 ///
 /// For tracked orders this emits typed `OrderEventAny` events via the
@@ -1953,7 +2119,7 @@ mod tests {
     use super::{
         Cloid, ExecutionReport, FifoCache, HyperliquidWebSocketClient, OrderIdentity,
         WsDispatchState, determine_order_list_grouping, handle_execution_report,
-        register_order_identity_into,
+        register_order_identity_into, validate_order_for_hyperliquid,
     };
     use crate::{common::enums::HyperliquidEnvironment, http::models::HyperliquidExecGrouping};
 
@@ -2680,6 +2846,167 @@ mod tests {
         assert_eq!(
             ws_client.get_cloid_mapping(&cloid_for("O-HER-ACC")),
             Some(cid)
+        );
+    }
+
+    fn outcome_limit_order(id: &str, reduce_only: bool) -> OrderAny {
+        outcome_limit_order_full(id, reduce_only, false, TimeInForce::Gtc)
+    }
+
+    fn outcome_limit_order_full(
+        id: &str,
+        reduce_only: bool,
+        post_only: bool,
+        time_in_force: TimeInForce,
+    ) -> OrderAny {
+        OrderAny::Limit(LimitOrder::new(
+            TraderId::from("TESTER-001"),
+            StrategyId::from("S-001"),
+            InstrumentId::from("+10.HYPERLIQUID"),
+            ClientOrderId::from(id),
+            OrderSide::Buy,
+            Quantity::from("1"),
+            Price::from("0.5000"),
+            time_in_force,
+            None,
+            post_only,
+            reduce_only,
+            false,
+            None,
+            None,
+            None,
+            Some(ContingencyType::NoContingency),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+            Default::default(),
+        ))
+    }
+
+    fn outcome_stop_order(id: &str) -> OrderAny {
+        OrderAny::StopMarket(StopMarketOrder::new(
+            TraderId::from("TESTER-001"),
+            StrategyId::from("S-001"),
+            InstrumentId::from("+10.HYPERLIQUID"),
+            ClientOrderId::from(id),
+            OrderSide::Sell,
+            Quantity::from("1"),
+            Price::from("0.4000"),
+            TriggerType::LastPrice,
+            TimeInForce::Gtc,
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+            Some(ContingencyType::NoContingency),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+            Default::default(),
+        ))
+    }
+
+    fn perp_with_unsupported_symbol(id: &str) -> OrderAny {
+        OrderAny::Limit(LimitOrder::new(
+            TraderId::from("TESTER-001"),
+            StrategyId::from("S-001"),
+            InstrumentId::from("BTC-USD-FOO.HYPERLIQUID"),
+            ClientOrderId::from(id),
+            OrderSide::Buy,
+            Quantity::from("1"),
+            Price::from("100.0"),
+            TimeInForce::Gtc,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            Some(ContingencyType::NoContingency),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+            Default::default(),
+        ))
+    }
+
+    #[rstest]
+    fn test_validate_accepts_perp_limit_order() {
+        let order = limit_order(
+            "O-VAL-PERP",
+            false,
+            ContingencyType::NoContingency,
+            None,
+            None,
+        );
+        validate_order_for_hyperliquid(&order).unwrap();
+    }
+
+    #[rstest]
+    #[case::gtc_post_only(true, TimeInForce::Gtc)]
+    #[case::gtc_taker(false, TimeInForce::Gtc)]
+    #[case::ioc_post_only(true, TimeInForce::Ioc)]
+    #[case::ioc_taker(false, TimeInForce::Ioc)]
+    fn test_validate_accepts_outcome_limit_order(
+        #[case] post_only: bool,
+        #[case] time_in_force: TimeInForce,
+    ) {
+        let order = outcome_limit_order_full(
+            "O-VAL-OUTCOME",
+            /* reduce_only */ false,
+            post_only,
+            time_in_force,
+        );
+        validate_order_for_hyperliquid(&order).unwrap();
+    }
+
+    #[rstest]
+    fn test_validate_rejects_outcome_reduce_only() {
+        let order = outcome_limit_order("O-VAL-RO", true);
+        let err = validate_order_for_hyperliquid(&order).unwrap_err();
+        assert!(
+            err.to_string().contains("Reduce-only is not supported"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[rstest]
+    fn test_validate_rejects_outcome_trigger_order() {
+        let order = outcome_stop_order("O-VAL-TRIG");
+        let err = validate_order_for_hyperliquid(&order).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Trigger order types are not supported"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[rstest]
+    fn test_validate_rejects_unsupported_symbol_suffix() {
+        let order = perp_with_unsupported_symbol("O-VAL-BAD");
+        let err = validate_order_for_hyperliquid(&order).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unsupported instrument symbol format"),
+            "unexpected error: {err}",
         );
     }
 }

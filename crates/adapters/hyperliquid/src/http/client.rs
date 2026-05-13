@@ -82,13 +82,13 @@ use crate::{
             HyperliquidExecOrderKind, HyperliquidExecOrderResponseData, HyperliquidExecOrderStatus,
             HyperliquidExecPlaceOrderRequest, HyperliquidExecTif, HyperliquidExecTpSl,
             HyperliquidExecTriggerParams, HyperliquidFills, HyperliquidFundingHistoryEntry,
-            HyperliquidL2Book, HyperliquidMeta, HyperliquidOrderStatus, PerpMeta, PerpMetaAndCtxs,
-            RESPONSE_STATUS_OK, SpotClearinghouseState, SpotMeta, SpotMetaAndCtxs,
+            HyperliquidL2Book, HyperliquidMeta, HyperliquidOrderStatus, OutcomeMeta, PerpMeta,
+            PerpMetaAndCtxs, RESPONSE_STATUS_OK, SpotClearinghouseState, SpotMeta, SpotMetaAndCtxs,
         },
         parse::{
             HyperliquidInstrumentDef, instruments_from_defs_owned, parse_fill_report,
-            parse_order_status_report_from_basic, parse_perp_instruments,
-            parse_position_status_report, parse_spot_instruments,
+            parse_order_status_report_from_basic, parse_outcome_instruments,
+            parse_perp_instruments, parse_position_status_report, parse_spot_instruments,
             parse_spot_position_status_report,
         },
         query::{ExchangeAction, InfoRequest},
@@ -341,6 +341,13 @@ impl HyperliquidRawHttpClient {
     /// Get spot metadata with asset contexts (for price precision refinement).
     pub async fn get_spot_meta_and_ctxs(&self) -> Result<SpotMetaAndCtxs> {
         let request = InfoRequest::spot_meta_and_asset_ctxs();
+        let response = self.send_info_request(&request).await?;
+        serde_json::from_value(response).map_err(Error::Serde)
+    }
+
+    /// Get outcome metadata.
+    pub async fn get_outcome_meta(&self) -> Result<OutcomeMeta> {
+        let request = InfoRequest::outcome_meta();
         let response = self.send_info_request(&request).await?;
         serde_json::from_value(response).map_err(Error::Serde)
     }
@@ -1312,6 +1319,27 @@ impl HyperliquidHttpClient {
             }
         }
 
+        // HIP-4 outcome metadata is best-effort: the venue may not expose it
+        // and the response shape is still firming up. Treat any error as a
+        // soft skip so missing outcomes do not break perp/spot loading.
+        match self.inner.get_outcome_meta().await {
+            Ok(outcome_meta) => match parse_outcome_instruments(&outcome_meta) {
+                Ok(outcome_defs) => {
+                    log::debug!(
+                        "Loaded Hyperliquid outcome definitions: count={}",
+                        outcome_defs.len(),
+                    );
+                    defs.extend(outcome_defs);
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse Hyperliquid outcome instruments: {e}");
+                }
+            },
+            Err(e) => {
+                log::debug!("Skipping Hyperliquid outcome metadata: {e}");
+            }
+        }
+
         // Drop defs whose Nautilus-internal symbol collides with one already
         // accepted. This guards the HIP-3 case where two distinct venue names
         // (e.g. `dex:FOO*` and `dex:FOO?`) sanitize onto the same internal
@@ -1425,6 +1453,11 @@ impl HyperliquidHttpClient {
     #[allow(dead_code)]
     pub(crate) async fn get_spot_meta(&self) -> Result<SpotMeta> {
         self.inner.get_spot_meta().await
+    }
+
+    /// Get outcome metadata (internal helper).
+    pub(crate) async fn get_outcome_meta(&self) -> Result<OutcomeMeta> {
+        self.inner.get_outcome_meta().await
     }
 
     /// Get L2 order book for a coin.
@@ -2036,6 +2069,8 @@ impl HyperliquidHttpClient {
     /// When `instrument_id` resolves to a specific product type, the opposite
     /// product's endpoint is skipped to avoid wasted round trips and make
     /// filtered queries independent of the unused endpoint's availability.
+    /// HIP-4 outcomes live in `spotClearinghouseState`, so an outcome filter
+    /// is routed like a spot filter (perp leg skipped).
     ///
     /// For vault tokens (starting with "vntls:") that are not in the cache,
     /// synthetic instruments will be created automatically. Spot balances whose
@@ -2058,7 +2093,11 @@ impl HyperliquidHttpClient {
 
         let filter_product = instrument_id
             .and_then(|id| HyperliquidProductType::from_symbol(id.symbol.as_str()).ok());
-        let fetch_perp = filter_product != Some(HyperliquidProductType::Spot);
+
+        let fetch_perp = !matches!(
+            filter_product,
+            Some(HyperliquidProductType::Spot | HyperliquidProductType::Outcome)
+        );
         let fetch_spot = filter_product != Some(HyperliquidProductType::Perp);
 
         let mut reports = Vec::new();
@@ -2205,10 +2244,13 @@ impl HyperliquidHttpClient {
     /// Request spot position status reports for a user.
     ///
     /// Each non-zero spot balance is reported as a Long position against its
-    /// `{BASE}-{QUOTE}-SPOT` instrument. Balances whose base token has no
-    /// matching instrument in the cache are skipped with a debug log (callers
-    /// should ensure [`request_instruments`](Self::request_instruments) has run
-    /// first).
+    /// `{BASE}-{QUOTE}-SPOT` instrument. HIP-4 outcome side tokens arrive on
+    /// this same endpoint with `coin` set to the `+<encoding>` token form;
+    /// those balances are resolved against the matching Outcome instrument so
+    /// outcome holdings surface as positions through the standard reconcile
+    /// path. Balances whose base token has no matching instrument in the
+    /// cache are skipped with a debug log (callers should ensure
+    /// [`request_instruments`](Self::request_instruments) has run first).
     ///
     /// # Errors
     ///
@@ -2244,8 +2286,12 @@ impl HyperliquidHttpClient {
                 continue;
             }
 
-            let instrument = match self
-                .get_or_create_instrument(&balance.coin, Some(HyperliquidProductType::Spot))
+            let product_type = match HyperliquidProductType::from_symbol(balance.coin.as_str()) {
+                Ok(HyperliquidProductType::Outcome) => HyperliquidProductType::Outcome,
+                _ => HyperliquidProductType::Spot,
+            };
+
+            let instrument = match self.get_or_create_instrument(&balance.coin, Some(product_type))
             {
                 Some(inst) => inst,
                 None => continue,
@@ -2873,6 +2919,15 @@ fn perp_dex_asset_index_base(dex_index: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::{net::SocketAddr, sync::Arc};
+
+    use axum::{
+        Router,
+        extract::State,
+        http::StatusCode,
+        response::{IntoResponse, Json, Response},
+        routing::post,
+    };
     use nautilus_core::{MUTEX_POISONED, time::get_atomic_clock_realtime};
     use nautilus_model::{
         currencies::CURRENCY_MAP,
@@ -2882,6 +2937,7 @@ mod tests {
         types::{Currency, Price, Quantity},
     };
     use rstest::rstest;
+    use serde_json::{Value, json};
     use ustr::Ustr;
 
     use super::HyperliquidHttpClient;
@@ -2892,6 +2948,63 @@ mod tests {
         },
         http::query::InfoRequest,
     };
+
+    #[derive(Clone, Default)]
+    struct OutcomeMetaServerState {
+        last_request_body: Arc<tokio::sync::Mutex<Option<Value>>>,
+    }
+
+    async fn handle_outcome_meta_info(
+        State(state): State<OutcomeMetaServerState>,
+        body: axum::body::Bytes,
+    ) -> Response {
+        let Ok(request_body): Result<Value, _> = serde_json::from_slice(&body) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid JSON body"})),
+            )
+                .into_response();
+        };
+
+        *state.last_request_body.lock().await = Some(request_body.clone());
+
+        if request_body.get("type").and_then(|value| value.as_str()) != Some("outcomeMeta") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Expected outcomeMeta request"})),
+            )
+                .into_response();
+        }
+
+        Json(json!({
+            "outcomes": [
+                {
+                    "outcome": 123,
+                    "name": "Recurring",
+                    "description": "class:priceBinary|underlying:HYPE|expiry:20260310-1100|targetPrice:34.5|period:3m",
+                    "sideSpecs": [
+                        {"name": "Yes"},
+                        {"name": "No"}
+                    ]
+                }
+            ]
+        }))
+        .into_response()
+    }
+
+    async fn start_outcome_meta_server(state: OutcomeMetaServerState) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route("/info", post(handle_outcome_meta_info))
+            .with_state(state);
+
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        addr
+    }
 
     #[rstest]
     fn stable_json_roundtrips() {
@@ -2911,6 +3024,27 @@ mod tests {
         let pretty = serde_json::to_string_pretty(&val).unwrap();
         assert!(pretty.contains("\"type\": \"l2Book\""));
         assert!(pretty.contains("\"coin\": \"BTC\""));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_production_client_get_outcome_meta_uses_outcome_meta_request() {
+        let state = OutcomeMetaServerState::default();
+        let addr = start_outcome_meta_server(state.clone()).await;
+        let mut client =
+            HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+        client.set_base_info_url(format!("http://{addr}/info"));
+
+        let meta = client.get_outcome_meta().await.unwrap();
+        let request_body = state.last_request_body.lock().await.clone().unwrap();
+
+        assert_eq!(request_body, json!({"type": "outcomeMeta"}));
+        assert_eq!(meta.outcomes.len(), 1);
+        assert_eq!(meta.outcomes[0].outcome, 123);
+        assert_eq!(meta.outcomes[0].name, "Recurring");
+        assert_eq!(meta.outcomes[0].side_specs.len(), 2);
+        assert_eq!(meta.outcomes[0].side_specs[0].name, "Yes");
+        assert_eq!(meta.outcomes[0].side_specs[1].name, "No");
     }
 
     #[rstest]

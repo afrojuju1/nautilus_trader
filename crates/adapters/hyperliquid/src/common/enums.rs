@@ -816,6 +816,8 @@ pub enum HyperliquidInfoRequestType {
     MetaAndAssetCtxs,
     /// Get spot metadata with asset contexts.
     SpotMetaAndAssetCtxs,
+    /// Get outcome metadata.
+    OutcomeMeta,
     /// Get L2 order book for a coin.
     L2Book,
     /// Get all mid prices.
@@ -877,6 +879,7 @@ impl HyperliquidInfoRequestType {
             Self::SpotMeta => "spotMeta",
             Self::MetaAndAssetCtxs => "metaAndAssetCtxs",
             Self::SpotMetaAndAssetCtxs => "spotMetaAndAssetCtxs",
+            Self::OutcomeMeta => "outcomeMeta",
             Self::L2Book => "l2Book",
             Self::AllMids => "allMids",
             Self::UserFills => "userFills",
@@ -953,6 +956,8 @@ pub enum HyperliquidProductType {
     Perp,
     /// Spot markets.
     Spot,
+    /// HIP-4 binary outcome side tokens.
+    Outcome,
 }
 
 impl HyperliquidProductType {
@@ -966,10 +971,24 @@ impl HyperliquidProductType {
             Ok(Self::Perp)
         } else if symbol.ends_with("-SPOT") {
             Ok(Self::Spot)
+        } else if is_outcome_wire_symbol(symbol) {
+            Ok(Self::Outcome)
         } else {
             anyhow::bail!("Invalid Hyperliquid symbol format: {symbol}")
         }
     }
+}
+
+// Outcomes use the `#<encoding>` spot-coin form or the `+<encoding>` token
+// form, where the encoding is `10 * outcome + side` and must parse as `u32`.
+fn is_outcome_wire_symbol(symbol: &str) -> bool {
+    let Some(rest) = symbol
+        .strip_prefix('#')
+        .or_else(|| symbol.strip_prefix('+'))
+    else {
+        return false;
+    };
+    !rest.is_empty() && rest.parse::<u32>().is_ok()
 }
 
 /// Hyperliquid API environment.
@@ -1083,6 +1102,14 @@ mod tests {
                 tif
             );
         }
+    }
+
+    #[rstest]
+    fn test_info_request_type_outcome_meta_as_str() {
+        assert_eq!(
+            HyperliquidInfoRequestType::OutcomeMeta.as_str(),
+            "outcomeMeta"
+        );
     }
 
     #[rstest]
@@ -1586,5 +1613,35 @@ mod tests {
             let back_to_cond = HyperliquidConditionalOrderType::from(order_type);
             assert_eq!(cond_type, back_to_cond, "Roundtrip conversion failed");
         }
+    }
+
+    #[rstest]
+    #[case("BTC-USD-PERP", HyperliquidProductType::Perp)]
+    #[case("HYPE-USDC-SPOT", HyperliquidProductType::Spot)]
+    #[case("#10", HyperliquidProductType::Outcome)]
+    #[case("+31", HyperliquidProductType::Outcome)]
+    #[case("#0", HyperliquidProductType::Outcome)]
+    fn test_product_type_from_symbol(
+        #[case] symbol: &str,
+        #[case] expected: HyperliquidProductType,
+    ) {
+        assert_eq!(
+            HyperliquidProductType::from_symbol(symbol).unwrap(),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case("")]
+    #[case("BTC")]
+    #[case("#")]
+    #[case("+")]
+    #[case("#abc")]
+    #[case("+12.5")]
+    #[case("@1")]
+    #[case("#-1")]
+    #[case("+-1")]
+    fn test_product_type_from_symbol_rejects_invalid(#[case] symbol: &str) {
+        assert!(HyperliquidProductType::from_symbol(symbol).is_err());
     }
 }

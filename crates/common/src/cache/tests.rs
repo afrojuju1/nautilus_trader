@@ -17,7 +17,7 @@
 
 #[cfg(feature = "defi")]
 use std::sync::Arc;
-use std::{cell::RefCell, rc::Rc};
+use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
 use ahash::AHashSet;
 use bytes::Bytes;
@@ -42,8 +42,8 @@ use nautilus_model::{
         OrderRejected, OrderReleased, OrderSubmitted, OrderUpdated,
     },
     identifiers::{
-        AccountId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId, Symbol,
-        TradeId, Venue, VenueOrderId,
+        AccountId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId, PositionId,
+        StrategyId, Symbol, TradeId, Venue, VenueOrderId,
     },
     instruments::{CurrencyPair, Instrument, InstrumentAny, SyntheticInstrument, stubs::*},
     orderbook::OrderBook,
@@ -5043,4 +5043,1143 @@ fn test_update_closed_emulated_order_removes_from_orders_emulated(
         "Closed emulated order should be removed from orders_emulated index"
     );
     assert_eq!(cache.orders_emulated_count(None, None, None, None, None), 0);
+}
+
+// Covers the size-ordered intersection paths in `query_orders_in_bucket` /
+// `count_orders_in_bucket` and the filter-discard regression in `orders_for_exec_algorithm`.
+
+fn build_filter_order(
+    instrument_id: InstrumentId,
+    side: OrderSide,
+    client_order_id: ClientOrderId,
+    strategy_id: Option<StrategyId>,
+    exec_algorithm_id: Option<ExecAlgorithmId>,
+) -> OrderAny {
+    let mut builder = OrderTestBuilder::new(OrderType::Limit);
+    builder
+        .instrument_id(instrument_id)
+        .side(side)
+        .price(Price::from("1.00000"))
+        .quantity(Quantity::from("1"))
+        .client_order_id(client_order_id);
+
+    if let Some(strategy_id) = strategy_id {
+        builder.strategy_id(strategy_id);
+    }
+
+    if let Some(exec_algorithm_id) = exec_algorithm_id {
+        builder.exec_algorithm_id(exec_algorithm_id);
+    }
+
+    builder.build()
+}
+
+fn promote_to_open(
+    cache: &mut Cache,
+    order: &mut OrderAny,
+    account_id: AccountId,
+    venue_order_id: VenueOrderId,
+) {
+    let submitted = TestOrderEventStubs::submitted(order, account_id);
+    update_order_with_event(cache, order, submitted);
+    let accepted = TestOrderEventStubs::accepted(order, account_id, venue_order_id);
+    update_order_with_event(cache, order, accepted);
+}
+
+fn order_id_set(orders: &[OrderRef<'_>]) -> AHashSet<ClientOrderId> {
+    orders.iter().map(|o| o.client_order_id()).collect()
+}
+
+#[rstest]
+fn test_orders_for_exec_algorithm_applies_filters(mut cache: Cache) {
+    // Mixed universe: TWAP and VWAP across two venues / two instruments / two sides.
+    // The filter discard regression in the original Rust port returned every TWAP order
+    // regardless of venue/instrument/side; this test pins the corrected behavior.
+    let venue_a = Venue::from("VENUE-A");
+    let inst_a1 = InstrumentId::from("SYMBOL-1.VENUE-A");
+    let inst_a2 = InstrumentId::from("SYMBOL-2.VENUE-A");
+    let inst_b1 = InstrumentId::from("SYMBOL-1.VENUE-B");
+    let twap = ExecAlgorithmId::from("TWAP");
+    let vwap = ExecAlgorithmId::from("VWAP");
+
+    let twap_a1_buy = build_filter_order(
+        inst_a1,
+        OrderSide::Buy,
+        ClientOrderId::from("O-T-A1-BUY"),
+        None,
+        Some(twap),
+    );
+    let twap_a2_sell = build_filter_order(
+        inst_a2,
+        OrderSide::Sell,
+        ClientOrderId::from("O-T-A2-SELL"),
+        None,
+        Some(twap),
+    );
+    let twap_b1_buy = build_filter_order(
+        inst_b1,
+        OrderSide::Buy,
+        ClientOrderId::from("O-T-B1-BUY"),
+        None,
+        Some(twap),
+    );
+    let vwap_a1_buy = build_filter_order(
+        inst_a1,
+        OrderSide::Buy,
+        ClientOrderId::from("O-V-A1-BUY"),
+        None,
+        Some(vwap),
+    );
+    let untagged_a1 = build_filter_order(
+        inst_a1,
+        OrderSide::Buy,
+        ClientOrderId::from("O-UN-A1"),
+        None,
+        None,
+    );
+
+    for order in [
+        &twap_a1_buy,
+        &twap_a2_sell,
+        &twap_b1_buy,
+        &vwap_a1_buy,
+        &untagged_a1,
+    ] {
+        cache.add_order(order.clone(), None, None, false).unwrap();
+    }
+
+    // No filter: all TWAP orders, regardless of venue or instrument
+    assert_eq!(
+        order_id_set(&cache.orders_for_exec_algorithm(&twap, None, None, None, None, None)),
+        [
+            twap_a1_buy.client_order_id(),
+            twap_a2_sell.client_order_id(),
+            twap_b1_buy.client_order_id(),
+        ]
+        .into_iter()
+        .collect::<AHashSet<_>>()
+    );
+
+    // Venue filter: only VENUE-A TWAP orders
+    assert_eq!(
+        order_id_set(&cache.orders_for_exec_algorithm(
+            &twap,
+            Some(&venue_a),
+            None,
+            None,
+            None,
+            None,
+        )),
+        [
+            twap_a1_buy.client_order_id(),
+            twap_a2_sell.client_order_id()
+        ]
+        .into_iter()
+        .collect::<AHashSet<_>>()
+    );
+
+    // Venue + instrument filter: pinpoints a single TWAP order
+    assert_eq!(
+        order_id_set(&cache.orders_for_exec_algorithm(
+            &twap,
+            Some(&venue_a),
+            Some(&inst_a1),
+            None,
+            None,
+            None,
+        )),
+        [twap_a1_buy.client_order_id()]
+            .into_iter()
+            .collect::<AHashSet<_>>()
+    );
+
+    // Side filter (Buy) excludes the Sell-side TWAP order
+    assert_eq!(
+        order_id_set(&cache.orders_for_exec_algorithm(
+            &twap,
+            None,
+            None,
+            None,
+            None,
+            Some(OrderSide::Buy),
+        )),
+        [twap_a1_buy.client_order_id(), twap_b1_buy.client_order_id()]
+            .into_iter()
+            .collect::<AHashSet<_>>()
+    );
+
+    // VWAP id sees only the VWAP-tagged order
+    assert_eq!(
+        order_id_set(&cache.orders_for_exec_algorithm(&vwap, None, None, None, None, None)),
+        [vwap_a1_buy.client_order_id()]
+            .into_iter()
+            .collect::<AHashSet<_>>()
+    );
+}
+
+#[rstest]
+fn test_orders_for_exec_algorithm_unknown_id_returns_empty(
+    mut cache: Cache,
+    audusd_sim: CurrencyPair,
+) {
+    let twap = ExecAlgorithmId::from("TWAP");
+    let unknown = ExecAlgorithmId::from("UNKNOWN");
+    let order = build_filter_order(
+        audusd_sim.id,
+        OrderSide::Buy,
+        ClientOrderId::from("O-1"),
+        None,
+        Some(twap),
+    );
+    cache.add_order(order, None, None, false).unwrap();
+
+    assert!(
+        cache
+            .orders_for_exec_algorithm(&unknown, None, None, None, None, None)
+            .is_empty()
+    );
+}
+
+#[rstest]
+fn test_orders_for_exec_algorithm_unknown_venue_returns_empty(
+    mut cache: Cache,
+    audusd_sim: CurrencyPair,
+) {
+    // Drives the FilterSources::Empty path inside query_orders_in_bucket: a filter is
+    // provided but its index entry is missing, so the result must be empty regardless
+    // of what is in the bucket.
+    let twap = ExecAlgorithmId::from("TWAP");
+    let other_venue = Venue::from("OTHER-VENUE");
+    let order = build_filter_order(
+        audusd_sim.id,
+        OrderSide::Buy,
+        ClientOrderId::from("O-1"),
+        None,
+        Some(twap),
+    );
+    cache.add_order(order, None, None, false).unwrap();
+
+    assert!(
+        cache
+            .orders_for_exec_algorithm(&twap, Some(&other_venue), None, None, None, None)
+            .is_empty()
+    );
+}
+
+#[rstest]
+fn test_client_order_ids_state_buckets_with_filters(mut cache: Cache) {
+    // Universe: 4 orders across 2 venues × 2 instruments. Two are promoted to OPEN and
+    // two stay INITIALIZED (active_local). Filter combinations exercise the size-ordered
+    // intersection in `query_orders_in_bucket` against state-specific buckets, not just
+    // the universal `index.orders` bucket exercised by `test_client_order_ids_filtering`.
+    let venue_a = Venue::from("VENUE-A");
+    let venue_b = Venue::from("VENUE-B");
+    let inst_a = InstrumentId::from("SYMBOL-1.VENUE-A");
+    let inst_b = InstrumentId::from("SYMBOL-1.VENUE-B");
+    let account_id = AccountId::from("SIM-001");
+
+    let mut o_a_open = build_filter_order(
+        inst_a,
+        OrderSide::Buy,
+        ClientOrderId::from("O-A-OPEN"),
+        None,
+        None,
+    );
+    let mut o_b_open = build_filter_order(
+        inst_b,
+        OrderSide::Sell,
+        ClientOrderId::from("O-B-OPEN"),
+        None,
+        None,
+    );
+    let o_a_init = build_filter_order(
+        inst_a,
+        OrderSide::Buy,
+        ClientOrderId::from("O-A-INIT"),
+        None,
+        None,
+    );
+    let o_b_init = build_filter_order(
+        inst_b,
+        OrderSide::Sell,
+        ClientOrderId::from("O-B-INIT"),
+        None,
+        None,
+    );
+
+    cache
+        .add_order(o_a_open.clone(), None, None, false)
+        .unwrap();
+    cache
+        .add_order(o_b_open.clone(), None, None, false)
+        .unwrap();
+    cache
+        .add_order(o_a_init.clone(), None, None, false)
+        .unwrap();
+    cache
+        .add_order(o_b_init.clone(), None, None, false)
+        .unwrap();
+
+    promote_to_open(
+        &mut cache,
+        &mut o_a_open,
+        account_id,
+        VenueOrderId::from("V-A-1"),
+    );
+    promote_to_open(
+        &mut cache,
+        &mut o_b_open,
+        account_id,
+        VenueOrderId::from("V-B-1"),
+    );
+
+    // No filter: open bucket has both promoted orders, active_local has both initialized
+    assert_eq!(
+        cache.client_order_ids_open(None, None, None, None),
+        [o_a_open.client_order_id(), o_b_open.client_order_id()]
+            .into_iter()
+            .collect::<AHashSet<_>>()
+    );
+    assert_eq!(
+        cache.client_order_ids_active_local(None, None, None, None),
+        [o_a_init.client_order_id(), o_b_init.client_order_id()]
+            .into_iter()
+            .collect::<AHashSet<_>>()
+    );
+
+    // Venue filter: bucket fold restricts to the requested venue's slice of each state
+    assert_eq!(
+        cache.client_order_ids_open(Some(&venue_a), None, None, None),
+        [o_a_open.client_order_id()]
+            .into_iter()
+            .collect::<AHashSet<_>>()
+    );
+    assert_eq!(
+        cache.client_order_ids_active_local(Some(&venue_b), None, None, None),
+        [o_b_init.client_order_id()]
+            .into_iter()
+            .collect::<AHashSet<_>>()
+    );
+
+    // Venue + instrument filter: same instrument in different states must not bleed
+    // across buckets
+    assert_eq!(
+        cache.client_order_ids_open(Some(&venue_a), Some(&inst_a), None, None),
+        [o_a_open.client_order_id()]
+            .into_iter()
+            .collect::<AHashSet<_>>()
+    );
+    assert!(
+        cache
+            .client_order_ids_open(Some(&venue_a), Some(&inst_b), None, None)
+            .is_empty()
+    );
+
+    // Closed bucket has nothing yet
+    assert!(
+        cache
+            .client_order_ids_closed(None, None, None, None)
+            .is_empty()
+    );
+    assert!(
+        cache
+            .client_order_ids_closed(Some(&venue_a), None, None, None)
+            .is_empty()
+    );
+}
+
+#[rstest]
+fn test_orders_count_with_filters_and_side(mut cache: Cache) {
+    // Drives `count_orders_in_bucket` through the Sets arm with side filtering. Existing
+    // count tests in this file exercise only the no-filter no-side path.
+    let venue_a = Venue::from("VENUE-A");
+    let venue_b = Venue::from("VENUE-B");
+    let inst_a = InstrumentId::from("SYMBOL-1.VENUE-A");
+    let inst_b = InstrumentId::from("SYMBOL-1.VENUE-B");
+    let strategy = StrategyId::from("S-FILTER-001");
+    let account_id = AccountId::from("SIM-001");
+
+    let mut buy_a = build_filter_order(
+        inst_a,
+        OrderSide::Buy,
+        ClientOrderId::from("O-BUY-A"),
+        Some(strategy),
+        None,
+    );
+    let mut sell_a = build_filter_order(
+        inst_a,
+        OrderSide::Sell,
+        ClientOrderId::from("O-SELL-A"),
+        Some(strategy),
+        None,
+    );
+    let mut buy_b = build_filter_order(
+        inst_b,
+        OrderSide::Buy,
+        ClientOrderId::from("O-BUY-B"),
+        Some(strategy),
+        None,
+    );
+
+    cache.add_order(buy_a.clone(), None, None, false).unwrap();
+    cache.add_order(sell_a.clone(), None, None, false).unwrap();
+    cache.add_order(buy_b.clone(), None, None, false).unwrap();
+
+    promote_to_open(
+        &mut cache,
+        &mut buy_a,
+        account_id,
+        VenueOrderId::from("V-1"),
+    );
+    promote_to_open(
+        &mut cache,
+        &mut sell_a,
+        account_id,
+        VenueOrderId::from("V-2"),
+    );
+    promote_to_open(
+        &mut cache,
+        &mut buy_b,
+        account_id,
+        VenueOrderId::from("V-3"),
+    );
+
+    // No filter, no side
+    assert_eq!(cache.orders_open_count(None, None, None, None, None), 3);
+
+    // Venue filter
+    assert_eq!(
+        cache.orders_open_count(Some(&venue_a), None, None, None, None),
+        2
+    );
+    assert_eq!(
+        cache.orders_open_count(Some(&venue_b), None, None, None, None),
+        1
+    );
+
+    // Venue + instrument filter
+    assert_eq!(
+        cache.orders_open_count(Some(&venue_a), Some(&inst_a), None, None, None),
+        2
+    );
+
+    // Strategy filter (all orders share the strategy)
+    assert_eq!(
+        cache.orders_open_count(None, None, Some(&strategy), None, None),
+        3
+    );
+
+    // Side filter alone (Unfiltered + side branch)
+    assert_eq!(
+        cache.orders_open_count(None, None, None, None, Some(OrderSide::Buy)),
+        2
+    );
+    assert_eq!(
+        cache.orders_open_count(None, None, None, None, Some(OrderSide::Sell)),
+        1
+    );
+
+    // Venue + side (Sets + side branch)
+    assert_eq!(
+        cache.orders_open_count(Some(&venue_a), None, None, None, Some(OrderSide::Buy)),
+        1
+    );
+    assert_eq!(
+        cache.orders_open_count(Some(&venue_a), None, None, None, Some(OrderSide::Sell)),
+        1
+    );
+    assert_eq!(
+        cache.orders_open_count(Some(&venue_b), None, None, None, Some(OrderSide::Sell)),
+        0
+    );
+
+    // Total count with side filter applies across all buckets the same way
+    assert_eq!(
+        cache.orders_total_count(None, None, None, None, Some(OrderSide::Buy)),
+        2
+    );
+
+    // Unknown venue: FilterSources::Empty path returns 0
+    let unknown = Venue::from("OTHER");
+    assert_eq!(
+        cache.orders_open_count(Some(&unknown), None, None, None, None),
+        0
+    );
+    assert_eq!(
+        cache.orders_open_count(Some(&unknown), Some(&inst_a), None, None, None),
+        0
+    );
+}
+
+#[rstest]
+fn test_unknown_filter_returns_empty_across_query_methods(
+    mut cache: Cache,
+    audusd_sim: CurrencyPair,
+) {
+    // Pins the FilterSources::Empty path: when a filter argument names a key that does
+    // not appear in the corresponding index, the result is unconditionally empty.
+    let order = build_filter_order(
+        audusd_sim.id,
+        OrderSide::Buy,
+        ClientOrderId::from("O-1"),
+        None,
+        None,
+    );
+    cache.add_order(order, None, None, false).unwrap();
+
+    let unknown_venue = Venue::from("OTHER-VENUE");
+    let unknown_instrument = InstrumentId::from("SYMBOL-NONE.NOWHERE");
+    let unknown_strategy = StrategyId::from("S-UNKNOWN");
+
+    assert!(
+        cache
+            .client_order_ids(Some(&unknown_venue), None, None, None)
+            .is_empty()
+    );
+    assert!(
+        cache
+            .client_order_ids(None, Some(&unknown_instrument), None, None)
+            .is_empty()
+    );
+    assert!(
+        cache
+            .client_order_ids(None, None, Some(&unknown_strategy), None)
+            .is_empty()
+    );
+    assert!(
+        cache
+            .client_order_ids_active_local(Some(&unknown_venue), None, None, None)
+            .is_empty()
+    );
+    assert_eq!(
+        cache.orders_total_count(Some(&unknown_venue), None, None, None, None),
+        0
+    );
+    assert_eq!(
+        cache.orders_active_local_count(Some(&unknown_venue), None, None, None, None),
+        0
+    );
+}
+
+#[rstest]
+fn test_position_filters_with_state_and_side(mut cache: Cache) {
+    // Mirrors the order coverage for positions. Builds two open positions on different
+    // venues and a closed position on venue A; asserts filter and side branches against
+    // `position_*_ids` and `positions_*_count`.
+    fn make_pair(id_str: &str) -> CurrencyPair {
+        CurrencyPair::new(
+            InstrumentId::from(id_str),
+            Symbol::from(id_str),
+            Currency::USD(),
+            Currency::EUR(),
+            2,
+            4,
+            Price::from("0.01"),
+            Quantity::from("0.0001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        )
+    }
+
+    let venue_a = Venue::from("VENUE-A");
+    let venue_b = Venue::from("VENUE-B");
+    let instr_a = make_pair("PAIR-1.VENUE-A");
+    let instr_b = make_pair("PAIR-1.VENUE-B");
+
+    let order_a = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instr_a.id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1"))
+        .build();
+    let fill_a = match TestOrderEventStubs::filled(
+        &order_a,
+        &InstrumentAny::CurrencyPair(instr_a.clone()),
+        None,
+        Some(PositionId::new("POS-A")),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        OrderEventAny::Filled(f) => f,
+        _ => unreachable!(),
+    };
+    let pos_a_long = Position::new(&InstrumentAny::CurrencyPair(instr_a), fill_a);
+
+    let order_b = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instr_b.id)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("1"))
+        .build();
+    let fill_b = match TestOrderEventStubs::filled(
+        &order_b,
+        &InstrumentAny::CurrencyPair(instr_b.clone()),
+        None,
+        Some(PositionId::new("POS-B")),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        OrderEventAny::Filled(f) => f,
+        _ => unreachable!(),
+    };
+    let mut pos_b_short = Position::new(&InstrumentAny::CurrencyPair(instr_b), fill_b);
+    pos_b_short.side = PositionSide::Short;
+
+    let mut pos_a_closed = pos_a_long.clone();
+    pos_a_closed.id = PositionId::new("POS-A-CLOSED");
+    pos_a_closed.side = PositionSide::Flat;
+    pos_a_closed.ts_closed = Some(UnixNanos::from(1));
+
+    cache.add_position(&pos_a_long, OmsType::Netting).unwrap();
+    cache.add_position(&pos_b_short, OmsType::Netting).unwrap();
+    cache.add_position(&pos_a_closed, OmsType::Netting).unwrap();
+    // `add_position` always inserts into `positions_open`; the closed flag is honored
+    // only when state is reconciled via `update_position`.
+    cache.update_position(&pos_a_closed).unwrap();
+
+    // Open ids: filter by venue
+    assert_eq!(
+        cache.position_open_ids(Some(&venue_a), None, None, None),
+        [pos_a_long.id].into_iter().collect::<AHashSet<_>>()
+    );
+    assert_eq!(
+        cache.position_open_ids(Some(&venue_b), None, None, None),
+        [pos_b_short.id].into_iter().collect::<AHashSet<_>>()
+    );
+
+    // Closed ids: only the flagged position on venue A
+    assert_eq!(
+        cache.position_closed_ids(None, None, None, None),
+        [pos_a_closed.id].into_iter().collect::<AHashSet<_>>()
+    );
+    assert_eq!(
+        cache.position_closed_ids(Some(&venue_a), None, None, None),
+        [pos_a_closed.id].into_iter().collect::<AHashSet<_>>()
+    );
+    assert!(
+        cache
+            .position_closed_ids(Some(&venue_b), None, None, None)
+            .is_empty()
+    );
+
+    // Counts with filters (side-filter coverage is symmetric with `count_orders_in_bucket`
+    // and is exercised by `test_orders_count_with_filters_and_side`).
+    assert_eq!(cache.positions_open_count(None, None, None, None, None), 2);
+    assert_eq!(
+        cache.positions_open_count(Some(&venue_a), None, None, None, None),
+        1
+    );
+    assert_eq!(cache.positions_total_count(None, None, None, None, None), 3);
+    assert_eq!(
+        cache.positions_closed_count(None, None, None, None, None),
+        1
+    );
+
+    // Unknown filter -> empty / 0
+    let unknown = Venue::from("OTHER");
+    assert!(
+        cache
+            .position_open_ids(Some(&unknown), None, None, None)
+            .is_empty()
+    );
+    assert_eq!(
+        cache.positions_open_count(Some(&unknown), None, None, None, None),
+        0
+    );
+}
+
+// Pins the semantic invariants of the new `has_*`, `_view`, and `iter_*` query API
+// families against the existing owned/`_count` methods. A wrong-bucket binding or
+// inverted intersection in any wrapper would break one of these consistency checks.
+
+fn populate_orders_universe(
+    cache: &mut Cache,
+) -> (Venue, Venue, InstrumentId, InstrumentId, StrategyId) {
+    let venue_a = Venue::from("VENUE-A");
+    let venue_b = Venue::from("VENUE-B");
+    let inst_a = InstrumentId::from("SYMBOL-1.VENUE-A");
+    let inst_b = InstrumentId::from("SYMBOL-1.VENUE-B");
+    let strategy = StrategyId::from("S-CONS-001");
+    let account_id = AccountId::from("SIM-001");
+
+    let mut o_a_open = build_filter_order(
+        inst_a,
+        OrderSide::Buy,
+        ClientOrderId::from("O-A-OPEN"),
+        Some(strategy),
+        None,
+    );
+    let mut o_b_open = build_filter_order(
+        inst_b,
+        OrderSide::Sell,
+        ClientOrderId::from("O-B-OPEN"),
+        Some(strategy),
+        None,
+    );
+    let o_a_init = build_filter_order(
+        inst_a,
+        OrderSide::Buy,
+        ClientOrderId::from("O-A-INIT"),
+        Some(strategy),
+        None,
+    );
+    let o_b_init = build_filter_order(
+        inst_b,
+        OrderSide::Sell,
+        ClientOrderId::from("O-B-INIT"),
+        Some(strategy),
+        None,
+    );
+
+    cache
+        .add_order(o_a_open.clone(), None, None, false)
+        .unwrap();
+    cache
+        .add_order(o_b_open.clone(), None, None, false)
+        .unwrap();
+    cache.add_order(o_a_init, None, None, false).unwrap();
+    cache.add_order(o_b_init, None, None, false).unwrap();
+
+    promote_to_open(
+        cache,
+        &mut o_a_open,
+        account_id,
+        VenueOrderId::from("V-A-1"),
+    );
+    promote_to_open(
+        cache,
+        &mut o_b_open,
+        account_id,
+        VenueOrderId::from("V-B-1"),
+    );
+
+    (venue_a, venue_b, inst_a, inst_b, strategy)
+}
+
+fn assert_orders_apis_consistent(
+    cache: &Cache,
+    venue: Option<&Venue>,
+    instrument: Option<&InstrumentId>,
+    strategy: Option<&StrategyId>,
+) {
+    macro_rules! check_bucket {
+        ($owned:ident, $view:ident, $iter:ident, $count:ident, $has:ident, $label:literal) => {{
+            let owned = cache.$owned(venue, instrument, strategy, None);
+            let view = cache.$view(venue, instrument, strategy, None);
+            let iter: AHashSet<ClientOrderId> =
+                cache.$iter(venue, instrument, strategy, None).collect();
+            let count = cache.$count(venue, instrument, strategy, None, None);
+            let has = cache.$has(venue, instrument, strategy, None, None);
+
+            assert_eq!(
+                view.as_ref(),
+                &owned,
+                "view != owned for {} / {venue:?} / {instrument:?} / {strategy:?}",
+                $label,
+            );
+            assert_eq!(
+                iter, owned,
+                "iter.collect != owned for {} / {venue:?} / {instrument:?} / {strategy:?}",
+                $label,
+            );
+            assert_eq!(
+                count,
+                owned.len(),
+                "count != owned.len() for {} / {venue:?} / {instrument:?} / {strategy:?}",
+                $label,
+            );
+            assert_eq!(
+                has,
+                !owned.is_empty(),
+                "has != !owned.is_empty() for {} / {venue:?} / {instrument:?} / {strategy:?}",
+                $label,
+            );
+        }};
+    }
+
+    check_bucket!(
+        client_order_ids,
+        client_order_ids_view,
+        iter_client_order_ids,
+        orders_total_count,
+        has_orders,
+        "all"
+    );
+    check_bucket!(
+        client_order_ids_open,
+        client_order_ids_open_view,
+        iter_client_order_ids_open,
+        orders_open_count,
+        has_orders_open,
+        "open"
+    );
+    check_bucket!(
+        client_order_ids_closed,
+        client_order_ids_closed_view,
+        iter_client_order_ids_closed,
+        orders_closed_count,
+        has_orders_closed,
+        "closed"
+    );
+    check_bucket!(
+        client_order_ids_active_local,
+        client_order_ids_active_local_view,
+        iter_client_order_ids_active_local,
+        orders_active_local_count,
+        has_orders_active_local,
+        "active_local"
+    );
+    check_bucket!(
+        client_order_ids_emulated,
+        client_order_ids_emulated_view,
+        iter_client_order_ids_emulated,
+        orders_emulated_count,
+        has_orders_emulated,
+        "emulated"
+    );
+    check_bucket!(
+        client_order_ids_inflight,
+        client_order_ids_inflight_view,
+        iter_client_order_ids_inflight,
+        orders_inflight_count,
+        has_orders_inflight,
+        "inflight"
+    );
+}
+
+#[rstest]
+fn test_orders_query_apis_are_consistent(mut cache: Cache) {
+    let (venue_a, venue_b, inst_a, inst_b, strategy) = populate_orders_universe(&mut cache);
+
+    let combos: [(Option<&Venue>, Option<&InstrumentId>, Option<&StrategyId>); 7] = [
+        (None, None, None),
+        (Some(&venue_a), None, None),
+        (Some(&venue_b), None, None),
+        (None, Some(&inst_a), None),
+        (Some(&venue_a), Some(&inst_a), None),
+        (Some(&venue_a), Some(&inst_b), None),
+        (None, None, Some(&strategy)),
+    ];
+
+    for (venue, instrument, strategy_filter) in combos {
+        assert_orders_apis_consistent(&cache, venue, instrument, strategy_filter);
+    }
+}
+
+fn assert_positions_apis_consistent(
+    cache: &Cache,
+    venue: Option<&Venue>,
+    instrument: Option<&InstrumentId>,
+    strategy: Option<&StrategyId>,
+) {
+    macro_rules! check_bucket {
+        ($owned:ident, $view:ident, $iter:ident, $count:ident, $has:ident, $label:literal) => {{
+            let owned = cache.$owned(venue, instrument, strategy, None);
+            let view = cache.$view(venue, instrument, strategy, None);
+            let iter: AHashSet<PositionId> =
+                cache.$iter(venue, instrument, strategy, None).collect();
+            let count = cache.$count(venue, instrument, strategy, None, None);
+            let has = cache.$has(venue, instrument, strategy, None, None);
+
+            assert_eq!(view.as_ref(), &owned, "view != owned for {}", $label);
+            assert_eq!(iter, owned, "iter.collect != owned for {}", $label);
+            assert_eq!(count, owned.len(), "count != owned.len() for {}", $label);
+            assert_eq!(
+                has,
+                !owned.is_empty(),
+                "has != !owned.is_empty() for {}",
+                $label,
+            );
+        }};
+    }
+
+    check_bucket!(
+        position_ids,
+        position_ids_view,
+        iter_position_ids,
+        positions_total_count,
+        has_positions,
+        "all"
+    );
+    check_bucket!(
+        position_open_ids,
+        position_open_ids_view,
+        iter_position_open_ids,
+        positions_open_count,
+        has_positions_open,
+        "open"
+    );
+    check_bucket!(
+        position_closed_ids,
+        position_closed_ids_view,
+        iter_position_closed_ids,
+        positions_closed_count,
+        has_positions_closed,
+        "closed"
+    );
+}
+
+#[rstest]
+fn test_positions_query_apis_are_consistent(mut cache: Cache) {
+    fn make_pair(id_str: &str) -> CurrencyPair {
+        CurrencyPair::new(
+            InstrumentId::from(id_str),
+            Symbol::from(id_str),
+            Currency::USD(),
+            Currency::EUR(),
+            2,
+            4,
+            Price::from("0.01"),
+            Quantity::from("0.0001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        )
+    }
+
+    let venue_a = Venue::from("VENUE-A");
+    let venue_b = Venue::from("VENUE-B");
+    let instr_a = make_pair("PAIR-1.VENUE-A");
+    let instr_b = make_pair("PAIR-1.VENUE-B");
+
+    let order_a = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instr_a.id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1"))
+        .build();
+    let fill_a = match TestOrderEventStubs::filled(
+        &order_a,
+        &InstrumentAny::CurrencyPair(instr_a.clone()),
+        None,
+        Some(PositionId::new("POS-A")),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        OrderEventAny::Filled(f) => f,
+        _ => unreachable!(),
+    };
+    let pos_a = Position::new(&InstrumentAny::CurrencyPair(instr_a), fill_a);
+
+    let order_b = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instr_b.id)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("1"))
+        .build();
+    let fill_b = match TestOrderEventStubs::filled(
+        &order_b,
+        &InstrumentAny::CurrencyPair(instr_b.clone()),
+        None,
+        Some(PositionId::new("POS-B")),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        OrderEventAny::Filled(f) => f,
+        _ => unreachable!(),
+    };
+    let pos_b = Position::new(&InstrumentAny::CurrencyPair(instr_b), fill_b);
+
+    let mut pos_a_closed = pos_a.clone();
+    pos_a_closed.id = PositionId::new("POS-A-CLOSED");
+    pos_a_closed.side = PositionSide::Flat;
+    pos_a_closed.ts_closed = Some(UnixNanos::from(1));
+
+    cache.add_position(&pos_a, OmsType::Netting).unwrap();
+    cache.add_position(&pos_b, OmsType::Netting).unwrap();
+    cache.add_position(&pos_a_closed, OmsType::Netting).unwrap();
+    cache.update_position(&pos_a_closed).unwrap();
+
+    let combos: [(Option<&Venue>, Option<&InstrumentId>); 5] = [
+        (None, None),
+        (Some(&venue_a), None),
+        (Some(&venue_b), None),
+        (Some(&venue_a), Some(&pos_a.instrument_id)),
+        (None, Some(&pos_b.instrument_id)),
+    ];
+
+    for (venue, instrument) in combos {
+        assert_positions_apis_consistent(&cache, venue, instrument, None);
+    }
+}
+
+#[rstest]
+fn test_has_orders_with_side_filter(mut cache: Cache) {
+    // Mixed-side universe so side filtering can flip results
+    let venue_a = Venue::from("VENUE-A");
+    let inst_a = InstrumentId::from("SYMBOL-1.VENUE-A");
+    let strategy = StrategyId::from("S-SIDE-001");
+    let account_id = AccountId::from("SIM-001");
+
+    let mut buy = build_filter_order(
+        inst_a,
+        OrderSide::Buy,
+        ClientOrderId::from("O-BUY"),
+        Some(strategy),
+        None,
+    );
+    let mut sell = build_filter_order(
+        inst_a,
+        OrderSide::Sell,
+        ClientOrderId::from("O-SELL"),
+        Some(strategy),
+        None,
+    );
+    cache.add_order(buy.clone(), None, None, false).unwrap();
+    cache.add_order(sell.clone(), None, None, false).unwrap();
+    promote_to_open(&mut cache, &mut buy, account_id, VenueOrderId::from("V-1"));
+    promote_to_open(&mut cache, &mut sell, account_id, VenueOrderId::from("V-2"));
+
+    let cases: [(Option<&Venue>, Option<OrderSide>, bool); 6] = [
+        (None, None, true),
+        (None, Some(OrderSide::NoOrderSide), true),
+        (None, Some(OrderSide::Buy), true),
+        (None, Some(OrderSide::Sell), true),
+        (Some(&venue_a), Some(OrderSide::Buy), true),
+        (Some(&Venue::from("OTHER")), Some(OrderSide::Buy), false),
+    ];
+
+    for (venue, side, expected) in cases {
+        assert_eq!(
+            cache.has_orders_open(venue, None, None, None, side),
+            expected,
+            "has_orders_open mismatch for venue={venue:?} side={side:?}",
+        );
+        assert_eq!(
+            cache.has_orders_open(venue, None, None, None, side),
+            cache.orders_open_count(venue, None, None, None, side) > 0,
+            "has_orders_open != count > 0 for venue={venue:?} side={side:?}",
+        );
+        assert_eq!(
+            cache.has_orders_active_local(venue, None, None, None, side),
+            cache.orders_active_local_count(venue, None, None, None, side) > 0,
+            "has_orders_active_local != count > 0 for venue={venue:?} side={side:?}",
+        );
+    }
+}
+
+#[rstest]
+fn test_unknown_filter_consistent_across_new_apis(mut cache: Cache, audusd_sim: CurrencyPair) {
+    // Same fixture shape as the existing unknown-filter test, but pinned against the new
+    // `has_*`, `_view`, and `iter_*` API families to lock the FilterSources::Empty path.
+    let order = build_filter_order(
+        audusd_sim.id,
+        OrderSide::Buy,
+        ClientOrderId::from("O-1"),
+        None,
+        None,
+    );
+    cache.add_order(order, None, None, false).unwrap();
+
+    let unknown_venue = Venue::from("OTHER-VENUE");
+    let unknown_instrument = InstrumentId::from("SYMBOL-NONE.NOWHERE");
+    let unknown_strategy = StrategyId::from("S-UNKNOWN");
+
+    // has_*: should all be false
+    assert!(!cache.has_orders(Some(&unknown_venue), None, None, None, None));
+    assert!(!cache.has_orders_active_local(Some(&unknown_venue), None, None, None, None));
+    assert!(!cache.has_orders_active_local(None, Some(&unknown_instrument), None, None, None));
+    assert!(!cache.has_orders_active_local(None, None, Some(&unknown_strategy), None, None));
+
+    // _view: should be Cow::Owned(empty)
+    let view_venue = cache.client_order_ids_view(Some(&unknown_venue), None, None, None);
+    assert!(view_venue.is_empty());
+    assert!(matches!(view_venue, Cow::Owned(_)));
+    let view_active =
+        cache.client_order_ids_active_local_view(Some(&unknown_venue), None, None, None);
+    assert!(view_active.is_empty());
+    assert!(matches!(view_active, Cow::Owned(_)));
+
+    // iter_*: should be empty
+    assert_eq!(
+        cache
+            .iter_client_order_ids(Some(&unknown_venue), None, None, None)
+            .count(),
+        0,
+    );
+    assert_eq!(
+        cache
+            .iter_client_order_ids_active_local(Some(&unknown_venue), None, None, None)
+            .count(),
+        0,
+    );
+}
+
+#[rstest]
+fn test_view_returns_borrowed_when_unfiltered(mut cache: Cache, audusd_sim: CurrencyPair) {
+    // Loaded so the bucket is non-empty; the borrow check is independent of contents
+    let order = build_filter_order(
+        audusd_sim.id,
+        OrderSide::Buy,
+        ClientOrderId::from("O-1"),
+        None,
+        None,
+    );
+    cache.add_order(order, None, None, false).unwrap();
+
+    // Each unfiltered view must return a borrow that points at the corresponding index entry
+    macro_rules! check_borrow {
+        ($view:ident, $bucket:ident) => {{
+            let view = cache.$view(None, None, None, None);
+            match &view {
+                Cow::Borrowed(set) => assert!(
+                    std::ptr::eq(*set, &cache.index.$bucket),
+                    "{} should borrow from index.{}",
+                    stringify!($view),
+                    stringify!($bucket),
+                ),
+                Cow::Owned(_) => panic!(
+                    "{} should return Cow::Borrowed when unfiltered",
+                    stringify!($view),
+                ),
+            }
+        }};
+    }
+
+    check_borrow!(client_order_ids_view, orders);
+    check_borrow!(client_order_ids_open_view, orders_open);
+    check_borrow!(client_order_ids_closed_view, orders_closed);
+    check_borrow!(client_order_ids_active_local_view, orders_active_local);
+    check_borrow!(client_order_ids_emulated_view, orders_emulated);
+    check_borrow!(client_order_ids_inflight_view, orders_inflight);
+    check_borrow!(position_ids_view, positions);
+    check_borrow!(position_open_ids_view, positions_open);
+    check_borrow!(position_closed_ids_view, positions_closed);
 }

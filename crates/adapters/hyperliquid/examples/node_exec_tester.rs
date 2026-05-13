@@ -39,7 +39,7 @@ use nautilus_trading::strategy::StrategyConfig;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
-    let environment = Environment::Live;
+    let nt_environment = Environment::Live;
     let hl_environment = HyperliquidEnvironment::Mainnet;
     let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("HYPERLIQUID-001");
@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let mut node = LiveNode::builder(trader_id, environment)?
+    let mut node = LiveNode::builder(trader_id, nt_environment)?
         .with_name(node_name)
         .with_logging(log_config)
         .add_data_client(None, Box::new(data_factory), Box::new(data_config))?

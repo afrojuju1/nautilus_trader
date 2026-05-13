@@ -41,16 +41,38 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod backend;
+pub mod capture;
 pub mod entry;
 pub mod error;
 pub mod hash;
 pub mod headers;
 pub mod manifest;
+pub mod reader;
+pub mod verifier;
+pub mod writer;
+
 mod wire;
 
-pub use backend::{EventStore, IndexKind, ScanDirection};
+pub use backend::{
+    AppendEntry, EventStore, IndexKey, IndexKind, MemoryBackend, RedbBackend, ScanDirection,
+};
+pub use capture::{
+    BusCaptureAdapter, CaptureError, Encode, EncodeError, EncodedPayload, EncoderRegistry,
+    PAYLOAD_TYPE_ACCOUNT_STATE, PAYLOAD_TYPE_ORDER_FILLED, PAYLOAD_TYPE_ORDER_STATUS_REPORT,
+    PAYLOAD_TYPE_SUBMIT_ORDER, TypedEncoder, default_registry, encode_account_state,
+    encode_order_filled, encode_order_status_report, encode_submit_order, register_default,
+};
 pub use entry::{EventStoreEntry, PayloadType, Topic};
 pub use error::EventStoreError;
 pub use hash::{EntryHash, compute_entry_hash};
 pub use headers::Headers;
 pub use manifest::{RegisteredComponents, RunId, RunManifest, RunStatus};
+pub use reader::{DEFAULT_SCAN_CHUNK_SIZE, EventStoreReader, RangeScan};
+pub use verifier::{
+    GapRange, IndexDrift, ManifestField, Verifier, VerifyError, VerifyFinding, VerifyReport,
+};
+pub use writer::{
+    DEFAULT_CHANNEL_CAPACITY, DEFAULT_HALT_THRESHOLD, DEFAULT_MAX_BATCH_ENTRIES,
+    DEFAULT_MAX_BATCH_LATENCY, EntryDraft, EventStoreWriter, HaltCallback, HaltReason, SubmitError,
+    WriterConfig, noop_halt,
+};
