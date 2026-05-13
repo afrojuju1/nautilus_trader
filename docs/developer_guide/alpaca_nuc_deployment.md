@@ -13,6 +13,12 @@ uses a file lock so only one runner can own a given Alpaca account workflow.
 - `deploy/alpaca/alpaca-options-engine.base.toml.example`: shared strategy universe, scanner, sector,
   and management defaults inherited by account configs.
 - `deploy/alpaca/alpaca-options-engine.toml.example`: strategy/scanner/management config template.
+- `deploy/alpaca/alpaca-options-engine.paper-directional.toml.example`: defined-risk watchlist
+  account config template.
+- `deploy/alpaca/alpaca-options-engine.paper-put-credit-spy.toml.example`: isolated SPY
+  put-credit account config template.
+- `deploy/alpaca/alpaca-options-engine.paper-call-credit-qqq.toml.example`: isolated QQQ
+  call-credit account config template.
 - `deploy/alpaca/alpaca-fleet.toml.example`: read-only fleet registry template.
 - `deploy/alpaca/alpaca-options-install.sh`: builds release binaries and installs user files.
 - `deploy/alpaca/alpaca-options-runner.sh`: `flock`-guarded runner wrapper.
@@ -124,10 +130,12 @@ alpaca-control accounts
 alpaca-control today
 alpaca-control --account paper-main status
 alpaca-control --account paper-directional status
+alpaca-control --account paper-put-credit-spy status
+alpaca-control --account paper-call-credit-qqq status
 alpaca-control --account paper-undefined-risk status
 alpaca-control --account paper-undefined-risk check-config
 alpaca-control --account paper-undefined-risk scan naked GDX,SLV
-alpaca-control --account paper-directional scan directional XLF,XLK
+alpaca-control --account paper-directional scan credit SPY,QQQ
 alpaca-control alerts candidates --all --dry-run
 alpaca-control alerts candidates --all --send
 alpaca-control alerts enable
@@ -180,6 +188,8 @@ For account-instance services:
 ```bash
 systemctl --user start alpaca-options@paper-directional.service
 systemctl --user status alpaca-options@paper-directional.service --no-pager
+systemctl --user start alpaca-options@paper-put-credit-spy.service
+systemctl --user start alpaca-options@paper-call-credit-qqq.service
 systemctl --user restart alpaca-options@paper-undefined-risk.service
 systemctl --user stop alpaca-options@paper-undefined-risk.service
 ```
@@ -255,9 +265,11 @@ The example fleet separates paper account roles deliberately:
 
 | Account | Service | Role | Default state | Permission boundary |
 |---------|---------|------|---------------|---------------------|
-| `paper-main` | `alpaca-options.service` | `defined_risk_short_premium` | Enabled | Defined-risk credit verticals and iron condors only. |
-| `paper-directional` | `alpaca-options@paper-directional.service` | `long_premium_directional` | Disabled | Long-premium debit verticals only. |
-| `paper-undefined-risk` | `alpaca-options@paper-undefined-risk.service` | `undefined_risk_short_premium` | Disabled | Naked calls and naked puts only, behind explicit undefined-risk permissions. |
+| `paper-main` | `alpaca-options.service` | `defined_risk_short_premium` | Enabled | Iron-condor watchlist/management only by default. |
+| `paper-directional` | `alpaca-options@paper-directional.service` | `defined_risk_watchlist` | Enabled | Put-credit and call-credit watchlist scans only. |
+| `paper-put-credit-spy` | `alpaca-options@paper-put-credit-spy.service` | `defined_risk_put_credit_spy` | Enabled | Isolated SPY put-credit paper profile. |
+| `paper-call-credit-qqq` | `alpaca-options@paper-call-credit-qqq.service` | `defined_risk_call_credit_qqq` | Enabled | Isolated QQQ call-credit paper profile. |
+| `paper-undefined-risk` | `alpaca-options@paper-undefined-risk.service` | `undefined_risk_short_premium` | Enabled | Naked calls and naked puts only, behind explicit undefined-risk permissions. |
 
 Do not mix these roles casually. A strategy/role mismatch forces submission off and the kill switch
 on for that account runtime, but the operator should still keep each account's env file, TOML,
@@ -310,10 +322,12 @@ After an account env/config pair is reviewed, the account can be enabled explici
 
 ```bash
 systemctl --user start alpaca-options@paper-directional.service
+systemctl --user start alpaca-options@paper-put-credit-spy.service
+systemctl --user start alpaca-options@paper-call-credit-qqq.service
 ```
 
-Do not enable account-instance services on login until paper proof is complete for that account's
-role and strategy set.
+Do not enable new account-instance services on login until paper proof is complete for that
+account's role and strategy set.
 
 ## Safety Gates
 

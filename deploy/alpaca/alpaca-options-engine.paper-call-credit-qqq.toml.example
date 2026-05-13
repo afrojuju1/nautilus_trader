@@ -1,0 +1,34 @@
+# Copy to ~/.config/nautilus-trader/alpaca/configs/paper-call-credit-qqq-options-engine.toml.
+# Isolated paper profile for the QQQ call-credit candidate selected from focused sweeps.
+
+extends = "../base-options-engine.toml"
+
+[runtime]
+strategies = ["call_credit"]
+dry_run_strategies = []
+submit = true
+manage = true
+close = true
+kill_switch = false
+state_path = "/home/ade/.local/state/nautilus_trader/alpaca/paper-call-credit-qqq/strategy_state.json"
+
+[universe]
+underlyings = ["QQQ"]
+entry_start = "09:45"
+entry_end = "10:15"
+
+[scanner]
+min_return_on_risk = 0.20
+
+[management]
+profit_target_close_fraction = 0.50
+stop_loss_close_multiple = 2.0
+max_hold_secs = 14400
+expiration_exit_days = 1
+
+[risk]
+max_active_entries = 1
+max_daily_submits = 1
+max_open_orders = 2
+max_active_entries_per_underlying = 1
+max_active_entries_per_sector = 1

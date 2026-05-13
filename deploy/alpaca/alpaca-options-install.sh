@@ -64,10 +64,17 @@ install_runtime_file deploy/alpaca/alpaca-options-engine.toml.example "$CONFIG_F
 if [[ ! -f "$FLEET_CONFIG_FILE" ]]; then
   install -Dm600 deploy/alpaca/alpaca-fleet.toml.example "$FLEET_CONFIG_FILE"
 fi
+install -d -m 700 "$ACCOUNT_ENV_DIR" "$ACCOUNT_CONFIG_DIR"
 if [[ ! -f "$ALERTS_ENV_FILE" ]]; then
   install -Dm600 deploy/alpaca/alpaca-alerts.env.example "$ALERTS_ENV_FILE"
 fi
-install -d -m 700 "$ACCOUNT_ENV_DIR" "$ACCOUNT_CONFIG_DIR"
+install_runtime_file deploy/alpaca/alpaca-options-engine.account.env.example "$ACCOUNT_ENV_DIR/paper-directional.env"
+install_runtime_file deploy/alpaca/alpaca-options-engine.account.env.example "$ACCOUNT_ENV_DIR/paper-put-credit-spy.env"
+install_runtime_file deploy/alpaca/alpaca-options-engine.account.env.example "$ACCOUNT_ENV_DIR/paper-call-credit-qqq.env"
+install_runtime_file deploy/alpaca/alpaca-options-engine.account.env.example "$ACCOUNT_ENV_DIR/paper-undefined-risk.env"
+install_runtime_file deploy/alpaca/alpaca-options-engine.paper-directional.toml.example "$ACCOUNT_CONFIG_DIR/paper-directional-options-engine.toml"
+install_runtime_file deploy/alpaca/alpaca-options-engine.paper-put-credit-spy.toml.example "$ACCOUNT_CONFIG_DIR/paper-put-credit-spy-options-engine.toml"
+install_runtime_file deploy/alpaca/alpaca-options-engine.paper-call-credit-qqq.toml.example "$ACCOUNT_CONFIG_DIR/paper-call-credit-qqq-options-engine.toml"
 
 systemctl --user daemon-reload
 

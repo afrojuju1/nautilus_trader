@@ -31,7 +31,9 @@ usage: $(basename "$0") [--account ACCOUNT] <command> [args]
 
 Account aliases:
   main, default, paper-main       primary defined-risk paper account
-  paper-directional              long-premium directional paper account
+  paper-directional              defined-risk credit watchlist paper account
+  paper-put-credit-spy           isolated SPY put-credit paper account
+  paper-call-credit-qqq          isolated QQQ call-credit paper account
   paper-undefined-risk           undefined-risk paper account
 
 Commands:
@@ -62,8 +64,10 @@ Scan profiles:
 
 Examples:
   $(basename "$0") --account paper-undefined-risk check-config
+  $(basename "$0") --account paper-put-credit-spy check-config
+  $(basename "$0") --account paper-call-credit-qqq check-config
   $(basename "$0") --account paper-undefined-risk scan naked GDX,SLV
-  $(basename "$0") --account paper-directional scan directional XLF,XLK
+  $(basename "$0") --account paper-directional scan credit SPY,QQQ
   $(basename "$0") today
   $(basename "$0") performance --all
   $(basename "$0") alerts candidates --all --dry-run
@@ -252,8 +256,14 @@ default_profile_for_account() {
   local account
   account="$(normalize_account "$1")"
   case "$account" in
+    paper-put-credit-spy)
+      printf '%s\n' "put-credit"
+      ;;
+    paper-call-credit-qqq)
+      printf '%s\n' "call-credit"
+      ;;
     paper-directional)
-      printf '%s\n' "directional"
+      printf '%s\n' "credit"
       ;;
     paper-undefined-risk)
       printf '%s\n' "naked"

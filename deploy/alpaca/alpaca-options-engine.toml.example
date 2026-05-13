@@ -1,21 +1,44 @@
-# Copy to ~/.config/nautilus-trader/alpaca/options-engine.toml before running the service.
+# Copy to ~/.config/nautilus-trader/alpaca/options-engine.toml before running the base service.
 # Shared scanner, universe, sector, and management defaults live in base-options-engine.toml.
+# This base account keeps iron condors in watchlist mode while still managing existing state.
 
 extends = "base-options-engine.toml"
 
 [runtime]
-strategies = ["put"]
-dry_run_strategies = []
+strategies = ["iron_condor"]
+dry_run_strategies = ["iron_condor"]
 submit = false
-manage = false
-close = false
-kill_switch = true
+manage = true
+close = true
+kill_switch = false
 state_path = "/home/ade/.local/state/nautilus_trader/alpaca_options_engine_state.json"
 
+[universe]
+entry_start = "10:00"
+entry_end = "13:30"
+
+[scanner]
+short_delta_min = 0.10
+short_delta_max = 0.18
+min_open_interest = 500
+max_leg_spread_pct = 0.08
+min_return_on_risk = 0.10
+min_credit_to_width = 0.06
+
+[iron_condor]
+min_return_on_risk = 0.12
+wing_min_return_on_risk = 0.08
+require_equal_widths = true
+
 [risk]
-# Account-level caps checked before any hosted strategy can submit a new entry.
-# Omit a field or set it through env only when the cap should be unlimited.
-max_active_entries = 1
-max_daily_submits = 1
-max_open_orders = 1
-max_active_entries_per_sector = 3
+max_active_entries = 6
+max_daily_submits = 4
+max_open_orders = 6
+max_active_entries_per_underlying = 2
+max_active_entries_per_sector = 4
+
+[management]
+profit_target_close_fraction = 0.60
+stop_loss_close_multiple = 1.60
+max_hold_secs = 172800
+expiration_exit_days = 2
