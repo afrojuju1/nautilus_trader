@@ -94,10 +94,6 @@ pub fn score_contracts_with_rejections_at(
             record_rejection(&mut rejections, "missing_delta");
             continue;
         };
-        if delta_abs < config.short_delta_min || delta_abs > config.short_delta_max {
-            record_rejection(&mut rejections, "short_delta_range");
-            continue;
-        }
         let Some(dte) = days_to_expiration_from(&contract.expiration_date, scan_date) else {
             record_rejection(&mut rejections, "invalid_expiration");
             continue;
@@ -210,10 +206,6 @@ pub fn score_debit_contracts_with_rejections_at(
             record_rejection(&mut rejections, "missing_delta");
             continue;
         };
-        if delta_abs < config.long_delta_min || delta_abs > config.long_delta_max {
-            record_rejection(&mut rejections, "long_delta_range");
-            continue;
-        }
         let Some(dte) = days_to_expiration_from(&contract.expiration_date, scan_date) else {
             record_rejection(&mut rejections, "invalid_expiration");
             continue;
@@ -622,6 +614,10 @@ pub fn build_candidates_for_kind_with_rejections(
     let mut candidates = Vec::new();
     let mut rejections = BTreeMap::new();
     for short in contracts {
+        if short.delta_abs < config.short_delta_min || short.delta_abs > config.short_delta_max {
+            record_rejection(&mut rejections, "short_delta_range");
+            continue;
+        }
         for width in &config.widths {
             let long_strike = kind.long_strike(short.strike, *width);
             let Some(long) = by_expiration_strike
@@ -727,6 +723,10 @@ pub fn build_debit_candidates_for_kind_with_rejections(
     let mut candidates = Vec::new();
     let mut rejections = BTreeMap::new();
     for long in contracts {
+        if long.delta_abs < config.long_delta_min || long.delta_abs > config.long_delta_max {
+            record_rejection(&mut rejections, "long_delta_range");
+            continue;
+        }
         for width in &config.widths {
             let short_strike = kind.short_strike(long.strike, *width);
             let Some(short) = by_expiration_strike
