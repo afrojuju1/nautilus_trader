@@ -668,9 +668,14 @@ fn build_snapshot_map(
         else {
             continue;
         };
-        let half_spread = (synthetic_spread_pct.max(0.0) / 2.0).min(0.49);
-        let bid = (mark.price * (1.0 - half_spread)).max(0.01);
-        let ask = (mark.price * (1.0 + half_spread)).max(bid);
+        let (bid, ask, quote_size) = synthetic_quote(
+            contract,
+            scan_date,
+            underlying_price,
+            mark.price,
+            mark.volume,
+            synthetic_spread_pct,
+        );
         let implied_volatility = underlying_price
             .and_then(|price| implied_volatility_from_mark(contract, scan_date, price, mark.price))
             .unwrap_or(assumed_iv);
@@ -682,9 +687,9 @@ fn build_snapshot_map(
             AlpacaOptionSnapshot {
                 latest_quote: Some(AlpacaOptionQuote {
                     ask_price: Some(ask),
-                    ask_size: Some(10),
+                    ask_size: Some(quote_size),
                     bid_price: Some(bid),
-                    bid_size: Some(10),
+                    bid_size: Some(quote_size),
                     timestamp: mark.timestamp.clone(),
                 }),
                 latest_trade: None,
@@ -710,6 +715,7 @@ struct HistoricalMark {
     price: f64,
     timestamp: Option<String>,
     source: &'static str,
+    volume: Option<u64>,
 }
 
 fn historical_mark(
@@ -725,6 +731,7 @@ fn historical_mark(
             price: trade.price?,
             timestamp: trade.timestamp.clone(),
             source: "trade",
+            volume: trade.size,
         });
     }
 
@@ -735,7 +742,104 @@ fn historical_mark(
         price: bar.close?,
         timestamp: bar.timestamp.clone(),
         source: "bar",
+        volume: bar.volume,
     })
+}
+
+fn synthetic_quote(
+    contract: &AlpacaOptionContract,
+    scan_date: NaiveDate,
+    underlying_price: Option<f64>,
+    mark_price: f64,
+    mark_volume: Option<u64>,
+    base_spread_pct: f64,
+) -> (f64, f64, u64) {
+    let mut spread_pct = base_spread_pct.max(0.0);
+
+    if mark_price < 0.25 {
+        spread_pct += 0.25;
+    } else if mark_price < 0.50 {
+        spread_pct += 0.15;
+    } else if mark_price < 1.00 {
+        spread_pct += 0.08;
+    }
+
+    match mark_volume.unwrap_or(0) {
+        0 => spread_pct += 0.20,
+        1..=9 => spread_pct += 0.10,
+        10..=49 => spread_pct += 0.05,
+        _ => {}
+    }
+
+    let open_interest = contract
+        .open_interest
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    match open_interest {
+        0 => spread_pct += 0.08,
+        1..=99 => spread_pct += 0.04,
+        _ => {}
+    }
+
+    if let Some(dte) = days_to_expiration(contract, scan_date) {
+        if dte <= 1 {
+            spread_pct += 0.06;
+        } else if dte <= 3 {
+            spread_pct += 0.03;
+        }
+    }
+
+    if let (Some(underlying_price), Ok(strike)) =
+        (underlying_price, contract.strike_price.parse::<f64>())
+    {
+        if underlying_price > 0.0 && strike > 0.0 {
+            let moneyness = ((strike / underlying_price) - 1.0).abs();
+            if moneyness > 0.30 {
+                spread_pct += 0.15;
+            } else if moneyness > 0.15 {
+                spread_pct += 0.06;
+            }
+        }
+    }
+
+    let spread_pct = spread_pct.clamp(0.01, 0.80);
+    let tick = option_tick_size(contract, mark_price);
+    let half_width = ((mark_price * spread_pct) / 2.0).max(tick);
+    let bid = floor_to_tick((mark_price - half_width).max(tick), tick);
+    let ask = ceil_to_tick((mark_price + half_width).max(bid + tick), tick);
+    let quote_size = synthetic_quote_size(mark_volume);
+    (bid, ask, quote_size)
+}
+
+fn days_to_expiration(contract: &AlpacaOptionContract, scan_date: NaiveDate) -> Option<i64> {
+    let expiration = NaiveDate::parse_from_str(&contract.expiration_date, "%Y-%m-%d").ok()?;
+    Some(expiration.signed_duration_since(scan_date).num_days())
+}
+
+fn option_tick_size(contract: &AlpacaOptionContract, mark_price: f64) -> f64 {
+    if contract.ppind == Some(true) || mark_price < 3.0 {
+        0.01
+    } else {
+        0.05
+    }
+}
+
+fn floor_to_tick(value: f64, tick: f64) -> f64 {
+    ((value / tick).floor() * tick * 100.0).round() / 100.0
+}
+
+fn ceil_to_tick(value: f64, tick: f64) -> f64 {
+    ((value / tick).ceil() * tick * 100.0).round() / 100.0
+}
+
+fn synthetic_quote_size(mark_volume: Option<u64>) -> u64 {
+    match mark_volume.unwrap_or(0) {
+        0 => 1,
+        1..=9 => 2,
+        10..=49 => 5,
+        _ => 10,
+    }
 }
 
 fn implied_volatility_from_mark(
