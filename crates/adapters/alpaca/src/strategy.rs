@@ -17,15 +17,21 @@
 
 use std::collections::BTreeMap;
 
+use chrono::{NaiveDate, Utc};
+
 use crate::{
     config::AlpacaDataClientConfig,
-    http::{client::AlpacaHttpClient, error::Result, models::AlpacaOptionType},
+    http::{
+        client::AlpacaHttpClient,
+        error::Result,
+        models::{AlpacaOptionContract, AlpacaOptionSnapshot, AlpacaOptionType},
+    },
 };
 
 mod chain;
 mod scoring;
 
-use chain::{load_option_chain_snapshot, load_underlying_price};
+use chain::{load_option_chain_snapshot_at, load_underlying_price};
 use scoring::merge_rejection_counts;
 pub use scoring::{
     annualized_premium_yield, build_candidates, build_candidates_for_kind,
@@ -35,8 +41,10 @@ pub use scoring::{
     build_naked_option_candidates_with_capital,
     build_naked_option_candidates_with_capital_and_rejections,
     estimated_naked_option_buying_power_requirement, option_candidate_metrics, score_contracts,
-    score_contracts_with_rejections, score_debit_contracts, score_debit_contracts_with_rejections,
+    score_contracts_with_rejections, score_contracts_with_rejections_at, score_debit_contracts,
+    score_debit_contracts_with_rejections, score_debit_contracts_with_rejections_at,
     score_naked_option_contracts, score_naked_option_contracts_with_rejections,
+    score_naked_option_contracts_with_rejections_at,
 };
 
 const SCANNER_RISK_FREE_RATE: f64 = 0.0425;
@@ -575,6 +583,29 @@ pub async fn scan_put_credit_underlying(
     .await
 }
 
+/// Loads chain data and ranks put credit spread candidates for one underlying using an explicit scan date.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_put_credit_underlying_at(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &PutCreditScannerConfig,
+    underlying: impl Into<String>,
+    scan_date: NaiveDate,
+) -> Result<PutCreditScanResult> {
+    scan_credit_spread_underlying_at(
+        client,
+        data_config,
+        config,
+        underlying,
+        CreditSpreadKind::Put,
+        scan_date,
+    )
+    .await
+}
+
 /// Loads chain data and ranks call credit spread candidates for one underlying.
 ///
 /// # Errors
@@ -592,6 +623,29 @@ pub async fn scan_call_credit_underlying(
         config,
         underlying,
         CreditSpreadKind::Call,
+    )
+    .await
+}
+
+/// Loads chain data and ranks call credit spread candidates for one underlying using an explicit scan date.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_call_credit_underlying_at(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &PutCreditScannerConfig,
+    underlying: impl Into<String>,
+    scan_date: NaiveDate,
+) -> Result<PutCreditScanResult> {
+    scan_credit_spread_underlying_at(
+        client,
+        data_config,
+        config,
+        underlying,
+        CreditSpreadKind::Call,
+        scan_date,
     )
     .await
 }
@@ -617,6 +671,29 @@ pub async fn scan_call_debit_underlying(
     .await
 }
 
+/// Loads chain data and ranks call debit spread candidates for one underlying using an explicit scan date.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_call_debit_underlying_at(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &DebitSpreadScannerConfig,
+    underlying: impl Into<String>,
+    scan_date: NaiveDate,
+) -> Result<DebitSpreadScanResult> {
+    scan_debit_spread_underlying_at(
+        client,
+        data_config,
+        config,
+        underlying,
+        DebitSpreadKind::Call,
+        scan_date,
+    )
+    .await
+}
+
 /// Loads chain data and ranks put debit spread candidates for one underlying.
 ///
 /// # Errors
@@ -634,6 +711,29 @@ pub async fn scan_put_debit_underlying(
         config,
         underlying,
         DebitSpreadKind::Put,
+    )
+    .await
+}
+
+/// Loads chain data and ranks put debit spread candidates for one underlying using an explicit scan date.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_put_debit_underlying_at(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &DebitSpreadScannerConfig,
+    underlying: impl Into<String>,
+    scan_date: NaiveDate,
+) -> Result<DebitSpreadScanResult> {
+    scan_debit_spread_underlying_at(
+        client,
+        data_config,
+        config,
+        underlying,
+        DebitSpreadKind::Put,
+        scan_date,
     )
     .await
 }
@@ -693,11 +793,45 @@ pub async fn scan_iron_condor_underlying(
     config: &IronCondorScannerConfig,
     underlying: impl Into<String>,
 ) -> Result<IronCondorScanResult> {
+    scan_iron_condor_underlying_at(
+        client,
+        data_config,
+        config,
+        underlying,
+        Utc::now().date_naive(),
+    )
+    .await
+}
+
+/// Loads chain data and ranks four-leg iron-condor candidates for one underlying using an explicit scan date.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_iron_condor_underlying_at(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &IronCondorScannerConfig,
+    underlying: impl Into<String>,
+    scan_date: NaiveDate,
+) -> Result<IronCondorScanResult> {
     let underlying = underlying.into();
-    let put =
-        scan_put_credit_underlying(client, data_config, &config.credit, underlying.clone()).await?;
-    let call = scan_call_credit_underlying(client, data_config, &config.credit, underlying.clone())
-        .await?;
+    let put = scan_put_credit_underlying_at(
+        client,
+        data_config,
+        &config.credit,
+        underlying.clone(),
+        scan_date,
+    )
+    .await?;
+    let call = scan_call_credit_underlying_at(
+        client,
+        data_config,
+        &config.credit,
+        underlying.clone(),
+        scan_date,
+    )
+    .await?;
     let (candidates, build_rejections) =
         build_iron_condor_candidates_with_rejections(&put.candidates, &call.candidates, config);
     let mut rejection_counts = put.rejection_counts.clone();
@@ -713,6 +847,49 @@ pub async fn scan_iron_condor_underlying(
     })
 }
 
+/// Ranks four-leg iron-condor candidates from already loaded scanner inputs.
+#[must_use]
+pub fn scan_iron_condor_snapshots_at(
+    underlying: impl Into<String>,
+    put_contracts: &[AlpacaOptionContract],
+    put_snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    call_contracts: &[AlpacaOptionContract],
+    call_snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    config: &IronCondorScannerConfig,
+    scan_date: NaiveDate,
+) -> IronCondorScanResult {
+    let underlying = underlying.into();
+    let put = scan_credit_spread_snapshot_at(
+        underlying.clone(),
+        put_contracts,
+        put_snapshots,
+        &config.credit,
+        CreditSpreadKind::Put,
+        scan_date,
+    );
+    let call = scan_credit_spread_snapshot_at(
+        underlying.clone(),
+        call_contracts,
+        call_snapshots,
+        &config.credit,
+        CreditSpreadKind::Call,
+        scan_date,
+    );
+    let (candidates, build_rejections) =
+        build_iron_condor_candidates_with_rejections(&put.candidates, &call.candidates, config);
+    let mut rejection_counts = put.rejection_counts.clone();
+    merge_rejection_counts(&mut rejection_counts, &call.rejection_counts);
+    merge_rejection_counts(&mut rejection_counts, &build_rejections);
+    IronCondorScanResult {
+        underlying,
+        contract_count: put.contract_count + call.contract_count,
+        snapshot_count: put.snapshot_count + call.snapshot_count,
+        scoreable_count: put.scoreable_count + call.scoreable_count,
+        rejection_counts,
+        candidates,
+    }
+}
+
 /// Loads chain data and ranks vertical credit spread candidates for one underlying.
 ///
 /// # Errors
@@ -725,30 +902,76 @@ pub async fn scan_credit_spread_underlying(
     underlying: impl Into<String>,
     kind: CreditSpreadKind,
 ) -> Result<PutCreditScanResult> {
+    scan_credit_spread_underlying_at(
+        client,
+        data_config,
+        config,
+        underlying,
+        kind,
+        Utc::now().date_naive(),
+    )
+    .await
+}
+
+/// Loads chain data and ranks vertical credit spread candidates for one underlying using an explicit scan date.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_credit_spread_underlying_at(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &PutCreditScannerConfig,
+    underlying: impl Into<String>,
+    kind: CreditSpreadKind,
+    scan_date: NaiveDate,
+) -> Result<PutCreditScanResult> {
     let underlying = underlying.into();
-    let chain = load_option_chain_snapshot(
+    let chain = load_option_chain_snapshot_at(
         client,
         data_config,
         &underlying,
         config.min_dte,
         config.max_dte,
         kind.option_type(),
+        scan_date,
     )
     .await?;
 
+    Ok(scan_credit_spread_snapshot_at(
+        underlying,
+        &chain.contracts,
+        &chain.snapshots,
+        config,
+        kind,
+        scan_date,
+    ))
+}
+
+/// Ranks vertical credit spread candidates from already loaded scanner inputs.
+#[must_use]
+pub fn scan_credit_spread_snapshot_at(
+    underlying: impl Into<String>,
+    contracts: &[AlpacaOptionContract],
+    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    config: &PutCreditScannerConfig,
+    kind: CreditSpreadKind,
+    scan_date: NaiveDate,
+) -> PutCreditScanResult {
+    let underlying = underlying.into();
     let (scored, mut rejection_counts) =
-        score_contracts_with_rejections(&chain.contracts, &chain.snapshots, config);
+        score_contracts_with_rejections_at(contracts, snapshots, config, scan_date);
     let (candidates, build_rejections) =
         build_candidates_for_kind_with_rejections(&scored, config, kind);
     merge_rejection_counts(&mut rejection_counts, &build_rejections);
-    Ok(PutCreditScanResult {
+    PutCreditScanResult {
         underlying,
-        contract_count: chain.contracts.len(),
-        snapshot_count: chain.snapshots.len(),
+        contract_count: contracts.len(),
+        snapshot_count: snapshots.len(),
         scoreable_count: scored.len(),
         rejection_counts,
         candidates,
-    })
+    }
 }
 
 /// Loads chain data and ranks vertical debit spread candidates for one underlying.
@@ -763,30 +986,76 @@ pub async fn scan_debit_spread_underlying(
     underlying: impl Into<String>,
     kind: DebitSpreadKind,
 ) -> Result<DebitSpreadScanResult> {
+    scan_debit_spread_underlying_at(
+        client,
+        data_config,
+        config,
+        underlying,
+        kind,
+        Utc::now().date_naive(),
+    )
+    .await
+}
+
+/// Loads chain data and ranks vertical debit spread candidates for one underlying using an explicit scan date.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_debit_spread_underlying_at(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &DebitSpreadScannerConfig,
+    underlying: impl Into<String>,
+    kind: DebitSpreadKind,
+    scan_date: NaiveDate,
+) -> Result<DebitSpreadScanResult> {
     let underlying = underlying.into();
-    let chain = load_option_chain_snapshot(
+    let chain = load_option_chain_snapshot_at(
         client,
         data_config,
         &underlying,
         config.min_dte,
         config.max_dte,
         kind.option_type(),
+        scan_date,
     )
     .await?;
 
+    Ok(scan_debit_spread_snapshot_at(
+        underlying,
+        &chain.contracts,
+        &chain.snapshots,
+        config,
+        kind,
+        scan_date,
+    ))
+}
+
+/// Ranks vertical debit spread candidates from already loaded scanner inputs.
+#[must_use]
+pub fn scan_debit_spread_snapshot_at(
+    underlying: impl Into<String>,
+    contracts: &[AlpacaOptionContract],
+    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    config: &DebitSpreadScannerConfig,
+    kind: DebitSpreadKind,
+    scan_date: NaiveDate,
+) -> DebitSpreadScanResult {
+    let underlying = underlying.into();
     let (scored, mut rejection_counts) =
-        score_debit_contracts_with_rejections(&chain.contracts, &chain.snapshots, config);
+        score_debit_contracts_with_rejections_at(contracts, snapshots, config, scan_date);
     let (candidates, build_rejections) =
         build_debit_candidates_for_kind_with_rejections(&scored, config, kind);
     merge_rejection_counts(&mut rejection_counts, &build_rejections);
-    Ok(DebitSpreadScanResult {
+    DebitSpreadScanResult {
         underlying,
-        contract_count: chain.contracts.len(),
-        snapshot_count: chain.snapshots.len(),
+        contract_count: contracts.len(),
+        snapshot_count: snapshots.len(),
         scoreable_count: scored.len(),
         rejection_counts,
         candidates,
-    })
+    }
 }
 
 /// Loads chain data and ranks naked short option candidates for one underlying.
@@ -818,36 +1087,89 @@ pub async fn scan_naked_option_underlying_with_capital(
     kind: NakedOptionKind,
     capital: Option<NakedOptionCapitalContext>,
 ) -> Result<NakedOptionScanResult> {
+    scan_naked_option_underlying_with_capital_at(
+        client,
+        data_config,
+        config,
+        underlying,
+        kind,
+        capital,
+        Utc::now().date_naive(),
+    )
+    .await
+}
+
+/// Loads chain data and ranks naked short-option candidates with account capital context and scan date.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca contract or snapshot requests fail.
+pub async fn scan_naked_option_underlying_with_capital_at(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    config: &NakedOptionScannerConfig,
+    underlying: impl Into<String>,
+    kind: NakedOptionKind,
+    capital: Option<NakedOptionCapitalContext>,
+    scan_date: NaiveDate,
+) -> Result<NakedOptionScanResult> {
     let underlying = underlying.into();
-    let chain = load_option_chain_snapshot(
+    let chain = load_option_chain_snapshot_at(
         client,
         data_config,
         &underlying,
         config.min_dte,
         config.max_dte,
         kind.option_type(),
+        scan_date,
     )
     .await?;
     let underlying_price = load_underlying_price(client, data_config, &underlying).await?;
 
-    let (scored, mut rejection_counts) = score_naked_option_contracts_with_rejections(
+    Ok(scan_naked_option_snapshot_at(
+        underlying,
         &chain.contracts,
         &chain.snapshots,
         config,
         kind,
         underlying_price,
+        capital,
+        scan_date,
+    ))
+}
+
+/// Ranks naked short-option candidates from already loaded scanner inputs.
+#[must_use]
+pub fn scan_naked_option_snapshot_at(
+    underlying: impl Into<String>,
+    contracts: &[AlpacaOptionContract],
+    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    config: &NakedOptionScannerConfig,
+    kind: NakedOptionKind,
+    underlying_price: f64,
+    capital: Option<NakedOptionCapitalContext>,
+    scan_date: NaiveDate,
+) -> NakedOptionScanResult {
+    let underlying = underlying.into();
+    let (scored, mut rejection_counts) = score_naked_option_contracts_with_rejections_at(
+        contracts,
+        snapshots,
+        config,
+        kind,
+        underlying_price,
+        scan_date,
     );
     let (candidates, build_rejections) =
         build_naked_option_candidates_with_capital_and_rejections(&scored, config, capital);
     merge_rejection_counts(&mut rejection_counts, &build_rejections);
-    Ok(NakedOptionScanResult {
+    NakedOptionScanResult {
         underlying,
-        contract_count: chain.contracts.len(),
-        snapshot_count: chain.snapshots.len(),
+        contract_count: contracts.len(),
+        snapshot_count: snapshots.len(),
         scoreable_count: scored.len(),
         rejection_counts,
         candidates,
-    })
+    }
 }
 
 #[cfg(test)]

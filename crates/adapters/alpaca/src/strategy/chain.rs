@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use time::{Duration, OffsetDateTime};
+use chrono::{Duration, NaiveDate, Utc};
 
 use crate::{
     config::AlpacaDataClientConfig,
@@ -31,9 +31,29 @@ pub(super) async fn load_option_chain_snapshot(
     max_dte: i64,
     option_type: AlpacaOptionType,
 ) -> Result<OptionChainSnapshot> {
-    let today = OffsetDateTime::now_utc().date();
-    let min_expiration = (today + Duration::days(min_dte)).to_string();
-    let max_expiration = (today + Duration::days(max_dte)).to_string();
+    load_option_chain_snapshot_at(
+        client,
+        data_config,
+        underlying,
+        min_dte,
+        max_dte,
+        option_type,
+        Utc::now().date_naive(),
+    )
+    .await
+}
+
+pub(super) async fn load_option_chain_snapshot_at(
+    client: &AlpacaHttpClient,
+    data_config: &AlpacaDataClientConfig,
+    underlying: &str,
+    min_dte: i64,
+    max_dte: i64,
+    option_type: AlpacaOptionType,
+    scan_date: NaiveDate,
+) -> Result<OptionChainSnapshot> {
+    let min_expiration = (scan_date + Duration::days(min_dte)).to_string();
+    let max_expiration = (scan_date + Duration::days(max_dte)).to_string();
     let provider = AlpacaOptionContractProvider::new(client.clone());
 
     let contracts = provider

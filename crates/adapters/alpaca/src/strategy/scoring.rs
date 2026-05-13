@@ -32,6 +32,17 @@ pub fn score_contracts_with_rejections(
     snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
     config: &PutCreditScannerConfig,
 ) -> (Vec<ScoredContract>, BTreeMap<String, usize>) {
+    score_contracts_with_rejections_at(contracts, snapshots, config, Utc::now().date_naive())
+}
+
+/// Scores contracts and counts filter rejections using an explicit scan date.
+#[must_use]
+pub fn score_contracts_with_rejections_at(
+    contracts: &[AlpacaOptionContract],
+    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    config: &PutCreditScannerConfig,
+    scan_date: NaiveDate,
+) -> (Vec<ScoredContract>, BTreeMap<String, usize>) {
     let mut scored = Vec::new();
     let mut rejections = BTreeMap::new();
     for contract in contracts {
@@ -87,7 +98,7 @@ pub fn score_contracts_with_rejections(
             record_rejection(&mut rejections, "short_delta_range");
             continue;
         }
-        let Some(dte) = days_to_expiration(&contract.expiration_date) else {
+        let Some(dte) = days_to_expiration_from(&contract.expiration_date, scan_date) else {
             record_rejection(&mut rejections, "invalid_expiration");
             continue;
         };
@@ -136,6 +147,17 @@ pub fn score_debit_contracts_with_rejections(
     contracts: &[AlpacaOptionContract],
     snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
     config: &DebitSpreadScannerConfig,
+) -> (Vec<ScoredContract>, BTreeMap<String, usize>) {
+    score_debit_contracts_with_rejections_at(contracts, snapshots, config, Utc::now().date_naive())
+}
+
+/// Scores debit-spread contracts and counts filter rejections using an explicit scan date.
+#[must_use]
+pub fn score_debit_contracts_with_rejections_at(
+    contracts: &[AlpacaOptionContract],
+    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    config: &DebitSpreadScannerConfig,
+    scan_date: NaiveDate,
 ) -> (Vec<ScoredContract>, BTreeMap<String, usize>) {
     let mut scored = Vec::new();
     let mut rejections = BTreeMap::new();
@@ -192,7 +214,7 @@ pub fn score_debit_contracts_with_rejections(
             record_rejection(&mut rejections, "long_delta_range");
             continue;
         }
-        let Some(dte) = days_to_expiration(&contract.expiration_date) else {
+        let Some(dte) = days_to_expiration_from(&contract.expiration_date, scan_date) else {
             record_rejection(&mut rejections, "invalid_expiration");
             continue;
         };
@@ -252,6 +274,26 @@ pub fn score_naked_option_contracts_with_rejections(
     config: &NakedOptionScannerConfig,
     kind: NakedOptionKind,
     underlying_price: f64,
+) -> (Vec<ScoredContract>, BTreeMap<String, usize>) {
+    score_naked_option_contracts_with_rejections_at(
+        contracts,
+        snapshots,
+        config,
+        kind,
+        underlying_price,
+        Utc::now().date_naive(),
+    )
+}
+
+/// Scores naked-option contracts and counts filter rejections using an explicit scan date.
+#[must_use]
+pub fn score_naked_option_contracts_with_rejections_at(
+    contracts: &[AlpacaOptionContract],
+    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    config: &NakedOptionScannerConfig,
+    kind: NakedOptionKind,
+    underlying_price: f64,
+    scan_date: NaiveDate,
 ) -> (Vec<ScoredContract>, BTreeMap<String, usize>) {
     let mut scored = Vec::new();
     let mut rejections = BTreeMap::new();
@@ -342,7 +384,7 @@ pub fn score_naked_option_contracts_with_rejections(
             record_rejection(&mut rejections, "invalid_strike");
             continue;
         };
-        let Some(dte) = days_to_expiration(&contract.expiration_date) else {
+        let Some(dte) = days_to_expiration_from(&contract.expiration_date, scan_date) else {
             record_rejection(&mut rejections, "invalid_expiration");
             continue;
         };
@@ -1011,12 +1053,12 @@ fn strike_key(strike: f64) -> i64 {
 }
 
 fn days_to_expiration(expiration_date: &str) -> Option<i64> {
+    days_to_expiration_from(expiration_date, Utc::now().date_naive())
+}
+
+fn days_to_expiration_from(expiration_date: &str, scan_date: NaiveDate) -> Option<i64> {
     let expiration = NaiveDate::parse_from_str(expiration_date, "%Y-%m-%d").ok()?;
-    Some(
-        expiration
-            .signed_duration_since(Utc::now().date_naive())
-            .num_days(),
-    )
+    Some(expiration.signed_duration_since(scan_date).num_days())
 }
 
 fn term_score(dte: i64, min_dte: i64, max_dte: i64) -> f64 {
