@@ -34,7 +34,7 @@ use crate::{
             ListOptionContractsRequest, ListOrdersRequest, OptionBarsRequest, OptionBarsResponse,
             OptionContractsResponse, OptionSnapshotsRequest, OptionSnapshotsResponse,
             ReplaceOrderRequest,
-            StockSnapshotsRequest, StockSnapshotsResponse,
+            StockBarsRequest, StockBarsResponse, StockSnapshotsRequest, StockSnapshotsResponse,
         },
     },
     orders::{MlegOrderPayload, SimpleOrderPayload},
@@ -264,6 +264,49 @@ impl AlpacaHttpClient {
         }
 
         Ok(OptionBarsResponse {
+            bars,
+            next_page_token: None,
+        })
+    }
+
+    /// Lists one page of historical stock bars from Alpaca's Market Data API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be decoded.
+    pub async fn stock_bars_page(&self, request: &StockBarsRequest) -> Result<StockBarsResponse> {
+        self.get_data_json("/v2/stocks/bars", &request.query_pairs())
+            .await
+    }
+
+    /// Lists historical stock bars for all symbols in the request, batching at Alpaca's 100-symbol cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any request fails or cannot be decoded.
+    pub async fn stock_bars(&self, request: &StockBarsRequest) -> Result<StockBarsResponse> {
+        let mut bars = std::collections::BTreeMap::new();
+
+        for symbol_batch in request.symbols.chunks(100) {
+            let mut page_token = request.page_token.clone();
+
+            loop {
+                let page_request =
+                    request.with_symbols_and_page(symbol_batch.iter().cloned(), page_token.clone());
+                let page = self.stock_bars_page(&page_request).await?;
+                page_token = page.next_token();
+
+                for (symbol, mut symbol_bars) in page.bars {
+                    bars.entry(symbol).or_default().append(&mut symbol_bars);
+                }
+
+                if page_token.is_none() {
+                    break;
+                }
+            }
+        }
+
+        Ok(StockBarsResponse {
             bars,
             next_page_token: None,
         })
