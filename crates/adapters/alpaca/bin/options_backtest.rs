@@ -58,6 +58,7 @@ struct Args {
     sweep_synthetic_spread_pct: Vec<f64>,
     sweep_short_delta_min: Vec<f64>,
     sweep_short_delta_max: Vec<f64>,
+    sweep_min_return_on_risk: Vec<f64>,
     quantity: Option<u64>,
     json_output: bool,
 }
@@ -186,6 +187,7 @@ struct SweepVariant {
     synthetic_spread_pct: f64,
     short_delta_min: Option<f64>,
     short_delta_max: Option<f64>,
+    min_return_on_risk: Option<f64>,
 }
 
 #[tokio::main]
@@ -1574,24 +1576,39 @@ fn sweep_variants(args: &Args) -> Vec<SweepVariant> {
     } else {
         args.sweep_short_delta_max.iter().copied().map(Some).collect()
     };
+    let min_return_on_risks = if args.sweep_min_return_on_risk.is_empty() {
+        vec![None]
+    } else {
+        args.sweep_min_return_on_risk
+            .iter()
+            .copied()
+            .map(Some)
+            .collect()
+    };
 
     let mut variants = Vec::new();
     for synthetic_spread_pct in synthetic_spreads {
         for short_delta_min in &short_delta_mins {
             for short_delta_max in &short_delta_maxes {
-                let mut label_parts = vec![format!("spread={synthetic_spread_pct:.4}")];
-                if let Some(value) = short_delta_min {
-                    label_parts.push(format!("short_delta_min={value:.3}"));
+                for min_return_on_risk in &min_return_on_risks {
+                    let mut label_parts = vec![format!("spread={synthetic_spread_pct:.4}")];
+                    if let Some(value) = short_delta_min {
+                        label_parts.push(format!("short_delta_min={value:.3}"));
+                    }
+                    if let Some(value) = short_delta_max {
+                        label_parts.push(format!("short_delta_max={value:.3}"));
+                    }
+                    if let Some(value) = min_return_on_risk {
+                        label_parts.push(format!("min_ror={value:.3}"));
+                    }
+                    variants.push(SweepVariant {
+                        label: label_parts.join(","),
+                        synthetic_spread_pct,
+                        short_delta_min: *short_delta_min,
+                        short_delta_max: *short_delta_max,
+                        min_return_on_risk: *min_return_on_risk,
+                    });
                 }
-                if let Some(value) = short_delta_max {
-                    label_parts.push(format!("short_delta_max={value:.3}"));
-                }
-                variants.push(SweepVariant {
-                    label: label_parts.join(","),
-                    synthetic_spread_pct,
-                    short_delta_min: *short_delta_min,
-                    short_delta_max: *short_delta_max,
-                });
             }
         }
     }
@@ -1599,6 +1616,7 @@ fn sweep_variants(args: &Args) -> Vec<SweepVariant> {
         && args.sweep_synthetic_spread_pct.is_empty()
         && args.sweep_short_delta_min.is_empty()
         && args.sweep_short_delta_max.is_empty()
+        && args.sweep_min_return_on_risk.is_empty()
     {
         variants[0].label = "base".to_string();
     }
@@ -1631,6 +1649,11 @@ fn apply_sweep_variant(config: &mut OptionsEngineConfig, variant: &SweepVariant)
         config.iron_condor_scanner.credit.short_delta_max = value;
         config.naked_scanner.short_delta_max = value;
         config.naked_1_3dte_scanner.short_delta_max = value;
+    }
+    if let Some(value) = variant.min_return_on_risk {
+        config.scanner.min_return_on_risk = value;
+        config.iron_condor_scanner.credit.min_return_on_risk = value;
+        config.iron_condor_scanner.min_return_on_risk = value;
     }
 }
 
@@ -1747,6 +1770,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut sweep_synthetic_spread_pct = Vec::new();
     let mut sweep_short_delta_min = Vec::new();
     let mut sweep_short_delta_max = Vec::new();
+    let mut sweep_min_return_on_risk = Vec::new();
     let mut quantity = None;
     let mut json_output = false;
 
@@ -1818,6 +1842,10 @@ fn parse_args() -> anyhow::Result<Args> {
                 sweep_short_delta_max =
                     parse_float_csv(next_value(&mut iter, "--sweep-short-delta-max")?)?;
             }
+            "--sweep-min-return-on-risk" => {
+                sweep_min_return_on_risk =
+                    parse_float_csv(next_value(&mut iter, "--sweep-min-return-on-risk")?)?;
+            }
             "--quantity" | "--qty" => {
                 quantity = Some(
                     next_value(&mut iter, "--quantity")?
@@ -1853,6 +1881,7 @@ fn parse_args() -> anyhow::Result<Args> {
         sweep_synthetic_spread_pct,
         sweep_short_delta_min,
         sweep_short_delta_max,
+        sweep_min_return_on_risk,
         quantity,
         json_output,
     })
@@ -1974,6 +2003,6 @@ fn print_sweep_report(reports: &[BacktestReport]) {
 
 fn print_usage() {
     println!(
-        "Usage: alpaca-options-backtest --start YYYY-MM-DD --end YYYY-MM-DD [--entry-time HH:MM] [--exit-time HH:MM] [--underlyings SPY,QQQ] [--strategies put_credit,call_credit,iron_condor,call_debit,put_debit,naked_call,naked_put] [--timeframe 1Min] [--option-feed indicative] [--stock-feed iex] [--assumed-iv 0.35] [--synthetic-spread-pct 0.05] [--entry-mark-window-mins 10] [--historical-min-open-interest 0] [--missing-open-interest 0] [--historical-max-leg-spread-pct 0.80] [--sweep-synthetic-spread-pct 0.03,0.05,0.08] [--sweep-short-delta-min 0.10,0.15] [--sweep-short-delta-max 0.20,0.25] [--quantity 1] [--json]"
+        "Usage: alpaca-options-backtest --start YYYY-MM-DD --end YYYY-MM-DD [--entry-time HH:MM] [--exit-time HH:MM] [--underlyings SPY,QQQ] [--strategies put_credit,call_credit,iron_condor,call_debit,put_debit,naked_call,naked_put] [--timeframe 1Min] [--option-feed indicative] [--stock-feed iex] [--assumed-iv 0.35] [--synthetic-spread-pct 0.05] [--entry-mark-window-mins 10] [--historical-min-open-interest 0] [--missing-open-interest 0] [--historical-max-leg-spread-pct 0.80] [--sweep-synthetic-spread-pct 0.03,0.05,0.08] [--sweep-short-delta-min 0.10,0.15] [--sweep-short-delta-max 0.20,0.25] [--sweep-min-return-on-risk 0.04,0.08,0.13] [--quantity 1] [--json]"
     );
 }
