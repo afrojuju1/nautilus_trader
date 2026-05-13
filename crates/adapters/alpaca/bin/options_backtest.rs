@@ -50,12 +50,16 @@ struct Args {
     stock_feed: Option<String>,
     assumed_iv: f64,
     synthetic_spread_pct: f64,
+    sweep_synthetic_spread_pct: Vec<f64>,
+    sweep_short_delta_min: Vec<f64>,
+    sweep_short_delta_max: Vec<f64>,
     quantity: Option<u64>,
     json_output: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct BacktestReport {
+    variant: String,
     start: String,
     end: String,
     entry_time: String,
@@ -167,6 +171,14 @@ impl LegSide {
     }
 }
 
+#[derive(Clone, Debug)]
+struct SweepVariant {
+    label: String,
+    synthetic_spread_pct: f64,
+    short_delta_min: Option<f64>,
+    short_delta_max: Option<f64>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     load_options_env_file()?;
@@ -176,8 +188,32 @@ async fn main() -> anyhow::Result<()> {
         bail!("--end must be on or after --start");
     }
 
+    let variants = sweep_variants(&args);
+    let mut reports = Vec::new();
+    for variant in variants {
+        reports.push(run_backtest(args.clone(), variant).await?);
+    }
+
+    if args.json_output {
+        if reports.len() == 1 {
+            println!("{}", serde_json::to_string_pretty(&reports[0])?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&reports)?);
+        }
+    } else if reports.len() == 1 {
+        print_report(&reports[0]);
+    } else {
+        print_sweep_report(&reports);
+    }
+
+    Ok(())
+}
+
+async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<BacktestReport> {
+    args.synthetic_spread_pct = variant.synthetic_spread_pct;
     let mut config = OptionsEngineConfig::from_runtime_env_with_storage().await?;
     apply_backtest_overrides(&mut config, &args)?;
+    apply_sweep_variant(&mut config, &variant);
     let account_id = config
         .storage_account_id
         .clone()
@@ -224,7 +260,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let summary = summarize(&days);
-    let report = BacktestReport {
+    Ok(BacktestReport {
+        variant: variant.label,
         start: args.start.to_string(),
         end: args.end.to_string(),
         entry_time: entry_time.format("%H:%M:%S").to_string(),
@@ -239,15 +276,7 @@ async fn main() -> anyhow::Result<()> {
         strategies: enabled_strategy_names(&config),
         summary,
         days,
-    };
-
-    if args.json_output {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print_report(&report);
-    }
-
-    Ok(())
+    })
 }
 
 async fn backtest_underlying_day(
@@ -1456,6 +1485,68 @@ fn summarize(days: &[BacktestDay]) -> BacktestSummary {
     summary
 }
 
+fn sweep_variants(args: &Args) -> Vec<SweepVariant> {
+    let synthetic_spreads = if args.sweep_synthetic_spread_pct.is_empty() {
+        vec![args.synthetic_spread_pct]
+    } else {
+        args.sweep_synthetic_spread_pct.clone()
+    };
+    let short_delta_mins = if args.sweep_short_delta_min.is_empty() {
+        vec![None]
+    } else {
+        args.sweep_short_delta_min.iter().copied().map(Some).collect()
+    };
+    let short_delta_maxes = if args.sweep_short_delta_max.is_empty() {
+        vec![None]
+    } else {
+        args.sweep_short_delta_max.iter().copied().map(Some).collect()
+    };
+
+    let mut variants = Vec::new();
+    for synthetic_spread_pct in synthetic_spreads {
+        for short_delta_min in &short_delta_mins {
+            for short_delta_max in &short_delta_maxes {
+                let mut label_parts = vec![format!("spread={synthetic_spread_pct:.4}")];
+                if let Some(value) = short_delta_min {
+                    label_parts.push(format!("short_delta_min={value:.3}"));
+                }
+                if let Some(value) = short_delta_max {
+                    label_parts.push(format!("short_delta_max={value:.3}"));
+                }
+                variants.push(SweepVariant {
+                    label: label_parts.join(","),
+                    synthetic_spread_pct,
+                    short_delta_min: *short_delta_min,
+                    short_delta_max: *short_delta_max,
+                });
+            }
+        }
+    }
+    if variants.len() == 1
+        && args.sweep_synthetic_spread_pct.is_empty()
+        && args.sweep_short_delta_min.is_empty()
+        && args.sweep_short_delta_max.is_empty()
+    {
+        variants[0].label = "base".to_string();
+    }
+    variants
+}
+
+fn apply_sweep_variant(config: &mut OptionsEngineConfig, variant: &SweepVariant) {
+    if let Some(value) = variant.short_delta_min {
+        config.scanner.short_delta_min = value;
+        config.iron_condor_scanner.credit.short_delta_min = value;
+        config.naked_scanner.short_delta_min = value;
+        config.naked_1_3dte_scanner.short_delta_min = value;
+    }
+    if let Some(value) = variant.short_delta_max {
+        config.scanner.short_delta_max = value;
+        config.iron_condor_scanner.credit.short_delta_max = value;
+        config.naked_scanner.short_delta_max = value;
+        config.naked_1_3dte_scanner.short_delta_max = value;
+    }
+}
+
 fn apply_backtest_overrides(config: &mut OptionsEngineConfig, args: &Args) -> anyhow::Result<()> {
     if let Some(underlyings) = args.underlyings.as_ref() {
         config.underlyings = underlyings.clone();
@@ -1562,6 +1653,9 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut stock_feed = None;
     let mut assumed_iv = 0.35;
     let mut synthetic_spread_pct = 0.05;
+    let mut sweep_synthetic_spread_pct = Vec::new();
+    let mut sweep_short_delta_min = Vec::new();
+    let mut sweep_short_delta_max = Vec::new();
     let mut quantity = None;
     let mut json_output = false;
 
@@ -1593,6 +1687,18 @@ fn parse_args() -> anyhow::Result<Args> {
                     bail!("--synthetic-spread-pct cannot be negative");
                 }
             }
+            "--sweep-synthetic-spread-pct" => {
+                sweep_synthetic_spread_pct =
+                    parse_float_csv(next_value(&mut iter, "--sweep-synthetic-spread-pct")?)?;
+            }
+            "--sweep-short-delta-min" => {
+                sweep_short_delta_min =
+                    parse_float_csv(next_value(&mut iter, "--sweep-short-delta-min")?)?;
+            }
+            "--sweep-short-delta-max" => {
+                sweep_short_delta_max =
+                    parse_float_csv(next_value(&mut iter, "--sweep-short-delta-max")?)?;
+            }
             "--quantity" | "--qty" => {
                 quantity = Some(
                     next_value(&mut iter, "--quantity")?
@@ -1621,6 +1727,9 @@ fn parse_args() -> anyhow::Result<Args> {
         stock_feed,
         assumed_iv,
         synthetic_spread_pct,
+        sweep_synthetic_spread_pct,
+        sweep_short_delta_min,
+        sweep_short_delta_max,
         quantity,
         json_output,
     })
@@ -1652,9 +1761,23 @@ fn split_csv(value: String) -> Vec<String> {
         .collect()
 }
 
+fn parse_float_csv(value: String) -> anyhow::Result<Vec<f64>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .with_context(|| format!("invalid numeric sweep value {value}"))
+        })
+        .collect()
+}
+
 fn print_report(report: &BacktestReport) {
     println!(
-        "Alpaca options strategy backtest {} -> {} entry={} exit={} strategies={} underlyings={} mark_source={}",
+        "Alpaca options strategy backtest variant={} {} -> {} entry={} exit={} strategies={} underlyings={} mark_source={}",
+        report.variant,
         report.start,
         report.end,
         report.entry_time,
@@ -1703,8 +1826,31 @@ fn print_report(report: &BacktestReport) {
     }
 }
 
+fn print_sweep_report(reports: &[BacktestReport]) {
+    println!("Alpaca options strategy backtest sweep results:");
+    let mut ranked = reports.iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .summary
+            .total_pnl
+            .partial_cmp(&left.summary.total_pnl)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for report in ranked {
+        println!(
+            "variant={} selected={} closed={} win_rate={:.1}% total_pnl={:.2} avg_pnl={:.2}",
+            report.variant,
+            report.summary.selected_trades,
+            report.summary.closed_trades,
+            report.summary.win_rate * 100.0,
+            report.summary.total_pnl,
+            report.summary.average_pnl,
+        );
+    }
+}
+
 fn print_usage() {
     println!(
-        "Usage: alpaca-options-backtest --start YYYY-MM-DD --end YYYY-MM-DD [--entry-time HH:MM] [--exit-time HH:MM] [--underlyings SPY,QQQ] [--strategies put_credit,call_credit,iron_condor,call_debit,put_debit,naked_call,naked_put] [--timeframe 1Min] [--option-feed indicative] [--stock-feed iex] [--assumed-iv 0.35] [--synthetic-spread-pct 0.05] [--quantity 1] [--json]"
+        "Usage: alpaca-options-backtest --start YYYY-MM-DD --end YYYY-MM-DD [--entry-time HH:MM] [--exit-time HH:MM] [--underlyings SPY,QQQ] [--strategies put_credit,call_credit,iron_condor,call_debit,put_debit,naked_call,naked_put] [--timeframe 1Min] [--option-feed indicative] [--stock-feed iex] [--assumed-iv 0.35] [--synthetic-spread-pct 0.05] [--sweep-synthetic-spread-pct 0.03,0.05,0.08] [--sweep-short-delta-min 0.10,0.15] [--sweep-short-delta-max 0.20,0.25] [--quantity 1] [--json]"
     );
 }
