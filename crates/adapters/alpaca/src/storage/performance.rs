@@ -98,7 +98,7 @@ pub async fn summarize_performance_ledger(
     filters: PerformanceLedgerSummaryFilters,
 ) -> anyhow::Result<PerformanceLedgerSummary> {
     let query = format!(
-        "SELECT payload FROM \"{}\".performance_ledger WHERE account_id = $1 AND ($2::date IS NULL OR ledger_date >= $2) AND ($3::date IS NULL OR ledger_date <= $3) AND (payload->>'type') = 'realized_trade' ORDER BY ts_utc ASC",
+        "SELECT payload FROM \"{}\".performance_ledger WHERE account_id = $1 AND ($2::date IS NULL OR ledger_date >= $2::date) AND ($3::date IS NULL OR ledger_date <= $3::date) AND (payload->>'type') = 'realized_trade' ORDER BY ts_utc ASC",
         storage.schema()
     );
     let rows = sqlx::query(&query)
@@ -236,7 +236,7 @@ pub async fn summarize_candidate_outcomes(
     filters: CandidateOutcomeSummaryFilters,
 ) -> anyhow::Result<CandidateOutcomeSummary> {
     let query = format!(
-        "SELECT payload FROM \"{}\".candidate_outcome WHERE account_id = $1 AND ($2::date IS NULL OR trade_date >= $2) AND ($3::date IS NULL OR trade_date <= $3) ORDER BY ts_utc ASC",
+        "SELECT payload FROM \"{}\".candidate_outcome WHERE account_id = $1 AND ($2::date IS NULL OR trade_date >= $2::date) AND ($3::date IS NULL OR trade_date <= $3::date) ORDER BY ts_utc ASC",
         storage.schema()
     );
     let rows = sqlx::query(&query)

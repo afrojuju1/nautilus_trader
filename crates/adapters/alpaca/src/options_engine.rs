@@ -1641,7 +1641,10 @@ mod tests {
         common::consts::ALPACA_CLIENT_ID,
         fleet::{AccountConfig, FleetConfig, FleetSection, ResolvedFleetConfig},
         options_runtime::SelectedNakedOptionEntry,
-        runtime::{debit_spread_strategy_name, naked_option_strategy_name},
+        runtime::{
+            debit_spread_strategy_name, naked_option_strategy_name, save_strategy_state_atomic,
+        },
+        storage::STORAGE_SCHEMA_DEFAULT,
         strategy::{
             DebitSpreadScannerConfig, IronCondorScannerConfig, NakedOptionCandidate,
             NakedOptionKind, PutCreditScannerConfig,
@@ -1701,6 +1704,10 @@ mod tests {
             fleet: None,
             fleet_account_id: None,
             fleet_policy_blocks: Vec::new(),
+            storage_repository: None,
+            storage_database_url: None,
+            storage_schema: STORAGE_SCHEMA_DEFAULT.to_string(),
+            storage_account_id: None,
         }
     }
 

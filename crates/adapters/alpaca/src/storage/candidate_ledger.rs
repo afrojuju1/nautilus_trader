@@ -84,7 +84,7 @@ pub async fn read_candidate_ledger_records(
     filters: CandidateLedgerSummaryFilters,
 ) -> anyhow::Result<Vec<Value>> {
     let query = format!(
-        "SELECT payload FROM \"{}\".candidate_ledger WHERE account_id = $1 AND ($2::date IS NULL OR trade_date >= $2) AND ($3::date IS NULL OR trade_date <= $3) ORDER BY ts_utc ASC",
+        "SELECT payload FROM \"{}\".candidate_ledger WHERE account_id = $1 AND ($2::date IS NULL OR trade_date >= $2::date) AND ($3::date IS NULL OR trade_date <= $3::date) ORDER BY ts_utc ASC",
         storage.schema()
     );
     let rows = sqlx::query(&query)

@@ -482,15 +482,6 @@ available. The operator can also run `alpaca-control performance` to append miss
 The performance ledger is deduped by record key, so repeated backfills should not create duplicate
 realized-trade records.
 
-Legacy JSONL ledgers can be imported once into Postgres with:
-
-```bash
-alpaca-migrate-jsonl-storage
-```
-
-The importer scans `~/.local/state/nautilus_trader/alpaca/<account-id>/` by default and is
-idempotent. Set `ALPACA_JSONL_MIGRATION_ROOT` only when importing from a non-standard legacy root.
-
 ## Operator Runbook
 
 Normal overnight monitoring:
