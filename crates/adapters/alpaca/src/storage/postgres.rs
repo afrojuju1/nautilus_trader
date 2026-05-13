@@ -110,6 +110,20 @@ CREATE TABLE IF NOT EXISTS "{table_schema}".candidate_outcome (
 
 CREATE INDEX IF NOT EXISTS "ix_candidate_outcome_account_date"
     ON "{table_schema}".candidate_outcome (account_id, trade_date, ts_utc);
+
+CREATE TABLE IF NOT EXISTS "{table_schema}".backtest_market_cache (
+    id BIGSERIAL PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    cache_kind TEXT NOT NULL,
+    cache_key TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_backtest_market_cache_key UNIQUE (account_id, cache_kind, cache_key)
+);
+
+CREATE INDEX IF NOT EXISTS "ix_backtest_market_cache_account_kind"
+    ON "{table_schema}".backtest_market_cache (account_id, cache_kind);
 "#
         );
         for statement in schema_sql

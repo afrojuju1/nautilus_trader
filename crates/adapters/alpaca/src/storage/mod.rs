@@ -9,6 +9,8 @@ pub const STORAGE_ACCOUNT_ID_DEFAULT: &str = "default";
 #[cfg(feature = "live")]
 pub mod candidate_ledger;
 #[cfg(feature = "live")]
+pub mod market_cache;
+#[cfg(feature = "live")]
 pub mod performance;
 #[cfg(feature = "live")]
 pub mod state;
@@ -26,6 +28,9 @@ pub use candidate_ledger::{
     CandidateLedgerSummaryFilters, read_candidate_ledger_records, summarize_candidate_ledger,
     summarize_candidate_ledger_records,
 };
+
+#[cfg(feature = "live")]
+pub use market_cache::{read_backtest_market_cache, write_backtest_market_cache};
 
 #[cfg(feature = "live")]
 pub use performance::{
