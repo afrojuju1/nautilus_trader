@@ -78,10 +78,13 @@ use crate::{
             ClearinghouseState, Cloid, HyperliquidCandleSnapshot, HyperliquidExchangeRequest,
             HyperliquidExchangeResponse, HyperliquidExecAction, HyperliquidExecBuilderFee,
             HyperliquidExecCancelByCloidRequest, HyperliquidExecCancelOrderRequest,
-            HyperliquidExecGrouping, HyperliquidExecLimitParams, HyperliquidExecModifyOrderRequest,
-            HyperliquidExecOrderKind, HyperliquidExecOrderResponseData, HyperliquidExecOrderStatus,
-            HyperliquidExecPlaceOrderRequest, HyperliquidExecTif, HyperliquidExecTpSl,
-            HyperliquidExecTriggerParams, HyperliquidFills, HyperliquidFundingHistoryEntry,
+            HyperliquidExecGrouping, HyperliquidExecLimitParams, HyperliquidExecMergeOutcomeParams,
+            HyperliquidExecMergeQuestionParams, HyperliquidExecModifyOrderRequest,
+            HyperliquidExecNegateOutcomeParams, HyperliquidExecOrderKind,
+            HyperliquidExecOrderResponseData, HyperliquidExecOrderStatus,
+            HyperliquidExecPlaceOrderRequest, HyperliquidExecSplitOutcomeParams,
+            HyperliquidExecTif, HyperliquidExecTpSl, HyperliquidExecTriggerParams,
+            HyperliquidExecUserOutcomeOp, HyperliquidFills, HyperliquidFundingHistoryEntry,
             HyperliquidL2Book, HyperliquidMeta, HyperliquidOrderStatus, OutcomeMeta, PerpMeta,
             PerpMetaAndCtxs, RESPONSE_STATUS_OK, SpotClearinghouseState, SpotMeta, SpotMetaAndCtxs,
         },
@@ -94,7 +97,7 @@ use crate::{
         query::{ExchangeAction, InfoRequest},
         rate_limits::{
             RateLimitSnapshot, WeightedLimiter, backoff_full_jitter, exchange_weight,
-            info_base_weight, info_extra_weight,
+            exec_action_weight, info_base_weight, info_extra_weight,
         },
     },
     signing::{
@@ -577,22 +580,19 @@ impl HyperliquidRawHttpClient {
         let signer_id = self.signer_id();
         let time_nonce = nonce_manager.next(signer_id)?;
 
-        let action_value = serde_json::to_value(action)
-            .context("serialize exchange action")
-            .map_err(|e| Error::bad_request(e.to_string()))?;
-
-        // Serialize the original action struct with MessagePack for L1 signing
+        // L1 signing uses `action_bytes` only; skip the JSON value to save work
         let action_bytes = rmp_serde::to_vec_named(action)
             .context("serialize action with MessagePack")
             .map_err(|e| Error::bad_request(e.to_string()))?;
 
         let sign_request = SignRequest {
-            action: action_value,
+            action: None,
             action_bytes: Some(action_bytes),
             time_nonce,
             action_type: HyperliquidActionType::L1,
             is_testnet: self.is_testnet(),
             vault_address: self.vault_address.as_ref().map(|v| v.to_hex()),
+            expires_after: None,
         };
 
         let sig = signer.sign(&sign_request)?.signature;
@@ -651,23 +651,12 @@ impl HyperliquidRawHttpClient {
         }
     }
 
-    /// Send a signed action to the exchange using the typed HyperliquidExecAction enum.
-    ///
-    /// This is the preferred method for placing orders as it uses properly typed
-    /// structures that match Hyperliquid's API expectations exactly.
-    pub async fn post_action_exec(
+    /// Build a signed exchange request using the typed HyperliquidExecAction enum.
+    pub fn sign_action_exec_request(
         &self,
         action: &HyperliquidExecAction,
-    ) -> Result<HyperliquidExchangeResponse> {
-        let w = match action {
-            HyperliquidExecAction::Order { orders, .. } => 1 + (orders.len() as u32 / 40),
-            HyperliquidExecAction::Cancel { cancels } => 1 + (cancels.len() as u32 / 40),
-            HyperliquidExecAction::CancelByCloid { cancels } => 1 + (cancels.len() as u32 / 40),
-            HyperliquidExecAction::BatchModify { modifies } => 1 + (modifies.len() as u32 / 40),
-            _ => 1,
-        };
-        self.rest_limiter.acquire(w).await;
-
+        expires_after: Option<u64>,
+    ) -> Result<HyperliquidExchangeRequest<HyperliquidExecAction>> {
         let signer = self
             .signer
             .as_ref()
@@ -682,27 +671,24 @@ impl HyperliquidRawHttpClient {
         let time_nonce = nonce_manager.next(signer_id)?;
         // No need to validate - next() guarantees a valid, unused nonce
 
-        let action_value = serde_json::to_value(action)
-            .context("serialize exchange action")
-            .map_err(|e| Error::bad_request(e.to_string()))?;
-
-        // Serialize the original action struct with MessagePack for L1 signing
+        // L1 signing uses `action_bytes` only; skip the JSON value to save work
         let action_bytes = rmp_serde::to_vec_named(action)
             .context("serialize action with MessagePack")
             .map_err(|e| Error::bad_request(e.to_string()))?;
 
         let sig = signer
             .sign(&SignRequest {
-                action: action_value,
+                action: None,
                 action_bytes: Some(action_bytes),
                 time_nonce,
                 action_type: HyperliquidActionType::L1,
                 is_testnet: self.is_testnet(),
                 vault_address: self.vault_address.as_ref().map(|v| v.to_hex()),
+                expires_after,
             })?
             .signature;
 
-        let request = if let Some(vault) = self.vault_address {
+        let mut request = if let Some(vault) = self.vault_address {
             HyperliquidExchangeRequest::with_vault(
                 action.clone(),
                 time_nonce.as_millis() as u64,
@@ -712,6 +698,22 @@ impl HyperliquidRawHttpClient {
         } else {
             HyperliquidExchangeRequest::new(action.clone(), time_nonce.as_millis() as u64, sig)
         };
+        request.expires_after = expires_after;
+        Ok(request)
+    }
+
+    /// Send a signed action to the exchange using the typed HyperliquidExecAction enum.
+    ///
+    /// This is the preferred method for placing orders as it uses properly typed
+    /// structures that match Hyperliquid's API expectations exactly.
+    pub async fn post_action_exec(
+        &self,
+        action: &HyperliquidExecAction,
+    ) -> Result<HyperliquidExchangeResponse> {
+        let w = exec_action_weight(action);
+        self.rest_limiter.acquire(w).await;
+
+        let request = self.sign_action_exec_request(action, None)?;
 
         let response = self.http_roundtrip_exchange(&request).await?;
 
@@ -1155,9 +1157,15 @@ impl HyperliquidHttpClient {
             return Some(instrument.clone());
         }
 
-        // HTTP responses lack product type context, try PERP then SPOT
+        // HTTP responses lack product type context. HIP-4 outcome coins
+        // (`#E`/`+E`) are checked first because they never collide with
+        // perp or spot symbols, then perp, then spot.
         if product_type.is_none() {
             let guard = self.instruments_by_coin.load();
+
+            if let Some(instrument) = guard.get(&(*coin, HyperliquidProductType::Outcome)) {
+                return Some(instrument.clone());
+            }
 
             if let Some(instrument) = guard.get(&(*coin, HyperliquidProductType::Perp)) {
                 return Some(instrument.clone());
@@ -1541,6 +1549,15 @@ impl HyperliquidHttpClient {
         self.inner.post_action_exec(action).await
     }
 
+    /// Build the signed exchange request used by both HTTP and WebSocket post transports.
+    pub fn sign_action_exec_request(
+        &self,
+        action: &HyperliquidExecAction,
+        expires_after: Option<u64>,
+    ) -> Result<HyperliquidExchangeRequest<HyperliquidExecAction>> {
+        self.inner.sign_action_exec_request(action, expires_after)
+    }
+
     /// Get metadata about available markets (low-level delegation).
     pub async fn info_meta(&self) -> Result<HyperliquidMeta> {
         self.inner.info_meta().await
@@ -1751,6 +1768,105 @@ impl HyperliquidHttpClient {
         }
     }
 
+    /// Split an HIP-4 outcome's quote tokens into matched Yes and No side tokens.
+    ///
+    /// Submits a `userOutcome` exchange action with the `splitOutcome` operation:
+    /// debits `amount` quote tokens (USDH) and credits `amount` Yes plus `amount`
+    /// No side tokens for the given `outcome` index. Ordinary directional
+    /// buys and sells on outcome instruments go through the standard order path
+    /// without calling this; the action is for dual-side market making and
+    /// inventory creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the venue rejects the
+    /// action, or the response cannot be parsed.
+    pub async fn submit_split_outcome(
+        &self,
+        outcome: u32,
+        amount: Decimal,
+    ) -> Result<HyperliquidExchangeResponse> {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::SplitOutcome(HyperliquidExecSplitOutcomeParams {
+                outcome,
+                amount,
+            }),
+        };
+        self.inner.post_action_exec(&action).await
+    }
+
+    /// Merge matched Yes + No side-token pairs of an HIP-4 outcome back into quote tokens.
+    ///
+    /// Submits a `userOutcome` action with the `mergeOutcome` operation. Pass
+    /// `amount = None` to merge the maximum mergeable balance (venue-side
+    /// `null`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the venue rejects the
+    /// action, or the response cannot be parsed.
+    pub async fn submit_merge_outcome(
+        &self,
+        outcome: u32,
+        amount: Option<Decimal>,
+    ) -> Result<HyperliquidExchangeResponse> {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::MergeOutcome(HyperliquidExecMergeOutcomeParams {
+                outcome,
+                amount,
+            }),
+        };
+        self.inner.post_action_exec(&action).await
+    }
+
+    /// Merge `Yes` shares of every outcome in a multi-outcome question into quote tokens.
+    ///
+    /// Submits a `userOutcome` action with the `mergeQuestion` operation. Pass
+    /// `amount = None` to merge the maximum balance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the venue rejects the
+    /// action, or the response cannot be parsed.
+    pub async fn submit_merge_question(
+        &self,
+        question: u32,
+        amount: Option<Decimal>,
+    ) -> Result<HyperliquidExchangeResponse> {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::MergeQuestion(HyperliquidExecMergeQuestionParams {
+                question,
+                amount,
+            }),
+        };
+        self.inner.post_action_exec(&action).await
+    }
+
+    /// Swap `No` shares of one outcome into `Yes` shares of every other outcome.
+    ///
+    /// Submits a `userOutcome` action with the `negateOutcome` operation. Both
+    /// outcomes must belong to the same multi-outcome `question`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the venue rejects the
+    /// action, or the response cannot be parsed.
+    pub async fn submit_negate_outcome(
+        &self,
+        question: u32,
+        outcome: u32,
+        amount: Decimal,
+    ) -> Result<HyperliquidExchangeResponse> {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::NegateOutcome(HyperliquidExecNegateOutcomeParams {
+                question,
+                outcome,
+                amount,
+            }),
+        };
+        self.inner.post_action_exec(&action).await
+    }
+
     /// Request order status reports for a user.
     ///
     /// Fetches open orders via `info_frontend_open_orders` and parses them into OrderStatusReports.
@@ -1913,6 +2029,8 @@ impl HyperliquidHttpClient {
             timestamp: entry.order.timestamp,
             orig_sz: entry.order.orig_sz,
             cloid: entry.order.cloid,
+            tif: None,
+            reduce_only: None,
             trigger_px: None,
             is_market: None,
             tpsl: None,
@@ -3151,6 +3269,80 @@ mod tests {
             client.get_or_create_instrument(&Ustr::from("vntls:vCURSOR"), None);
         assert!(retrieved_without_type.is_some());
         assert_eq!(retrieved_without_type.unwrap().id(), instrument.id());
+    }
+
+    #[rstest]
+    fn test_get_or_create_instrument_outcome_fallback_no_product_type() {
+        // HTTP fill payloads for HIP-4 outcomes arrive with `coin = "#E"` and
+        // no product-type context, so the no-product fallback in
+        // `get_or_create_instrument` must check the Outcome bucket. Without
+        // this, venue Settlement and userOutcome fills are silently dropped
+        // from request_fill_reports / request_order_status_reports.
+        use nautilus_core::time::get_atomic_clock_realtime;
+        use nautilus_model::{
+            enums::AssetClass,
+            identifiers::{InstrumentId, Symbol},
+            instruments::{BinaryOption, InstrumentAny},
+            types::{Currency, Price, Quantity},
+        };
+
+        let client = HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+        let coin = "#500";
+        let token = "+500";
+
+        let usdh = Currency::new("USDH", 8, 0, "Hyperliquid USD", CurrencyType::Crypto);
+        let symbol = Symbol::new(token);
+        let raw_symbol = Symbol::new(coin);
+        let venue = *HYPERLIQUID_VENUE;
+        let instrument_id = InstrumentId::new(symbol, venue);
+
+        let clock = get_atomic_clock_realtime();
+        let ts = clock.get_time_ns();
+
+        let binary = InstrumentAny::BinaryOption(BinaryOption::new(
+            instrument_id,
+            raw_symbol,
+            AssetClass::Alternative,
+            usdh,
+            Default::default(),
+            Default::default(),
+            4,
+            2,
+            Price::from("0.0001"),
+            Quantity::from("0.01"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ts,
+            ts,
+        ));
+
+        client.cache_instrument(&binary);
+
+        let with_type = client
+            .get_or_create_instrument(&Ustr::from(coin), Some(HyperliquidProductType::Outcome));
+        assert!(with_type.is_some());
+        assert_eq!(with_type.unwrap().id(), instrument_id);
+
+        let no_type = client.get_or_create_instrument(&Ustr::from(coin), None);
+        assert!(
+            no_type.is_some(),
+            "Outcome coin must resolve through the no-product fallback",
+        );
+        assert_eq!(no_type.unwrap().id(), instrument_id);
+
+        let missing = client.get_or_create_instrument(&Ustr::from("#9999"), None);
+        assert!(missing.is_none());
     }
 
     #[rstest]

@@ -1639,6 +1639,7 @@ fn test_process_cancel_command_valid(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
 
     engine_l2
@@ -1685,6 +1686,7 @@ fn test_process_cancel_command_order_not_found(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
 
     // Process cancel command for order which doesn't exists
@@ -1789,6 +1791,7 @@ fn test_process_cancel_all_command(instrument_eth_usdt: InstrumentAny, account_i
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_cancel_all(&cancel_all_command, account_id);
 
@@ -1888,6 +1891,7 @@ fn test_process_batch_cancel_command(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     let cancel_2 = CancelOrder::new(
         TraderId::test_default(),
@@ -1899,6 +1903,7 @@ fn test_process_batch_cancel_command(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     let batch_cancel_command = BatchCancelOrders::new(
         TraderId::test_default(),
@@ -1909,6 +1914,7 @@ fn test_process_batch_cancel_command(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
 
     engine_l2.process_batch_cancel(&batch_cancel_command, account_id);
@@ -2007,6 +2013,7 @@ fn test_process_cancel_skips_already_canceled_order(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     assert!(
         engine_l2.order_exists(client_order_id),
@@ -2023,6 +2030,76 @@ fn test_process_cancel_skips_already_canceled_order(
     assert!(
         !engine_l2.order_exists(client_order_id),
         "stale matching-core entry should be purged when the gate fires",
+    );
+}
+
+#[rstest]
+fn test_iterate_purges_already_canceled_order_from_core(
+    instrument_eth_usdt: InstrumentAny,
+    account_id: AccountId,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+    let mut engine_l2 = get_order_matching_engine_l2(
+        instrument_eth_usdt.clone(),
+        Some(cache.clone()),
+        None,
+        None,
+        None,
+    );
+
+    let orderbook_delta_sell = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+        .book_action(BookAction::Add)
+        .book_order(BookOrder::new(
+            OrderSide::Sell,
+            Price::from("1500.00"),
+            Quantity::from("1.000"),
+            1,
+        ))
+        .build();
+    engine_l2
+        .process_order_book_delta(&orderbook_delta_sell)
+        .unwrap();
+
+    let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+    let mut limit_order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("1495.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(client_order_id)
+        .submit(true)
+        .build();
+
+    engine_l2.process_order(&mut limit_order, account_id);
+
+    let cached_order = cache.borrow().order(&client_order_id).unwrap().clone();
+    let canceled_event =
+        TestOrderEventStubs::canceled(&cached_order, account_id, Some(VenueOrderId::from("V1")));
+    cache
+        .borrow_mut()
+        .order_mut(&client_order_id)
+        .unwrap()
+        .apply(canceled_event)
+        .unwrap();
+
+    clear_order_event_handler_messages(&order_event_handler);
+
+    assert!(
+        engine_l2.order_exists(client_order_id),
+        "matching core should still hold the order before iterate runs",
+    );
+
+    engine_l2.iterate(UnixNanos::from(1), AggressorSide::NoAggressor);
+
+    let saved_messages = get_order_event_handler_messages(&order_event_handler);
+    assert!(
+        saved_messages.is_empty(),
+        "expected no events while purging stale closed order, found {saved_messages:?}",
+    );
+    assert!(
+        !engine_l2.order_exists(client_order_id),
+        "stale closed order should be purged during matching iteration",
     );
 }
 
@@ -2107,6 +2184,7 @@ fn test_process_cancel_all_skips_orders_closed_by_contingent_cascade(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_cancel_all(&cancel_all_command, account_id);
 
@@ -2237,6 +2315,7 @@ fn test_process_modify_order_rejected_not_found(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_modify(&modify_order_command, account_id);
 
@@ -2313,6 +2392,7 @@ fn test_rejected_post_only_modify_preserves_fifo_priority(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_modify(&modify_command, account_id);
 
@@ -2423,6 +2503,7 @@ fn test_rejected_post_only_modify_preserves_queue_position(
         UUID4::new(),
         UnixNanos::from(3u64),
         None,
+        None, // correlation_id
     );
     engine.process_modify(&modify_command, account_id);
     let after_modify = get_order_event_handler_messages(&handler);
@@ -2528,6 +2609,7 @@ fn test_rejected_stop_market_modify_preserves_fifo_priority(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_modify(&modify_command, account_id);
 
@@ -2606,6 +2688,7 @@ fn test_update_limit_order_post_only_matched(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_modify(&modify_order_command, account_id);
 
@@ -2689,6 +2772,7 @@ fn test_update_limit_order_valid(instrument_eth_usdt: InstrumentAny, account_id:
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_modify(&modify_order_command, account_id);
 
@@ -2770,6 +2854,7 @@ fn test_update_stop_market_order_valid(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_modify(&modify_order_command, account_id);
 
@@ -2829,6 +2914,7 @@ fn test_update_stop_limit_order_valid_update_not_triggered(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_modify(&modify_order_command, account_id);
 
@@ -2939,6 +3025,7 @@ fn test_update_market_if_touched_order_valid(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_modify(&modify_order_command, account_id);
 
@@ -3080,6 +3167,7 @@ fn test_update_limit_if_touched_order_valid(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_modify(&modify_order_command, account_id);
 
@@ -3408,6 +3496,7 @@ fn test_updating_of_contingent_orders(instrument_eth_usdt: InstrumentAny, accoun
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_modify(&modify_order_command, account_id);
 
@@ -3875,6 +3964,7 @@ fn test_modify_partially_filled_order_quantity_below_filled_rejected(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_modify(&modify_order_command, account_id);
 
@@ -4004,6 +4094,7 @@ fn test_ouo_child_cancelled_when_parent_leaves_zero(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_modify(&modify_order_command, account_id);
 
@@ -4601,6 +4692,7 @@ fn test_modify_limit_order_price_persists_to_core(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
 
     engine_l2.process_modify(&modify_command, account_id);
@@ -4673,6 +4765,7 @@ fn test_rejected_modify_does_not_change_book_priority(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
 
     engine_l2.process_modify(&modify_command, account_id);
@@ -8040,8 +8133,137 @@ fn test_fully_filled_limit_order_removed_from_core(
     );
     assert_eq!(
         engine.cached_filled_qty_len(),
+        1,
+        "cached_filled_qty should stay until the fill event closes the cached order",
+    );
+}
+
+#[rstest]
+fn test_closed_filled_order_purges_cached_fill_qty_after_cache_update(
+    instrument_eth_usdt: InstrumentAny,
+    order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    account_id: AccountId,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut engine = get_order_matching_engine_l2(
+        instrument_eth_usdt.clone(),
+        Some(cache.clone()),
+        None,
+        None,
+        None,
+    );
+
+    let delta = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+        .book_action(BookAction::Add)
+        .book_order(BookOrder::new(
+            OrderSide::Sell,
+            Price::from("1500.00"),
+            Quantity::from("5.000"),
+            1,
+        ))
+        .build();
+    engine.process_order_book_delta(&delta).unwrap();
+
+    let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+    let mut limit_order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("1501.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(client_order_id)
+        .submit(true)
+        .build();
+
+    engine.process_order(&mut limit_order, account_id);
+    assert_eq!(engine.cached_filled_qty_len(), 1);
+
+    let fill_event = get_order_event_handler_messages(&order_event_handler)
+        .iter()
+        .find(|event| matches!(event, OrderEventAny::Filled(_)))
+        .unwrap()
+        .clone();
+    cache.borrow_mut().update_order(&fill_event).unwrap();
+
+    engine.iterate(UnixNanos::from(1), AggressorSide::NoAggressor);
+
+    assert_eq!(
+        engine.cached_filled_qty_len(),
         0,
-        "cached_filled_qty should be cleared after full fill",
+        "closed cached orders should purge filled-quantity guards without core membership",
+    );
+
+    clear_order_event_handler_messages(&order_event_handler);
+    engine.fill_limit_order(client_order_id);
+
+    assert!(
+        get_order_event_handler_messages(&order_event_handler)
+            .iter()
+            .all(|event| !matches!(event, OrderEventAny::Filled(_))),
+        "closed orders should not fill again after their cached guard is purged",
+    );
+}
+
+#[rstest]
+fn test_closed_filled_market_order_does_not_fill_after_cache_update(
+    instrument_eth_usdt: InstrumentAny,
+    order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    account_id: AccountId,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut engine = get_order_matching_engine_l2(
+        instrument_eth_usdt.clone(),
+        Some(cache.clone()),
+        None,
+        None,
+        None,
+    );
+
+    let delta = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+        .book_action(BookAction::Add)
+        .book_order(BookOrder::new(
+            OrderSide::Sell,
+            Price::from("1500.00"),
+            Quantity::from("5.000"),
+            1,
+        ))
+        .build();
+    engine.process_order_book_delta(&delta).unwrap();
+
+    let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+    let mut market_order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(client_order_id)
+        .submit(true)
+        .build();
+
+    engine.process_order(&mut market_order, account_id);
+    assert_eq!(engine.cached_filled_qty_len(), 1);
+
+    let fill_event = get_order_event_handler_messages(&order_event_handler)
+        .iter()
+        .find(|event| matches!(event, OrderEventAny::Filled(_)))
+        .unwrap()
+        .clone();
+    cache.borrow_mut().update_order(&fill_event).unwrap();
+
+    engine.iterate(UnixNanos::from(1), AggressorSide::NoAggressor);
+
+    assert_eq!(
+        engine.cached_filled_qty_len(),
+        0,
+        "closed cached market orders should purge filled-quantity guards without core membership",
+    );
+
+    clear_order_event_handler_messages(&order_event_handler);
+    engine.fill_market_order(client_order_id);
+
+    assert!(
+        get_order_event_handler_messages(&order_event_handler)
+            .iter()
+            .all(|event| !matches!(event, OrderEventAny::Filled(_))),
+        "closed market orders should not fill again after their cached guard is purged",
     );
 }
 
@@ -8150,8 +8372,8 @@ fn test_fully_filled_market_to_limit_not_in_core(
     );
     assert_eq!(
         engine.cached_filled_qty_len(),
-        0,
-        "cached_filled_qty should be cleared after MarketToLimit full fill",
+        1,
+        "cached_filled_qty should stay until the fill event closes the cached order",
     );
 }
 
@@ -8645,6 +8867,7 @@ fn test_modify_then_iterate_fills_at_new_limit_price(
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
     engine_l2.process_modify(&modify_order_command, account_id);
 

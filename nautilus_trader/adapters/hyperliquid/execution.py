@@ -144,6 +144,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             account_id=str(account_id),
             proxy_url=config.proxy_url,
         )
+        self._ws_client.set_post_timeout(config.ws_post_timeout_secs)
 
         # Caches to handle race conditions and duplicate messages
         self._processed_trade_ids: nautilus_pyo3.FifoCache = nautilus_pyo3.FifoCache()
@@ -164,6 +165,10 @@ class HyperliquidExecutionClient(LiveExecutionClient):
         # FillReports buffered during an in-flight cancel-replace, drained
         # from the cancel-replace ACCEPTED branch. See GH-3972.
         self._buffered_fills: dict[str, list[nautilus_pyo3.FillReport]] = {}
+
+        # FillReports buffered when fill arrives before order is in cache,
+        # drained on OrderAccepted.
+        self._pending_fills: dict[str, list[nautilus_pyo3.FillReport]] = {}
 
         self._fee_refresh_task: asyncio.Task | None = None
 
@@ -191,6 +196,19 @@ class HyperliquidExecutionClient(LiveExecutionClient):
     @property
     def hyperliquid_instrument_provider(self) -> HyperliquidInstrumentProvider:
         return self._instrument_provider
+
+    async def _split_outcome(self, outcome: int, amount: Decimal) -> str:
+        return await self._client.submit_split_outcome(outcome, amount)
+
+    async def _merge_outcome(self, outcome: int, amount: Decimal | None = None) -> str:
+        # `amount=None` serializes as JSON `null`, which the venue treats as the max mergeable balance
+        return await self._client.submit_merge_outcome(outcome, amount)
+
+    async def _merge_question(self, question: int, amount: Decimal | None = None) -> str:
+        return await self._client.submit_merge_question(question, amount)
+
+    async def _negate_outcome(self, question: int, outcome: int, amount: Decimal) -> str:
+        return await self._client.submit_negate_outcome(question, outcome, amount)
 
     def _cache_instruments(self) -> None:
         # Ensures instrument definitions are available for correct
@@ -261,6 +279,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
     def _cleanup_cloid_mapping(self, client_order_id: ClientOrderId) -> None:
         # Drop the cancel-replace fill buffer to avoid stranded entries (GH-3972).
         self._buffered_fills.pop(client_order_id.value, None)
+        self._pending_fills.pop(client_order_id.value, None)
         try:
             pyo3_client_order_id = nautilus_pyo3.ClientOrderId(client_order_id.value)
             cloid = nautilus_pyo3.hyperliquid_cloid_from_client_order_id(pyo3_client_order_id)
@@ -649,12 +668,12 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             else:
                 pyo3_trigger_price = None
 
-            # TODO: Refactor to use WebSocket trading API
             # Cache cloid mapping for WebSocket order/fill resolution
             cloid = nautilus_pyo3.hyperliquid_cloid_from_client_order_id(pyo3_client_order_id)
             self._ws_client.cache_cloid_mapping(cloid, pyo3_client_order_id)
 
-            await self._client.submit_order(
+            await self._ws_client.submit_order(
+                self._client,
                 instrument_id=pyo3_instrument_id,
                 client_order_id=pyo3_client_order_id,
                 order_side=pyo3_order_side,
@@ -726,7 +745,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
 
         try:
             pyo3_orders = [transform_order_to_pyo3(order) for order in orders]
-            await self._client.submit_orders(pyo3_orders)
+            await self._ws_client.submit_orders(self._client, pyo3_orders)
         except Exception as e:
             if _is_transport_error(e):
                 self._log.warning(
@@ -839,12 +858,13 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 pyo3_trigger_price = nautilus_pyo3.Price.from_str(str(trigger_price))
 
             # Mark in-flight BEFORE the await so the WS cancel handler sees it regardless of timing.
-            # Cleared on non-transport HTTP errors; preserved on transport errors so WS can reconcile.
+            # Cleared on non-transport post errors; preserved on transport errors so WS can reconcile.
             self._pending_modify_keys[command.client_order_id.value] = venue_order_id.value
             self._pending_modify_target_qty[command.client_order_id.value] = target_total_qty
             self._log.info(f"Order modification requested for {command.client_order_id}")
 
-            await self._client.modify_order(
+            await self._ws_client.modify_order(
+                self._client,
                 instrument_id=pyo3_instrument_id,
                 venue_order_id=pyo3_venue_order_id,
                 order_side=pyo3_order_side,
@@ -895,7 +915,8 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 nautilus_pyo3.VenueOrderId(venue_order_id.value) if venue_order_id else None
             )
 
-            await self._client.cancel_order(
+            await self._ws_client.cancel_order(
+                self._client,
                 instrument_id=pyo3_instrument_id,
                 client_order_id=pyo3_client_order_id,
                 venue_order_id=pyo3_venue_order_id,
@@ -938,30 +959,41 @@ class HyperliquidExecutionClient(LiveExecutionClient):
 
         self._log.info(f"Cancelling {len(open_orders)} open order(s)")
 
-        for order in open_orders:
-            try:
-                pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(
-                    order.instrument_id.value,
-                )
-                pyo3_client_order_id = nautilus_pyo3.ClientOrderId(order.client_order_id.value)
-                pyo3_venue_order_id = (
-                    nautilus_pyo3.VenueOrderId(order.venue_order_id.value)
-                    if order.venue_order_id
-                    else None
-                )
+        cancel_requests = [
+            (
+                nautilus_pyo3.InstrumentId.from_str(order.instrument_id.value),
+                nautilus_pyo3.ClientOrderId(order.client_order_id.value),
+                nautilus_pyo3.VenueOrderId(order.venue_order_id.value)
+                if order.venue_order_id
+                else None,
+            )
+            for order in open_orders
+        ]
 
-                await self._client.cancel_order(
-                    instrument_id=pyo3_instrument_id,
-                    client_order_id=pyo3_client_order_id,
-                    venue_order_id=pyo3_venue_order_id,
-                )
-            except Exception as e:
-                if _is_transport_error(e):
-                    self._log.warning(
-                        f"Cancel transport failure for {order.client_order_id} "
-                        f"({type(e).__name__}: {e}); awaiting WS reconciliation",
-                    )
+        try:
+            errors = await self._ws_client.cancel_orders(self._client, cancel_requests)
+
+            for order, error in zip(open_orders, errors, strict=False):
+                if error is None:
                     continue
+
+                self.generate_order_cancel_rejected(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=order.venue_order_id,
+                    reason=error,
+                    ts_event=self._clock.timestamp_ns(),
+                )
+        except Exception as e:
+            if _is_transport_error(e):
+                self._log.warning(
+                    f"Cancel-all transport failure ({type(e).__name__}: {e}); "
+                    "awaiting WS reconciliation",
+                )
+                return
+
+            for order in open_orders:
                 self.generate_order_cancel_rejected(
                     strategy_id=order.strategy_id,
                     instrument_id=order.instrument_id,
@@ -976,6 +1008,8 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             self._log.info("No orders to cancel in batch")
             return
 
+        entries = []
+
         for cancel_cmd in command.cancels:
             order = self._cache.order(cancel_cmd.client_order_id)
             if not order:
@@ -984,29 +1018,49 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 )
                 continue
 
-            try:
-                pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(
-                    cancel_cmd.instrument_id.value,
-                )
-                pyo3_client_order_id = nautilus_pyo3.ClientOrderId(cancel_cmd.client_order_id.value)
-                pyo3_venue_order_id = (
-                    nautilus_pyo3.VenueOrderId(order.venue_order_id.value)
-                    if order.venue_order_id
-                    else None
-                )
+            entries.append(
+                (
+                    order,
+                    (
+                        nautilus_pyo3.InstrumentId.from_str(cancel_cmd.instrument_id.value),
+                        nautilus_pyo3.ClientOrderId(cancel_cmd.client_order_id.value),
+                        nautilus_pyo3.VenueOrderId(order.venue_order_id.value)
+                        if order.venue_order_id
+                        else None,
+                    ),
+                ),
+            )
 
-                await self._client.cancel_order(
-                    instrument_id=pyo3_instrument_id,
-                    client_order_id=pyo3_client_order_id,
-                    venue_order_id=pyo3_venue_order_id,
-                )
-            except Exception as e:
-                if _is_transport_error(e):
-                    self._log.warning(
-                        f"Cancel transport failure for {order.client_order_id} "
-                        f"({type(e).__name__}: {e}); awaiting WS reconciliation",
-                    )
+        if not entries:
+            return
+
+        try:
+            errors = await self._ws_client.cancel_orders(
+                self._client,
+                [request for _, request in entries],
+            )
+
+            for (order, _), error in zip(entries, errors, strict=False):
+                if error is None:
                     continue
+
+                self.generate_order_cancel_rejected(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=order.venue_order_id,
+                    reason=error,
+                    ts_event=self._clock.timestamp_ns(),
+                )
+        except Exception as e:
+            if _is_transport_error(e):
+                self._log.warning(
+                    f"Batch cancel transport failure ({type(e).__name__}: {e}); "
+                    "awaiting WS reconciliation",
+                )
+                return
+
+            for order, _ in entries:
                 self.generate_order_cancel_rejected(
                     strategy_id=order.strategy_id,
                     instrument_id=order.instrument_id,
@@ -1066,6 +1120,9 @@ class HyperliquidExecutionClient(LiveExecutionClient):
 
         self._accepted_orders.add(key)
         self._send_order_event(event)
+
+        # Drain any fills that arrived before order was in cache.
+        self._drain_fill_buffer(self._pending_fills, key)
 
     def _handle_order_canceled_pyo3(self, msg: nautilus_pyo3.OrderCanceled) -> None:
         event = OrderCanceled.from_dict(msg.to_dict())
@@ -1240,10 +1297,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 )
 
                 # Drain buffered fills against the now-advanced state (GH-3972).
-                buffered = self._buffered_fills.pop(key, None)
-                if buffered:
-                    for pyo3_buffered in buffered:
-                        self._handle_fill_report_pyo3(pyo3_buffered)
+                self._drain_fill_buffer(self._buffered_fills, key)
                 return
 
             if key in self._accepted_orders or key in self._terminal_orders:
@@ -1257,6 +1311,10 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 venue_order_id=report.venue_order_id,
                 ts_event=report.ts_last,
             )
+
+            # Drain any fills that arrived before order was in cache.
+            self._drain_fill_buffer(self._pending_fills, key)
+
         elif report.order_status == OrderStatus.PENDING_CANCEL:
             if order.status == OrderStatus.PENDING_CANCEL:
                 self._log.debug(
@@ -1406,15 +1464,15 @@ class HyperliquidExecutionClient(LiveExecutionClient):
 
         order = self._cache.order(client_order_id)
         if order is None:
-            # Don't mark as processed - order may arrive later
-            self._log.error(
-                f"Cannot process fill report - order for {client_order_id!r} not found",
+            self._log.warning(
+                f"Buffering fill report - order for {client_order_id!r} not yet in cache, "
+                f"will drain on OrderAccepted",
             )
+            self._pending_fills.setdefault(client_order_id.value, []).append(pyo3_report)
             return
 
         instrument = self._cache.instrument(order.instrument_id)
         if instrument is None:
-            self._processed_trade_ids.add(trade_id_str)
             self._log.error(
                 f"Cannot process fill report - instrument {order.instrument_id} not found",
             )
@@ -1453,6 +1511,9 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 ts_event=report.ts_event,
             )
 
+            # Drain any fills that arrived before order was in cache.
+            self._drain_fill_buffer(self._pending_fills, key)
+
         self.generate_order_filled(
             strategy_id=order.strategy_id,
             instrument_id=order.instrument_id,
@@ -1475,6 +1536,16 @@ class HyperliquidExecutionClient(LiveExecutionClient):
         if key in self._pending_filled:
             self._pending_filled.discard(key)
             self._cleanup_cloid_mapping(order.client_order_id)
+
+    def _drain_fill_buffer(
+        self,
+        buffer: dict[str, list[nautilus_pyo3.FillReport]],
+        key: str,
+    ) -> None:
+        buffered = buffer.pop(key, None)
+        if buffered:
+            for pyo3_buffered in buffered:
+                self._handle_fill_report_pyo3(pyo3_buffered)
 
     def _handle_position_status_report_pyo3(
         self,

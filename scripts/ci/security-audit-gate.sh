@@ -17,24 +17,24 @@ set -euo pipefail
 #
 # Required env vars:
 #   EVENT_NAME       - github.event_name
-#   BRANCH           - github.ref_name
 #   PR_BASE_REF      - github.event.pull_request.base.ref (PR only)
 #   PR_HEAD_SHA      - github.event.pull_request.head.sha (PR only)
 #   PUSH_BEFORE_SHA  - github.event.before (push only)
 #   PUSH_AFTER_SHA   - github.event.after  (push only)
 #
-# Audit-relevant paths:
+# Audit-relevant paths. Keep in sync with the `security_audit_paths` anchor in
+# .github/workflows/security-audit.yml.
 #   - Lock files                Cargo.lock, uv.lock, python/uv.lock
 #   - Manifests                 Cargo.toml, crates/(...)?Cargo.toml,
 #                               pyproject.toml, python/pyproject.toml
 #   - Audit policy              deny.toml, osv-scanner.toml, .cargo/audit.toml,
-#                               .supply-chain/*
+#                               .supply-chain/*, .zizmor.yml
 #   - Toolchain config          .cargo/config.toml, rust-toolchain.toml,
 #                               tools.toml
 #   - Audit helpers             scripts/{cargo-tool-version,rust-toolchain,
 #                               uv-version}.sh,
-#                               .github/actions/cargo-tool-install/*
-#   - The workflow itself       .github/workflows/security-audit.yml
+#                               .github/actions/*
+#   - CI config                 .pre-commit-config.yaml, .github/workflows/*
 
 emit() {
   echo "audit_needed=$1" >> "$GITHUB_OUTPUT"
@@ -47,10 +47,6 @@ case "$EVENT_NAME" in
     exit 0
     ;;
   push)
-    if [[ "$BRANCH" == "test-security" ]]; then
-      emit true "force-run branch test-security"
-      exit 0
-    fi
     base="$PUSH_BEFORE_SHA"
     head="$PUSH_AFTER_SHA"
     if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
@@ -87,13 +83,14 @@ pattern='^('
 pattern+='Cargo\.(lock|toml)'
 pattern+='|crates/(.*/)?Cargo\.toml'
 pattern+='|uv\.lock|pyproject\.toml'
+pattern+='|\.pre-commit-config\.yaml'
 pattern+='|python/(uv\.lock|pyproject\.toml)'
-pattern+='|deny\.toml|osv-scanner\.toml|\.supply-chain/.*'
+pattern+='|deny\.toml|osv-scanner\.toml|\.supply-chain/.*|\.zizmor\.yml'
 pattern+='|tools\.toml|\.cargo/(config|audit)\.toml|rust-toolchain\.toml'
 pattern+='|scripts/(cargo-tool-version|rust-toolchain|uv-version)\.sh'
 pattern+='|scripts/ci/security-audit-gate\.sh'
-pattern+='|\.github/actions/cargo-tool-install/.*'
-pattern+='|\.github/workflows/security-audit\.yml'
+pattern+='|\.github/actions/.*'
+pattern+='|\.github/workflows/.*'
 pattern+=')$'
 
 changed=$(git diff --name-only "$base" "$head")

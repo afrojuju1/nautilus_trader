@@ -1530,6 +1530,9 @@ cdef class BacktestEngine:
             clock.set_time(start_ns)
 
         if self._iteration == 0:
+            for exchange in self._venues.values():
+                exchange._set_instrument_expiration_timers()
+
             # Initialize run
             self._run_config_id = run_config_id  # Can be None
             self._run_id = UUID4()
@@ -3005,6 +3008,7 @@ cdef class SimulatedExchange:
         self._matching_engines[instrument.id] = matching_engine
 
         self._update_next_instrument_expiration(matching_engine)
+        self._set_instrument_expiration_timer(matching_engine)
 
         self._log.info(f"Added instrument {instrument.id} and created matching engine")
 
@@ -3284,6 +3288,8 @@ cdef class SimulatedExchange:
             return
 
         matching_engine.update_instrument(instrument)
+        self._update_next_instrument_expiration(matching_engine)
+        self._set_instrument_expiration_timer(matching_engine)
 
     cdef bint _has_pending_commands(self, uint64_t ts_now):
         if self._message_queue:
@@ -3622,6 +3628,9 @@ cdef class SimulatedExchange:
         if found:
             self._next_instrument_expiration_ns = earliest
 
+    cpdef void _process_instrument_expiration_time_event(self, TimeEvent event):
+        self._process_instrument_expirations(event.ts_event)
+
     cdef void _update_next_instrument_expiration(self, OrderMatchingEngine matching_engine):
         cdef uint64_t expiration_ns
         if matching_engine._instrument_has_expiration and not matching_engine._expiration_processed:
@@ -3630,6 +3639,32 @@ cdef class SimulatedExchange:
                 if not self._has_next_instrument_expiration or expiration_ns < self._next_instrument_expiration_ns:
                     self._has_next_instrument_expiration = True
                     self._next_instrument_expiration_ns = expiration_ns
+
+    cdef void _set_instrument_expiration_timer(self, OrderMatchingEngine matching_engine):
+        if not matching_engine._instrument_has_expiration or matching_engine._expiration_processed:
+            return
+
+        cdef uint64_t expiration_ns = matching_engine.instrument.expiration_ns
+        if expiration_ns == 0:
+            return
+
+        cdef str timer_name = self._instrument_expiration_timer_name(matching_engine.instrument.id)
+        if timer_name in self._clock.timer_names:
+            self._clock.cancel_timer(timer_name)
+
+        self._clock.set_time_alert_ns(
+            name=timer_name,
+            alert_time_ns=expiration_ns,
+            callback=self._process_instrument_expiration_time_event,
+        )
+
+    cdef void _set_instrument_expiration_timers(self):
+        cdef OrderMatchingEngine matching_engine
+        for matching_engine in self._matching_engines.values():
+            self._set_instrument_expiration_timer(matching_engine)
+
+    cdef str _instrument_expiration_timer_name(self, InstrumentId instrument_id):
+        return f"INSTRUMENT-EXPIRATION:{instrument_id.value}"
 
     cpdef void reset(self):
         """
@@ -5748,6 +5783,7 @@ cdef class OrderMatchingEngine:
 
         """
         self._clock.set_time(timestamp_ns)
+        self._purge_closed_cached_filled_qty()
 
         cdef Price_t bid
         cdef Price_t ask
@@ -5768,6 +5804,7 @@ cdef class OrderMatchingEngine:
         cdef Order order
         for order in orders:
             if order.is_closed_c():
+                self._core.delete_order(order)
                 self._cached_filled_qty.pop(order.client_order_id, None)
                 continue
 
@@ -5797,6 +5834,19 @@ cdef class OrderMatchingEngine:
         self._has_targets = False
 
         self.check_instrument_expiration(timestamp_ns)
+        self._purge_closed_cached_filled_qty()
+
+    cdef void _purge_closed_cached_filled_qty(self):
+        cdef list[ClientOrderId] client_order_ids = list(self._cached_filled_qty.keys())
+        cdef ClientOrderId client_order_id
+        cdef Order order
+
+        for client_order_id in client_order_ids:
+            order = self.cache.order(client_order_id)
+            if order is None:
+                order = self._core.get_order(client_order_id)
+            if order is None or order.is_closed_c():
+                self._cached_filled_qty.pop(client_order_id, None)
 
     cpdef void check_instrument_expiration(self, uint64_t timestamp_ns):
         """Run instrument expiration at timestamp_ns (option exercise/expiry or futures close)."""
@@ -6099,6 +6149,11 @@ cdef class OrderMatchingEngine:
             The order to fill.
 
         """
+        if order.is_closed_c():
+            self._core.delete_order(order)
+            self._cached_filled_qty.pop(order.client_order_id, None)
+            return
+
         # Convert quote-denominated quantity at fill time for trigger-style market
         # orders that skipped conversion at submission. Idempotent: orders already
         # converted have `is_quote_quantity=False`.
@@ -6500,6 +6555,11 @@ cdef class OrderMatchingEngine:
 
         """
         Condition.is_true(order.has_price_c(), "order has no limit `price`")
+
+        if order.is_closed_c():
+            self._core.delete_order(order)
+            self._cached_filled_qty.pop(order.client_order_id, None)
+            return
 
         # Convert quote-denominated quantity at fill time for orders that entered
         # this path still carrying a quote notional (e.g. trailing-stop-limit with
@@ -7637,6 +7697,7 @@ cdef class OrderMatchingEngine:
 
         cdef Quantity cached_filled_qty = self._cached_filled_qty.get(order.client_order_id)
         cdef Quantity leaves_qty = None
+        cdef Quantity total_filled_qty = None
         if cached_filled_qty is None:
             # Clamp the first fill to the order quantity to avoid over-filling
             last_qty = Quantity.from_raw_c(min(order.quantity._mem.raw, last_qty._mem.raw), size_prec)
@@ -7644,7 +7705,8 @@ cdef class OrderMatchingEngine:
         else:
             if order.quantity._mem.raw <= cached_filled_qty._mem.raw:
                 self._core.delete_order(order)
-                self._cached_filled_qty.pop(order.client_order_id, None)
+                if order.is_closed_c():
+                    self._cached_filled_qty.pop(order.client_order_id, None)
                 return
 
             leaves_qty = Quantity.from_raw_c(order.quantity._mem.raw - cached_filled_qty._mem.raw, size_prec)
@@ -7676,10 +7738,18 @@ cdef class OrderMatchingEngine:
             liquidity_side=order.liquidity_side,
         )
 
-        if order.is_passive_c() and order.is_closed_c():
+        total_filled_qty = self._cached_filled_qty.get(order.client_order_id)
+        if (
+            order.is_closed_c()
+            or (
+                total_filled_qty is not None
+                and total_filled_qty._mem.raw >= order.quantity._mem.raw
+            )
+        ):
             # Remove order from market
             self._core.delete_order(order)
-            self._cached_filled_qty.pop(order.client_order_id, None)
+            if order.is_closed_c():
+                self._cached_filled_qty.pop(order.client_order_id, None)
 
         if not self._support_contingent_orders:
             return

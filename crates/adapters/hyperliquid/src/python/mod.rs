@@ -29,7 +29,7 @@ pub mod websocket;
 
 use nautilus_common::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
-use nautilus_model::identifiers::ClientOrderId;
+use nautilus_model::{data::ensure_rust_extractor_registered, identifiers::ClientOrderId};
 use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
 
@@ -42,6 +42,7 @@ use crate::{
         },
     },
     config::{HyperliquidDataClientConfig, HyperliquidExecClientConfig},
+    data_types::{HyperliquidAllMids, register_hyperliquid_custom_data},
     factories::{
         HyperliquidDataClientFactory, HyperliquidExecFactoryConfig,
         HyperliquidExecutionClientFactory,
@@ -154,6 +155,10 @@ pub fn hyperliquid(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HyperliquidExecFactoryConfig>()?;
     m.add_class::<HyperliquidDataClientFactory>()?;
     m.add_class::<HyperliquidExecutionClientFactory>()?;
+    m.add_class::<HyperliquidAllMids>()?;
+
+    register_hyperliquid_custom_data();
+    let _result = ensure_rust_extractor_registered::<HyperliquidAllMids>();
 
     let registry = get_global_pyo3_registry();
 

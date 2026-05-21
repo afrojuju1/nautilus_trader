@@ -42,9 +42,28 @@ use crate::{
 /// [`EventStoreReader::scan_range_chunked`] when a workload prefers different bounds.
 pub const DEFAULT_SCAN_CHUNK_SIZE: u64 = 1_024;
 
+/// Replay bounds derived from the latest cache snapshot anchor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotReplayPlan {
+    /// Latest cache snapshot anchor, or `None` when restore must replay from the start.
+    pub anchor: Option<SnapshotAnchor>,
+    /// First event-store seq to replay after the cache snapshot restore.
+    pub from_seq: u64,
+    /// Current durable high-watermark for the run.
+    pub to_seq: u64,
+}
+
+impl SnapshotReplayPlan {
+    /// Returns whether there are no entries to replay for this plan.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.from_seq > self.to_seq
+    }
+}
+
 /// Read-only handle over an [`EventStore`] backend.
 ///
-/// The reader is the canonical entry point for forensics replay, audit, and verifier
+/// The reader is the canonical entry point for read-only replay, audit, and verifier
 /// scans: it never mutates the backend (no `append_batch` surface) and it tolerates
 /// running and sealed backends uniformly.
 #[derive(Debug)]
@@ -111,6 +130,55 @@ impl<B: EventStore> EventStoreReader<B> {
     /// cannot decode.
     pub fn latest_snapshot_anchor(&self) -> Result<Option<SnapshotAnchor>, EventStoreError> {
         self.backend.latest_snapshot_anchor()
+    }
+
+    /// Builds the restore replay bounds from the latest snapshot anchor.
+    ///
+    /// Restore callers fetch and validate the cache-owned snapshot blob first, then
+    /// replay entries in `[from_seq, to_seq]`. When an anchor exists, `from_seq` is
+    /// `anchor.high_watermark + 1`; without an anchor, restore replays from seq `1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventStoreError::Backend`] when no run is open or the backend does not
+    /// support snapshot anchors, and [`EventStoreError::Corrupted`] when the stored
+    /// anchor points past the durable high-watermark.
+    pub fn snapshot_replay_plan(&self) -> Result<SnapshotReplayPlan, EventStoreError> {
+        let anchor = self.latest_snapshot_anchor()?;
+        let to_seq = self.high_watermark()?;
+        let from_seq = match anchor.as_ref() {
+            Some(anchor) if anchor.high_watermark > to_seq => {
+                return Err(EventStoreError::Corrupted(format!(
+                    "snapshot anchor high_watermark {} exceeds durable high_watermark {to_seq}",
+                    anchor.high_watermark,
+                )));
+            }
+            Some(anchor) => anchor.high_watermark.saturating_add(1),
+            None => 1,
+        };
+
+        Ok(SnapshotReplayPlan {
+            anchor,
+            from_seq,
+            to_seq,
+        })
+    }
+
+    /// Scans the forward replay tail after the latest snapshot anchor.
+    ///
+    /// This pairs [`Self::snapshot_replay_plan`] with the actual event iterator used by
+    /// restore: entries start at `anchor.high_watermark + 1` when an anchor exists, or
+    /// at seq `1` when no cache snapshot has been anchored.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::snapshot_replay_plan`].
+    pub fn scan_snapshot_replay_tail(
+        &self,
+    ) -> Result<(SnapshotReplayPlan, RangeScan<'_>), EventStoreError> {
+        let plan = self.snapshot_replay_plan()?;
+        let scan = self.scan_range(plan.from_seq, plan.to_seq, ScanDirection::Forward);
+        Ok((plan, scan))
     }
 
     /// Scans entries by `seq` over the inclusive range `[from, to]`.
@@ -323,7 +391,7 @@ impl Iterator for RangeScan<'_> {
 mod tests {
     use bytes::Bytes;
     use indexmap::IndexMap;
-    use nautilus_core::{UUID4, UnixNanos};
+    use nautilus_core::UnixNanos;
     use rstest::{fixture, rstest};
     use ustr::Ustr;
 
@@ -399,6 +467,67 @@ mod tests {
         EventStoreReader::new(backend)
     }
 
+    #[derive(Debug)]
+    struct AnchorPastWatermarkBackend;
+
+    impl EventStore for AnchorPastWatermarkBackend {
+        fn open_run(&mut self, _manifest: RunManifest) -> Result<(), EventStoreError> {
+            Ok(())
+        }
+
+        fn append_batch(&mut self, _entries: &[AppendEntry]) -> Result<u64, EventStoreError> {
+            Ok(1)
+        }
+
+        fn scan_range(
+            &self,
+            _from: u64,
+            _to: u64,
+            _direction: ScanDirection,
+        ) -> Result<Vec<EventStoreEntry>, EventStoreError> {
+            Ok(Vec::new())
+        }
+
+        fn scan_seq(&self, _seq: u64) -> Result<Option<EventStoreEntry>, EventStoreError> {
+            Ok(None)
+        }
+
+        fn lookup(&self, _kind: IndexKind, _key: &str) -> Result<Option<u64>, EventStoreError> {
+            Ok(None)
+        }
+
+        fn iter_index_keys(&self, _kind: IndexKind) -> Result<Vec<(String, u64)>, EventStoreError> {
+            Ok(Vec::new())
+        }
+
+        fn record_snapshot_anchor(
+            &mut self,
+            _anchor: SnapshotAnchor,
+        ) -> Result<(), EventStoreError> {
+            Ok(())
+        }
+
+        fn latest_snapshot_anchor(&self) -> Result<Option<SnapshotAnchor>, EventStoreError> {
+            Ok(Some(SnapshotAnchor::new(
+                2,
+                "cache://snapshots/run-reader/2",
+                "blake3:abc",
+            )))
+        }
+
+        fn seal(&mut self, _status: RunStatus) -> Result<(), EventStoreError> {
+            Ok(())
+        }
+
+        fn manifest(&self) -> Result<RunManifest, EventStoreError> {
+            Ok(manifest("run-anchor-past-watermark"))
+        }
+
+        fn high_watermark(&self) -> Result<u64, EventStoreError> {
+            Ok(1)
+        }
+    }
+
     #[fixture]
     fn reader_with_three() -> EventStoreReader<MemoryBackend> {
         populated(3)
@@ -437,6 +566,132 @@ mod tests {
     }
 
     #[rstest]
+    fn snapshot_replay_plan_without_anchor_replays_from_start(
+        reader_with_three: EventStoreReader<MemoryBackend>,
+    ) {
+        let plan = reader_with_three
+            .snapshot_replay_plan()
+            .expect("snapshot replay plan");
+
+        assert_eq!(
+            plan,
+            SnapshotReplayPlan {
+                anchor: None,
+                from_seq: 1,
+                to_seq: 3,
+            },
+        );
+        assert!(!plan.is_empty());
+    }
+
+    #[rstest]
+    fn snapshot_replay_plan_with_anchor_starts_after_anchor_watermark() {
+        let mut backend = MemoryBackend::new();
+        backend.open_run(manifest("run-anchor")).expect("open run");
+        backend
+            .append_batch(&[
+                append_with(1, 101, Vec::new()),
+                append_with(2, 102, Vec::new()),
+                append_with(3, 103, Vec::new()),
+            ])
+            .expect("append");
+        let anchor = SnapshotAnchor::new(2, "cache://snapshots/run-anchor/2", "blake3:abc");
+        backend
+            .record_snapshot_anchor(anchor.clone())
+            .expect("record anchor");
+        let reader = EventStoreReader::new(backend);
+
+        let plan = reader.snapshot_replay_plan().expect("snapshot replay plan");
+
+        assert_eq!(
+            plan,
+            SnapshotReplayPlan {
+                anchor: Some(anchor),
+                from_seq: 3,
+                to_seq: 3,
+            },
+        );
+        assert!(!plan.is_empty());
+    }
+
+    #[rstest]
+    fn snapshot_replay_plan_rejects_anchor_past_watermark() {
+        let reader = EventStoreReader::new(AnchorPastWatermarkBackend);
+        let err = reader
+            .snapshot_replay_plan()
+            .expect_err("anchor past watermark must fail");
+
+        match err {
+            EventStoreError::Corrupted(msg) => {
+                assert!(
+                    msg.contains("exceeds durable high_watermark"),
+                    "msg was: {msg}",
+                );
+            }
+            other => panic!("expected Corrupted, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn scan_snapshot_replay_tail_yields_entries_after_anchor() {
+        let mut backend = MemoryBackend::new();
+        backend.open_run(manifest("run-anchor")).expect("open run");
+        backend
+            .append_batch(&[
+                append_with(1, 101, Vec::new()),
+                append_with(2, 102, Vec::new()),
+                append_with(3, 103, Vec::new()),
+            ])
+            .expect("append");
+        backend
+            .record_snapshot_anchor(SnapshotAnchor::new(
+                2,
+                "cache://snapshots/run-anchor/2",
+                "blake3:abc",
+            ))
+            .expect("record anchor");
+        let reader = EventStoreReader::new(backend);
+
+        let (plan, scan) = reader
+            .scan_snapshot_replay_tail()
+            .expect("snapshot replay tail");
+        let seqs: Vec<_> = scan.map(|entry| entry.expect("entry").seq).collect();
+
+        assert_eq!(plan.from_seq, 3);
+        assert_eq!(seqs, vec![3]);
+    }
+
+    #[rstest]
+    fn scan_snapshot_replay_tail_is_empty_when_anchor_matches_watermark() {
+        let mut backend = MemoryBackend::new();
+        backend.open_run(manifest("run-anchor")).expect("open run");
+        backend
+            .append_batch(&[
+                append_with(1, 101, Vec::new()),
+                append_with(2, 102, Vec::new()),
+            ])
+            .expect("append");
+        backend
+            .record_snapshot_anchor(SnapshotAnchor::new(
+                2,
+                "cache://snapshots/run-anchor/2",
+                "blake3:abc",
+            ))
+            .expect("record anchor");
+        let reader = EventStoreReader::new(backend);
+
+        let (plan, scan) = reader
+            .scan_snapshot_replay_tail()
+            .expect("snapshot replay tail");
+        let seqs: Vec<_> = scan.map(|entry| entry.expect("entry").seq).collect();
+
+        assert_eq!(plan.from_seq, 3);
+        assert_eq!(plan.to_seq, 2);
+        assert!(plan.is_empty());
+        assert!(seqs.is_empty());
+    }
+
+    #[rstest]
     fn scan_seq_returns_committed_entry(reader_with_three: EventStoreReader<MemoryBackend>) {
         let entry = reader_with_three
             .scan_seq(2)
@@ -461,14 +716,10 @@ mod tests {
             .append_batch(&[
                 AppendEntry::new(
                     build_entry(1, 100),
-                    vec![IndexKey::new(IndexKind::IntentId, "intent-A".to_string())],
-                ),
-                AppendEntry::new(
-                    build_entry(2, 101),
                     vec![IndexKey::new(IndexKind::ClientOrderId, "O-1".to_string())],
                 ),
                 AppendEntry::new(
-                    build_entry(3, 102),
+                    build_entry(2, 101),
                     vec![IndexKey::new(IndexKind::VenueOrderId, "V-1".to_string())],
                 ),
             ])
@@ -477,25 +728,19 @@ mod tests {
 
         assert_eq!(
             reader
-                .lookup(IndexKind::IntentId, "intent-A")
+                .lookup(IndexKind::ClientOrderId, "O-1")
                 .expect("lookup"),
             Some(1),
         );
         assert_eq!(
             reader
-                .lookup(IndexKind::ClientOrderId, "O-1")
+                .lookup(IndexKind::VenueOrderId, "V-1")
                 .expect("lookup"),
             Some(2),
         );
-        assert_eq!(
-            reader
-                .lookup(IndexKind::VenueOrderId, "V-1")
-                .expect("lookup"),
-            Some(3),
-        );
         assert!(
             reader
-                .lookup(IndexKind::IntentId, "missing")
+                .lookup(IndexKind::ClientOrderId, "missing")
                 .expect("lookup")
                 .is_none(),
         );
@@ -700,24 +945,24 @@ mod tests {
         // record it; the reader's lookup path must not collapse kinds.
         let mut backend = MemoryBackend::new();
         backend.open_run(manifest("run-kinds")).expect("open run");
-        let intent_id = UUID4::new();
+        let shared_key = "shared-key".to_string();
         backend
             .append_batch(&[AppendEntry::new(
                 build_entry(1, 100),
-                vec![IndexKey::new(IndexKind::IntentId, intent_id.to_string())],
+                vec![IndexKey::new(IndexKind::ClientOrderId, shared_key.clone())],
             )])
             .expect("append");
         let reader = EventStoreReader::new(backend);
 
         assert_eq!(
             reader
-                .lookup(IndexKind::IntentId, &intent_id.to_string())
+                .lookup(IndexKind::ClientOrderId, &shared_key)
                 .expect("lookup"),
             Some(1),
         );
         assert!(
             reader
-                .lookup(IndexKind::ClientOrderId, &intent_id.to_string())
+                .lookup(IndexKind::VenueOrderId, &shared_key)
                 .expect("lookup")
                 .is_none(),
         );

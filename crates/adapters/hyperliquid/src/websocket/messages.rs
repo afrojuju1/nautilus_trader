@@ -17,7 +17,7 @@ use ahash::AHashMap;
 use derive_builder::Builder;
 use nautilus_model::{
     data::{
-        Bar, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDeltas,
+        Bar, Data, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDeltas,
         OrderBookDepth10, QuoteTick, TradeTick,
     },
     reports::{FillReport, OrderStatusReport},
@@ -25,10 +25,13 @@ use nautilus_model::{
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use crate::common::enums::{
-    HyperliquidBarInterval, HyperliquidFillDirection, HyperliquidLiquidationMethod,
-    HyperliquidOrderStatus as HyperliquidOrderStatusEnum, HyperliquidSide, HyperliquidTpSl,
-    HyperliquidTwapStatus,
+use crate::{
+    common::enums::{
+        HyperliquidBarInterval, HyperliquidFillDirection, HyperliquidLiquidationMethod,
+        HyperliquidOrderStatus as HyperliquidOrderStatusEnum, HyperliquidSide,
+        HyperliquidTimeInForce, HyperliquidTpSl, HyperliquidTwapStatus,
+    },
+    http::models::{HyperliquidExchangeRequest, HyperliquidExecAction},
 };
 
 /// Represents an outbound WebSocket message from client to Hyperliquid.
@@ -124,7 +127,9 @@ pub enum PostRequest {
     /// Info request (no signature required).
     Info { payload: serde_json::Value },
     /// Action request (requires signature).
-    Action { payload: ActionPayload },
+    Action {
+        payload: HyperliquidExchangeRequest<HyperliquidExecAction>,
+    },
 }
 
 /// Action payload with signature.
@@ -376,7 +381,7 @@ pub enum PostResponsePayload {
 /// All mid prices data.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AllMidsData {
-    pub mids: AHashMap<String, String>,
+    pub mids: AHashMap<Ustr, String>,
 }
 
 /// Notification data.
@@ -465,6 +470,9 @@ pub struct WsBasicOrderData {
     #[serde(rename = "origSz")]
     pub orig_sz: String,
     pub cloid: Option<String>,
+    pub tif: Option<HyperliquidTimeInForce>,
+    #[serde(rename = "reduceOnly")]
+    pub reduce_only: Option<bool>,
     /// Trigger price for conditional orders (stop/take-profit).
     #[serde(rename = "triggerPx")]
     pub trigger_px: Option<String>,
@@ -1048,6 +1056,8 @@ pub enum NautilusWsMessage {
     IndexPrice(IndexPriceUpdate),
     /// Funding rate update.
     FundingRate(FundingRateUpdate),
+    /// Custom data (e.g. allMids).
+    CustomData(Data),
     /// Error occurred.
     Error(String),
     /// WebSocket reconnected.

@@ -1,6 +1,90 @@
-# NautilusTrader 1.227.0 Beta
+# NautilusTrader 1.228.0 Beta
 
 Released on TBD (UTC).
+
+### Enhancements
+- Added BSC chain support to blockchain adapter with `UniswapV3` and `PancakeSwapV3` DEX registrations
+- Added Aerodrome Slipstream pool-event signatures and parsers for bootstrap and replay on Base
+- Added structured `PoolProfilerError` carrying pool id, block, transaction/log index, and event kind
+- Added generic structured key-value fields to `LogLine` (#4090), thanks @filipmacek
+- Added `correlation_id` field to Rust trading and system command structs for request tracing
+- Added Cap'n Proto and adapter split propagation of trading command `correlation_id`
+- Added `nautilus-plugin` crate for loading separately compiled Rust cdylibs at live-node startup (Rust)
+- Added custom-data plug point via `PluginCustomData` trait and `nautilus_plugin!` macro (Rust)
+- Added actor plug point via `PluginActor` trait with lifecycle and data callbacks (Rust)
+- Added strategy plug point via `PluginStrategy` trait with `HostVTable` order-command surface (Rust)
+- Added plug-in `HostVTable` callbacks for cache, subscriptions, msgbus, and timers (Rust)
+- Added `PluginActorAdapter` and `PluginStrategyAdapter` wrapping plug-in cdylibs as host `DataActor`/`Strategy` (Rust)
+- Added `PluginLoader::with_host` so the live node can install a custom `HostVTable` for order-command routing (Rust)
+- Added `host_vtable` and `plugin_loader` helpers binding submit/cancel/modify order to the strategy adapter (Rust)
+- Added `register_custom_data_from_manifest` to register plug-in custom data with `DataRegistry` at load time (Rust)
+- Added `config_json` argument to plug-in `create` thunks and `PluginActor::new`/`PluginStrategy::new` (Rust)
+- Added portfolio PyO3 bindings and `Strategy.portfolio` access (#4085), thanks @ms32035
+- Added Binance Futures liquidation custom data subscriptions (#4095), thanks @graceyangfan
+- Added Deribit `option_combo` and `future_combo` parsing as `OptionSpread`/`FuturesSpread` instruments
+- Added Deribit combo trade leg parsing (`legs[]`, `combo_id`, `combo_trade_id`) on public trade messages
+- Added Deribit `get_last_trades_by_currency` HTTP endpoint for combo trade backfill
+- Added Deribit `get_expirations` HTTP endpoint for traded option-chain expirations
+- Added Deribit public `TradeId` provenance prefix (`RFQ-`/`BLK-`/`COMBO-`) for block, RFQ, and combo trades
+- Added Deribit `subscribe_combo_legs` opt-in for combo leg trade streams
+- Added Hyperliquid WebSocket trading API support for submit, cancel, modify, and cancel-all actions
+- Added Kraken WebSocket rate limiting (#4093), thanks @filipmacek
+
+### Breaking Changes
+- Changed `PoolProfiler::initialize` and `check_if_initialized` to return `Result` rather than assert
+- Changed Rust command `new` constructors to accept `correlation_id: Option<UUID4>` (pass `None` for old behavior)
+
+### Security
+None
+
+### Fixes
+- Fixed `BacktestEngine` losing latency-deferred commands at shutdown (Rust) (#4062), thanks for reporting @zhanghaoda
+- Fixed blockchain adapter caching a half-initialized `PoolProfiler` when `initialize` returns `InitialTickMismatch`
+- Fixed Aerodrome Slipstream `AmmType` from `StableSwap` to `CLAMM`
+- Fixed `PoolProfiler::update_position` to pre-validate active liquidity so failures leave pool state unchanged
+- Fixed Betfair Rust adapter snapshot book deltas emitting zero-volume `Add` entries
+- Fixed Betfair Rust adapter traded volume cache to handle bet voids and non-runner adjustments
+- Fixed Betfair Rust adapter RCM custom data `ts_init` parity between live and historical streams
+- Fixed dYdX rate limiter being skipped due to missing keys (#4091), thanks @filipmacek
+- Fixed Hyperliquid `Alo` limit order status reports being parsed as trigger orders
+- Fixed `LiveNode` signal handling during startup connection wait (#4102), thanks @filipmacek
+- Fixed Python `ShutdownSystem` dict serialization to round-trip `correlation_id` (was previously dropped)
+- Fixed `BacktestEngine` option positions remaining open when data stops before expiry
+
+### Internal Improvements
+- Added `cargo machete` pre-commit hook to detect unused workspace dependencies
+- Added cargo conventions check for stale `[package.metadata.cargo-machete]` ignored entries
+- Added `try_liquidity_math_add` returning structured `LiquidityMathError` alongside the panicking variant
+- Added structured-error coverage tests for `PoolProfiler` overflow/underflow paths and Display formats
+- Added round-trip tests for `correlation_id` in Cap'n Proto, Arrow, and msgpack serialization
+- Added DEX event-signature/parser parity tests across all registered chains
+- Added Hyperliquid `flatten` binary that cancels working orders and closes perpetual positions
+- Added Hyperliquid Criterion bench groups for inbound pipeline, exec pipeline, and dispatch (Rust)
+- Added OKX Criterion bench groups for inbound pipeline, exec pipeline, dispatch, and HTTP signing (Rust)
+- Added Polymarket Criterion bench groups for inbound pipeline, exec pipeline, and signing (Rust)
+- Enabled `unreachable_pub` rustc lint workspace-wide to prevent dead public surface
+- Implemented OKX `DataClient::unsubscribe_instrument` override to silence missing-handler warning at teardown
+- Improved Binance Spot SBE missing credentials error message (#4092), thanks @filipmacek
+- Refined Hyperliquid adapter hot paths in WebSocket handler, parse, and signing modules
+- Refined OKX adapter hot paths in WebSocket frame deserializer, book10 parse, and fee currency lookup
+- Refined Interactive Brokers `nautilus-execution`/`nautilus-network` deps behind `execution` feature
+- Refined `OptionSpread`/`FuturesSpread` trait accessors to read `size_precision`/`size_increment` fields
+- Removed dead Hyperliquid WebSocket codec module
+- Removed unused `async-stream` and `indexmap` from `nautilus-interactive-brokers` dependencies
+- Optimized Hyperliquid hot paths with benchmark report
+- Optimized OKX hot paths with benchmark report
+
+### Documentation Updates
+- Added `nautilus-plugin` README early-alpha warning declaring ABI and public API are not stable
+
+### Deprecations
+None
+
+---
+
+# NautilusTrader 1.227.0 Beta
+
+Released on 18th May 2026 (UTC).
 
 ### Enhancements
 - Added continuous futures support for aggregated bars (#3921), thanks @faysou
@@ -9,7 +93,7 @@ Released on TBD (UTC).
 - Added `LoggerConfig` Python constructor for direct construction without `from_spec` (#3955), thanks @filipmacek
 - Added `limit_aggressive` and `test_modify_rejected` flags to `ExecTesterConfig` for marketable/modify-rejection tests
 - Added `CompositeMarketMaker` example strategy with book-mid quoting and synthetic-signal skew (Rust)
-- Added `#[custom_data_field(json)]` for JSON-backed Arrow `Utf8` storage of Serde-serializable fields, with typed PyO3 dict conversion for supported `IndexMap<K, V>` and `HashMap<K, V>` element types (#4003), thanks @faysou
+- Added `#[custom_data_field(json)]` for JSON-backed Arrow Serde fields and PyO3 `IndexMap`/`HashMap` dict conversion (#4003), thanks @faysou
 - Added `priority` parameter to `DataActor.subscribe_signal` for ordered dispatch between subscribers (Rust and PyO3)
 - Added `Cache::order_owned` returning an owned `OrderAny` snapshot for boundary handover (Rust)
 - Added `Cache::account_mut`, `account_owned`, `account_for_venue_owned` with `AccountRefMut`/`AccountAny` returns (Rust)
@@ -18,20 +102,34 @@ Released on TBD (UTC).
 - Added `Portfolio::build_snapshot` and `Portfolio::snapshots` accessors with a bounded per-account ring (Rust)
 - Added `subscribe_portfolio_snapshot` and `publish_portfolio_snapshot` message bus API on `events.portfolio` (Rust)
 - Added `subscribe_positions` message bus function (Rust)
+- Added `InstrumentId::parse_parent_components` and `InstrumentClass` parent suffix conversion methods, exposed via PyO3 (Rust)
+- Added serde `Deserialize` support for `LiveNodeConfig` and adapter client configs to enable loading from TOML
 - Added Betfair Rust adapter post-reconnect mass-status reconciliation that halts submits via `STREAM_RECONCILING`
 - Added Betfair Rust adapter `stream_gap_recovery_lookback_mins` config for the reconciliation lookback window
+- Added Binance Spot `expiryReason` field capture on schema 3:4 SBE order responses (Rust)
+- Added Binance Spot `serverShutdown` event handling on market-data and trading WebSocket streams (Rust)
+- Added Binance USDM mark price moving average (`ap`) field on `BinanceFuturesMarkPriceMsg` (Rust)
 - Added Bybit hedge-mode venue position IDs for order, position, and fill events
 - Added Bybit BBO order support for linear and inverse limit-style orders
 - Added Bybit `flatten` binary that cancels working orders and flattens Linear/Inverse positions
+- Added Bybit instrument-info `symbolId`, `symbolType` (with `xstocks`/`stock`/`forex`/`commodity`), and spot `xstockMultiplier` fields (Rust)
+- Added Bybit position `openTime` field on REST `BybitPosition` and WS `BybitWsAccountPosition` (Rust)
+- Added Bybit `execution.fast` private WebSocket channel support with slim payload struct and `FillReport` dispatch (Rust)
 - Added Coinbase liquidation/ADL warning on forced-close order events
 - Added Coinbase CFM liquidation buffer warning when buffer drops below 20%
+- Added Databento `set_price_precision` and `get_price_precisions` methods on the data loader and historical client
 - Added Deribit `auto_load_missing_instruments` config flag to lazy-load uncached instruments on subscribe
+- Added Deribit DVOL custom data subscriptions (#4069), thanks @graceyangfan
 - Added dYdX historical funding rate requests via the `request_funding_rates` HTTP method and PyO3 binding
 - Added Hyperliquid HIP-4 outcome instruments: `+E`/`#E` encoding, USDH settlement, and per-side BinaryOption modeling
 - Added Hyperliquid HIP-4 outcome reconciliation via spot balances; `outcomeMeta` settlement dispatch on the Rust client
-- Added Hyperliquid HIP-4 outcome order scaffolding; live placement awaits `splitOutcome` action wiring
+- Added Hyperliquid HIP-4 `userOutcome` actions (split, merge, mergeQuestion, negate) and venue `Settlement` fill parsing
+- Added Hyperliquid `allMids` custom data subscriptions with optional dex metadata (#4067), thanks @graceyangfan
 - Added Kraken Spot margin trading support (#3965), thanks @mcgrj
+- Added Kraken Spot L3 order book support via WebSocket v2 (#4041), thanks @mcgrj
 - Added Kraken Spot WebSocket v2 order submission (#4007), thanks @mcgrj
+- Added OKX X-Perp (`ruleType=xperp`) futures support with funding-rate subscriptions
+- Added OKX `slippagePct` parameter for market orders via the `slippage_pct` order param
 - Added OKX event contracts support
 - Added Polymarket `OrderStatusReport.filled_qty` dust snap at terminal `Filled` status to absorb venue truncation
 - Added Polymarket `PolymarketFeeModel` backtest fee model with maker-rebate inference
@@ -54,17 +152,19 @@ Released on TBD (UTC).
 - Changed Python order `create()` methods to raise `ValueError` on invalid `OrderInitialized` instead of panicking
 - Changed default `TransportBackend` to `Sockudo`; set `backend = Tungstenite` to keep the previous default
 - Changed `nautilus-network` default Cargo features to include `transport-sockudo`
-- Changed `nautilus-model` to make `arrow` support optional behind a Cargo feature; enable the `arrow` feature (or `python-arrow` for the Python bindings) to restore the previous behavior (#4008), thanks @sunlei
+- Changed `nautilus-model` `arrow` to an optional feature; enable `arrow` (or `python-arrow`) for prior behavior (#4008), thanks @sunlei
 - Changed `OrderMatchingEngineConfig` defaults to match the Cython per-engine constructor (Rust)
-- Changed `Strategy` order APIs to take `Option<Params>` to avoid unnecessary `IndexMap` allocations (Rust); use `None` or `Some(params)`
+- Changed `Strategy` order methods to take `Option<Params>` to avoid unnecessary `IndexMap` allocations (Rust); use `None` or `Some(params)`
 - Changed `Strategy::cancel_order` and `modify_order` to take `ClientOrderId` instead of `OrderAny` (Rust v2)
 - Changed `Strategy::cancel_orders` to take `Vec<ClientOrderId>` instead of `Vec<OrderAny>` (Rust v2)
 - Changed Rust strategy registration to append `order_id_tag` to explicit strategy IDs, matching Cython
 - Changed Binance Futures to prefer `DEMO` endpoints for simulated trading
+- Changed Databento data loaders to error on unresolved precision; pass `price_precision` or call `set_price_precision`
 - Changed Kraken Spot to reject `DEMO`; demo remains Futures-only
-- Changed `nautilus_core::from_pydict` signature from `Py<PyDict>` to `&Py<PyDict>` to avoid moving the input dict (Rust) (#4003), thanks @faysou
+- Changed `nautilus_core::from_pydict` from `Py<PyDict>` to `&Py<PyDict>` to avoid moving the input dict (Rust) (#4003), thanks @faysou
 - Changed `DataActor::subscribe_signal` to take `priority: Option<u32>`; existing callers must pass `None` (Rust)
 - Changed message bus subscription `priority` from `u8` to `u32` to match Cython `int priority` parity (Rust)
+- Changed `OrderFactory::bracket` to a `bon` builder with per-leg `entry_*`/`tp_*`/`sl_*` setters; use `factory.bracket()...call()` (Rust)
 
 ### Security
 - Added Sigstore SBOM attestation for Docker container images at the published digest
@@ -73,8 +173,8 @@ Released on TBD (UTC).
 - Hardened CI release signing chain: pinned cosign tooling, `harden-runner` on merge jobs
 - Hardened nightly-merge auth by storing token in git extraheader rather than remote URL
 - Hardened PyPI publishing with OIDC trusted publishing, eliminating long-lived API tokens
-- Hardened Python dependency installation by listing every third-party package in `[tool.uv].no-build-package` (kept in sync with `uv.lock` by a pre-commit hook) so unexpected loss of wheel publishing fails `uv lock` instead of silently building from an sdist
-- Upgraded `urllib3` to v2.7.0 (addresses GHSA-mf9v-mfxr-j63j decompression-bomb bypass and GHSA-qccp-gfcp-xxvc sensitive header leak on cross-host proxy redirect)
+- Hardened Python deps: pinned every third-party package in `[tool.uv].no-build-package` so lost wheels fail `uv lock` not build sdist
+- Upgraded `urllib3` to v2.7.0 (GHSA-mf9v-mfxr-j63j decompression-bomb bypass, GHSA-qccp-gfcp-xxvc cross-host proxy header leak)
 - Fixed `DatabaseConfig` repr to fully redact passwords (#4028), thanks @faysou
 - Documented Sigstore signature and SBOM verification commands in `SECURITY.md`
 
@@ -82,7 +182,7 @@ Released on TBD (UTC).
 - Fixed `RefCell` reentrancy panic in `ExecutionEngine::handle_order_fill` for OTO parent fills (#3981), thanks for reporting @GreatLandmark
 - Fixed `RefCell` reentrancy in `ExecutionEngine::load_cache` nested `borrow_mut` calls
 - Fixed `RefCell` double-borrow panic in `Portfolio::update_position` when `calculate_account_state` is true
-- Fixed identifier deserialization inside `#[serde(tag = "type")]` enums and `serde_json::Value`; all identifiers now accept owned strings via `Cow<'de, str>`
+- Fixed identifier deserialization inside `#[serde(tag = "type")]` enums and `serde_json::Value` via `Cow<'de, str>` owned-string support
 - Fixed `AccountsManager::update_balances` discarding recalculated balances by mutating a dropped clone
 - Fixed margin account balance not applying realized price PnL on close and reversal fills (#4056), thanks @faysou
 - Fixed Rust portfolio account event clone overhead (#4004), thanks for reporting @magnified103
@@ -93,13 +193,17 @@ Released on TBD (UTC).
 - Fixed `OwnOrderBook` tracking for reconciled external open orders (Rust)
 - Fixed `OrderAny::from_events` panic on malformed `OrderInitialized`; reconciliation returns `Err` instead of crashing
 - Fixed `BacktestEngine` not enabling `calculate_account_state` on accounts (#3988), thanks for reporting @magnified103
+- Fixed `BacktestEngine` not settling `on_stop` commands before shutdown (#4062), thanks for reporting @zhanghaoda
 - Fixed `MessageBus` late wildcard subscriptions missing events on already-cached topics (#3942), thanks for reporting @graceyangfan
 - Fixed `OrderMatchingEngine` to propagate tick-size to `MatchingCore` (#3942), thanks for reporting @graceyangfan
+- Fixed `OrderMatchingEngine` duplicate fills from closed matching-core orders (#4075)
 - Fixed `OrderMatchingEngine.reset` leaking `OrderBook.ts_last` across resets (Python) (#3992), thanks @YeeTsai
 - Fixed sandbox tick-size precision race that could panic on stale ticks (#3994), thanks @graceyangfan
 - Fixed matching engine and sandbox handling of stale-precision quote and trade ticks (#4044), thanks @graceyangfan
 - Fixed bracket SL/TP rejected by matching engine on submit (Rust) (#4040), thanks for reporting @maximsamsonov
 - Fixed `ExecutionEngine` reconciliation skipping `OrderUpdated` when both report and order were already `ACCEPTED`
+- Fixed `ExecutionEngine` `subscribe_venue_instruments` routing through the typed publisher so adapters receive instrument updates
+- Fixed execution fill reconciliation account scoping and duplicate trade IDs (Rust)
 - Fixed reconciliation drift when a venue snapshot carries both a fill mismatch and a quantity/price amendment (Rust)
 - Fixed reconciliation premature `OrderUpdated` emission for pending venue states before venue confirmation (Rust)
 - Fixed reconciliation missing `MarketIfTouched`/`LimitIfTouched` price and trigger drift detection (Rust)
@@ -112,6 +216,8 @@ Released on TBD (UTC).
 - Fixed `ExecTester` LIT pricing direction so reconciled BUY/SELL LIT orders satisfy the `trigger_price` invariant
 - Fixed wrangler v2 timestamp resolution to force nanoseconds before the int64 cast for pandas 3 compatibility (#3970), thanks @gzenz
 - Fixed custom data parquet schema registration and multi-file query (#4021), thanks @faysou
+- Fixed `custom_data` macro PyO3 stub generation: order `gen_stub` above `pyo3` attributes and detect `cfg_attr`-wrapped invocations
+- Fixed catalog `consolidate_data_by_period` cleanup for skipped targets (#4080), thanks @arpankapoor
 - Fixed SQL `ParserError` for symbols containing ampersand (#4025), thanks @arpankapoor
 - Fixed `DataEngine` to route subscribe/unsubscribe commands to the `BACKTEST` client when registered (Rust)
 - Fixed `DataEngine` to apply `validate_data_sequence` to bars emitted by internal aggregators (Rust)
@@ -122,14 +228,20 @@ Released on TBD (UTC).
 - Fixed `DataEngine` bar aggregator quote/trade subscription priority (Rust)
 - Fixed `DataEngine::reset` leaking book and option-chain state across resets (Rust)
 - Fixed `DataActor` composite book delta subscriptions not receiving per-underlying publishes (Rust)
-- Fixed Binance Futures reduce-only orders not reconciling venue-side quantity reductions (Python and Rust) (#3983), thanks for reporting @KaizynX
+- Fixed Architect AX `GET /order-status` to use `oid`/`cid` per v14.0.1; legacy `order_id`/`client_order_id` now return HTTP 400
+- Fixed Binance Futures reduce-only orders not reconciling venue-side quantity (Python and Rust) (#3983), thanks for reporting @KaizynX
+- Fixed Binance Spot inflight REST polls for pruned IOC orders (#4072), thanks for reporting @marcelmdn
 - Fixed Binance WebSocket pong unhandled `RuntimeError` blocking reconnect after server close (#4020), thanks for reporting @M-at-ti-a
-- Fixed Bybit BBO orders not reconciling the venue-resolved price (Python emitted `OrderUpdated` without a preceding `OrderAccepted`; Rust emitted `OrderAccepted` but never reconciled the cached price)
+- Fixed Bybit ambiguous submit failures to await reconciliation, thanks for reporting @shorino
+- Fixed Bybit BBO orders not reconciling the venue-resolved price in cached order state (Rust and Python)
+- Fixed Bybit funding rate parsing for dated futures on shared `tickers.linear` WS topic; gates to `CryptoPerpetual` only (#4084)
 - Fixed Betfair Rust adapter dropped fills on reconnect by resyncing the fill tracker from cache
 - Fixed Betfair Rust adapter panic on blank `customerOrderRef`/`rfo` by normalizing empty strings to `None`
 - Fixed Betfair Rust adapter spurious `OrderRejected` after OCM already reported a terminal state
 - Fixed Betfair Rust adapter `ignore_external_orders` to treat empty `rfo` strings the same as missing
 - Fixed Databento market data price precision preservation (#4002), thanks @faysou
+- Fixed Databento MBP10 panic on undefined depth levels (#4046), thanks for reporting @prajjwal23
+- Fixed Databento decoder gaps on dbn 0.58 wire data: skip `'I'` (Index) classes and map new stat types 14-20
 - Fixed dYdX FOK and DAY time-in-force orders to reject pre-submission instead of failing at the venue or mapping to GTC
 - Fixed dYdX MIT/LIT round-tripping on reconcile when the Indexer collapses both variants under `TAKE_PROFIT`
 - Fixed dYdX GTD expiry to surface `OrderExpired` on both WS and HTTP reconciliation paths
@@ -139,22 +251,28 @@ Released on TBD (UTC).
 - Fixed dYdX Python `_request_instrument(s)` to pass the full `_handle_data_response` argument set
 - Fixed dYdX Python `_subscribe_order_book_depth` to log a graceful warning instead of raising `NotImplementedError`
 - Fixed Deribit `StopMarket` `OrderRejected` when the order response omits `filled_amount` (#3995), thanks for reporting @marco-rigoni
-- Fixed Deribit cross-margin balance overcounting; now reports `equity` for total and `available_withdrawal_funds` for free (#4009), thanks @filipmacek
+- Fixed Deribit cross-margin overcounting; reports `equity` for total and `available_withdrawal_funds` for free (#4009), thanks @filipmacek
 - Fixed Deribit subscriptions silently dropping data for uncached instruments (#4035), thanks for reporting @linimin
-- Fixed Hyperliquid modify-after-partial-fill sending absolute total quantity to the cancel-replace leg, causing the engine to overfill the order (#3986)
-- Fixed Hyperliquid testnet orders rejected with "Builder fee has not been approved"; testnet orders now omit builder attribution to match the vault-order behavior (#3989)
+- Fixed Deribit funding rate log spam from perpetual channel updates emitting info/debug on every tick (#4083)
+- Fixed Deribit and Hyperliquid custom data builds without the `arrow` feature
+- Fixed Hyperliquid modify-after-partial-fill sending absolute quantity to the cancel-replace leg, causing engine overfill (#3986)
+- Fixed Hyperliquid testnet orders rejected with "Builder fee has not been approved" by omitting builder attribution like vault orders (#3989)
 - Fixed Hyperliquid spurious `OrderCanceled` on concurrent modifies (Python and Rust) (#3971), thanks @M-Advis
 - Fixed Hyperliquid cancel-replace fill race emitting `OrderFilled` against stale local order state (Python and Rust) (#3972)
-- Fixed Hyperliquid emitting terminal rejections on submit, cancel, and modify transport failures; defers to WS reconciliation (Python and Rust), thanks for reporting @M-Advis
+- Fixed Hyperliquid dropping `FillReport` before order cached; fills now buffered and drained on `OrderAccepted` (#4076), thanks @M-Advis
+- Fixed Hyperliquid terminal rejections on submit/cancel/modify failures; defers to WS reconciliation (Python and Rust), thanks @M-Advis
+- Fixed Hyperliquid Rust data client reconnect leaving the consumption loop on a cancelled token after disconnect
 - Fixed Interactive Brokers spread fill races (#3957), thanks @taozle
 - Fixed Interactive Brokers callback ordering races (#3976), thanks @faysou
 - Fixed Interactive Brokers market data farm reconnects not resubscribing feeds (#3968), thanks @onixenix
 - Fixed Interactive Brokers market data dispatch on fractional tick sizes (#4022), thanks @faysou
 - Fixed Interactive Brokers shutdown reader `RuntimeError` on stop and dispose (#4023), thanks @faysou
 - Fixed Interactive Brokers reconnect before server version handshake (#4027), thanks @faysou
+- Fixed Interactive Brokers SMART stock venue resolution (#4061), thanks @faysou
 - Fixed Kraken Spot margin wallet balances for multi-asset collateral (#3997), thanks @mcgrj
 - Fixed Kraken symbol normalization for WS v2 compatibility (#3961), thanks @mcgrj
 - Fixed Kraken Spot WebSocket dispatch dropping delta-only execution frames that omit `symbol` (#4052), thanks @mcgrj
+- Fixed Kraken Futures order-update batches failing to deserialize on venue-emitted `"unknown"` enum values
 - Fixed OKX missing `post_only` instrument status (#3966), thanks @jhavie
 - Fixed OKX missing `rebase` instrument status (#3998), thanks @jhavie
 - Fixed OKX future instrument status parsing (#4005), thanks @cryptoSUN2049
@@ -162,6 +280,10 @@ Released on TBD (UTC).
 - Fixed Polymarket REST fill paths bypassing dust normalization, causing engine state to diverge from venue across paths
 - Fixed Polymarket residual `ACCEPTED` orders via trade-history recovery (#4024), thanks for reporting @fedoraiver
 - Fixed Polymarket adapter book resync on `tick_size_change` (#3942), thanks for reporting @graceyangfan
+- Fixed Polymarket no-op `tick_size_change` clearing local book and queuing a redundant snapshot (Python and Rust)
+- Fixed Polymarket stale local book and last quote leaked across unsubscribe cycles (Python and Rust)
+- Fixed Polymarket auto-loaded instrument subscriptions not receiving live data (#4050), thanks for reporting @d0dge
+- Fixed Polymarket auto-load dropping subscriptions on CLOB transient 404 and empty `token_id` for newly-minted markets
 - Fixed Polymarket market IOC orders submitting as FOK (#4006), thanks for reporting @fedoraiver
 - Fixed Polymarket WS order parsing of venue cancellations with reason suffix (#3987), thanks for reporting @Javdu10
 - Fixed Polymarket WebSocket parse-error logging raising a secondary exception on non-UTF8 payloads (#4038), thanks @graceyangfan
@@ -169,6 +291,7 @@ Released on TBD (UTC).
 - Fixed Polymarket `parse_trades` `ts_event` collisions on same-second fills (Python and Rust)
 - Fixed Polymarket `fetch_trades` aborting on historical-offset ceiling; warns and returns partial (Python and Rust)
 - Fixed Polymarket `load_trades` non-deterministic same-second ordering across pages (Python and Rust)
+- Fixed Polymarket Gamma instrument loading capped at 100 markets (#4086), thanks for reporting @haimgel
 - Fixed Tardis instrument metadata parsing for numeric fields encoded as strings
 
 ### Internal Improvements
@@ -183,15 +306,22 @@ Released on TBD (UTC).
 - Added Python `TradingNode` parity stress harness for v1 vs v2 comparison
 - Added `cargo-flamegraph` to workspace tools with pinned version
 - Added `simulation` feature on `nautilus-live` so the stress harness runs under `cfg(madsim)` for DST validation
+- Added `NautilusKernel::with_cache_database` builder setter and constructor variant for cache database adapter injection (Rust)
+- Added `nautilus-event-store` snapshot capture/restore/replay via `NautilusKernel` for durable cache state across runs (Rust)
 - Added automatic `Tungstenite` fallback when `WebSocketConfig.proxy_url` is set with Sockudo selected (Rust)
+- Added typed publish_instrument() to message bus (#4081), thanks @filipmacek
+- Added Binance Futures `-4531` (UM/CM `dualSidePosition` sync) error classifier with hedge-mode hint (Rust)
+- Added `BinanceSpotUserDataEventType` enum for typed Spot user-data event dispatch (Rust)
 - Added Interactive Brokers PyO3 live client config support in `TradingNodeConfig` (#3964), thanks @faysou
 - Added Interactive Brokers Rust adapter support for v2 live trading (#3974), thanks @faysou
-- Refined data engine request workflow (#3928), thanks @faysou
+- Added Interactive Brokers per-order exchange routing params (#4079), thanks @faysou
+- Improved `#[custom_data]` to support live-only JSON types without Arrow registration
 - Improved `DataEngine.reset` to clear book updaters, snapshotters, option chain managers, and timers (Rust)
 - Improved `DataEngine` to create per-underlying books for composite-symbol book subscriptions (Rust)
 - Improved object materialization in Rust stream Feather to parquet conversion (#3954), thanks @faysou
 - Improved cache order storage to per-order `Rc<RefCell<OrderAny>>` cells, closing stale-clone bug class (Rust)
 - Improved `OwnBookLadder` to defer error logging to callers, removing duplicate own-book error noise
+- Improved `DataEngine`/`DataActor` bulky responses: summaries at debug, full at trace; same for raw WS frames in Bybit, OKX, BitMEX
 - Improved `OrderMatchingEngine` trailing-stop activation to use the `OrderMatchingCore` `iter_*` API (Rust)
 - Improved `OrderMatchingEngine.iterate` per-order loop to align trailing-stop and GTD timing with Cython (Rust)
 - Improved `OrderMatchingEngine` queue-position fill gating to match Cython on cross-through trades (Rust)
@@ -207,12 +337,17 @@ Released on TBD (UTC).
 - Improved Betfair Rust `unsubscribe_book_deltas` log level to `warn` to match Python visibility
 - Improved Betfair Rust adapter with explicit info-level no-op overrides for unsupported unsubscribe methods
 - Improved Betfair Rust integration test coverage to cover OCM, replace flow, batch ops, and session recovery
+- Improved Hyperliquid data client to track spawned subscribe tasks for abort on disconnect/reset (Rust)
 - Improved Interactive Brokers Python 3.14 installation and integration test coverage
+- Regenerated Binance Spot SBE codecs against schema 3:4
+- Refined data engine request workflow (#3928), thanks @faysou
+- Refined Hyperliquid data client by extracting `parse_l2_book_snapshot` helper for direct unit testing (Rust)
 - Optimized `Cache` order and position query methods to a single size-ordered intersection pass (Rust)
 - Optimized `Cache::*_count` methods to count via index without materializing a sorted `Vec` (Rust)
 - Optimized `OrderMatchingCore` storage to split `BTreeMap` limit/stop books per side for price-time priority (Rust)
 - Optimized live node biased select to dispatch exec commands ahead of market data (Rust)
 - Optimized live node loop by collapsing six maintenance timers into one shared maintenance dispatcher (Rust)
+- Ported Interactive Brokers adapter hardening fixes to Rust (#4073)
 - Upgraded `alloy` crate to v2.0.4
 - Upgraded `databento` crate to v0.51.0
 - Upgraded `redis` crate to v1.2.1
@@ -223,12 +358,18 @@ Released on TBD (UTC).
 - Added Bybit hedge-mode docs with official `positionIdx` API links
 - Added Bybit BBO order docs with params and examples
 - Added Databento docs for price precision precedence and publisher mappings
+- Added Deribit DVOL and Hyperliquid `allMids` adapter docs
 - Added Polymarket fill quantity normalization section explaining the dust snap, deferred dust, and commission semantics
 - Added dYdX adapter notes for FOK deprecation, DAY rejection, equity-tier limit, and MIT/LIT round-tripping
+- Added adapter timestamp conversion conventions covering ms-to-ns helpers and `ts_event` vs `ts_init`
 - Added Rust shared-mutability storage guide with `Rc<RefCell<T>>` decision tree to the developer guide
+- Improved Hyperliquid integration guide flagging Rust-only execution config options and scoped slippage note
+- Added `Shutdown semantics` to the backtesting guide covering `on_stop` command settlement
 - Updated adapter docs and examples to use environment enums instead of legacy test flags
 
-### Deprecations
+### Errata
+- Seven 0.57.0 crates manually published via API token (not OIDC) due to a topo-sort bug in `publish-cargo-crates.sh`
+- Affected: `nautilus-{analysis,common,execution,network,portfolio,testkit,trading}`; fixed for v1.228.0
 
 ---
 
@@ -285,7 +426,7 @@ Released on 29th April 2026 (UTC).
 - Added `Option<&AccountId>` to Rust `Portfolio::unrealized_pnls`, `realized_pnls`, `total_pnls`; pass `None` to keep prior behavior
 - Added `backend: TransportBackend` to `WebSocketConfig`; struct-literal callers must add the field (Rust)
 - Added `proxy_url: Option<String>` to `WebSocketConfig`; struct-literal callers must add the field (Rust)
-- Migrated Polymarket adapter to CLOB V2: new EIP-712 domain version `2`, new exchange contract addresses, `timestamp`/`metadata`/`builder` order fields replace `taker`/`nonce`/`feeRateBps`, and pUSD replaces USDC.e as collateral; the Python adapter now uses `py-clob-client-v2`
+- Migrated Polymarket adapter to CLOB V2: new EIP-712 domain, new exchange contracts, reshaped order fields, pUSD collateral, and `py-clob-client-v2` on the Python side
 - Consolidated adapter HTTP and WebSocket proxy plumbing onto a single `proxy_url` field, replacing the prior `http_proxy_url` / `ws_proxy_url` split across adapter Rust and Python configs
 - Removed `DockerizedIBGatewayConfig::from_env_or_defaults` (Rust); use the bon builder or `Default::default`, which still falls back to `TWS_USERNAME`/`TWS_PASSWORD`
 - Removed `OrderMatchingEngineConfig::new` and `with_price_protection_points` (Rust); use `OrderMatchingEngineConfig::builder()` instead
@@ -315,7 +456,7 @@ Released on 29th April 2026 (UTC).
 - Changed workspace `nautilus-live` to `default-features = false`; enable `features = ["node"]` for `LiveNode` (Rust)
 - Changed adapter `LiveNode` examples to require `--features examples` to build (Rust)
 - Changed `ParquetDataCatalog::to_object_path` and `to_object_path_parsed` to return `anyhow::Result` so cross-store URIs surface as errors instead of silently rewriting against the catalog bucket (Rust)
-- Changed prefixed remote catalogs (`s3://bucket/base/path`, etc.) to read and write under their declared URI prefix; data previously written to the bucket root by the prior buggy behavior will not be discovered after upgrading and must be moved into the prefix (#3930)
+- Changed prefixed remote catalogs (`s3://bucket/base/path`) to read and write under their declared URI prefix; move data previously written to the bucket root into the prefix (#3930)
 
 ### Security
 - Hardened Binance Ed25519 credential detection so base64 HMAC secrets no longer pass as Ed25519 keys (Rust)
@@ -1264,8 +1405,8 @@ This release adds support for Python 3.14 with the following limitations:
 - Renamed `ExecTesterConfig.enable_sells` to `enable_limit_sells`
 - Changed `ParquetDataCatalog.register_data` to now treat `files=[]` as registering no files; pass `files=None` (default) to include all files
 - **Standardized data catalog directory naming**: Order book data directory names now use plural forms to align with the Rust catalog and Tardis Machine conventions; this ensures data written by the Python `StreamingFeatherWriter` can be read by the Rust catalog
-  - `order_book_delta/` → `order_book_deltas/`
-  - `order_book_depth10/` → `order_book_depths/`
+  - `order_book_delta/` -> `order_book_deltas/`
+  - `order_book_depth10/` -> `order_book_depths/`
 
   **Migration**: Rename existing data directories to use plural forms:
   ```bash

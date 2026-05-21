@@ -40,6 +40,38 @@ use serde::{Deserialize, Serialize};
 /// The default rate limit string used for order submission and modification.
 const DEFAULT_ORDER_RATE_LIMIT: &str = "100/00:00:01";
 
+/// Configuration for one Rust-native plug-in instance loaded by a live node.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
+pub struct PluginConfig {
+    /// Path to the plug-in cdylib. Relative paths resolve from the process working directory.
+    pub path: String,
+    /// Type name from the plug-in manifest to instantiate.
+    pub type_name: String,
+    /// Per-instance JSON configuration passed to the plug-in `create` thunk.
+    #[builder(default)]
+    pub config: HashMap<String, serde_json::Value>,
+    /// Optional SHA-256 hex digest of the cdylib before loading.
+    pub sha256: Option<String>,
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self::builder()
+            .path(String::new())
+            .type_name(String::new())
+            .build()
+    }
+}
+
 /// Configuration for live data engines.
 #[cfg_attr(
     feature = "python",
@@ -50,7 +82,7 @@ const DEFAULT_ORDER_RATE_LIMIT: &str = "100/00:00:01";
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct LiveDataEngineConfig {
     /// If time bar aggregators will build and emit bars with no new market updates.
     #[builder(default = true)]
@@ -132,6 +164,7 @@ impl From<LiveDataEngineConfig> for DataEngineConfig {
             buffer_deltas: config.buffer_deltas,
             emit_quotes_from_book: config.emit_quotes_from_book,
             emit_quotes_from_book_depths: config.emit_quotes_from_book_depths,
+            disable_historical_cache: false,
             external_clients: config.external_clients,
             debug: config.debug,
         }
@@ -148,7 +181,7 @@ impl From<LiveDataEngineConfig> for DataEngineConfig {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct LiveRiskEngineConfig {
     /// If all pre-trade risk checks should be bypassed.
     #[builder(default)]
@@ -265,7 +298,7 @@ fn parse_rate_limit(input: &str) -> anyhow::Result<RateLimit> {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct LiveExecEngineConfig {
     /// If the cache should be loaded on initialization.
     #[builder(default = true)]
@@ -429,7 +462,7 @@ impl From<LiveExecEngineConfig> for ExecutionEngineConfig {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, bon::Builder)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct RoutingConfig {
     /// If the client should be registered as the default routing client.
     #[builder(default)]
@@ -448,7 +481,7 @@ pub struct RoutingConfig {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct InstrumentProviderConfig {
     /// Whether to load all instruments on startup.
     #[builder(default)]
@@ -481,7 +514,7 @@ impl Default for InstrumentProviderConfig {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, bon::Builder)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct LiveDataClientConfig {
     /// If `DataClient` will emit bar updates when a new bar opens.
     #[builder(default)]
@@ -504,7 +537,7 @@ pub struct LiveDataClientConfig {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, bon::Builder)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct LiveExecClientConfig {
     /// The client's instrument provider configuration.
     #[builder(default)]
@@ -523,7 +556,8 @@ pub struct LiveExecClientConfig {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
-#[derive(Debug, Clone, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
 pub struct LiveNodeConfig {
     /// The trading environment.
     #[builder(default = Environment::Live)]
@@ -588,6 +622,9 @@ pub struct LiveNodeConfig {
     /// The execution client configurations.
     #[builder(default)]
     pub exec_clients: HashMap<String, LiveExecClientConfig>,
+    /// The Rust-native plug-in instances to load before startup.
+    #[builder(default)]
+    pub plugins: Vec<PluginConfig>,
 }
 
 impl Default for LiveNodeConfig {
@@ -626,6 +663,37 @@ impl LiveNodeConfig {
         self.data_engine.validate_runtime_support()?;
         self.risk_engine.validate_runtime_support()?;
         self.exec_engine.validate_runtime_support()?;
+        self.validate_plugin_configs()?;
+
+        Ok(())
+    }
+
+    fn validate_plugin_configs(&self) -> anyhow::Result<()> {
+        for (index, plugin) in self.plugins.iter().enumerate() {
+            plugin.validate_runtime_support(index)?;
+        }
+        Ok(())
+    }
+}
+
+impl PluginConfig {
+    fn validate_runtime_support(&self, index: usize) -> anyhow::Result<()> {
+        if self.path.trim().is_empty() {
+            anyhow::bail!("LiveNodeConfig.plugins[{index}].path must not be empty");
+        }
+
+        if self.type_name.trim().is_empty() {
+            anyhow::bail!("LiveNodeConfig.plugins[{index}].type_name must not be empty");
+        }
+
+        if let Some(sha256) = &self.sha256 {
+            let valid = sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit());
+            if !valid {
+                anyhow::bail!(
+                    "LiveNodeConfig.plugins[{index}].sha256 must be a 64-character hex digest"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -867,6 +935,7 @@ mod tests {
         assert!(!config.exec_engine.filter_unclaimed_external_orders);
         assert!(config.data_clients.is_empty());
         assert!(config.exec_clients.is_empty());
+        assert!(config.plugins.is_empty());
     }
 
     #[rstest]
@@ -1254,6 +1323,50 @@ mod tests {
     }
 
     #[rstest]
+    fn test_validate_runtime_support_rejects_empty_plugin_path() {
+        let config = LiveNodeConfig {
+            plugins: vec![PluginConfig {
+                type_name: "ExampleActor".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = config.validate_runtime_support().unwrap_err().to_string();
+        assert!(error.contains("plugins[0].path"));
+    }
+
+    #[rstest]
+    fn test_validate_runtime_support_rejects_empty_plugin_type_name() {
+        let config = LiveNodeConfig {
+            plugins: vec![PluginConfig {
+                path: "./libexample.so".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = config.validate_runtime_support().unwrap_err().to_string();
+        assert!(error.contains("plugins[0].type_name"));
+    }
+
+    #[rstest]
+    fn test_validate_runtime_support_rejects_invalid_plugin_sha256() {
+        let config = LiveNodeConfig {
+            plugins: vec![PluginConfig {
+                path: "./libexample.so".to_string(),
+                type_name: "ExampleActor".to_string(),
+                sha256: Some("not-a-digest".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = config.validate_runtime_support().unwrap_err().to_string();
+        assert!(error.contains("sha256"));
+    }
+
+    #[rstest]
     fn test_live_exec_engine_config_defaults() {
         let config = LiveExecEngineConfig::default();
 
@@ -1364,5 +1477,62 @@ mod tests {
                 .to_string()
                 .contains("unknown field `instrument_provider`")
         );
+    }
+
+    #[rstest]
+    fn test_live_node_config_toml_minimal() {
+        let config: LiveNodeConfig = toml::from_str(
+            r#"
+environment = "Live"
+trader_id = "TRADER-042"
+
+[data_engine]
+debug = true
+
+[risk_engine]
+bypass = false
+
+[exec_engine]
+reconciliation = false
+
+[data_clients.hyperliquid]
+handle_revised_bars = true
+
+[exec_clients.hyperliquid]
+routing = { default = true, venues = ["HYPERLIQUID"] }
+instrument_provider = { load_all = true }
+
+[[plugins]]
+path = "./target/debug/examples/libcustom_data_plugin.so"
+type_name = "ExampleStrategy"
+config = { strategy_id = "ExampleStrategy-001", threshold = 10 }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.environment, Environment::Live);
+        assert_eq!(config.trader_id, TraderId::from("TRADER-042"));
+        assert!(config.data_engine.debug);
+        assert!(!config.risk_engine.bypass);
+        assert!(!config.exec_engine.reconciliation);
+        assert!(config.data_clients["hyperliquid"].handle_revised_bars);
+        let exec_client = &config.exec_clients["hyperliquid"];
+        assert!(exec_client.routing.default);
+        assert_eq!(
+            exec_client.routing.venues,
+            Some(vec!["HYPERLIQUID".to_string()]),
+        );
+        assert!(exec_client.instrument_provider.load_all);
+        assert_eq!(config.plugins.len(), 1);
+        assert_eq!(
+            config.plugins[0].path,
+            "./target/debug/examples/libcustom_data_plugin.so"
+        );
+        assert_eq!(config.plugins[0].type_name, "ExampleStrategy");
+        assert_eq!(
+            config.plugins[0].config["strategy_id"],
+            serde_json::json!("ExampleStrategy-001")
+        );
+        assert_eq!(config.plugins[0].config["threshold"], serde_json::json!(10));
     }
 }

@@ -23,6 +23,7 @@ pub mod fifo;
 pub mod quote;
 pub mod refs;
 
+mod bounded;
 mod index;
 
 #[cfg(test)]
@@ -31,13 +32,14 @@ mod tests;
 use std::{
     borrow::Cow,
     cell::{Ref, RefCell},
-    collections::VecDeque,
     fmt::{Debug, Display},
     rc::Rc,
+    str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use ahash::{AHashMap, AHashSet};
+use bounded::BoundedVecDeque;
 use bytes::Bytes;
 pub use config::CacheConfig; // Re-export
 use database::{CacheDatabaseAdapter, CacheMap};
@@ -57,8 +59,8 @@ use nautilus_model::{
         MarkPriceUpdate, QuoteTick, TradeTick, YieldCurveData, option_chain::OptionGreeks,
     },
     enums::{
-        AggregationSource, ContingencyType, OmsType, OrderSide, PositionSide, PriceType,
-        TriggerType,
+        AggregationSource, ContingencyType, InstrumentClass, OmsType, OrderSide, PositionSide,
+        PriceType, TriggerType,
     },
     events::{AccountState, OrderEventAny},
     identifiers::{
@@ -78,6 +80,29 @@ pub use refs::{AccountRef, AccountRefMut, OrderRef, OrderRefMut, PositionRef, Po
 use ustr::Ustr;
 
 use crate::xrate::get_exchange_rate;
+
+/// Cache-owned reference to a snapshot blob.
+///
+/// The cache writes and later fetches the blob; external systems persist this opaque reference
+/// and may hash the bytes before recording a durable anchor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheSnapshotRef {
+    /// Opaque cache-owned snapshot location.
+    pub blob_ref: String,
+    /// Snapshot bytes stored under [`Self::blob_ref`].
+    pub blob: Bytes,
+}
+
+impl CacheSnapshotRef {
+    /// Creates a new [`CacheSnapshotRef`].
+    #[must_use]
+    pub fn new(blob_ref: impl Into<String>, blob: impl Into<Bytes>) -> Self {
+        Self {
+            blob_ref: blob_ref.into(),
+            blob: blob.into(),
+        }
+    }
+}
 
 /// Read-only view over the platform cache.
 ///
@@ -192,14 +217,14 @@ pub struct Cache {
     synthetics: AHashMap<InstrumentId, SyntheticInstrument>,
     books: AHashMap<InstrumentId, OrderBook>,
     own_books: AHashMap<InstrumentId, OwnOrderBook>,
-    quotes: AHashMap<InstrumentId, VecDeque<QuoteTick>>,
-    trades: AHashMap<InstrumentId, VecDeque<TradeTick>>,
+    quotes: AHashMap<InstrumentId, BoundedVecDeque<QuoteTick>>,
+    trades: AHashMap<InstrumentId, BoundedVecDeque<TradeTick>>,
     mark_xrates: AHashMap<(Currency, Currency), f64>,
-    mark_prices: AHashMap<InstrumentId, VecDeque<MarkPriceUpdate>>,
-    index_prices: AHashMap<InstrumentId, VecDeque<IndexPriceUpdate>>,
-    funding_rates: AHashMap<InstrumentId, VecDeque<FundingRateUpdate>>,
-    instrument_statuses: AHashMap<InstrumentId, VecDeque<InstrumentStatus>>,
-    bars: AHashMap<BarType, VecDeque<Bar>>,
+    mark_prices: AHashMap<InstrumentId, BoundedVecDeque<MarkPriceUpdate>>,
+    index_prices: AHashMap<InstrumentId, BoundedVecDeque<IndexPriceUpdate>>,
+    funding_rates: AHashMap<InstrumentId, BoundedVecDeque<FundingRateUpdate>>,
+    instrument_statuses: AHashMap<InstrumentId, BoundedVecDeque<InstrumentStatus>>,
+    bars: AHashMap<BarType, BoundedVecDeque<Bar>>,
     greeks: AHashMap<InstrumentId, GreeksData>,
     option_greeks: AHashMap<InstrumentId, OptionGreeks>,
     yield_curves: AHashMap<String, YieldCurveData>,
@@ -256,12 +281,19 @@ impl Cache {
     /// # Note
     ///
     /// Uses provided `CacheConfig` or defaults, and optional `CacheDatabaseAdapter` for persistence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cache config has a zero tick or bar capacity.
     pub fn new(
         config: Option<CacheConfig>,
         database: Option<Box<dyn CacheDatabaseAdapter>>,
     ) -> Self {
+        let config = config.unwrap_or_default();
+        config.validate().expect("invalid `CacheConfig`");
+
         Self {
-            config: config.unwrap_or_default(),
+            config,
             index: CacheIndex::default(),
             database,
             general: AHashMap::new(),
@@ -666,7 +698,7 @@ impl Cache {
     /// Returns whether the cache has a backing database.
     #[must_use]
     pub const fn has_backing(&self) -> bool {
-        self.config.database.is_some()
+        self.database.is_some()
     }
 
     // Calculate the unrealized profit and loss (PnL) for `position`.
@@ -1661,7 +1693,7 @@ impl Cache {
         let mark_prices_deque = self
             .mark_prices
             .entry(mark_price.instrument_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
         mark_prices_deque.push_front(mark_price);
         Ok(())
     }
@@ -1684,7 +1716,7 @@ impl Cache {
         let index_prices_deque = self
             .index_prices
             .entry(index_price.instrument_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
         index_prices_deque.push_front(index_price);
         Ok(())
     }
@@ -1707,7 +1739,7 @@ impl Cache {
         let funding_rates_deque = self
             .funding_rates
             .entry(funding_rate.instrument_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
         funding_rates_deque.push_front(funding_rate);
         Ok(())
     }
@@ -1737,7 +1769,7 @@ impl Cache {
         let funding_rate_deque = self
             .funding_rates
             .entry(instrument_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
 
         for funding_rate in funding_rates {
             funding_rate_deque.push_front(*funding_rate);
@@ -1760,7 +1792,7 @@ impl Cache {
         let statuses_deque = self
             .instrument_statuses
             .entry(status.instrument_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
         statuses_deque.push_front(status);
         Ok(())
     }
@@ -1782,7 +1814,7 @@ impl Cache {
         let quotes_deque = self
             .quotes
             .entry(quote.instrument_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
         quotes_deque.push_front(quote);
         Ok(())
     }
@@ -1809,7 +1841,7 @@ impl Cache {
         let quotes_deque = self
             .quotes
             .entry(instrument_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
 
         for quote in quotes {
             quotes_deque.push_front(*quote);
@@ -1834,7 +1866,7 @@ impl Cache {
         let trades_deque = self
             .trades
             .entry(trade.instrument_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
         trades_deque.push_front(trade);
         Ok(())
     }
@@ -1861,7 +1893,7 @@ impl Cache {
         let trades_deque = self
             .trades
             .entry(instrument_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
 
         for trade in trades {
             trades_deque.push_front(*trade);
@@ -1886,7 +1918,7 @@ impl Cache {
         let bars = self
             .bars
             .entry(bar.bar_type)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.bar_capacity));
+            .or_insert_with(|| BoundedVecDeque::new(self.config.bar_capacity));
         bars.push_front(bar);
         Ok(())
     }
@@ -1913,7 +1945,7 @@ impl Cache {
         let bars_deque = self
             .bars
             .entry(bar_type)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| BoundedVecDeque::new(self.config.bar_capacity));
 
         for bar in bars {
             bars_deque.push_front(*bar);
@@ -2733,7 +2765,7 @@ impl Cache {
     /// # Errors
     ///
     /// Returns an error if serializing or storing the position snapshot fails.
-    pub fn snapshot_position(&mut self, position: &Position) -> anyhow::Result<()> {
+    pub fn snapshot_position(&mut self, position: &Position) -> anyhow::Result<CacheSnapshotRef> {
         let position_id = position.id;
 
         let mut copied_position = position.clone();
@@ -2742,14 +2774,89 @@ impl Cache {
 
         // Serialize the position (TODO: temporarily just to JSON to remove a dependency)
         let position_serialized = serde_json::to_vec(&copied_position)?;
+        let snapshot_index = self.position_snapshot_count(&position_id);
+        let blob_ref = format!(
+            "cache://position-snapshots/{}/{}",
+            position_id.as_str(),
+            snapshot_index,
+        );
+        let snapshot_blob = Bytes::from(position_serialized);
 
+        self.add(&blob_ref, snapshot_blob.clone())?;
         self.position_snapshots
             .entry(position_id)
             .or_default()
-            .push(Bytes::from(position_serialized));
+            .push(snapshot_blob.clone());
 
         log::debug!("Snapshot {copied_position}");
+        Ok(CacheSnapshotRef::new(blob_ref, snapshot_blob))
+    }
+
+    /// Loads the cache-owned snapshot blob stored under `blob_ref`.
+    ///
+    /// The cache first checks in-memory snapshot state. When the blob is not present and a
+    /// database adapter exists, the generic cache entries are loaded and checked for the same
+    /// opaque reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if loading generic cache entries from the backing database fails.
+    pub fn load_snapshot_blob(&mut self, blob_ref: &str) -> anyhow::Result<Option<Bytes>> {
+        if let Some(blob) = self.snapshot_blob(blob_ref) {
+            return Ok(Some(blob));
+        }
+
+        if self.database.is_some() {
+            self.cache_general()?;
+        }
+
+        Ok(self.snapshot_blob(blob_ref))
+    }
+
+    /// Restores the cache-owned snapshot blob stored under `blob_ref`.
+    ///
+    /// Only cache-owned `cache://position-snapshots/...` blobs are currently supported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blob reference is unsupported, malformed, skips earlier
+    /// snapshot frames, conflicts with an existing frame, or does not decode to the expected
+    /// position snapshot.
+    pub fn restore_snapshot_blob(&mut self, blob_ref: &str, blob: Bytes) -> anyhow::Result<()> {
+        let (position_id, snapshot_index) = parse_position_snapshot_blob_ref(blob_ref)?;
+        validate_position_snapshot_blob(&position_id, blob.as_ref())?;
+
+        let frames = self.position_snapshots.entry(position_id).or_default();
+        match frames.get(snapshot_index) {
+            Some(existing) if existing == &blob => {}
+            Some(_) => {
+                anyhow::bail!(
+                    "position snapshot frame {snapshot_index} for {position_id} already exists with different bytes"
+                );
+            }
+            None if frames.len() == snapshot_index => frames.push(blob.clone()),
+            None => {
+                anyhow::bail!(
+                    "position snapshot blob_ref {blob_ref} skips missing frame {}",
+                    frames.len()
+                );
+            }
+        }
+
+        self.general.insert(blob_ref.to_string(), blob);
         Ok(())
+    }
+
+    fn snapshot_blob(&self, blob_ref: &str) -> Option<Bytes> {
+        if let Some(blob) = self.general.get(blob_ref) {
+            return Some(blob.clone());
+        }
+
+        let (position_id, snapshot_index) = parse_position_snapshot_blob_ref(blob_ref).ok()?;
+        self.position_snapshots
+            .get(&position_id)
+            .and_then(|frames| frames.get(snapshot_index))
+            .cloned()
     }
 
     /// Creates a snapshot of the `position` state in the database.
@@ -5001,7 +5108,7 @@ impl Cache {
     pub fn quote_count(&self, instrument_id: &InstrumentId) -> usize {
         self.quotes
             .get(instrument_id)
-            .map_or(0, std::collections::VecDeque::len)
+            .map_or(0, BoundedVecDeque::len)
     }
 
     /// Gets the trade tick count for the `instrument_id`.
@@ -5009,15 +5116,13 @@ impl Cache {
     pub fn trade_count(&self, instrument_id: &InstrumentId) -> usize {
         self.trades
             .get(instrument_id)
-            .map_or(0, std::collections::VecDeque::len)
+            .map_or(0, BoundedVecDeque::len)
     }
 
     /// Gets the bar count for the `instrument_id`.
     #[must_use]
     pub fn bar_count(&self, bar_type: &BarType) -> usize {
-        self.bars
-            .get(bar_type)
-            .map_or(0, std::collections::VecDeque::len)
+        self.bars.get(bar_type).map_or(0, BoundedVecDeque::len)
     }
 
     /// Returns whether the cache contains an order book for the `instrument_id`.
@@ -5182,6 +5287,27 @@ impl Cache {
             .values()
             .filter(|i| &i.id().venue == venue)
             .filter(|i| underlying.is_none_or(|u| i.underlying() == Some(*u)))
+            .collect()
+    }
+
+    /// Returns references to all instruments for the `venue` whose underlying
+    /// equals `root` and whose [`InstrumentClass`] equals `class`.
+    ///
+    /// Use when expanding a parent-symbol subscription: filtering by class as
+    /// well as root prevents leaves of a different class (e.g. options when
+    /// the user asked for futures, or vice versa) from being pulled in.
+    #[must_use]
+    pub fn instruments_by_parent(
+        &self,
+        venue: &Venue,
+        root: &Ustr,
+        class: InstrumentClass,
+    ) -> Vec<&InstrumentAny> {
+        self.instruments
+            .values()
+            .filter(|i| &i.id().venue == venue)
+            .filter(|i| i.underlying() == Some(*root))
+            .filter(|i| i.instrument_class() == class)
             .collect()
     }
 
@@ -5423,4 +5549,45 @@ impl Cache {
 
         log::debug!("Completed own books audit in {:?}", start.elapsed());
     }
+}
+
+fn parse_position_snapshot_blob_ref(blob_ref: &str) -> anyhow::Result<(PositionId, usize)> {
+    let Some(rest) = blob_ref.strip_prefix("cache://position-snapshots/") else {
+        anyhow::bail!("unsupported cache snapshot blob_ref {blob_ref}");
+    };
+
+    let Some((position_id, snapshot_index)) = rest.rsplit_once('/') else {
+        anyhow::bail!("malformed position snapshot blob_ref {blob_ref}");
+    };
+
+    if position_id.is_empty() {
+        anyhow::bail!("position snapshot blob_ref {blob_ref} has empty position id");
+    }
+
+    let snapshot_index = snapshot_index.parse::<usize>().map_err(|e| {
+        anyhow::anyhow!("position snapshot blob_ref {blob_ref} has invalid frame index: {e}")
+    })?;
+
+    Ok((PositionId::new(position_id), snapshot_index))
+}
+
+fn validate_position_snapshot_blob(position_id: &PositionId, blob: &[u8]) -> anyhow::Result<()> {
+    let snapshot = serde_json::from_slice::<Position>(blob)?;
+    let expected_prefix = format!("{}-", position_id.as_str());
+
+    let Some(snapshot_uuid) = snapshot.id.as_str().strip_prefix(&expected_prefix) else {
+        anyhow::bail!(
+            "position snapshot id {} does not match blob_ref position {position_id}",
+            snapshot.id
+        );
+    };
+
+    if UUID4::from_str(snapshot_uuid).is_err() {
+        anyhow::bail!(
+            "position snapshot id {} does not match blob_ref position {position_id}",
+            snapshot.id
+        );
+    }
+
+    Ok(())
 }

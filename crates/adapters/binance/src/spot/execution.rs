@@ -677,9 +677,13 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                 .await;
 
             match result {
-                Ok(report) => {
+                Ok(Some(report)) => {
                     event_emitter.send_order_status_report(report);
                 }
+                Ok(None) => log::debug!(
+                    "No order status report returned: client_order_id={}",
+                    command.client_order_id
+                ),
                 Err(e) => log::warn!("Failed to query order status: {e}"),
             }
 
@@ -771,17 +775,14 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             .as_ref()
             .map(|id| VenueOrderId::new(id.inner()));
 
-        let report = self
-            .http_client
+        self.http_client
             .request_order_status_report(
                 self.core.account_id,
                 instrument_id,
                 venue_order_id,
                 cmd.client_order_id,
             )
-            .await?;
-
-        Ok(Some(report))
+            .await
     }
 
     async fn generate_order_status_reports(
@@ -1497,6 +1498,11 @@ fn dispatch_ws_trading_message(
         }
         BinanceSpotWsTradingMessage::Reconnected => {
             log::info!("WS trading API reconnected");
+        }
+        BinanceSpotWsTradingMessage::ServerShutdown { event_time } => {
+            log::warn!(
+                "WS trading API server shutdown notice (event_time={event_time}); reconnect expected within ~10 minutes"
+            );
         }
         BinanceSpotWsTradingMessage::Error(err) => {
             log::error!("WS trading API error: {err}");

@@ -42,7 +42,6 @@ use crate::{
 
 const ENTRIES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("entries");
 const MANIFEST_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("manifest");
-const INTENT_INDEX: TableDefinition<&str, u64> = TableDefinition::new("intent_id_idx");
 const CLIENT_ORDER_INDEX: TableDefinition<&str, u64> = TableDefinition::new("client_order_id_idx");
 const VENUE_ORDER_INDEX: TableDefinition<&str, u64> = TableDefinition::new("venue_order_id_idx");
 const SNAPSHOT_ANCHOR_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshot_anchor");
@@ -109,14 +108,13 @@ impl RedbBackend {
         Ok(self.state()?.file_path.as_path())
     }
 
-    /// Opens the sealed run file at `<base>/<instance_id>/<run_id>.redb` for read-only
-    /// forensics replay.
+    /// Opens the sealed run file at `<base>/<instance_id>/<run_id>.redb` for read-only replay.
     ///
     /// # Design
     ///
     /// The standard [`EventStore::open_run`] path rejects sealed files: that is the
     /// crash-recovery guard, a successor must not silently reopen a predecessor's log
-    /// without going through seal. Forensics replay is the legitimate case for touching
+    /// without going through seal. Event-store replay is the legitimate case for touching
     /// a sealed file, so the reader uses this constructor instead.
     ///
     /// The shared [`EventStore`] trait is held intentionally narrow and is locked by
@@ -264,7 +262,6 @@ impl RedbBackend {
             .map_err(|e| EventStoreError::Backend(format!("set durability: {e}")))?;
         {
             txn.open_table(ENTRIES_TABLE).map_err(map_table_err)?;
-            txn.open_table(INTENT_INDEX).map_err(map_table_err)?;
             txn.open_table(CLIENT_ORDER_INDEX).map_err(map_table_err)?;
             txn.open_table(VENUE_ORDER_INDEX).map_err(map_table_err)?;
             txn.open_table(SNAPSHOT_ANCHOR_TABLE)
@@ -462,7 +459,6 @@ impl EventStore for RedbBackend {
             .map_err(|e| EventStoreError::Backend(format!("set durability: {e}")))?;
         {
             let mut entries_table = txn.open_table(ENTRIES_TABLE).map_err(map_table_err)?;
-            let mut intent_table = txn.open_table(INTENT_INDEX).map_err(map_table_err)?;
             let mut client_table = txn.open_table(CLIENT_ORDER_INDEX).map_err(map_table_err)?;
             let mut venue_table = txn.open_table(VENUE_ORDER_INDEX).map_err(map_table_err)?;
 
@@ -473,7 +469,6 @@ impl EventStore for RedbBackend {
 
                 for IndexKey { kind, key } in &append.index_keys {
                     let table = match kind {
-                        IndexKind::IntentId => &mut intent_table,
                         IndexKind::ClientOrderId => &mut client_table,
                         IndexKind::VenueOrderId => &mut venue_table,
                     };
@@ -608,7 +603,6 @@ impl EventStore for RedbBackend {
         let state = self.state()?;
         let txn = state.db.begin_read().map_err(map_transaction_err)?;
         let definition = match kind {
-            IndexKind::IntentId => INTENT_INDEX,
             IndexKind::ClientOrderId => CLIENT_ORDER_INDEX,
             IndexKind::VenueOrderId => VENUE_ORDER_INDEX,
         };
@@ -621,7 +615,6 @@ impl EventStore for RedbBackend {
         let state = self.state()?;
         let txn = state.db.begin_read().map_err(map_transaction_err)?;
         let definition = match kind {
-            IndexKind::IntentId => INTENT_INDEX,
             IndexKind::ClientOrderId => CLIENT_ORDER_INDEX,
             IndexKind::VenueOrderId => VENUE_ORDER_INDEX,
         };

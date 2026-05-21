@@ -560,6 +560,7 @@ async fn test_generate_order_status_reports_empty_without_instruments() {
         params: None,
         log_receipt_level: LogLevel::Info,
         correlation_id: None,
+        causation_id: None,
     };
 
     let reports = client.generate_order_status_reports(&cmd).await.unwrap();
@@ -585,6 +586,7 @@ async fn test_generate_fill_reports_empty_without_instruments() {
         params: None,
         log_receipt_level: LogLevel::Info,
         correlation_id: None,
+        causation_id: None,
     };
 
     let reports = client.generate_fill_reports(cmd).await.unwrap();
@@ -608,6 +610,7 @@ async fn test_generate_position_status_reports_always_empty() {
         params: None,
         log_receipt_level: LogLevel::Info,
         correlation_id: None,
+        causation_id: None,
     };
 
     let reports = client.generate_position_status_reports(&cmd).await.unwrap();
@@ -631,6 +634,7 @@ async fn test_generate_order_status_report_single_requires_venue_order_id() {
         venue_order_id: None,
         params: None,
         correlation_id: None,
+        causation_id: None,
     };
 
     let result = client.generate_order_status_report(&cmd).await.unwrap();
@@ -653,6 +657,7 @@ async fn test_generate_order_status_report_single_requires_instrument_id() {
         venue_order_id: Some(VenueOrderId::from("0x123")),
         params: None,
         correlation_id: None,
+        causation_id: None,
     };
 
     let result = client.generate_order_status_report(&cmd).await.unwrap();
@@ -676,6 +681,7 @@ async fn test_generate_order_status_report_single_returns_report() {
         venue_order_id: Some(VenueOrderId::from("0x123")),
         params: None,
         correlation_id: None,
+        causation_id: None,
     };
 
     let result = client.generate_order_status_report(&cmd).await.unwrap();
@@ -748,6 +754,7 @@ async fn test_generate_order_status_report_recovers_filled_from_trades() {
         venue_order_id: Some(venue_order_id),
         params: None,
         correlation_id: None,
+        causation_id: None,
     };
 
     let report = client
@@ -824,6 +831,7 @@ async fn test_generate_order_status_report_recovers_canceled_when_no_trades() {
         venue_order_id: Some(venue_order_id),
         params: None,
         correlation_id: None,
+        causation_id: None,
     };
 
     let report = client
@@ -865,6 +873,7 @@ async fn test_generate_order_status_report_returns_none_without_cached_order() {
         venue_order_id: Some(venue_order_id),
         params: None,
         correlation_id: None,
+        causation_id: None,
     };
 
     let result = client.generate_order_status_report(&cmd).await.unwrap();
@@ -962,6 +971,7 @@ async fn test_generate_order_status_report_recovers_filled_with_dust_snap() {
         venue_order_id: Some(venue_order_id),
         params: None,
         correlation_id: None,
+        causation_id: None,
     };
 
     let report = client
@@ -1039,6 +1049,7 @@ async fn test_generate_order_status_report_recovers_canceled_with_partial_fill()
         venue_order_id: Some(venue_order_id),
         params: None,
         correlation_id: None,
+        causation_id: None,
     };
 
     let report = client
@@ -1119,6 +1130,7 @@ async fn test_generate_order_status_report_resolves_via_venue_order_id_index() {
         venue_order_id: Some(venue_order_id),
         params: None,
         correlation_id: None,
+        causation_id: None,
     };
 
     let report = client
@@ -1214,6 +1226,8 @@ async fn test_modify_order_emits_rejection() {
         command_id: UUID4::new(),
         ts_init: UnixNanos::default(),
         params: None,
+        correlation_id: None,
+        causation_id: None,
     };
 
     client.modify_order(cmd).unwrap();
@@ -1282,6 +1296,7 @@ async fn test_submit_market_order_denied_buy_without_quote_quantity() {
         None, // params
         UUID4::new(),
         UnixNanos::default(),
+        None, // correlation_id
     );
 
     client.submit_order(cmd).unwrap();
@@ -1341,6 +1356,7 @@ async fn test_submit_market_order_denied_sell_with_quote_quantity() {
         None,
         UUID4::new(),
         UnixNanos::default(),
+        None, // correlation_id
     );
 
     client.submit_order(cmd).unwrap();
@@ -1993,6 +2009,7 @@ fn make_submit_cmd(order: &OrderAny, instrument_id: InstrumentId) -> SubmitOrder
         None, // params
         UUID4::new(),
         UnixNanos::default(),
+        None, // correlation_id
     )
 }
 
@@ -2021,6 +2038,7 @@ fn make_submit_order_list_cmd(instrument_id: InstrumentId, orders: &[OrderAny]) 
         None,
         UUID4::new(),
         UnixNanos::default(),
+        None, // correlation_id
     )
 }
 
@@ -2035,6 +2053,7 @@ fn make_cancel_cmd(client_order_id: &str, instrument_id: InstrumentId) -> Cancel
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     )
 }
 
@@ -3461,6 +3480,7 @@ async fn test_batch_cancel_orders_with_partial_failure() {
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
 
     client.batch_cancel_orders(cmd).unwrap();
@@ -3784,6 +3804,7 @@ async fn test_query_order_does_not_block_within_runtime() {
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
 
     // This must not panic with "Cannot start a runtime from within a runtime"
@@ -3811,6 +3832,7 @@ async fn test_query_account_does_not_block_within_runtime() {
         UUID4::new(),
         UnixNanos::default(),
         None,
+        None, // correlation_id
     );
 
     // This must not panic with "Cannot start a runtime from within a runtime"

@@ -1928,6 +1928,17 @@ impl OrderMatchingEngine {
         }
     }
 
+    /// Processes instrument expiration at the given timestamp.
+    pub fn process_instrument_expiration(&mut self, timestamp_ns: UnixNanos) {
+        self.check_instrument_expiration(timestamp_ns);
+    }
+
+    /// Returns whether instrument expiration has already been processed.
+    #[must_use]
+    pub const fn is_expiration_processed(&self) -> bool {
+        self.expiration_processed
+    }
+
     fn check_instrument_expiration(&mut self, timestamp_ns: UnixNanos) {
         if self.expiration_processed {
             return;
@@ -3103,7 +3114,7 @@ impl OrderMatchingEngine {
             .unwrap_or_default();
         let leaves_qty = order.quantity().saturating_sub(filled_qty);
         if leaves_qty.is_zero() {
-            self.cached_filled_qty.swap_remove(&client_order_id);
+            self.purge_cached_filled_qty_if_closed(client_order_id);
             return;
         }
 
@@ -3397,6 +3408,7 @@ impl OrderMatchingEngine {
     /// transient trade price overrides.
     pub fn iterate(&mut self, timestamp_ns: UnixNanos, aggressor_side: AggressorSide) {
         // TODO implement correct clock fixed time setting self.clock.set_time(ts_now);
+        self.purge_closed_cached_filled_qty();
 
         // Only reset bid/ask from book when not processing trade execution
         // (preserves transient trade price override for L2/L3 books). The
@@ -3444,6 +3456,7 @@ impl OrderMatchingEngine {
             };
 
             if order.is_closed() {
+                let _ = self.core.delete_order(client_order_id);
                 self.cached_filled_qty.swap_remove(&client_order_id);
                 continue;
             }
@@ -3515,6 +3528,7 @@ impl OrderMatchingEngine {
         // Process instrument expiration last so orders at the expiration tick
         // get a chance to fill before positions are closed.
         self.check_instrument_expiration(timestamp_ns);
+        self.purge_closed_cached_filled_qty();
     }
 
     fn get_trailing_activation_price(
@@ -3937,6 +3951,11 @@ impl OrderMatchingEngine {
             }
         };
 
+        if order.is_closed() {
+            self.purge_stale_core_entry(client_order_id);
+            return;
+        }
+
         // Convert quote-denominated quantity at fill time for trigger-style market
         // orders that skipped conversion at submission. Idempotent: orders already
         // converted have `is_quote_quantity == false`.
@@ -4067,6 +4086,11 @@ impl OrderMatchingEngine {
                 return;
             }
         };
+
+        if order.is_closed() {
+            self.purge_stale_core_entry(client_order_id);
+            return;
+        }
 
         // Convert quote-denominated quantity at fill time for orders that entered
         // this path still carrying a quote notional (e.g. trailing-stop-limit with
@@ -4437,14 +4461,14 @@ impl OrderMatchingEngine {
             .get(&order.client_order_id())
             .is_some_and(|qty| qty >= &order.quantity());
 
-        if order.is_passive() && (order.is_closed() || fully_filled) {
+        if order.is_closed() || fully_filled {
             if self.core.order_exists(order.client_order_id()) {
                 let _ = self.core.delete_order(order.client_order_id());
             }
             // MarketToLimit reads `cached_filled_qty` in its caller to compute leaves;
             // its own cleanup happens there after the read.
             if order.order_type() != OrderType::MarketToLimit {
-                self.cached_filled_qty.swap_remove(&order.client_order_id());
+                self.purge_cached_filled_qty_if_closed(order.client_order_id());
             }
         }
 
@@ -4566,6 +4590,27 @@ impl OrderMatchingEngine {
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn cached_order_is_closed(&self, client_order_id: ClientOrderId) -> bool {
+        self.cache
+            .borrow()
+            .order(&client_order_id)
+            .is_none_or(|order| order.is_closed())
+    }
+
+    fn purge_cached_filled_qty_if_closed(&mut self, client_order_id: ClientOrderId) {
+        if self.cached_order_is_closed(client_order_id) {
+            self.cached_filled_qty.swap_remove(&client_order_id);
+        }
+    }
+
+    fn purge_closed_cached_filled_qty(&mut self) {
+        let client_order_ids: Vec<ClientOrderId> = self.cached_filled_qty.keys().copied().collect();
+
+        for client_order_id in client_order_ids {
+            self.purge_cached_filled_qty_if_closed(client_order_id);
         }
     }
 

@@ -124,6 +124,17 @@ async def test_account_address_used_for_user_address(exec_client_builder, monkey
     assert client._user_address == agent_account
 
 
+def test_ws_post_timeout_forwarded_to_ws_client(exec_client_builder, monkeypatch):
+    # Arrange & Act
+    _, ws_client, _, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"ws_post_timeout_secs": 7},
+    )
+
+    # Assert
+    ws_client.set_post_timeout.assert_called_once_with(7)
+
+
 @pytest.mark.asyncio
 async def test_connect_success(exec_client_builder, monkeypatch):
     # Arrange
@@ -225,7 +236,7 @@ async def test_generate_order_status_reports_handles_failure(
     monkeypatch,
 ):
     # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     http_client.request_order_status_reports.side_effect = Exception("boom")
 
     command = GenerateOrderStatusReports(
@@ -260,7 +271,7 @@ async def test_generate_order_status_report_forwards_identifiers(
     venue_order_id,
 ):
     # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
 
     expected_report = MagicMock()
     expected_report.client_order_id = client_order_id
@@ -509,8 +520,10 @@ async def test_submit_limit_order(exec_client_builder, monkeypatch, instrument):
         # Act
         await client._submit_order(command)
 
-        # Assert - Hyperliquid uses HTTP for order submission
-        http_client.submit_order.assert_awaited_once()
+        # Assert - Hyperliquid uses WebSocket post for order submission
+        ws_client.submit_order.assert_awaited_once()
+        http_client.submit_order.assert_not_awaited()
+        assert ws_client.submit_order.call_args.args[0] is http_client
     finally:
         await client._disconnect()
 
@@ -524,7 +537,7 @@ async def test_submit_order_rejection(exec_client_builder, monkeypatch, instrume
     await client._connect()
 
     client.generate_order_rejected = MagicMock()
-    http_client.submit_order.side_effect = Exception("Order rejected: Insufficient margin")
+    ws_client.submit_order.side_effect = Exception("Order rejected: Insufficient margin")
 
     order = LimitOrder(
         trader_id=TestIdStubs.trader_id(),
@@ -553,7 +566,8 @@ async def test_submit_order_rejection(exec_client_builder, monkeypatch, instrume
         await client._submit_order(command)
 
         # Assert - Order rejection is emitted with the venue reason
-        http_client.submit_order.assert_awaited_once()
+        ws_client.submit_order.assert_awaited_once()
+        http_client.submit_order.assert_not_awaited()
         client.generate_order_rejected.assert_called_once()
         reason = client.generate_order_rejected.call_args.kwargs["reason"]
         assert "Insufficient margin" in reason
@@ -603,8 +617,10 @@ async def test_cancel_order_by_client_id(
         # Act
         await client._cancel_order(command)
 
-        # Assert - Hyperliquid uses HTTP for order cancellation
-        http_client.cancel_order.assert_awaited_once()
+        # Assert - Hyperliquid uses WebSocket post for order cancellation
+        ws_client.cancel_order.assert_awaited_once()
+        http_client.cancel_order.assert_not_awaited()
+        assert ws_client.cancel_order.call_args.args[0] is http_client
     finally:
         await client._disconnect()
 
@@ -652,7 +668,8 @@ async def test_cancel_order_by_venue_id(
         await client._cancel_order(command)
 
         # Assert
-        http_client.cancel_order.assert_awaited_once()
+        ws_client.cancel_order.assert_awaited_once()
+        http_client.cancel_order.assert_not_awaited()
     finally:
         await client._disconnect()
 
@@ -671,7 +688,7 @@ async def test_cancel_order_rejection(
     await client._connect()
 
     client.generate_order_cancel_rejected = MagicMock()
-    http_client.cancel_order.side_effect = Exception("Order already filled")
+    ws_client.cancel_order.side_effect = Exception("Order already filled")
 
     order = LimitOrder(
         trader_id=TestIdStubs.trader_id(),
@@ -703,7 +720,8 @@ async def test_cancel_order_rejection(
         await client._cancel_order(command)
 
         # Assert - Cancel rejection is emitted with the venue reason
-        http_client.cancel_order.assert_awaited_once()
+        ws_client.cancel_order.assert_awaited_once()
+        http_client.cancel_order.assert_not_awaited()
         client.generate_order_cancel_rejected.assert_called_once()
         reason = client.generate_order_cancel_rejected.call_args.kwargs["reason"]
         assert "Order already filled" in reason
@@ -737,8 +755,117 @@ async def test_cancel_all_orders_no_open_orders(
         # Act
         await client._cancel_all_orders(command)
 
-        # Assert - No orders to cancel means no HTTP calls
+        # Assert - No orders to cancel means no trading post calls
+        ws_client.cancel_order.assert_not_awaited()
+        ws_client.cancel_orders.assert_not_awaited()
         http_client.cancel_order.assert_not_awaited()
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_orders_per_item_error_emits_cancel_rejected(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    # Arrange
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    client.generate_order_cancel_rejected = MagicMock()
+    ws_client.cancel_orders.return_value = [None, "Order already cancelled", None]
+
+    order_a = _make_limit_order(instrument, coid="O-ERR-ALL-A")
+    order_b = _make_limit_order(instrument, coid="O-ERR-ALL-B")
+    order_c = _make_limit_order(instrument, coid="O-ERR-ALL-C")
+    for order, venue_order_id in ((order_a, "7101"), (order_b, "7102"), (order_c, "7103")):
+        _accept_order(order, voi=venue_order_id)
+        cache.add_order(order, None)
+        cache.update_order(order)
+
+    command = CancelAllOrders(
+        trader_id=order_a.trader_id,
+        strategy_id=order_a.strategy_id,
+        instrument_id=instrument.id,
+        order_side=OrderSide.NO_ORDER_SIDE,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        client_id=None,
+    )
+
+    try:
+        # Act
+        await client._cancel_all_orders(command)
+
+        # Assert
+        ws_client.cancel_orders.assert_awaited_once()
+        http_client.cancel_order.assert_not_awaited()
+        assert ws_client.cancel_orders.call_args.args[0] is http_client
+        client.generate_order_cancel_rejected.assert_called_once()
+        call_kwargs = client.generate_order_cancel_rejected.call_args.kwargs
+        assert call_kwargs["client_order_id"] == order_b.client_order_id
+        assert call_kwargs["reason"] == "Order already cancelled"
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_batch_cancel_orders_per_item_error_emits_cancel_rejected(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    # Arrange
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    client.generate_order_cancel_rejected = MagicMock()
+    ws_client.cancel_orders.return_value = [None, "Order already filled"]
+
+    order_a = _make_limit_order(instrument, coid="O-ERR-BATCH-A")
+    order_b = _make_limit_order(instrument, coid="O-ERR-BATCH-B")
+    for order, venue_order_id in ((order_a, "7201"), (order_b, "7202")):
+        _accept_order(order, voi=venue_order_id)
+        cache.add_order(order, None)
+
+    cancels = [
+        CancelOrder(
+            trader_id=order.trader_id,
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            command_id=TestIdStubs.uuid(),
+            ts_init=0,
+            client_id=None,
+        )
+        for order in (order_a, order_b)
+    ]
+    command = BatchCancelOrders(
+        trader_id=order_a.trader_id,
+        strategy_id=order_a.strategy_id,
+        instrument_id=instrument.id,
+        cancels=cancels,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        client_id=None,
+    )
+
+    try:
+        # Act
+        await client._batch_cancel_orders(command)
+
+        # Assert
+        ws_client.cancel_orders.assert_awaited_once()
+        http_client.cancel_order.assert_not_awaited()
+        assert ws_client.cancel_orders.call_args.args[0] is http_client
+        client.generate_order_cancel_rejected.assert_called_once()
+        call_kwargs = client.generate_order_cancel_rejected.call_args.kwargs
+        assert call_kwargs["client_order_id"] == order_b.client_order_id
+        assert call_kwargs["reason"] == "Order already filled"
     finally:
         await client._disconnect()
 
@@ -771,7 +898,7 @@ async def test_submit_stop_market_derives_price_from_trigger(
     Verify limit_px is derived from trigger_price, not the current quote.
     """
     # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     quote = QuoteTick(
@@ -813,8 +940,9 @@ async def test_submit_stop_market_derives_price_from_trigger(
         await client._submit_order(command)
 
         # Assert
-        http_client.submit_order.assert_awaited_once()
-        call_kwargs = http_client.submit_order.call_args.kwargs
+        ws_client.submit_order.assert_awaited_once()
+        http_client.submit_order.assert_not_awaited()
+        call_kwargs = ws_client.submit_order.call_args.kwargs
         submitted_price = Decimal(str(call_kwargs["price"]))
         trigger_price = Decimal(trigger_str)
 
@@ -835,7 +963,7 @@ async def test_submit_stop_market_derives_price_from_trigger(
             actual_decimals = 0
         assert actual_decimals <= instrument.price_precision
 
-        # Trigger price is forwarded to the HTTP client
+        # Trigger price is forwarded to the WebSocket post call
         assert call_kwargs["trigger_price"] is not None
     finally:
         await client._disconnect()
@@ -866,7 +994,7 @@ async def test_submit_stop_market_eth_derives_price_from_trigger(
     """
     # Arrange
     cache.add_instrument(eth_instrument)
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     quote = QuoteTick(
@@ -908,8 +1036,9 @@ async def test_submit_stop_market_eth_derives_price_from_trigger(
         await client._submit_order(command)
 
         # Assert
-        http_client.submit_order.assert_awaited_once()
-        call_kwargs = http_client.submit_order.call_args.kwargs
+        ws_client.submit_order.assert_awaited_once()
+        http_client.submit_order.assert_not_awaited()
+        call_kwargs = ws_client.submit_order.call_args.kwargs
         submitted_price = Decimal(str(call_kwargs["price"]))
         trigger_price = Decimal(trigger_str)
 
@@ -955,7 +1084,7 @@ async def test_submit_market_if_touched_derives_price_from_trigger(
     Verify MarketIfTouched also derives limit_px from trigger_price.
     """
     # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     quote = QuoteTick(
@@ -997,8 +1126,9 @@ async def test_submit_market_if_touched_derives_price_from_trigger(
         await client._submit_order(command)
 
         # Assert
-        http_client.submit_order.assert_awaited_once()
-        call_kwargs = http_client.submit_order.call_args.kwargs
+        ws_client.submit_order.assert_awaited_once()
+        http_client.submit_order.assert_not_awaited()
+        call_kwargs = ws_client.submit_order.call_args.kwargs
         submitted_price = Decimal(str(call_kwargs["price"]))
         trigger_price = Decimal(trigger_str)
 
@@ -1030,7 +1160,7 @@ async def test_submit_order_list_calls_batch_path(
     Verify _submit_order_list uses the batch submit_orders path.
     """
     # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     order = StopMarketOrder(
@@ -1066,8 +1196,10 @@ async def test_submit_order_list_calls_batch_path(
         await client._submit_order_list(command)
 
         # Assert - batch path calls submit_orders, not submit_order
-        http_client.submit_orders.assert_awaited_once()
+        ws_client.submit_orders.assert_awaited_once()
+        http_client.submit_orders.assert_not_awaited()
         http_client.submit_order.assert_not_awaited()
+        assert ws_client.submit_orders.call_args.args[0] is http_client
     finally:
         await client._disconnect()
 
@@ -1080,7 +1212,7 @@ async def test_modify_limit_order(
     cache,
 ):
     # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     order = LimitOrder(
@@ -1115,7 +1247,9 @@ async def test_modify_limit_order(
         await client._modify_order(command)
 
         # Assert
-        http_client.modify_order.assert_awaited_once()
+        ws_client.modify_order.assert_awaited_once()
+        http_client.modify_order.assert_not_awaited()
+        assert ws_client.modify_order.call_args.args[0] is http_client
     finally:
         await client._disconnect()
 
@@ -1132,7 +1266,7 @@ async def test_modify_order_after_partial_fill_sends_remaining_qty(
     remaining quantity (target_total - already_filled), not the absolute total.
     """
     # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     order = LimitOrder(
@@ -1184,8 +1318,9 @@ async def test_modify_order_after_partial_fill_sends_remaining_qty(
         await client._modify_order(command)
 
         # Assert
-        http_client.modify_order.assert_awaited_once()
-        sent_quantity = http_client.modify_order.await_args.kwargs["quantity"]
+        ws_client.modify_order.assert_awaited_once()
+        http_client.modify_order.assert_not_awaited()
+        sent_quantity = ws_client.modify_order.await_args.kwargs["quantity"]
         assert sent_quantity == nautilus_pyo3.Quantity.from_str("0.00060")
         # Marker tracks the user-intended absolute total so the WS
         # cancel-replace promotion can emit OrderUpdated with that value.
@@ -1209,7 +1344,7 @@ async def test_modify_order_rejected_when_target_qty_not_greater_than_filled(
     non-positive replacement size.
     """
     # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     order = LimitOrder(
@@ -1257,7 +1392,8 @@ async def test_modify_order_rejected_when_target_qty_not_greater_than_filled(
         # Act
         await client._modify_order(command)
 
-        # Assert - rejected, no HTTP call
+        # Assert - rejected, no trading post call
+        ws_client.modify_order.assert_not_awaited()
         http_client.modify_order.assert_not_awaited()
         assert order.client_order_id.value not in client._pending_modify_keys
         assert order.client_order_id.value not in client._pending_modify_target_qty
@@ -1272,7 +1408,7 @@ async def test_modify_order_rejected_when_not_in_cache(
     instrument,
 ):
     # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     command = ModifyOrder(
@@ -1292,7 +1428,8 @@ async def test_modify_order_rejected_when_not_in_cache(
         # Act
         await client._modify_order(command)
 
-        # Assert - rejected, no HTTP call
+        # Assert - rejected, no trading post call
+        ws_client.modify_order.assert_not_awaited()
         http_client.modify_order.assert_not_awaited()
     finally:
         await client._disconnect()
@@ -1306,7 +1443,7 @@ async def test_modify_order_rejected_when_no_venue_order_id(
     cache,
 ):
     # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     order = LimitOrder(
@@ -1341,7 +1478,8 @@ async def test_modify_order_rejected_when_no_venue_order_id(
         # Act
         await client._modify_order(command)
 
-        # Assert - rejected, no HTTP call
+        # Assert - rejected, no trading post call
+        ws_client.modify_order.assert_not_awaited()
         http_client.modify_order.assert_not_awaited()
     finally:
         await client._disconnect()
@@ -1358,7 +1496,7 @@ async def test_modify_stop_market_uses_trigger_price_as_fallback(
     StopMarket has no limit price; trigger_price is used as the price field.
     """
     # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     order = StopMarketOrder(
@@ -1394,23 +1532,24 @@ async def test_modify_stop_market_uses_trigger_price_as_fallback(
         await client._modify_order(command)
 
         # Assert
-        http_client.modify_order.assert_awaited_once()
+        ws_client.modify_order.assert_awaited_once()
+        http_client.modify_order.assert_not_awaited()
     finally:
         await client._disconnect()
 
 
 @pytest.mark.asyncio
-async def test_modify_order_rejection_on_http_error(
+async def test_modify_order_rejection_on_ws_error(
     exec_client_builder,
     monkeypatch,
     instrument,
     cache,
 ):
     # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
-    http_client.modify_order.side_effect = Exception("Modify rejected: Invalid order")
+    ws_client.modify_order.side_effect = Exception("Modify rejected: Invalid order")
 
     order = LimitOrder(
         trader_id=TestIdStubs.trader_id(),
@@ -1444,7 +1583,8 @@ async def test_modify_order_rejection_on_http_error(
         await client._modify_order(command)
 
         # Assert - rejection handled internally, no stale in-flight marker
-        http_client.modify_order.assert_awaited_once()
+        ws_client.modify_order.assert_awaited_once()
+        http_client.modify_order.assert_not_awaited()
         assert order.client_order_id.value not in client._pending_modify_keys
         assert order.client_order_id.value not in client._pending_modify_target_qty
     finally:
@@ -1703,19 +1843,19 @@ async def test_modify_order_recovers_after_timed_out_modify(
     cache,
 ):
     """
-    If a modify HTTP call fails (transport timeout or wrapped error) but the exchange
-    actually accepted the modify, the eventual WS ACCEPTED(new_voi) must still be
-    translated into an OrderUpdated.
+    If a modify WebSocket post fails (transport timeout or wrapped error) but the
+    exchange actually accepted the modify, the eventual WS ACCEPTED(new_voi) must still
+    be translated into an OrderUpdated.
 
     The adapter relies purely on the cached venue_order_id diverging from the report's
     venue_order_id, so no in-flight state tracking is needed.
 
     """
     # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, _, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
-    http_client.modify_order.side_effect = ValueError(
+    ws_client.modify_order.side_effect = ValueError(
         "error sending request for url (...): operation timed out",
     )
 
@@ -1789,8 +1929,8 @@ async def test_modify_order_cancel_replace_handles_cancel_before_accept(
     for an in-flight modify, the adapter must suppress the old leg's cancel and still
     route the subsequent ACCEPTED as OrderUpdated.
 
-    The pending-modify marker is populated before the modify HTTP call and cleared on
-    failure, so the race branch never fires on a failed modify.
+    The pending-modify marker is populated before the modify WebSocket post and cleared
+    on failure, so the race branch never fires on a failed modify.
 
     """
     # Arrange
@@ -1851,7 +1991,7 @@ async def test_modify_order_cancel_replace_handles_cancel_before_accept(
     )
 
     try:
-        # Act - modify call populates the pending marker before the HTTP await
+        # Act - modify call populates the pending marker before the WebSocket post await
         await client._modify_order(modify_command)
         assert client._pending_modify_keys[order.client_order_id.value] == old_voi.value
 
@@ -2175,8 +2315,9 @@ async def test_submit_order_list_converts_to_pyo3(
         await client._submit_order_list(command)
 
         # Assert
-        http_client.submit_orders.assert_awaited_once()
-        submitted = http_client.submit_orders.call_args[0][0]
+        ws_client.submit_orders.assert_awaited_once()
+        http_client.submit_orders.assert_not_awaited()
+        submitted = ws_client.submit_orders.call_args[0][1]
 
         assert len(submitted) == 3
         assert isinstance(submitted[0], nautilus_pyo3.MarketOrder)
@@ -2726,6 +2867,398 @@ async def test_buffered_fills_cleared_on_terminal_cleanup(
         await client._disconnect()
 
 
+def _build_order_accepted_pyo3(client, instrument, client_order_id, venue_order_id):
+    return nautilus_pyo3.OrderAccepted(
+        trader_id=nautilus_pyo3.TraderId(TestIdStubs.trader_id().value),
+        strategy_id=nautilus_pyo3.StrategyId(TestIdStubs.strategy_id().value),
+        instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument.id.value),
+        client_order_id=nautilus_pyo3.ClientOrderId(client_order_id.value),
+        venue_order_id=nautilus_pyo3.VenueOrderId(venue_order_id),
+        account_id=nautilus_pyo3.AccountId(client.account_id.value),
+        event_id=nautilus_pyo3.UUID4(),
+        ts_event=0,
+        ts_init=0,
+        reconciliation=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_fill_report_buffers_when_order_not_in_cache(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    """
+    A FillReport arriving before the order has been added to the local cache must be
+    buffered in `_pending_fills` rather than dropped, so it can be replayed once the
+    order becomes known.
+    """
+    # Arrange
+    client, _, _, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    cid = ClientOrderId("O-PENDING-001")
+    # Force the non-external path while the cache has no order, exercising the race.
+    monkeypatch.setattr(client, "_is_external_order", lambda _: False)
+
+    captured: list = []
+    monkeypatch.setattr(client, "_send_order_event", lambda event: captured.append(event))
+
+    fill = _build_fill_report_pyo3(
+        client,
+        instrument,
+        cid,
+        "9400",
+        "T-PENDING-1",
+        "0.00020",
+        "56730.0",
+    )
+
+    try:
+        # Act
+        client._handle_fill_report_pyo3(fill)
+
+        # Assert
+        assert captured == []
+        assert client._pending_fills[cid.value] == [fill]
+        assert "T-PENDING-1" not in client._processed_trade_ids
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_order_accepted_drains_pending_fill(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    """
+    The dedicated OrderAccepted WS event must drain any FillReport that was buffered
+    while the order was not yet in cache, producing OrderFilled in order.
+    """
+    # Arrange
+    client, _, _, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-PENDING-002"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.00020"),
+        price=Price.from_str("56730.0"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    voi = VenueOrderId("9410")
+    captured: list = []
+    monkeypatch.setattr(client, "_send_order_event", lambda event: captured.append(event))
+
+    fill = _build_fill_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+        "T-PENDING-2",
+        "0.00020",
+        "56730.0",
+    )
+    accepted_msg = _build_order_accepted_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+    )
+
+    try:
+        monkeypatch.setattr(client, "_is_external_order", lambda _: False)
+
+        # Act 1: fill arrives before order known, buffered.
+        client._handle_fill_report_pyo3(fill)
+        assert client._pending_fills[order.client_order_id.value] == [fill]
+
+        # Act 2: order is now added to cache; OrderAccepted drains the buffer.
+        cache.add_order(order, None)
+        client._handle_order_accepted_pyo3(accepted_msg)
+
+        # Assert
+        filled_events = [e for e in captured if isinstance(e, OrderFilled)]
+        assert len(filled_events) == 1
+        assert filled_events[0].venue_order_id == voi
+        assert filled_events[0].trade_id.value == "T-PENDING-2"
+        assert order.client_order_id.value not in client._pending_fills
+        assert "T-PENDING-2" in client._processed_trade_ids
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_order_status_accepted_drains_pending_fill(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    """
+    The ACCEPTED branch of OrderStatusReport must drain any FillReport buffered while
+    the order was not yet in cache.
+    """
+    # Arrange
+    client, _, _, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-PENDING-003"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.00020"),
+        price=Price.from_str("56730.0"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    voi = VenueOrderId("9420")
+    captured: list = []
+    monkeypatch.setattr(client, "_send_order_event", lambda event: captured.append(event))
+
+    fill = _build_fill_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+        "T-PENDING-3",
+        "0.00020",
+        "56730.0",
+    )
+    accepted_report = _build_status_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+        nautilus_pyo3.OrderStatus.ACCEPTED,
+        price="56730.0",
+        quantity="0.00020",
+    )
+
+    try:
+        monkeypatch.setattr(client, "_is_external_order", lambda _: False)
+
+        # Act 1: fill arrives before order known, buffered.
+        client._handle_fill_report_pyo3(fill)
+        assert client._pending_fills[order.client_order_id.value] == [fill]
+
+        # Act 2: order is now in cache; OrderStatusReport(ACCEPTED) drains.
+        cache.add_order(order, None)
+        client._handle_order_status_report_pyo3(accepted_report)
+
+        # Assert
+        filled_events = [e for e in captured if isinstance(e, OrderFilled)]
+        assert len(filled_events) == 1
+        assert filled_events[0].venue_order_id == voi
+        assert filled_events[0].trade_id.value == "T-PENDING-3"
+        assert order.client_order_id.value not in client._pending_fills
+        assert "T-PENDING-3" in client._processed_trade_ids
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_inline_auto_accept_drains_pending_fill(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    """
+    When a later FillReport arrives and finds the order in cache but not yet accepted in
+    the local state machine, the inline auto-accept path must drain any previously
+    buffered FillReports for the same order.
+    """
+    # Arrange
+    client, _, _, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-PENDING-004"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.00040"),
+        price=Price.from_str("56730.0"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    voi = VenueOrderId("9430")
+    captured: list = []
+    monkeypatch.setattr(client, "_send_order_event", lambda event: captured.append(event))
+
+    fill_a = _build_fill_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+        "T-PENDING-4A",
+        "0.00020",
+        "56730.0",
+    )
+    fill_b = _build_fill_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+        "T-PENDING-4B",
+        "0.00020",
+        "56735.0",
+    )
+
+    try:
+        monkeypatch.setattr(client, "_is_external_order", lambda _: False)
+
+        # Act 1: fill A arrives before order known, buffered.
+        client._handle_fill_report_pyo3(fill_a)
+        assert client._pending_fills[order.client_order_id.value] == [fill_a]
+
+        # Act 2: order is now in cache; fill B finds order and triggers inline drain.
+        cache.add_order(order, None)
+        client._handle_fill_report_pyo3(fill_b)
+
+        # Assert: both fills processed, A before B (drain runs before B's own emit).
+        filled_events = [e for e in captured if isinstance(e, OrderFilled)]
+        assert len(filled_events) == 2
+        assert filled_events[0].trade_id.value == "T-PENDING-4A"
+        assert filled_events[1].trade_id.value == "T-PENDING-4B"
+        assert order.client_order_id.value not in client._pending_fills
+        assert "T-PENDING-4A" in client._processed_trade_ids
+        assert "T-PENDING-4B" in client._processed_trade_ids
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_multiple_pending_fills_drained_in_arrival_order(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    """
+    Multiple FillReports buffered while the order is not in cache must be re-dispatched
+    in arrival order so the engine observes the correct cumulative fill sequence.
+    """
+    # Arrange
+    client, _, _, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-PENDING-MULTI"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.00040"),
+        price=Price.from_str("56730.0"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    voi = VenueOrderId("9440")
+    captured: list = []
+    monkeypatch.setattr(client, "_send_order_event", lambda event: captured.append(event))
+
+    fill_a = _build_fill_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+        "T-PENDING-MA",
+        "0.00010",
+        "56720.0",
+    )
+    fill_b = _build_fill_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+        "T-PENDING-MB",
+        "0.00010",
+        "56725.0",
+    )
+    accepted_msg = _build_order_accepted_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        voi.value,
+    )
+
+    try:
+        monkeypatch.setattr(client, "_is_external_order", lambda _: False)
+
+        # Act 1: two fills arrive, both buffered.
+        client._handle_fill_report_pyo3(fill_a)
+        client._handle_fill_report_pyo3(fill_b)
+        assert len(client._pending_fills[order.client_order_id.value]) == 2
+
+        # Act 2: order added, OrderAccepted drains both in order.
+        cache.add_order(order, None)
+        client._handle_order_accepted_pyo3(accepted_msg)
+
+        # Assert
+        filled_events = [e for e in captured if isinstance(e, OrderFilled)]
+        assert len(filled_events) == 2
+        assert filled_events[0].trade_id.value == "T-PENDING-MA"
+        assert filled_events[0].last_px == Price.from_str("56720.0")
+        assert filled_events[1].trade_id.value == "T-PENDING-MB"
+        assert filled_events[1].last_px == Price.from_str("56725.0")
+        assert order.client_order_id.value not in client._pending_fills
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_pending_fills_cleared_on_terminal_cleanup(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    """
+    Terminal cleanup must drop any pending fills so a stranded entry cannot outlive the
+    cloid mapping it was keyed on.
+    """
+    # Arrange
+    client, _, _, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    cid = ClientOrderId("O-PENDING-005")
+    fill = _build_fill_report_pyo3(
+        client,
+        instrument,
+        cid,
+        "9450",
+        "T-PENDING-5",
+        "0.00020",
+        "56730.0",
+    )
+    client._pending_fills[cid.value] = [fill]
+
+    try:
+        # Act
+        client._cleanup_cloid_mapping(cid)
+
+        # Assert
+        assert cid.value not in client._pending_fills
+    finally:
+        await client._disconnect()
+
+
 @pytest.mark.parametrize(
     ("exc", "expected"),
     [
@@ -2782,11 +3315,11 @@ async def test_submit_order_transport_failure_does_not_reject(
     instrument,
     exc,
 ):
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     client.generate_order_rejected = MagicMock()
-    http_client.submit_order.side_effect = exc
+    ws_client.submit_order.side_effect = exc
 
     order = _make_limit_order(instrument, coid="O-TXP-SUBMIT")
     command = SubmitOrder(
@@ -2802,7 +3335,8 @@ async def test_submit_order_transport_failure_does_not_reject(
     try:
         await client._submit_order(command)
 
-        http_client.submit_order.assert_awaited_once()
+        ws_client.submit_order.assert_awaited_once()
+        http_client.submit_order.assert_not_awaited()
         client.generate_order_rejected.assert_not_called()
         assert order.client_order_id.value not in client._terminal_orders
     finally:
@@ -2817,11 +3351,11 @@ async def test_submit_order_list_transport_failure_does_not_reject(
     instrument,
     exc,
 ):
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     client.generate_order_rejected = MagicMock()
-    http_client.submit_orders.side_effect = exc
+    ws_client.submit_orders.side_effect = exc
 
     order = _make_limit_order(instrument, coid="O-TXP-LIST")
     order_list = OrderList(order_list_id=OrderListId("OL-TXP"), orders=[order])
@@ -2838,7 +3372,8 @@ async def test_submit_order_list_transport_failure_does_not_reject(
     try:
         await client._submit_order_list(command)
 
-        http_client.submit_orders.assert_awaited_once()
+        ws_client.submit_orders.assert_awaited_once()
+        http_client.submit_orders.assert_not_awaited()
         client.generate_order_rejected.assert_not_called()
         assert order.client_order_id.value not in client._terminal_orders
     finally:
@@ -2854,11 +3389,11 @@ async def test_cancel_order_transport_failure_does_not_reject(
     cache,
     exc,
 ):
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     client.generate_order_cancel_rejected = MagicMock()
-    http_client.cancel_order.side_effect = exc
+    ws_client.cancel_order.side_effect = exc
 
     order = _make_limit_order(instrument, coid="O-TXP-CANCEL")
     _accept_order(order, voi="9001")
@@ -2878,7 +3413,8 @@ async def test_cancel_order_transport_failure_does_not_reject(
     try:
         await client._cancel_order(command)
 
-        http_client.cancel_order.assert_awaited_once()
+        ws_client.cancel_order.assert_awaited_once()
+        http_client.cancel_order.assert_not_awaited()
         client.generate_order_cancel_rejected.assert_not_called()
     finally:
         await client._disconnect()
@@ -2893,11 +3429,11 @@ async def test_cancel_all_orders_transport_failure_does_not_reject(
     cache,
     exc,
 ):
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     client.generate_order_cancel_rejected = MagicMock()
-    http_client.cancel_order.side_effect = exc
+    ws_client.cancel_orders.side_effect = exc
 
     order_a = _make_limit_order(instrument, coid="O-TXP-ALL-A")
     order_b = _make_limit_order(instrument, coid="O-TXP-ALL-B")
@@ -2921,7 +3457,9 @@ async def test_cancel_all_orders_transport_failure_does_not_reject(
     try:
         await client._cancel_all_orders(command)
 
-        assert http_client.cancel_order.await_count == 2
+        ws_client.cancel_orders.assert_awaited_once()
+        ws_client.cancel_order.assert_not_awaited()
+        http_client.cancel_order.assert_not_awaited()
         client.generate_order_cancel_rejected.assert_not_called()
     finally:
         await client._disconnect()
@@ -2936,11 +3474,11 @@ async def test_batch_cancel_orders_transport_failure_does_not_reject(
     cache,
     exc,
 ):
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     client.generate_order_cancel_rejected = MagicMock()
-    http_client.cancel_order.side_effect = exc
+    ws_client.cancel_orders.side_effect = exc
 
     order_a = _make_limit_order(instrument, coid="O-TXP-BATCH-A")
     order_b = _make_limit_order(instrument, coid="O-TXP-BATCH-B")
@@ -2975,7 +3513,9 @@ async def test_batch_cancel_orders_transport_failure_does_not_reject(
     try:
         await client._batch_cancel_orders(command)
 
-        assert http_client.cancel_order.await_count == 2
+        ws_client.cancel_orders.assert_awaited_once()
+        ws_client.cancel_order.assert_not_awaited()
+        http_client.cancel_order.assert_not_awaited()
         client.generate_order_cancel_rejected.assert_not_called()
     finally:
         await client._disconnect()
@@ -2990,11 +3530,11 @@ async def test_modify_order_transport_failure_preserves_pending_state(
     cache,
     exc,
 ):
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
     await client._connect()
 
     client.generate_order_modify_rejected = MagicMock()
-    http_client.modify_order.side_effect = exc
+    ws_client.modify_order.side_effect = exc
 
     order = _make_limit_order(instrument, coid="O-TXP-MODIFY")
     _accept_order(order, voi="9301")
@@ -3017,7 +3557,8 @@ async def test_modify_order_transport_failure_preserves_pending_state(
     try:
         await client._modify_order(command)
 
-        http_client.modify_order.assert_awaited_once()
+        ws_client.modify_order.assert_awaited_once()
+        http_client.modify_order.assert_not_awaited()
         client.generate_order_modify_rejected.assert_not_called()
         assert (
             client._pending_modify_keys[order.client_order_id.value] == order.venue_order_id.value
@@ -3025,3 +3566,68 @@ async def test_modify_order_transport_failure_preserves_pending_state(
         assert client._pending_modify_target_qty[order.client_order_id.value] == target_qty
     finally:
         await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_split_outcome_forwards_to_http_client(exec_client_builder, monkeypatch):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    response = await client._split_outcome(outcome=50, amount=Decimal("1.5"))
+
+    http_client.submit_split_outcome.assert_awaited_once_with(50, Decimal("1.5"))
+    assert response == '{"status":"ok","response":{"type":"default"}}'
+
+
+@pytest.mark.asyncio
+async def test_merge_outcome_defaults_amount_to_none(exec_client_builder, monkeypatch):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    await client._merge_outcome(outcome=7)
+
+    http_client.submit_merge_outcome.assert_awaited_once_with(7, None)
+
+
+@pytest.mark.asyncio
+async def test_merge_outcome_passes_amount(exec_client_builder, monkeypatch):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    await client._merge_outcome(outcome=7, amount=Decimal("0.5"))
+
+    http_client.submit_merge_outcome.assert_awaited_once_with(7, Decimal("0.5"))
+
+
+@pytest.mark.asyncio
+async def test_merge_question_defaults_amount_to_none(exec_client_builder, monkeypatch):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    await client._merge_question(question=9)
+
+    http_client.submit_merge_question.assert_awaited_once_with(9, None)
+
+
+@pytest.mark.asyncio
+async def test_merge_question_passes_amount(exec_client_builder, monkeypatch):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    await client._merge_question(question=9, amount=Decimal("2.0"))
+
+    http_client.submit_merge_question.assert_awaited_once_with(9, Decimal("2.0"))
+
+
+@pytest.mark.asyncio
+async def test_negate_outcome_forwards_all_args(exec_client_builder, monkeypatch):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    await client._negate_outcome(question=9, outcome=52, amount=Decimal("1.0"))
+
+    http_client.submit_negate_outcome.assert_awaited_once_with(9, 52, Decimal("1.0"))
+
+
+@pytest.mark.asyncio
+async def test_split_outcome_propagates_http_errors(exec_client_builder, monkeypatch):
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    http_client.submit_split_outcome.side_effect = RuntimeError("rate limited")
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        await client._split_outcome(outcome=50, amount=Decimal("1.0"))

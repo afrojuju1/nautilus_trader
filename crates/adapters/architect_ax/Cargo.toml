@@ -45,6 +45,11 @@ extension-module = [
   "python",
 ]
 
+[package.metadata.cargo-machete]
+ignored = [
+  "nautilus-system",
+] # Optional dep activated only via the python feature
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
@@ -94,6 +99,7 @@ axum = { workspace = true }
 criterion = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
+toml = { workspace = true }
 
 # cargo bench -p nautilus-architect-ax --bench deserialization
 [[bench]]

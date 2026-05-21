@@ -39,7 +39,7 @@ pub use crate::common::{
     enums::DeribitInstrumentState,
     rpc::{DeribitJsonRpcError, DeribitJsonRpcRequest, DeribitJsonRpcResponse},
 };
-use crate::websocket::error::DeribitWsError;
+use crate::{common::models::DeribitTradeLeg, websocket::error::DeribitWsError};
 
 /// JSON-RPC subscription notification from Deribit.
 #[derive(Debug, Clone, Deserialize)]
@@ -172,8 +172,14 @@ pub struct DeribitTradeMsg {
     pub combo_trade_id: Option<String>,
     /// Block trade ID.
     pub block_trade_id: Option<String>,
+    /// Block RFQ ID (if the trade originated from a Block RFQ).
+    #[serde(default)]
+    pub block_rfq_id: Option<i64>,
     /// Combo ID.
     pub combo_id: Option<String>,
+    /// Per-leg trades when this is the parent combo trade.
+    #[serde(default)]
+    pub legs: Option<Vec<DeribitTradeLeg>>,
 }
 
 /// Order book data from book.{instrument}.{interval} or book.{instrument}.{group}.{depth}.{interval} channels.
@@ -369,6 +375,17 @@ pub struct DeribitPerpetualMsg {
     pub interest: Decimal,
     /// Timestamp in milliseconds since Unix epoch.
     pub timestamp: u64,
+}
+
+/// Volatility index data from the `deribit_volatility_index.{index_name}` channel.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeribitVolatilityIndexMsg {
+    /// Timestamp in milliseconds since Unix epoch.
+    pub timestamp: u64,
+    /// Current volatility index value.
+    pub volatility: f64,
+    /// Index identifier (for example `"btc_usd"`).
+    pub index_name: String,
 }
 
 /// Chart/OHLC bar data from chart.trades.{instrument}.{resolution} channel.
@@ -1004,5 +1021,19 @@ mod tests {
             Some("ETH-25DEC25")
         );
         assert_eq!(extract_instrument_from_channel("platform_state"), None);
+    }
+
+    #[rstest]
+    fn test_parse_volatility_index_payload() {
+        let value = serde_json::json!({
+            "timestamp": 1619777946007_u64,
+            "volatility": 129.36_f64,
+            "index_name": "btc_usd",
+        });
+
+        let payload: DeribitVolatilityIndexMsg = serde_json::from_value(value).unwrap();
+        assert_eq!(payload.index_name, "btc_usd");
+        assert_eq!(payload.volatility, 129.36);
+        assert_eq!(payload.timestamp, 1619777946007_u64);
     }
 }

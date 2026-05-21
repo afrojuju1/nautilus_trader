@@ -1120,6 +1120,7 @@ impl PyCache {
         self.0
             .borrow_mut()
             .snapshot_position(&position_obj)
+            .map(|_| ())
             .map_err(to_pyvalue_err)
     }
 
@@ -1572,10 +1573,11 @@ impl Cache {
     fn py_snapshot_position(&mut self, py: Python, position: Py<PyAny>) -> PyResult<()> {
         let position_obj = position.extract::<Position>(py)?;
         self.snapshot_position(&position_obj)
+            .map(|_| ())
             .map_err(to_pyvalue_err)
     }
 
-    /// Returns a reference to the position with the `position_id` (if found).
+    /// Returns a borrow of the position with the `position_id` (if found).
     #[pyo3(name = "position")]
     fn py_position(&self, py: Python, position_id: PositionId) -> PyResult<Option<Py<PyAny>>> {
         match self.position(&position_id) {
@@ -2311,7 +2313,7 @@ impl Cache {
         self.exec_spawn_total_leaves_qty(&exec_spawn_id, active_only)
     }
 
-    /// Returns a reference to the position for the `client_order_id` (if found).
+    /// Returns a borrow of the position for the `client_order_id` (if found).
     #[pyo3(name = "position_for_order")]
     fn py_position_for_order(
         &self,
@@ -2330,7 +2332,11 @@ impl Cache {
         self.position_id(&client_order_id).copied()
     }
 
-    /// Returns a reference to all positions matching the optional filter parameters.
+    /// Returns borrows of all positions matching the optional filter parameters.
+    ///
+    /// Each `PositionRef` in the returned vector borrows its underlying cell; mutating any of
+    /// those positions while the vector is alive will panic at runtime. Drop the vector before
+    /// issuing writes.
     #[pyo3(name = "positions")]
     fn py_positions(
         &self,
@@ -2353,7 +2359,7 @@ impl Cache {
         .collect()
     }
 
-    /// Returns a reference to all open positions matching the optional filter parameters.
+    /// Returns borrows of all open positions matching the optional filter parameters.
     #[pyo3(name = "positions_open")]
     fn py_positions_open(
         &self,
@@ -2376,7 +2382,7 @@ impl Cache {
         .collect()
     }
 
-    /// Returns a reference to all closed positions matching the optional filter parameters.
+    /// Returns borrows of all closed positions matching the optional filter parameters.
     #[pyo3(name = "positions_closed")]
     fn py_positions_closed(
         &self,
@@ -2438,7 +2444,7 @@ impl Cache {
             .collect()
     }
 
-    /// Returns a reference to the account for the `account_id` (if found).
+    /// Returns a borrow of the account for the `account_id` (if found).
     #[pyo3(name = "account")]
     fn py_account(&self, py: Python, account_id: AccountId) -> PyResult<Option<Py<PyAny>>> {
         match self.account(&account_id) {
@@ -2447,7 +2453,7 @@ impl Cache {
         }
     }
 
-    /// Returns a reference to the account for the `venue` (if found).
+    /// Returns a borrow of the account for the `venue` (if found).
     #[pyo3(name = "account_for_venue")]
     fn py_account_for_venue(&self, py: Python, venue: Venue) -> PyResult<Option<Py<PyAny>>> {
         match self.account_for_venue(&venue) {

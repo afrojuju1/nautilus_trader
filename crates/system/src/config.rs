@@ -25,9 +25,7 @@ use nautilus_execution::engine::config::ExecutionEngineConfig;
 use nautilus_model::identifiers::TraderId;
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
-
-#[cfg(feature = "event_store")]
-use crate::event_store::EventStoreConfig;
+use serde::{Deserialize, Serialize};
 
 /// Configuration trait for a `NautilusKernel` core system instance.
 pub trait NautilusKernelConfig: Debug {
@@ -69,15 +67,6 @@ pub trait NautilusKernelConfig: Debug {
     fn portfolio(&self) -> Option<PortfolioConfig>;
     /// Returns the configuration for streaming to feather files.
     fn streaming(&self) -> Option<StreamingConfig>;
-    /// Returns the configuration for the event store, when run-lifecycle capture is
-    /// enabled.
-    ///
-    /// Returning `None` disables the event-store boot path; the kernel runs without
-    /// opening a run, recovering predecessors, or sealing on stop.
-    #[cfg(feature = "event_store")]
-    fn event_store(&self) -> Option<EventStoreConfig> {
-        None
-    }
 }
 
 /// Basic implementation of `NautilusKernelConfig` for builder and testing.
@@ -132,9 +121,6 @@ pub struct KernelConfig {
     pub portfolio: Option<PortfolioConfig>,
     /// The configuration for streaming to feather files.
     pub streaming: Option<StreamingConfig>,
-    /// The configuration for the event store; `None` disables run-lifecycle capture.
-    #[cfg(feature = "event_store")]
-    pub event_store: Option<EventStoreConfig>,
 }
 
 impl NautilusKernelConfig for KernelConfig {
@@ -213,11 +199,6 @@ impl NautilusKernelConfig for KernelConfig {
     fn streaming(&self) -> Option<StreamingConfig> {
         self.streaming.clone()
     }
-
-    #[cfg(feature = "event_store")]
-    fn event_store(&self) -> Option<EventStoreConfig> {
-        self.event_store.clone()
-    }
 }
 
 impl Default for KernelConfig {
@@ -227,7 +208,8 @@ impl Default for KernelConfig {
 }
 
 /// Configuration for file rotation in streaming output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RotationConfig {
     /// Rotate based on file size.
     Size {
@@ -251,7 +233,8 @@ pub enum RotationConfig {
 }
 
 /// Configuration for streaming live or backtest runs to the catalog in feather format.
-#[derive(Debug, Clone, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(deny_unknown_fields)]
 pub struct StreamingConfig {
     /// The path to the data catalog.
     pub catalog_path: String,
@@ -282,5 +265,56 @@ impl StreamingConfig {
             replace_existing,
             rotation_config,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_streaming_config_toml_round_trip() {
+        let config: StreamingConfig = toml::from_str(
+            r#"
+catalog_path = "/data/catalog"
+fs_protocol = "file"
+flush_interval_ms = 1000
+replace_existing = false
+
+[rotation_config.size]
+max_size = 1048576
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.catalog_path, "/data/catalog");
+        assert_eq!(config.fs_protocol, "file");
+        assert_eq!(config.flush_interval_ms, 1000);
+        assert!(!config.replace_existing);
+        assert!(matches!(
+            config.rotation_config,
+            RotationConfig::Size {
+                max_size: 1_048_576
+            }
+        ));
+    }
+
+    #[rstest]
+    fn test_streaming_config_with_no_rotation_toml() {
+        let config: StreamingConfig = toml::from_str(
+            r#"
+catalog_path = "/data/catalog"
+fs_protocol = "file"
+flush_interval_ms = 500
+replace_existing = true
+rotation_config = "no_rotation"
+"#,
+        )
+        .unwrap();
+
+        assert!(matches!(config.rotation_config, RotationConfig::NoRotation));
+        assert!(config.replace_existing);
     }
 }

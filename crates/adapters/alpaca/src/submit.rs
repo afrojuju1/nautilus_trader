@@ -115,6 +115,7 @@ pub fn build_simple_submit_order(request: SimpleSubmitOrderRequest) -> anyhow::R
         None,
         UUID4::new(),
         request.ts_init,
+        None,
     ))
 }
 
@@ -186,6 +187,7 @@ pub fn build_mleg_submit_order_list(
         None,
         UUID4::new(),
         request.ts_init,
+        None,
     ))
 }
 

@@ -3204,6 +3204,7 @@ mod tests {
             None,
             UUID4::new(),
             UnixNanos::from(1),
+            None,
         )
     }
 }

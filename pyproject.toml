@@ -1,6 +1,6 @@
 [project]
 name = "nautilus_trader"
-version = "1.227.0"
+version = "1.228.0"
 description = "Production-grade Rust-native trading engine with deterministic event-driven architecture"
 authors = [{ name = "Nautech Systems", email = "info@nautechsystems.io" }]
 classifiers = [
@@ -31,7 +31,7 @@ dependencies = [
   "pandas>=2.3.3,<3.0.0",
   "portion>=2.6.1",
   "pyarrow>=23.0.1",
-  "pytz>=2026.1.0",
+  "pytz>=2026.2",
   "tqdm>=4.67.3,<5.0.0",
   "uvloop==0.22.1,<1.0.0; sys_platform != \"win32\"", # Pinned to 0.22.1 for stability
 ]
@@ -91,17 +91,17 @@ visualization = [
 [dependency-groups]
 dev = [
   "cython==3.2.4", # Pinned to 3.2.4 for stability
-  "jupytext>=1.19.1,<2.0.0",
+  "jupytext>=1.19.2,<2.0.0",
   "setuptools>=82",
   "mypy==1.20.2,<2.0.0", # Pinned to 1.20.2 (keep in line with .pre-commit-config.yaml)
   "pandas-stubs>=2.3.3,<3.0.0",
-  "ruff==0.15.12", # Pinned to 0.15.12 (keep in line with .pre-commit-config.yaml)
+  "ruff==0.15.13", # Pinned to 0.15.13 (keep in line with .pre-commit-config.yaml)
   "types-pytz>=2026.1,<2027.0",
   "types-toml>=0.10.2,<1.0.0",
 ]
 test = [
   "aiohttp==3.13.5,<4.0.0", # Pinned to 3.13.5 for stability
-  "coverage>=7.13.5,<8.0.0",
+  "coverage>=7.14.0,<8.0.0",
   "pytest>=7.4.4,<8.0.0", # Intentionally held at 7.x
   "pytest-aiohttp>=1.1.0,<2.0.0",
   "pytest-asyncio==0.23.8", # Pinned to 0.23.8 for stability
@@ -121,7 +121,7 @@ docs = [
 ]
 
 [tool.uv]
-required-version = "==0.11.12"
+required-version = "==0.11.14"
 exclude-newer = "3 days"
 # Block sdist builds for every third-party package in uv.lock so unexpected loss
 # of wheel publishing fails `uv lock` instead of silently building from source.

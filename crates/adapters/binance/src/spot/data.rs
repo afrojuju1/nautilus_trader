@@ -118,6 +118,14 @@ impl BinanceSpotDataClient {
             config.environment,
             product_type,
         )
+        .inspect_err(|e| {
+            log::warn!(
+                "Failed to resolve Binance API credentials ({e}). \
+                 SBE WebSocket streams require an Ed25519 API key. \
+                 Set the appropriate env vars for your environment, \
+                 or provide api_key/api_secret in the data client config"
+            );
+        })
         .ok();
 
         // SBE streams require Ed25519 authentication
@@ -208,6 +216,12 @@ impl BinanceSpotDataClient {
                     Self::send_data(data_sender, Data::Deltas(OrderBookDeltas_API::new(deltas)));
                 }
             }
+            BinanceSpotWsMessage::ServerShutdown(ref msg) => {
+                log::warn!(
+                    "Binance server shutdown notice (event_time={}); disconnect expected within ~10 minutes",
+                    msg.event_time,
+                );
+            }
             BinanceSpotWsMessage::RawBinary(data) => {
                 log::debug!("Unhandled binary message: {} bytes", data.len());
             }
@@ -285,6 +299,14 @@ impl DataClient for BinanceSpotDataClient {
     async fn connect(&mut self) -> anyhow::Result<()> {
         if self.is_connected() {
             return Ok(());
+        }
+
+        if !self.ws_client.has_credentials() {
+            anyhow::bail!(
+                "Binance SBE WebSocket requires Ed25519 API credentials. \
+                 Set the appropriate env vars for your environment, \
+                 or provide api_key/api_secret in the data client config"
+            );
         }
 
         // Reinitialize token in case of reconnection after disconnect

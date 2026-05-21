@@ -95,7 +95,7 @@ pub(super) struct OKXWsFeedHandler {
 
 impl OKXWsFeedHandler {
     /// Creates a new [`OKXWsFeedHandler`] instance.
-    pub fn new(
+    pub(super) fn new(
         signal: Arc<AtomicBool>,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
         raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
@@ -562,7 +562,8 @@ impl OKXWsFeedHandler {
                 None
             }
             Message::Binary(msg) => {
-                log::debug!("Raw binary: {msg:?}");
+                log::debug!("Raw binary frame ({} bytes)", msg.len());
+                log::trace!("Raw binary: {msg:?}");
                 None
             }
             Message::Close(_) => {

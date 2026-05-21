@@ -46,8 +46,10 @@ pub mod entry;
 pub mod error;
 pub mod hash;
 pub mod headers;
+pub mod kernel;
 pub mod manifest;
 pub mod reader;
+pub mod replay;
 pub mod snapshot;
 pub mod verifier;
 pub mod writer;
@@ -59,17 +61,31 @@ pub use backend::{
 };
 pub use capture::{
     BusCaptureAdapter, CaptureError, Encode, EncodeError, EncodedPayload, EncoderRegistry,
-    PAYLOAD_TYPE_ACCOUNT_STATE, PAYLOAD_TYPE_ORDER_FILLED, PAYLOAD_TYPE_ORDER_STATUS_REPORT,
+    PAYLOAD_TYPE_ACCOUNT_STATE, PAYLOAD_TYPE_FILL_REPORT, PAYLOAD_TYPE_ORDER_FILLED,
+    PAYLOAD_TYPE_ORDER_STATUS_REPORT, PAYLOAD_TYPE_POSITION_STATUS_REPORT,
     PAYLOAD_TYPE_SUBMIT_ORDER, TypedEncoder, default_registry, encode_account_state,
-    encode_order_filled, encode_order_status_report, encode_submit_order, register_default,
+    encode_fill_report, encode_order_filled, encode_order_status_report,
+    encode_position_status_report, encode_submit_order, register_default,
 };
 pub use entry::{EventStoreEntry, PayloadType, Topic};
 pub use error::EventStoreError;
 pub use hash::{EntryHash, compute_entry_hash};
 pub use headers::Headers;
-pub use manifest::{RegisteredComponents, RunId, RunManifest, RunStatus};
-pub use reader::{DEFAULT_SCAN_CHUNK_SIZE, EventStoreReader, RangeScan};
-pub use snapshot::SnapshotAnchor;
+pub use kernel::{
+    BootError, EventStoreConfig, EventStoreLifecycle, EventStoreSession, HaltSignal, KernelError,
+    RecoveredRun, RecoveryOutcome, RetentionMode, RunIdentity, build_run_id, open_run,
+    recover_predecessors,
+};
+pub use manifest::{RunId, RunManifest, RunStatus};
+pub use nautilus_system::RegisteredComponents;
+pub use reader::{DEFAULT_SCAN_CHUNK_SIZE, EventStoreReader, RangeScan, SnapshotReplayPlan};
+pub use replay::{
+    CacheReplayError, CacheReplayReport, EventStoreReplayReport, apply_cache_replay_entry,
+    open_event_store_replay_source, replay_cache_snapshot_tail, restore_cache_from_sealed_run,
+    restore_cache_snapshot_and_replay_tail, restore_cache_snapshot_blob,
+    validate_event_store_replay_source,
+};
+pub use snapshot::{SnapshotAnchor, compute_snapshot_content_hash};
 pub use verifier::{
     GapRange, IndexDrift, ManifestField, Verifier, VerifyError, VerifyFinding, VerifyReport,
 };

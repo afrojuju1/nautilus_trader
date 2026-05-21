@@ -20,6 +20,11 @@ NautilusTrader operates primarily on granular order book data for the highest re
 in execution simulations. Backtests can also run on any supported market data type,
 depending on the desired simulation fidelity.
 
+When data flows over the message bus, topic-addressable data stays under the `data`
+root. Live streams use `data.<kind>...`; the data pipeline path uses
+`data.pipeline.<kind>...`. See [Message Bus](message_bus.md#topic-hierarchy) for
+the topic hierarchy.
+
 ## Order books
 
 A high-performance order book implemented in Rust is available to maintain order book state based on provided data.
@@ -1443,7 +1448,7 @@ The NautilusTrader data catalog provides market data management:
 
 - **Dual Backend**: Rust performance + Python flexibility.
 - **Multi-Protocol**: Local, S3, GCS, Azure storage.
-- **Streaming**: Feather → Parquet conversion pipeline.
+- **Streaming**: Feather -> Parquet conversion pipeline.
 - **Operations**: Reset file names, consolidate data, period-based organization.
 
 **Key use cases**:

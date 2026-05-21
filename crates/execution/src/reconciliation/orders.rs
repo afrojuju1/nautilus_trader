@@ -336,8 +336,7 @@ pub fn reconcile_fill_report(
         );
     }
 
-    // Use order's account_id if available, fallback to report's account_id
-    let account_id = order.account_id().unwrap_or(report.account_id);
+    let account_id = report.account_id;
     let venue_order_id = order.venue_order_id().unwrap_or(report.venue_order_id);
 
     log::info!(
@@ -406,7 +405,7 @@ pub fn should_reconciliation_update(order: &OrderAny, report: &OrderStatusReport
 ///
 /// Panics if the order does not have an `account_id` set.
 #[must_use]
-pub fn create_reconciliation_accepted(
+pub(super) fn create_reconciliation_accepted(
     order: &OrderAny,
     report: &OrderStatusReport,
     ts_now: UnixNanos,
@@ -475,7 +474,7 @@ pub fn create_reconciliation_triggered(
 
 /// Creates an `OrderCanceled` event for reconciliation.
 #[must_use]
-pub fn create_reconciliation_canceled(
+pub(super) fn create_reconciliation_canceled(
     order: &OrderAny,
     report: &OrderStatusReport,
     ts_now: UnixNanos,
@@ -496,7 +495,7 @@ pub fn create_reconciliation_canceled(
 
 /// Creates an `OrderExpired` event for reconciliation.
 #[must_use]
-pub fn create_reconciliation_expired(
+pub(super) fn create_reconciliation_expired(
     order: &OrderAny,
     report: &OrderStatusReport,
     ts_now: UnixNanos,
@@ -517,7 +516,7 @@ pub fn create_reconciliation_expired(
 
 /// Creates an `OrderUpdated` event for reconciliation.
 #[must_use]
-pub fn create_reconciliation_updated(
+pub(super) fn create_reconciliation_updated(
     order: &OrderAny,
     report: &OrderStatusReport,
     ts_now: UnixNanos,
@@ -558,7 +557,7 @@ pub fn create_reconciliation_updated(
 }
 
 /// Creates an inferred fill event for reconciliation when fill reports are missing.
-pub fn create_inferred_fill(
+pub(super) fn create_inferred_fill(
     order: &OrderAny,
     report: &OrderStatusReport,
     account_id: AccountId,
