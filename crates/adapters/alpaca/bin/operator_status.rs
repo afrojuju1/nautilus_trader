@@ -57,6 +57,7 @@ struct OperatorConfig {
     sectors: BTreeMap<String, String>,
     fleet_account_id: Option<String>,
     fleet_policy_blocks: Vec<String>,
+    storage_enabled: bool,
     json_output: bool,
 }
 
@@ -314,6 +315,7 @@ impl OperatorConfig {
             sectors: strategy_config.sectors,
             fleet_account_id: strategy_config.fleet_account_id,
             fleet_policy_blocks: strategy_config.fleet_policy_blocks,
+            storage_enabled: strategy_config.storage_repository.is_some(),
             json_output: env::args().any(|arg| arg == "--json"),
         })
     }
@@ -427,7 +429,7 @@ fn build_status(
 
     let strategy_state = StrategyStateStatus {
         path: config.state_path.display().to_string(),
-        exists: config.state_path.exists(),
+        exists: config.storage_enabled || config.state_path.exists(),
         entries: state.entries.len(),
         active_entries: state
             .entries

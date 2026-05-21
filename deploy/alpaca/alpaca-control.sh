@@ -16,6 +16,7 @@ FLEET_BIN="${NAUTILUS_ALPACA_FLEET_BIN:-$HOME/.local/bin/alpaca-fleet-status}"
 CANDIDATE_ALERTS_BIN="${NAUTILUS_ALPACA_CANDIDATE_ALERTS_BIN:-$HOME/.local/bin/alpaca-candidate-alerts}"
 PERFORMANCE_BIN="${NAUTILUS_ALPACA_PERFORMANCE_BIN:-$HOME/.local/bin/alpaca-performance-report}"
 ALERTS_ENV_FILE="${NAUTILUS_ALPACA_ALERTS_ENV_FILE:-$ALPACA_CONFIG_HOME/alerts.env}"
+FLEET_CONFIG_FILE="${NAUTILUS_ALPACA_FLEET_CONFIG:-$ALPACA_CONFIG_HOME/fleet.toml}"
 PROFILE_MANIFEST_FILE="${NAUTILUS_ALPACA_PROFILE_MANIFEST:-}"
 OVERRIDE_ENV_FILE=""
 
@@ -32,9 +33,7 @@ usage: $(basename "$0") [--account ACCOUNT] <command> [args]
 
 Account aliases:
   main, default, paper-main       primary defined-risk paper account
-  paper-directional              defined-risk credit watchlist paper account
-  paper-put-credit-spy           isolated SPY put-credit paper account
-  paper-call-credit-qqq          isolated QQQ call-credit paper account
+  paper-defined-risk             shared SPY/QQQ defined-risk paper account
   paper-undefined-risk           undefined-risk paper account
 
 Commands:
@@ -66,10 +65,9 @@ Scan profiles:
 
 Examples:
   $(basename "$0") --account paper-undefined-risk check-config
-  $(basename "$0") --account paper-put-credit-spy check-config
-  $(basename "$0") --account paper-call-credit-qqq check-config
+  $(basename "$0") --account paper-defined-risk check-config
   $(basename "$0") --account paper-undefined-risk scan naked GDX,SLV
-  $(basename "$0") --account paper-directional scan credit SPY,QQQ
+  $(basename "$0") --account paper-defined-risk scan credit SPY,QQQ
   $(basename "$0") strategy-report
   $(basename "$0") strategy-report --tomorrow
   $(basename "$0") today
@@ -156,6 +154,19 @@ account_lock_dir() {
 }
 
 known_accounts() {
+  if [[ -f "$FLEET_CONFIG_FILE" ]]; then
+    awk -F= '
+      /^[[:space:]]*id[[:space:]]*=/ {
+        value = $2
+        gsub(/[[:space:]"]/, "", value)
+        if (value != "") {
+          print value
+        }
+      }
+    ' "$FLEET_CONFIG_FILE"
+    return
+  fi
+
   printf '%s\n' "paper-main"
   if [[ -d "$ACCOUNT_ENV_DIR" ]]; then
     find "$ACCOUNT_ENV_DIR" -maxdepth 1 -type f -name '*.env' -printf '%f\n' \
@@ -270,6 +281,9 @@ default_profile_for_account() {
   local account
   account="$(normalize_account "$1")"
   case "$account" in
+    paper-defined-risk)
+      printf '%s\n' "credit"
+      ;;
     paper-put-credit-spy)
       printf '%s\n' "put-credit"
       ;;
