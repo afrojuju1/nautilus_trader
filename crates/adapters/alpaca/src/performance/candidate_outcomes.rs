@@ -95,6 +95,7 @@ pub async fn track_candidate_outcomes(
                 "rank": candidate.rank,
                 "score": candidate.score,
                 "symbols": &candidate.symbols,
+                "quantity": candidate.quantity,
                 "was_selected": candidate.was_selected,
                 "was_submitted": candidate.was_submitted,
                 "was_traded": candidate.was_traded,
@@ -108,6 +109,7 @@ pub async fn track_candidate_outcomes(
                 "rejection_reasons": &candidate.rejection_reasons,
                 "entry_net_premium": candidate.entry_net_premium,
                 "close_net_premium": outcome.close_net_premium,
+                "hypothetical_pnl_per_unit": outcome.hypothetical_pnl_per_unit,
                 "hypothetical_pnl": outcome.hypothetical_pnl,
                 "hypothetical_pnl_fraction": outcome.hypothetical_pnl_fraction,
                 "management_close_reason": &outcome.management_close_reason,
@@ -317,6 +319,7 @@ struct TrackCandidate {
     symbols: Vec<String>,
     entry_kind: CandidateEntryKind,
     entry_net_premium: f64,
+    quantity: u64,
     record: Value,
     was_selected: bool,
     was_submitted: bool,
@@ -344,6 +347,7 @@ struct CandidateSelection {
     rejected: Option<u64>,
     terminal_rejection_recorded: Option<bool>,
     rejection_reasons: Vec<String>,
+    quantity: Option<u64>,
 }
 
 impl CandidateSelection {
@@ -376,6 +380,10 @@ impl CandidateSelection {
     fn virtual_trade(&self) -> bool {
         self.was_selected() && !self.was_traded()
     }
+
+    fn quantity(&self) -> u64 {
+        self.quantity.unwrap_or(1).max(1)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -402,6 +410,7 @@ impl From<&OptionsEngineConfig> for VirtualCloseConfig {
 #[derive(Clone, Debug)]
 struct CandidateOutcomeValue {
     close_net_premium: f64,
+    hypothetical_pnl_per_unit: f64,
     hypothetical_pnl: f64,
     hypothetical_pnl_fraction: Option<f64>,
     management_close_reason: Option<String>,
@@ -426,6 +435,7 @@ fn selected_candidate_actions(records: &[Value]) -> BTreeMap<String, CandidateSe
                         .unwrap_or("selected")
                         .to_string(),
                 );
+                selection.quantity = record_u64(record, "quantity");
             }
             Some("candidate_submit_rejected") => {
                 selection.accepted = record_u64(record, "accepted");
@@ -534,6 +544,7 @@ fn track_candidate_from_record(
         symbols,
         entry_kind,
         entry_net_premium,
+        quantity: selection.quantity(),
         record: record.clone(),
         was_selected: selection.was_selected(),
         was_submitted: selection.was_submitted(),
@@ -611,7 +622,8 @@ fn value_candidate_outcome(
         CandidateEntryKind::Credit => candidate.entry_net_premium - close_net_premium,
         CandidateEntryKind::Debit => close_net_premium - candidate.entry_net_premium,
     };
-    let hypothetical_pnl = pnl_per_contract * OPTION_CONTRACT_MULTIPLIER;
+    let hypothetical_pnl_per_unit = pnl_per_contract * OPTION_CONTRACT_MULTIPLIER;
+    let hypothetical_pnl = hypothetical_pnl_per_unit * candidate.quantity as f64;
     let hypothetical_pnl_fraction = (candidate.entry_net_premium > 0.0)
         .then_some(pnl_per_contract / candidate.entry_net_premium);
     let management_close_reason = virtual_close_reason(candidate, close_net_premium, close_config);
@@ -621,6 +633,7 @@ fn value_candidate_outcome(
         .flatten();
     Some(CandidateOutcomeValue {
         close_net_premium,
+        hypothetical_pnl_per_unit,
         hypothetical_pnl,
         hypothetical_pnl_fraction,
         management_close_reason,
@@ -804,6 +817,7 @@ mod tests {
                 "alert_type": "selected_candidate",
                 "candidate_identity_key": identity,
                 "action": "submit",
+                "quantity": 2,
             }),
             json!({
                 "type": "candidate_alert",
@@ -827,6 +841,7 @@ mod tests {
         assert!(candidate.was_rejected);
         assert!(!candidate.was_traded);
         assert!(candidate.virtual_trade);
+        assert_eq!(candidate.quantity, 2);
         assert_eq!(candidate.rejected, Some(1));
         assert_eq!(candidate.rejection_reasons, vec!["account not eligible"]);
     }
@@ -839,6 +854,7 @@ mod tests {
                 "alert_type": "selected_candidate",
                 "candidate_identity_key": "naked_call|SLV|SLV260522C00030000",
                 "action": "dry_run",
+                "quantity": 2,
             }),
             naked_candidate_record(1),
         ];
@@ -870,7 +886,8 @@ mod tests {
             outcome.virtual_close_reason.as_deref(),
             Some("profit_target")
         );
-        assert!((outcome.hypothetical_pnl - 60.0).abs() < f64::EPSILON);
+        assert!((outcome.hypothetical_pnl_per_unit - 60.0).abs() < f64::EPSILON);
+        assert!((outcome.hypothetical_pnl - 120.0).abs() < f64::EPSILON);
     }
 
     fn naked_candidate_record(rank: u64) -> Value {

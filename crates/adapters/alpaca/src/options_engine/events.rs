@@ -101,19 +101,20 @@ pub(super) fn selected_entry_alert_payload(
     trade_date: &str,
     action: &str,
     order_list_id: Option<&str>,
+    quantity: u64,
 ) -> (String, Value) {
     match entry {
         SelectedOptionsEntry::Credit(entry) => {
-            selected_credit_alert_payload(entry, trade_date, action, order_list_id)
+            selected_credit_alert_payload(entry, trade_date, action, order_list_id, quantity)
         }
         SelectedOptionsEntry::IronCondor(entry) => {
-            selected_iron_condor_alert_payload(entry, trade_date, action, order_list_id)
+            selected_iron_condor_alert_payload(entry, trade_date, action, order_list_id, quantity)
         }
         SelectedOptionsEntry::Debit(entry) => {
-            selected_debit_alert_payload(entry, trade_date, action, order_list_id)
+            selected_debit_alert_payload(entry, trade_date, action, order_list_id, quantity)
         }
         SelectedOptionsEntry::NakedOption(entry) => {
-            selected_naked_alert_payload(entry, trade_date, action, order_list_id)
+            selected_naked_alert_payload(entry, trade_date, action, order_list_id, quantity)
         }
     }
 }
@@ -125,6 +126,7 @@ fn selected_credit_alert_payload(
     trade_date: &str,
     action: &str,
     order_list_id: Option<&str>,
+    quantity: u64,
 ) -> (String, Value) {
     let strategy = strategy_name(entry.kind);
     let identity_key = candidate_alert_identity_key(
@@ -140,6 +142,7 @@ fn selected_credit_alert_payload(
         action,
         trade_date,
         order_list_id,
+        quantity,
     );
     (identity_key, payload)
 }
@@ -149,6 +152,7 @@ fn selected_iron_condor_alert_payload(
     trade_date: &str,
     action: &str,
     order_list_id: Option<&str>,
+    quantity: u64,
 ) -> (String, Value) {
     let identity_key = candidate_alert_identity_key(
         "iron_condor",
@@ -168,6 +172,7 @@ fn selected_iron_condor_alert_payload(
         action,
         trade_date,
         order_list_id,
+        quantity,
     );
     (identity_key, payload)
 }
@@ -177,6 +182,7 @@ fn selected_debit_alert_payload(
     trade_date: &str,
     action: &str,
     order_list_id: Option<&str>,
+    quantity: u64,
 ) -> (String, Value) {
     let strategy = debit_spread_strategy_name(entry.kind);
     let identity_key = candidate_alert_identity_key(
@@ -192,6 +198,7 @@ fn selected_debit_alert_payload(
         action,
         trade_date,
         order_list_id,
+        quantity,
     );
     (identity_key, payload)
 }
@@ -201,6 +208,7 @@ fn selected_naked_alert_payload(
     trade_date: &str,
     action: &str,
     order_list_id: Option<&str>,
+    quantity: u64,
 ) -> (String, Value) {
     let strategy = naked_option_strategy_name(entry.kind);
     let identity_key = candidate_alert_identity_key(
@@ -216,6 +224,7 @@ fn selected_naked_alert_payload(
         action,
         trade_date,
         order_list_id,
+        quantity,
     );
     (identity_key, payload)
 }
@@ -226,10 +235,12 @@ fn insert_selected_alert_fields(
     action: &str,
     trade_date: &str,
     order_list_id: Option<&str>,
+    quantity: u64,
 ) {
     insert_string_field(payload, "candidate_identity_key", identity_key.to_string());
     insert_string_field(payload, "action", action.to_string());
     insert_string_field(payload, "trade_date", trade_date.to_string());
+    insert_value_field(payload, "quantity", Value::from(quantity));
     if let Some(order_list_id) = order_list_id {
         insert_string_field(payload, "order_list_id", order_list_id.to_string());
     }

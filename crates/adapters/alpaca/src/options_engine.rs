@@ -780,7 +780,13 @@ async fn apply_strategy_decision(
             details,
         } => {
             let (candidate_identity_key, mut candidate_alert_payload) =
-                selected_entry_alert_payload(&entry, trade_date, "selected_but_blocked", None);
+                selected_entry_alert_payload(
+                    &entry,
+                    trade_date,
+                    "selected_but_blocked",
+                    None,
+                    config.quantity,
+                );
             insert_string_field(&mut candidate_alert_payload, "reason", reason.clone());
             insert_value_field(
                 &mut candidate_alert_payload,
@@ -849,8 +855,13 @@ async fn apply_selected_entry_decision(
     let order_list_id = mode
         .is_submit()
         .then(|| order_list_id(trade_date, entry.underlying()));
-    let (candidate_identity_key, mut candidate_alert_payload) =
-        selected_entry_alert_payload(&entry, trade_date, mode.action(), order_list_id.as_deref());
+    let (candidate_identity_key, mut candidate_alert_payload) = selected_entry_alert_payload(
+        &entry,
+        trade_date,
+        mode.action(),
+        order_list_id.as_deref(),
+        config.quantity,
+    );
     if mode == EntryMode::DryRun {
         insert_string_field(
             &mut candidate_alert_payload,
