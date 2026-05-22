@@ -110,14 +110,34 @@ pub struct CandidateOutcomeSummary {
     pub average_loss: Option<f64>,
     /// Largest losing hypothetical outcome in dollars.
     pub largest_loss: Option<f64>,
+    /// Candidate-outcome records for candidates submitted to the broker.
+    pub submitted_records: usize,
+    /// Candidate-outcome records rejected by the broker.
+    pub rejected_records: usize,
+    /// Candidate-outcome records for selected candidates not traded at the broker.
+    pub virtual_records: usize,
+    /// First virtual close records for selected candidates not traded at the broker.
+    pub virtual_close_records: usize,
     /// Parse errors encountered while reading outcome records.
     pub parse_errors: usize,
     /// Records containing quote warnings.
     pub records_with_warnings: usize,
+    /// Selected-candidate outcome summary.
+    pub selected: CandidateOutcomeBucketSummary,
+    /// Submitted-candidate outcome summary.
+    pub submitted: CandidateOutcomeBucketSummary,
+    /// Broker-rejected candidate outcome summary.
+    pub rejected: CandidateOutcomeBucketSummary,
+    /// Virtual trade outcome summary for dry-run, blocked, or rejected selections.
+    pub virtual_trades: CandidateOutcomeBucketSummary,
+    /// First virtual close outcome summary.
+    pub virtual_closes: CandidateOutcomeBucketSummary,
     /// Summaries by observation bucket.
     pub by_bucket: BTreeMap<String, CandidateOutcomeBucketSummary>,
     /// Summaries by strategy.
     pub by_strategy: BTreeMap<String, CandidateOutcomeBucketSummary>,
+    /// Summaries by virtual close reason.
+    pub by_virtual_close_reason: BTreeMap<String, CandidateOutcomeBucketSummary>,
 }
 
 /// Bucketed candidate-outcome performance summary.
@@ -129,6 +149,14 @@ pub struct CandidateOutcomeBucketSummary {
     pub selected_records: usize,
     /// Candidate-outcome records for submitted candidates.
     pub traded_records: usize,
+    /// Candidate-outcome records for broker submission attempts.
+    pub submitted_records: usize,
+    /// Candidate-outcome records rejected by the broker.
+    pub rejected_records: usize,
+    /// Candidate-outcome records for selected candidates not traded at the broker.
+    pub virtual_records: usize,
+    /// First virtual close records for selected candidates not traded at the broker.
+    pub virtual_close_records: usize,
     /// Winning hypothetical outcomes.
     pub wins: usize,
     /// Losing hypothetical outcomes.

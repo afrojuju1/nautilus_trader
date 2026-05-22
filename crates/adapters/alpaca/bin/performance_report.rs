@@ -400,10 +400,11 @@ fn format_discord_digest(report: &PerformanceReport) -> String {
     let ledger = &report.ledger_summary;
     format!(
         "**Alpaca performance digest** `{account}`\n\
-opportunities={} selected={} submit_results={}\n\
-closed={} wins={} losses={} realized={} avg_win={} avg_loss={} largest_loss={}\n\
-candidate_outcomes={} hypothetical={}\n\
-open_unrealized={} observed_total={}",
+	opportunities={} selected={} submit_results={}\n\
+	closed={} wins={} losses={} realized={} avg_win={} avg_loss={} largest_loss={}\n\
+	candidate_outcomes={} hypothetical={} selected_outcomes={} selected_hypothetical={}\n\
+	virtual_closes={} virtual_close_pnl={}\n\
+	open_unrealized={} observed_total={}",
         report.opportunities.candidates,
         report.opportunities.selected_candidates,
         report.opportunities.submit_results,
@@ -416,6 +417,10 @@ open_unrealized={} observed_total={}",
         format_optional_money(ledger.largest_loss),
         report.candidate_outcomes.records,
         format_money(report.candidate_outcomes.hypothetical_pnl),
+        report.candidate_outcomes.selected.records,
+        format_money(report.candidate_outcomes.selected.hypothetical_pnl),
+        report.candidate_outcomes.virtual_closes.records,
+        format_money(report.candidate_outcomes.virtual_closes.hypothetical_pnl),
         format_money(report.summary.open_unrealized_pnl),
         format_money(report.summary.open_unrealized_pnl + ledger.realized_pnl),
     )
@@ -452,11 +457,15 @@ fn print_human_report(report: &PerformanceReport) {
         report.ledger_summary.records_with_warnings,
     );
     println!(
-        "candidate_outcomes files={} records={} selected={} traded={} wins={} losses={} flats={} hypothetical={} avg_win={} avg_loss={} largest_loss={} warnings={} parse_errors={}",
+        "candidate_outcomes files={} records={} selected={} submitted={} traded={} rejected={} virtual={} virtual_closes={} wins={} losses={} flats={} hypothetical={} avg_win={} avg_loss={} largest_loss={} warnings={} parse_errors={}",
         report.candidate_outcomes.files,
         report.candidate_outcomes.records,
         report.candidate_outcomes.selected_records,
+        report.candidate_outcomes.submitted_records,
         report.candidate_outcomes.traded_records,
+        report.candidate_outcomes.rejected_records,
+        report.candidate_outcomes.virtual_records,
+        report.candidate_outcomes.virtual_close_records,
         report.candidate_outcomes.wins,
         report.candidate_outcomes.losses,
         report.candidate_outcomes.flats,
@@ -467,15 +476,55 @@ fn print_human_report(report: &PerformanceReport) {
         report.candidate_outcomes.records_with_warnings,
         report.candidate_outcomes.parse_errors,
     );
+    println!(
+        "selected_outcomes records={} wins={} losses={} flats={} hypothetical={} avg_win={} avg_loss={} largest_loss={}",
+        report.candidate_outcomes.selected.records,
+        report.candidate_outcomes.selected.wins,
+        report.candidate_outcomes.selected.losses,
+        report.candidate_outcomes.selected.flats,
+        format_money(report.candidate_outcomes.selected.hypothetical_pnl),
+        format_optional_money(report.candidate_outcomes.selected.average_win),
+        format_optional_money(report.candidate_outcomes.selected.average_loss),
+        format_optional_money(report.candidate_outcomes.selected.largest_loss),
+    );
+    println!(
+        "virtual_closes records={} wins={} losses={} flats={} hypothetical={} avg_win={} avg_loss={} largest_loss={}",
+        report.candidate_outcomes.virtual_closes.records,
+        report.candidate_outcomes.virtual_closes.wins,
+        report.candidate_outcomes.virtual_closes.losses,
+        report.candidate_outcomes.virtual_closes.flats,
+        format_money(report.candidate_outcomes.virtual_closes.hypothetical_pnl),
+        format_optional_money(report.candidate_outcomes.virtual_closes.average_win),
+        format_optional_money(report.candidate_outcomes.virtual_closes.average_loss),
+        format_optional_money(report.candidate_outcomes.virtual_closes.largest_loss),
+    );
     if !report.candidate_outcomes.by_bucket.is_empty() {
         println!("candidate_outcomes_by_bucket:");
         for (bucket, summary) in &report.candidate_outcomes.by_bucket {
             println!(
-                "  bucket={} records={} selected={} traded={} wins={} losses={} flats={} hypothetical={}",
+                "  bucket={} records={} selected={} submitted={} traded={} rejected={} virtual={} virtual_closes={} wins={} losses={} flats={} hypothetical={}",
                 bucket,
                 summary.records,
                 summary.selected_records,
+                summary.submitted_records,
                 summary.traded_records,
+                summary.rejected_records,
+                summary.virtual_records,
+                summary.virtual_close_records,
+                summary.wins,
+                summary.losses,
+                summary.flats,
+                format_money(summary.hypothetical_pnl),
+            );
+        }
+    }
+    if !report.candidate_outcomes.by_virtual_close_reason.is_empty() {
+        println!("virtual_closes_by_reason:");
+        for (reason, summary) in &report.candidate_outcomes.by_virtual_close_reason {
+            println!(
+                "  reason={} records={} wins={} losses={} flats={} hypothetical={}",
+                reason,
+                summary.records,
                 summary.wins,
                 summary.losses,
                 summary.flats,

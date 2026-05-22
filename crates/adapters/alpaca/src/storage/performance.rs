@@ -214,9 +214,17 @@ pub async fn append_candidate_outcome(
                 .collect(),
         ),
     };
+    let preserve_existing =
+        record.get("observation_bucket").and_then(Value::as_str) == Some("virtual_close");
+    let conflict_clause = if preserve_existing {
+        "ON CONFLICT (account_id, record_key) DO NOTHING"
+    } else {
+        "ON CONFLICT (account_id, record_key) DO UPDATE\n         SET payload = EXCLUDED.payload, ts_utc = EXCLUDED.ts_utc"
+    };
     let query = format!(
-        "INSERT INTO \"{}\".candidate_outcome (account_id, trade_date, ts_utc, record_key, payload)\n         VALUES ($1, $2::date, $3::timestamptz, $4, $5)\n         ON CONFLICT (account_id, record_key) DO UPDATE\n         SET payload = EXCLUDED.payload, ts_utc = EXCLUDED.ts_utc",
-        storage.schema()
+        "INSERT INTO \"{}\".candidate_outcome (account_id, trade_date, ts_utc, record_key, payload)\n         VALUES ($1, $2::date, $3::timestamptz, $4, $5)\n         {}",
+        storage.schema(),
+        conflict_clause,
     );
     let result = sqlx::query(&query)
         .bind(account_id)
@@ -254,44 +262,74 @@ pub async fn summarize_candidate_outcomes(
         ),
         ..Default::default()
     };
-    let mut aggregate = OutcomeStats::default();
-    let mut dates = std::collections::BTreeSet::<String>::new();
-    let mut bucket_stats = std::collections::BTreeMap::<String, OutcomeStats>::new();
-    let mut strategy_stats = std::collections::BTreeMap::<String, OutcomeStats>::new();
-
+    let mut records_by_key = std::collections::BTreeMap::<String, Value>::new();
     for row in rows {
         let payload: sqlx::types::Json<Value> = row.try_get("payload")?;
         let record = payload.0;
+        let key = candidate_outcome_semantic_key(&record)
+            .or_else(|| {
+                record
+                    .get("record_key")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_else(|| format!("unknown|{}", records_by_key.len()));
+        records_by_key.insert(key, record);
+    }
+
+    let mut aggregate = OutcomeStats::default();
+    let mut selected_aggregate = OutcomeStats::default();
+    let mut submitted_aggregate = OutcomeStats::default();
+    let mut rejected_aggregate = OutcomeStats::default();
+    let mut virtual_aggregate = OutcomeStats::default();
+    let mut virtual_close_aggregate = OutcomeStats::default();
+    let mut dates = std::collections::BTreeSet::<String>::new();
+    let mut bucket_stats = std::collections::BTreeMap::<String, OutcomeStats>::new();
+    let mut strategy_stats = std::collections::BTreeMap::<String, OutcomeStats>::new();
+    let mut close_reason_stats = std::collections::BTreeMap::<String, OutcomeStats>::new();
+
+    for record in records_by_key.into_values() {
         let Some(hypothetical_pnl) = record.get("hypothetical_pnl").and_then(Value::as_f64) else {
             summary.parse_errors += 1;
             continue;
         };
-
-        let was_selected = record
-            .get("was_selected")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let was_traded = record
-            .get("was_traded")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        aggregate.add(hypothetical_pnl, was_selected, was_traded);
+        let flags = outcome_flags(&record);
+        aggregate.add(hypothetical_pnl, flags);
+        if flags.was_selected {
+            selected_aggregate.add(hypothetical_pnl, flags);
+        }
+        if flags.was_submitted {
+            submitted_aggregate.add(hypothetical_pnl, flags);
+        }
+        if flags.was_rejected {
+            rejected_aggregate.add(hypothetical_pnl, flags);
+        }
+        if flags.virtual_trade {
+            virtual_aggregate.add(hypothetical_pnl, flags);
+        }
+        if flags.virtual_close {
+            virtual_close_aggregate.add(hypothetical_pnl, flags);
+            if let Some(reason) = record.get("virtual_close_reason").and_then(Value::as_str) {
+                close_reason_stats
+                    .entry(reason.to_string())
+                    .or_default()
+                    .add(hypothetical_pnl, flags);
+            }
+        }
         if let Some(trade_date) = record.get("trade_date").and_then(Value::as_str) {
             dates.insert(trade_date.to_string());
         }
         if let Some(bucket) = record.get("observation_bucket").and_then(Value::as_str) {
-            bucket_stats.entry(bucket.to_string()).or_default().add(
-                hypothetical_pnl,
-                was_selected,
-                was_traded,
-            );
+            bucket_stats
+                .entry(bucket.to_string())
+                .or_default()
+                .add(hypothetical_pnl, flags);
         }
         if let Some(strategy) = record.get("strategy").and_then(Value::as_str) {
-            strategy_stats.entry(strategy.to_string()).or_default().add(
-                hypothetical_pnl,
-                was_selected,
-                was_traded,
-            );
+            strategy_stats
+                .entry(strategy.to_string())
+                .or_default()
+                .add(hypothetical_pnl, flags);
         }
 
         if record
@@ -313,6 +351,15 @@ pub async fn summarize_candidate_outcomes(
     summary.average_win = aggregate.average_win();
     summary.average_loss = aggregate.average_loss();
     summary.largest_loss = aggregate.largest_loss;
+    summary.submitted_records = aggregate.submitted_records;
+    summary.rejected_records = aggregate.rejected_records;
+    summary.virtual_records = aggregate.virtual_records;
+    summary.virtual_close_records = aggregate.virtual_close_records;
+    summary.selected = selected_aggregate.into();
+    summary.submitted = submitted_aggregate.into();
+    summary.rejected = rejected_aggregate.into();
+    summary.virtual_trades = virtual_aggregate.into();
+    summary.virtual_closes = virtual_close_aggregate.into();
     summary.missing = false;
     summary.files = 1;
     summary.dates = dates.into_iter().collect();
@@ -324,8 +371,84 @@ pub async fn summarize_candidate_outcomes(
         .into_iter()
         .map(|(strategy, stats)| (strategy, stats.into()))
         .collect();
+    summary.by_virtual_close_reason = close_reason_stats
+        .into_iter()
+        .map(|(reason, stats)| (reason, stats.into()))
+        .collect();
 
     Ok(summary)
+}
+
+fn candidate_outcome_semantic_key(record: &Value) -> Option<String> {
+    Some(format!(
+        "{}|{}|{}",
+        record.get("trade_date")?.as_str()?,
+        record.get("candidate_identity_key")?.as_str()?,
+        record.get("observation_bucket")?.as_str()?,
+    ))
+}
+
+#[derive(Clone, Copy, Default)]
+struct OutcomeFlags {
+    was_selected: bool,
+    was_submitted: bool,
+    was_traded: bool,
+    was_rejected: bool,
+    virtual_trade: bool,
+    virtual_close: bool,
+}
+
+fn outcome_flags(record: &Value) -> OutcomeFlags {
+    let was_selected = record
+        .get("was_selected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let selected_action = record.get("selected_action").and_then(Value::as_str);
+    let was_submitted = record
+        .get("was_submitted")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            selected_action
+                .is_some_and(|action| matches!(action, "submit" | "submitted" | "selected"))
+        });
+    let was_rejected = record
+        .get("was_rejected")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            record
+                .get("rejected")
+                .and_then(Value::as_u64)
+                .is_some_and(|rejected| rejected > 0)
+                || record
+                    .get("terminal_rejection_recorded")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        });
+    let was_traded = record
+        .get("was_traded")
+        .and_then(Value::as_bool)
+        .unwrap_or(was_submitted && !was_rejected);
+    let virtual_trade = record
+        .get("virtual_trade")
+        .and_then(Value::as_bool)
+        .unwrap_or(was_selected && !was_traded);
+    let virtual_close = record
+        .get("virtual_close")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            record
+                .get("virtual_close_reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| !reason.is_empty())
+        });
+    OutcomeFlags {
+        was_selected,
+        was_submitted,
+        was_traded,
+        was_rejected,
+        virtual_trade,
+        virtual_close,
+    }
 }
 
 #[derive(Clone, Default)]
@@ -377,7 +500,11 @@ impl BucketStats {
 struct OutcomeStats {
     records: usize,
     selected_records: usize,
+    submitted_records: usize,
     traded_records: usize,
+    rejected_records: usize,
+    virtual_records: usize,
+    virtual_close_records: usize,
     wins: usize,
     losses: usize,
     flats: usize,
@@ -388,14 +515,26 @@ struct OutcomeStats {
 }
 
 impl OutcomeStats {
-    fn add(&mut self, hypothetical_pnl: f64, was_selected: bool, was_traded: bool) {
+    fn add(&mut self, hypothetical_pnl: f64, flags: OutcomeFlags) {
         self.records += 1;
         self.hypothetical_pnl += hypothetical_pnl;
-        if was_selected {
+        if flags.was_selected {
             self.selected_records += 1;
         }
-        if was_traded {
+        if flags.was_submitted {
+            self.submitted_records += 1;
+        }
+        if flags.was_traded {
             self.traded_records += 1;
+        }
+        if flags.was_rejected {
+            self.rejected_records += 1;
+        }
+        if flags.virtual_trade {
+            self.virtual_records += 1;
+        }
+        if flags.virtual_close {
+            self.virtual_close_records += 1;
         }
         if hypothetical_pnl > 0.0 {
             self.wins += 1;
@@ -426,7 +565,11 @@ impl From<OutcomeStats> for crate::performance::CandidateOutcomeBucketSummary {
         Self {
             records: value.records,
             selected_records: value.selected_records,
+            submitted_records: value.submitted_records,
             traded_records: value.traded_records,
+            rejected_records: value.rejected_records,
+            virtual_records: value.virtual_records,
+            virtual_close_records: value.virtual_close_records,
             wins: value.wins,
             losses: value.losses,
             flats: value.flats,
@@ -462,4 +605,60 @@ pub async fn summarize_candidate_outcomes_records(
     let account_id = config.storage_account_id();
     let filters = CandidateOutcomeSummaryFilters { since, until };
     summarize_candidate_outcomes(storage, account_id, filters).await
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn outcome_flags_classify_rejected_virtual_close() {
+        let record = json!({
+            "was_selected": true,
+            "was_submitted": true,
+            "was_traded": false,
+            "was_rejected": true,
+            "virtual_trade": true,
+            "virtual_close": true,
+            "virtual_close_reason": "profit_target",
+        });
+
+        let flags = outcome_flags(&record);
+
+        assert!(flags.was_selected);
+        assert!(flags.was_submitted);
+        assert!(!flags.was_traded);
+        assert!(flags.was_rejected);
+        assert!(flags.virtual_trade);
+        assert!(flags.virtual_close);
+    }
+
+    #[test]
+    fn outcome_stats_count_selected_and_virtual_records() {
+        let mut stats = OutcomeStats::default();
+        stats.add(
+            12.0,
+            OutcomeFlags {
+                was_selected: true,
+                was_submitted: false,
+                was_traded: false,
+                was_rejected: false,
+                virtual_trade: true,
+                virtual_close: true,
+            },
+        );
+
+        let summary: crate::performance::CandidateOutcomeBucketSummary = stats.into();
+
+        assert_eq!(summary.records, 1);
+        assert_eq!(summary.selected_records, 1);
+        assert_eq!(summary.submitted_records, 0);
+        assert_eq!(summary.traded_records, 0);
+        assert_eq!(summary.virtual_records, 1);
+        assert_eq!(summary.virtual_close_records, 1);
+        assert_eq!(summary.wins, 1);
+        assert_eq!(summary.hypothetical_pnl, 12.0);
+    }
 }

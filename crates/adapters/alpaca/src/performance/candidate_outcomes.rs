@@ -69,37 +69,52 @@ pub async fn track_candidate_outcomes(
     snapshot_request.feed = Some(data_config.option_feed.as_str().to_string());
     let snapshots = client.option_snapshots(&snapshot_request).await?.snapshots;
     let payload_account_id = Some(config.storage_account_id().to_string());
+    let close_config = VirtualCloseConfig::from(config);
     let mut appended = 0;
     for candidate in &mut candidates {
-        let Some(outcome) = value_candidate_outcome(candidate, &snapshots) else {
+        let Some(outcome) = value_candidate_outcome(candidate, &snapshots, close_config) else {
             continue;
         };
-        for bucket in candidate_observation_buckets(candidate, config) {
-            let record_key = format!("{}|{bucket}", candidate.identity_key);
+        for bucket in candidate_observation_buckets(candidate, config, &outcome) {
+            let record_key = format!(
+                "{}|{}|{bucket}",
+                candidate.trade_date, candidate.identity_key
+            );
             let payload = json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "ts_utc": Utc::now().to_rfc3339(),
                 "type": "candidate_outcome",
-                "trade_date": candidate.trade_date,
+                "trade_date": &candidate.trade_date,
                 "account_id": payload_account_id.clone(),
-                "record_key": record_key,
-                "candidate_identity_key": candidate.identity_key,
+                "record_key": &record_key,
+                "candidate_identity_key": &candidate.identity_key,
                 "observation_bucket": bucket,
-                "candidate_type": candidate.candidate_type,
-                "strategy": candidate.strategy,
-                "underlying": candidate.underlying,
+                "candidate_type": &candidate.candidate_type,
+                "strategy": &candidate.strategy,
+                "underlying": &candidate.underlying,
                 "rank": candidate.rank,
                 "score": candidate.score,
-                "symbols": candidate.symbols,
+                "symbols": &candidate.symbols,
                 "was_selected": candidate.was_selected,
+                "was_submitted": candidate.was_submitted,
                 "was_traded": candidate.was_traded,
-                "selected_action": candidate.selected_action,
+                "was_rejected": candidate.was_rejected,
+                "was_dry_run": candidate.was_dry_run,
+                "virtual_trade": candidate.virtual_trade,
+                "selected_action": &candidate.selected_action,
+                "accepted": candidate.accepted,
+                "rejected": candidate.rejected,
+                "terminal_rejection_recorded": candidate.terminal_rejection_recorded,
+                "rejection_reasons": &candidate.rejection_reasons,
                 "entry_net_premium": candidate.entry_net_premium,
                 "close_net_premium": outcome.close_net_premium,
                 "hypothetical_pnl": outcome.hypothetical_pnl,
                 "hypothetical_pnl_fraction": outcome.hypothetical_pnl_fraction,
-                "quote_warnings": outcome.warnings,
-                "candidate": candidate.record,
+                "management_close_reason": &outcome.management_close_reason,
+                "virtual_close_reason": &outcome.virtual_close_reason,
+                "virtual_close": outcome.virtual_close_reason.is_some() && bucket == "virtual_close",
+                "quote_warnings": &outcome.warnings,
+                "candidate": &candidate.record,
             });
             let appended_record = append_candidate_outcome(
                 storage,
@@ -304,8 +319,16 @@ struct TrackCandidate {
     entry_net_premium: f64,
     record: Value,
     was_selected: bool,
+    was_submitted: bool,
     was_traded: bool,
+    was_rejected: bool,
+    was_dry_run: bool,
+    virtual_trade: bool,
     selected_action: Option<String>,
+    accepted: Option<u64>,
+    rejected: Option<u64>,
+    terminal_rejection_recorded: Option<bool>,
+    rejection_reasons: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -314,33 +337,123 @@ enum CandidateEntryKind {
     Debit,
 }
 
+#[derive(Clone, Debug, Default)]
+struct CandidateSelection {
+    action: Option<String>,
+    accepted: Option<u64>,
+    rejected: Option<u64>,
+    terminal_rejection_recorded: Option<bool>,
+    rejection_reasons: Vec<String>,
+}
+
+impl CandidateSelection {
+    fn was_selected(&self) -> bool {
+        self.action.is_some() || self.accepted.is_some() || self.rejected.is_some()
+    }
+
+    fn was_submitted(&self) -> bool {
+        self.action
+            .as_deref()
+            .is_some_and(|action| matches!(action, "submit" | "submitted" | "selected"))
+            || self.accepted.is_some()
+            || self.rejected.is_some()
+    }
+
+    fn was_rejected(&self) -> bool {
+        self.rejected.is_some_and(|rejected| rejected > 0)
+            || self.terminal_rejection_recorded == Some(true)
+    }
+
+    fn was_dry_run(&self) -> bool {
+        self.action.as_deref() == Some("dry_run")
+    }
+
+    fn was_traded(&self) -> bool {
+        self.accepted.is_some_and(|accepted| accepted > 0)
+            || (self.was_submitted() && !self.was_rejected())
+    }
+
+    fn virtual_trade(&self) -> bool {
+        self.was_selected() && !self.was_traded()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VirtualCloseConfig {
+    force_flatten: bool,
+    profit_target_close_fraction: f64,
+    stop_loss_close_multiple: f64,
+    max_hold_secs: u64,
+    expiration_exit_days: i64,
+}
+
+impl From<&OptionsEngineConfig> for VirtualCloseConfig {
+    fn from(config: &OptionsEngineConfig) -> Self {
+        Self {
+            force_flatten: config.force_flatten,
+            profit_target_close_fraction: config.profit_target_close_fraction,
+            stop_loss_close_multiple: config.stop_loss_close_multiple,
+            max_hold_secs: config.max_hold_secs,
+            expiration_exit_days: config.expiration_exit_days,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CandidateOutcomeValue {
     close_net_premium: f64,
     hypothetical_pnl: f64,
     hypothetical_pnl_fraction: Option<f64>,
+    management_close_reason: Option<String>,
+    virtual_close_reason: Option<String>,
     warnings: Vec<String>,
 }
 
-fn selected_candidate_actions(records: &[Value]) -> BTreeMap<String, String> {
-    records
+fn selected_candidate_actions(records: &[Value]) -> BTreeMap<String, CandidateSelection> {
+    let mut selected = BTreeMap::<String, CandidateSelection>::new();
+    for record in records
         .iter()
         .filter(|record| record_str(record, "type") == Some("candidate_alert"))
-        .filter(|record| record_str(record, "alert_type") == Some("selected_candidate"))
-        .filter_map(|record| {
-            Some((
-                record_str(record, "candidate_identity_key")?.to_string(),
-                record_str(record, "action")
-                    .unwrap_or("selected")
-                    .to_string(),
-            ))
-        })
-        .collect()
+    {
+        let Some(identity_key) = record_str(record, "candidate_identity_key") else {
+            continue;
+        };
+        let selection = selected.entry(identity_key.to_string()).or_default();
+        match record_str(record, "alert_type") {
+            Some("selected_candidate") => {
+                selection.action = Some(
+                    record_str(record, "action")
+                        .unwrap_or("selected")
+                        .to_string(),
+                );
+            }
+            Some("candidate_submit_rejected") => {
+                selection.accepted = record_u64(record, "accepted");
+                selection.rejected = record_u64(record, "rejected");
+                selection.terminal_rejection_recorded = record
+                    .get("terminal_rejection_recorded")
+                    .and_then(Value::as_bool);
+                selection.rejection_reasons = record
+                    .get("rejection_reasons")
+                    .and_then(Value::as_array)
+                    .map(|reasons| {
+                        reasons
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToString::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            }
+            _ => {}
+        }
+    }
+    selected
 }
 
 fn collect_track_candidates(
     records: &[Value],
-    selected: &BTreeMap<String, String>,
+    selected: &BTreeMap<String, CandidateSelection>,
     max_rank: u64,
     max_candidates: usize,
 ) -> Vec<TrackCandidate> {
@@ -349,12 +462,12 @@ fn collect_track_candidates(
         if record_str(record, "type") != Some("candidate") {
             continue;
         }
-        if record_u64(record, "rank").unwrap_or(1) > max_rank {
-            continue;
-        }
         let Some(candidate) = track_candidate_from_record(record, selected) else {
             continue;
         };
+        if record_u64(record, "rank").unwrap_or(1) > max_rank && !candidate.was_selected {
+            continue;
+        }
         by_identity
             .entry(candidate.identity_key.clone())
             .and_modify(|current| {
@@ -367,18 +480,26 @@ fn collect_track_candidates(
 
     let mut candidates = by_identity.into_values().collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        right.was_selected.cmp(&left.was_selected).then_with(|| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     });
-    candidates.truncate(max_candidates);
+    if max_candidates > 0 {
+        let selected_count = candidates
+            .iter()
+            .filter(|candidate| candidate.was_selected)
+            .count();
+        candidates.truncate(max_candidates.max(selected_count));
+    }
     candidates
 }
 
 fn track_candidate_from_record(
     record: &Value,
-    selected: &BTreeMap<String, String>,
+    selected: &BTreeMap<String, CandidateSelection>,
 ) -> Option<TrackCandidate> {
     let strategy = record_str(record, "strategy")?.to_string();
     let underlying = record_str(record, "underlying")?.to_string();
@@ -390,7 +511,8 @@ fn track_candidate_from_record(
         return None;
     }
     let identity_key = candidate_identity_key(&strategy, &underlying, &symbols);
-    let selected_action = selected.get(&identity_key).cloned();
+    let selection = selected.get(&identity_key).cloned().unwrap_or_default();
+    let selected_action = selection.action.clone();
     let entry_kind = if candidate_type == "debit_spread" || strategy.contains("debit") {
         CandidateEntryKind::Debit
     } else {
@@ -413,11 +535,17 @@ fn track_candidate_from_record(
         entry_kind,
         entry_net_premium,
         record: record.clone(),
-        was_selected: selected_action.is_some(),
-        was_traded: selected_action
-            .as_deref()
-            .is_some_and(|action| action == "selected" || action == "submitted"),
+        was_selected: selection.was_selected(),
+        was_submitted: selection.was_submitted(),
+        was_traded: selection.was_traded(),
+        was_rejected: selection.was_rejected(),
+        was_dry_run: selection.was_dry_run(),
+        virtual_trade: selection.virtual_trade(),
         selected_action,
+        accepted: selection.accepted,
+        rejected: selection.rejected,
+        terminal_rejection_recorded: selection.terminal_rejection_recorded,
+        rejection_reasons: selection.rejection_reasons,
     })
 }
 
@@ -456,6 +584,7 @@ fn candidate_identity_key(strategy: &str, underlying: &str, symbols: &[String]) 
 fn value_candidate_outcome(
     candidate: &TrackCandidate,
     snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    close_config: VirtualCloseConfig,
 ) -> Option<CandidateOutcomeValue> {
     let mut warnings = Vec::new();
     let close_net_premium = if candidate.candidate_type == "iron_condor" {
@@ -485,12 +614,72 @@ fn value_candidate_outcome(
     let hypothetical_pnl = pnl_per_contract * OPTION_CONTRACT_MULTIPLIER;
     let hypothetical_pnl_fraction = (candidate.entry_net_premium > 0.0)
         .then_some(pnl_per_contract / candidate.entry_net_premium);
+    let management_close_reason = virtual_close_reason(candidate, close_net_premium, close_config);
+    let virtual_close_reason = candidate
+        .virtual_trade
+        .then(|| management_close_reason.clone())
+        .flatten();
     Some(CandidateOutcomeValue {
         close_net_premium,
         hypothetical_pnl,
         hypothetical_pnl_fraction,
+        management_close_reason,
+        virtual_close_reason,
         warnings,
     })
+}
+
+fn virtual_close_reason(
+    candidate: &TrackCandidate,
+    close_net_premium: f64,
+    config: VirtualCloseConfig,
+) -> Option<String> {
+    if config.force_flatten {
+        return Some("manual_flatten".to_string());
+    }
+    match candidate.entry_kind {
+        CandidateEntryKind::Credit => {
+            if close_net_premium
+                <= candidate.entry_net_premium * config.profit_target_close_fraction.max(0.0)
+            {
+                return Some("profit_target".to_string());
+            }
+            if config.stop_loss_close_multiple > 0.0
+                && close_net_premium
+                    >= candidate.entry_net_premium * config.stop_loss_close_multiple
+            {
+                return Some("stop_loss".to_string());
+            }
+        }
+        CandidateEntryKind::Debit => {
+            if close_net_premium
+                >= candidate.entry_net_premium
+                    * (1.0 + config.profit_target_close_fraction.max(0.0))
+            {
+                return Some("profit_target".to_string());
+            }
+            if config.stop_loss_close_multiple > 0.0
+                && close_net_premium
+                    <= candidate.entry_net_premium / config.stop_loss_close_multiple
+            {
+                return Some("stop_loss".to_string());
+            }
+        }
+    }
+    if config.max_hold_secs > 0
+        && candidate.ts_utc.is_some_and(|ts| {
+            Utc::now().signed_duration_since(ts).num_seconds() >= config.max_hold_secs as i64
+        })
+    {
+        return Some("max_hold".to_string());
+    }
+    if config.expiration_exit_days >= 0
+        && candidate_days_to_expiration(candidate)
+            .is_some_and(|days| days <= config.expiration_exit_days)
+    {
+        return Some("expiration_risk".to_string());
+    }
+    None
 }
 
 fn quote_bid(
@@ -528,6 +717,7 @@ fn quote_ask(
 fn candidate_observation_buckets(
     candidate: &TrackCandidate,
     config: &OptionsEngineConfig,
+    outcome: &CandidateOutcomeValue,
 ) -> Vec<&'static str> {
     let mut buckets = Vec::new();
     let now_utc = Utc::now();
@@ -552,6 +742,9 @@ fn candidate_observation_buckets(
             .is_some_and(|days| days <= config.expiration_exit_days)
     {
         buckets.push("expiration_risk");
+    }
+    if candidate.virtual_trade && outcome.virtual_close_reason.is_some() {
+        buckets.push("virtual_close");
     }
     buckets.sort();
     buckets.dedup();
@@ -591,4 +784,128 @@ fn record_ts(record: &Value) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(record_str(record, "ts_utc")?)
         .ok()
         .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::http::models::AlpacaOptionQuote;
+
+    #[test]
+    fn selected_rejected_candidate_is_tracked_as_virtual_trade_beyond_rank_cap() {
+        let identity = "naked_call|SLV|SLV260522C00030000";
+        let records = vec![
+            json!({
+                "type": "candidate_alert",
+                "alert_type": "selected_candidate",
+                "candidate_identity_key": identity,
+                "action": "submit",
+            }),
+            json!({
+                "type": "candidate_alert",
+                "alert_type": "candidate_submit_rejected",
+                "candidate_identity_key": identity,
+                "accepted": 0,
+                "rejected": 1,
+                "terminal_rejection_recorded": true,
+                "rejection_reasons": ["account not eligible"],
+            }),
+            naked_candidate_record(9),
+        ];
+
+        let selections = selected_candidate_actions(&records);
+        let candidates = collect_track_candidates(&records, &selections, 3, 1);
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert!(candidate.was_selected);
+        assert!(candidate.was_submitted);
+        assert!(candidate.was_rejected);
+        assert!(!candidate.was_traded);
+        assert!(candidate.virtual_trade);
+        assert_eq!(candidate.rejected, Some(1));
+        assert_eq!(candidate.rejection_reasons, vec!["account not eligible"]);
+    }
+
+    #[test]
+    fn virtual_credit_candidate_closes_at_profit_target() {
+        let records = vec![
+            json!({
+                "type": "candidate_alert",
+                "alert_type": "selected_candidate",
+                "candidate_identity_key": "naked_call|SLV|SLV260522C00030000",
+                "action": "dry_run",
+            }),
+            naked_candidate_record(1),
+        ];
+        let selections = selected_candidate_actions(&records);
+        let candidate = track_candidate_from_record(&records[1], &selections).unwrap();
+        let snapshots = BTreeMap::from([(
+            "SLV260522C00030000".to_string(),
+            option_snapshot(0.35, 0.40),
+        )]);
+
+        let outcome = value_candidate_outcome(
+            &candidate,
+            &snapshots,
+            VirtualCloseConfig {
+                force_flatten: false,
+                profit_target_close_fraction: 0.50,
+                stop_loss_close_multiple: 2.0,
+                max_hold_secs: 0,
+                expiration_exit_days: -1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.management_close_reason.as_deref(),
+            Some("profit_target")
+        );
+        assert_eq!(
+            outcome.virtual_close_reason.as_deref(),
+            Some("profit_target")
+        );
+        assert!((outcome.hypothetical_pnl - 60.0).abs() < f64::EPSILON);
+    }
+
+    fn naked_candidate_record(rank: u64) -> Value {
+        json!({
+            "type": "candidate",
+            "trade_date": "2026-05-22",
+            "ts_utc": "2026-05-22T13:30:00Z",
+            "candidate_type": "naked_option",
+            "strategy": "naked_call",
+            "underlying": "SLV",
+            "rank": rank,
+            "score": 104.9,
+            "short_symbol": "SLV260522C00030000",
+            "credit": 1.00,
+            "short": {
+                "expiration_date": "2026-05-22"
+            }
+        })
+    }
+
+    fn option_snapshot(bid: f64, ask: f64) -> AlpacaOptionSnapshot {
+        AlpacaOptionSnapshot {
+            latest_quote: Some(AlpacaOptionQuote {
+                ask_price: Some(ask),
+                ask_size: None,
+                bid_price: Some(bid),
+                bid_size: None,
+                timestamp: None,
+            }),
+            latest_trade: None,
+            minute_bar: None,
+            daily_bar: None,
+            prev_daily_bar: None,
+            greeks: None,
+            implied_volatility: None,
+        }
+    }
 }
