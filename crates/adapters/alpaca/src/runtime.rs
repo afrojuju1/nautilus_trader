@@ -151,6 +151,18 @@ impl StrategyState {
         submitted.saturating_sub(replacement_exemptions) > 0
     }
 
+    /// Returns `true` when a canceled naked option entry has the supplied terminal reason.
+    #[must_use]
+    pub fn has_canceled_naked_entry_with_close_reason(&self, close_reason: &str) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.submitted
+                && entry.canceled
+                && !entry.closed
+                && entry.is_naked_option()
+                && entry.close_reason.as_deref() == Some(close_reason)
+        })
+    }
+
     /// Appends one submitted spread entry to the state.
     pub fn record_submission(
         &mut self,
@@ -493,6 +505,7 @@ pub async fn load_strategy_state_with_storage(
     account_id: &str,
 ) -> anyhow::Result<StrategyState> {
     if let Some(state) = crate::storage::load_strategy_state_record(storage, account_id).await? {
+        save_strategy_state_atomic(path, &state)?;
         return Ok(state);
     }
 
@@ -522,12 +535,13 @@ pub fn save_strategy_state_atomic(path: &Path, state: &StrategyState) -> anyhow:
 
 #[cfg(feature = "live")]
 pub async fn save_strategy_state_with_storage(
-    _path: &Path,
+    path: &Path,
     storage: &StorageRepository,
     state: &StrategyState,
     account_id: &str,
 ) -> anyhow::Result<()> {
-    crate::storage::save_strategy_state(storage, account_id, state).await
+    crate::storage::save_strategy_state(storage, account_id, state).await?;
+    save_strategy_state_atomic(path, state)
 }
 
 /// Emits one structured operator event to stdout.

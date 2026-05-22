@@ -65,12 +65,23 @@ const DEFAULT_EVENT_TIMEOUT_SECS: u64 = 20;
 const STRATEGY_FAMILY: &str = "ALPACA-OPTIONS-ENGINE";
 const SELECTED_CANDIDATE_ALERT: &str = "selected_candidate";
 const CANDIDATE_SUBMIT_REJECTED_ALERT: &str = "candidate_submit_rejected";
+const UNCOVERED_OPTION_PERMISSION_REJECTION_REASON: &str =
+    "entry_rejected_uncovered_option_permission";
 
 #[derive(Clone, Debug)]
 struct SubmitOutcome {
     accepted: usize,
     rejected: usize,
     parent_order_id: Option<String>,
+    rejection_reasons: Vec<String>,
+}
+
+impl SubmitOutcome {
+    fn has_uncovered_option_permission_rejection(&self) -> bool {
+        self.rejection_reasons
+            .iter()
+            .any(|reason| is_uncovered_option_permission_rejection(reason))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -293,6 +304,9 @@ async fn submission_block_for_selected(
     context: &AccountEngineContext<'_>,
     selected: &SelectedOptionsEntry,
 ) -> anyhow::Result<Option<SubmissionBlock>> {
+    if let Some(block) = broker_permission_block_for_selected(context.state, selected) {
+        return Ok(Some(block));
+    }
     if let Some(block) = risk_gate_decision(context).await?.into_submission_block() {
         return Ok(Some(block));
     }
@@ -364,6 +378,26 @@ async fn submission_block_for_selected(
         limit: None,
         details: admission.reasons,
     }))
+}
+
+fn broker_permission_block_for_selected(
+    state: &StrategyState,
+    selected: &SelectedOptionsEntry,
+) -> Option<SubmissionBlock> {
+    if selected.is_naked_option()
+        && state.has_canceled_naked_entry_with_close_reason(
+            UNCOVERED_OPTION_PERMISSION_REJECTION_REASON,
+        )
+    {
+        Some(SubmissionBlock {
+            reason: "broker_uncovered_option_permission".to_string(),
+            current: None,
+            limit: None,
+            details: vec!["alpaca_http_40310000".to_string()],
+        })
+    } else {
+        None
+    }
 }
 
 fn fleet_underlying_limit_block(
@@ -858,6 +892,8 @@ async fn apply_selected_entry_decision(
     let outcome = submit_selected_entry(&entry, &order_list_id, config.quantity, config).await?;
     let terminal_rejection =
         entry.is_naked_option() && outcome.accepted == 0 && outcome.rejected > 0;
+    let uncovered_permission_rejection =
+        terminal_rejection && outcome.has_uncovered_option_permission_rejection();
     if outcome.accepted > 0 || terminal_rejection {
         state.record_entry_submission(entry.state_entry_draft(
             trade_date,
@@ -867,7 +903,14 @@ async fn apply_selected_entry_decision(
         ));
         if terminal_rejection && let Some(entry) = state.entries.last_mut() {
             entry.mark_canceled();
-            entry.close_reason = Some("entry_rejected".to_string());
+            entry.close_reason = Some(
+                if uncovered_permission_rejection {
+                    UNCOVERED_OPTION_PERMISSION_REJECTION_REASON
+                } else {
+                    "entry_rejected"
+                }
+                .to_string(),
+            );
         }
     }
 
@@ -889,6 +932,18 @@ async fn apply_selected_entry_decision(
             Value::Bool(terminal_rejection),
         );
     }
+    if uncovered_permission_rejection {
+        insert_value_field(
+            &mut submit_payload,
+            "broker_permission_block",
+            Value::String("uncovered_options_not_eligible".to_string()),
+        );
+    }
+    insert_value_field(
+        &mut submit_payload,
+        "rejection_reasons",
+        json!(&outcome.rejection_reasons),
+    );
     record_submit_result_event(config, trade_date, submit_payload).await;
     if outcome.rejected > 0 {
         record_submit_rejected_candidate_alert(
@@ -902,6 +957,12 @@ async fn apply_selected_entry_decision(
         .await;
     }
     Ok(outcome.accepted > 0 || terminal_rejection)
+}
+
+fn is_uncovered_option_permission_rejection(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("40310000")
+        && reason.contains("not eligible to trade uncovered option contracts")
 }
 
 async fn risk_gate_decision(
@@ -1922,6 +1983,42 @@ mod tests {
         ];
 
         assert_eq!(admission_block_reason(&reasons), "account_not_tradable");
+    }
+
+    #[test]
+    fn submit_outcome_detects_uncovered_permission_rejection() {
+        let outcome = SubmitOutcome {
+            accepted: 0,
+            rejected: 1,
+            parent_order_id: None,
+            rejection_reasons: vec![
+                "submit-order-rejected: Alpaca request failed with HTTP 403 for https://paper-api.alpaca.markets/v2/orders: {\"code\":40310000,\"message\":\"account not eligible to trade uncovered option contracts\"}".to_string(),
+            ],
+        };
+
+        assert!(outcome.has_uncovered_option_permission_rejection());
+    }
+
+    #[test]
+    fn broker_permission_guard_blocks_naked_after_uncovered_rejection() {
+        let mut rejected = state_entry();
+        rejected.strategy = naked_option_strategy_name(NakedOptionKind::Call).to_string();
+        rejected.long_symbol.clear();
+        rejected.mark_canceled();
+        rejected.close_reason = Some(UNCOVERED_OPTION_PERMISSION_REJECTION_REASON.to_string());
+        let state = StrategyState {
+            entries: vec![rejected],
+        };
+        let selected = SelectedOptionsEntry::NakedOption(SelectedNakedOptionEntry {
+            underlying: "SPY".to_string(),
+            kind: NakedOptionKind::Call,
+            candidate: naked_option_candidate(),
+        });
+
+        let block = broker_permission_block_for_selected(&state, &selected).unwrap();
+
+        assert_eq!(block.reason, "broker_uncovered_option_permission");
+        assert_eq!(block.details, vec!["alpaca_http_40310000"]);
     }
 
     #[test]

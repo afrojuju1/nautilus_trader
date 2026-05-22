@@ -103,7 +103,8 @@ where
 
     submit(&mut client, trader_id, Some(client_id), strategy_id)?;
 
-    let (accepted, rejected) = collect_execution_events(&mut rx, expected_events).await;
+    let (accepted, rejected, rejection_reasons) =
+        collect_execution_events(&mut rx, expected_events).await;
     let parent_order_id = lookup_parent_order(&exec_config, order_list_id).await?;
     if cancel_after_accept && accepted > 0 {
         cancel_parent_order(&exec_config, parent_order_id.as_deref()).await?;
@@ -116,6 +117,7 @@ where
         accepted,
         rejected,
         parent_order_id,
+        rejection_reasons,
     })
 }
 
@@ -365,9 +367,10 @@ fn build_mleg_submit_order_list_from_plan(
 async fn collect_execution_events(
     rx: &mut mpsc::UnboundedReceiver<ExecutionEvent>,
     leg_count: usize,
-) -> (usize, usize) {
+) -> (usize, usize, Vec<String>) {
     let mut accepted = 0;
     let mut rejected = 0;
+    let mut rejection_reasons = Vec::new();
     let deadline = Instant::now()
         + Duration::from_secs(env_parse(
             "ALPACA_EVENT_TIMEOUT_SECS",
@@ -384,7 +387,12 @@ async fn collect_execution_events(
             print_order_event(&order_event);
             match order_event {
                 OrderEventAny::Accepted(_) => accepted += 1,
-                OrderEventAny::Rejected(_) => rejected += 1,
+                OrderEventAny::Rejected(_) => {
+                    rejected += 1;
+                    if let Some(reason) = order_event_reason(&order_event) {
+                        rejection_reasons.push(reason);
+                    }
+                }
                 _ => {}
             }
             if accepted + rejected >= leg_count {
@@ -393,7 +401,7 @@ async fn collect_execution_events(
         }
     }
 
-    (accepted, rejected)
+    (accepted, rejected, rejection_reasons)
 }
 
 fn print_order_event(order_event: &OrderEventAny) {
@@ -410,6 +418,14 @@ fn print_order_event(order_event: &OrderEventAny) {
             .reason()
             .map_or_else(|| "None".to_string(), |value| value.to_string()),
     );
+}
+
+fn order_event_reason(order_event: &OrderEventAny) -> Option<String> {
+    order_event
+        .clone()
+        .into_boxed()
+        .reason()
+        .map(|reason| reason.to_string())
 }
 
 async fn lookup_parent_order(

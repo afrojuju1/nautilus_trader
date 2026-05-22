@@ -2930,6 +2930,7 @@ mod tests {
             UUID4::new(),
             UnixNanos::from(1),
             Some(params),
+            None,
         );
 
         let request = replace_order_request_from_modify_order(&cmd).unwrap();
@@ -2954,6 +2955,7 @@ mod tests {
             Some(Price::new(0.50, 2)),
             UUID4::new(),
             UnixNanos::from(1),
+            None,
             None,
         );
 

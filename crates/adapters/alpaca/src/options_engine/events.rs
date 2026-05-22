@@ -73,6 +73,11 @@ pub(super) async fn record_submit_rejected_candidate_alert(
             .as_ref()
             .map_or(Value::Null, |value| Value::String(value.clone())),
     );
+    insert_value_field(
+        &mut payload,
+        "rejection_reasons",
+        serde_json::json!(&outcome.rejection_reasons),
+    );
     if let Some(recorded) = terminal_rejection_recorded {
         insert_value_field(
             &mut payload,
