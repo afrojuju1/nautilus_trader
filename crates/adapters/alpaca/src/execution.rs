@@ -35,6 +35,7 @@ use nautilus_model::{
     accounts::AccountAny,
     enums::{LiquiditySide, OmsType, PositionSideSpecified},
     identifiers::{ClientId, PositionId, TradeId, Venue},
+    instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money},
@@ -76,7 +77,10 @@ use crate::{
 use crate::{
     config::AlpacaExecClientConfig,
     http::models::{AlpacaActivity, ListActivitiesRequest, ReplaceOrderRequest},
-    orders::{AlpacaPositionIntent, MlegOrderLeg, MlegOrderPayload, SimpleOrderPayload},
+    orders::{
+        AlpacaPositionIntent, EquityOrderPayload, MlegOrderLeg, MlegOrderPayload,
+        SimpleOrderPayload,
+    },
     orders::{NetPremiumKind, TradeIntent, signed_net_limit_price},
     runtime::emit_operator_event,
     websocket::{
@@ -1375,14 +1379,30 @@ impl ExecutionClient for AlpacaExecutionClient {
             return Ok(());
         }
 
-        let payload = build_simple_payload_from_order(&order)?;
+        let cache = self.core.cache();
+        let instrument = cache.instrument(&order.instrument_id()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Alpaca simple order {} missing cached instrument {}",
+                order.client_order_id(),
+                order.instrument_id()
+            )
+        })?;
+        let payload = build_simple_payload_from_order(&order, instrument)?;
         self.emitter.emit_order_submitted(&order);
 
         let http_client = self.http_client.clone();
         let emitter = self.emitter.clone();
         let clock = self.clock;
         self.spawn_task("submit_simple_order", async move {
-            match http_client.submit_simple_order(&payload).await {
+            let result = match &payload {
+                AlpacaSimplePayload::Equity(payload) => {
+                    http_client.submit_equity_order(payload).await
+                }
+                AlpacaSimplePayload::Option(payload) => {
+                    http_client.submit_simple_order(payload).await
+                }
+            };
+            match result {
                 Ok(submitted) => {
                     let ts_event = clock.get_time_ns();
                     match submitted.id.as_deref() {
@@ -1875,7 +1895,30 @@ fn emit_trade_update_reports(
 }
 
 #[cfg(feature = "live")]
-fn build_simple_payload_from_order(order: &OrderAny) -> anyhow::Result<SimpleOrderPayload> {
+#[derive(Clone, Debug)]
+enum AlpacaSimplePayload {
+    Equity(EquityOrderPayload),
+    Option(SimpleOrderPayload),
+}
+
+#[cfg(feature = "live")]
+fn build_simple_payload_from_order(
+    order: &OrderAny,
+    instrument: &InstrumentAny,
+) -> anyhow::Result<AlpacaSimplePayload> {
+    match instrument {
+        InstrumentAny::Equity(_) => build_equity_payload_from_order(order),
+        InstrumentAny::OptionContract(_) => build_option_payload_from_order(order),
+        instrument => anyhow::bail!(
+            "Alpaca simple order {} uses unsupported instrument class {:?}",
+            order.client_order_id(),
+            instrument.instrument_class(),
+        ),
+    }
+}
+
+#[cfg(feature = "live")]
+fn build_option_payload_from_order(order: &OrderAny) -> anyhow::Result<AlpacaSimplePayload> {
     validate_simple_option_order(order)?;
     let quantity = positive_integer_quantity(order.quantity(), order.client_order_id())?;
     let price = order
@@ -1901,7 +1944,34 @@ fn build_simple_payload_from_order(order: &OrderAny) -> anyhow::Result<SimpleOrd
         price,
     )
     .and_then(|payload| payload.with_client_order_id(order.client_order_id().to_string()))
+    .map(AlpacaSimplePayload::Option)
     .map_err(|e| anyhow::anyhow!("invalid Alpaca simple payload: {e}"))
+}
+
+#[cfg(feature = "live")]
+fn build_equity_payload_from_order(order: &OrderAny) -> anyhow::Result<AlpacaSimplePayload> {
+    validate_simple_equity_order(order)?;
+    let quantity = positive_integer_quantity(order.quantity(), order.client_order_id())?;
+    let price = order
+        .price()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Alpaca equity order {} missing limit price",
+                order.client_order_id()
+            )
+        })?
+        .as_f64();
+    if price <= 0.0 {
+        anyhow::bail!(
+            "Alpaca equity order {} price must be positive, was {price}",
+            order.client_order_id()
+        );
+    }
+    let side = alpaca_order_side(order.order_side())?;
+    EquityOrderPayload::new_limit(order.instrument_id().symbol.as_str(), quantity, side, price)
+        .and_then(|payload| payload.with_client_order_id(order.client_order_id().to_string()))
+        .map(AlpacaSimplePayload::Equity)
+        .map_err(|e| anyhow::anyhow!("invalid Alpaca simple payload: {e}"))
 }
 
 #[cfg(feature = "live")]
@@ -2066,6 +2136,44 @@ fn validate_simple_option_order(order: &OrderAny) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "live")]
+fn validate_simple_equity_order(order: &OrderAny) -> anyhow::Result<()> {
+    if order.instrument_id().venue != Venue::new(ALPACA_VENUE) {
+        anyhow::bail!(
+            "Alpaca equity order {} has non-Alpaca instrument {}",
+            order.client_order_id(),
+            order.instrument_id()
+        );
+    }
+    if order.order_type() != OrderType::Limit {
+        anyhow::bail!(
+            "Alpaca equity order {} must be a limit order, was {:?}",
+            order.client_order_id(),
+            order.order_type()
+        );
+    }
+    if order.time_in_force() != TimeInForce::Day {
+        anyhow::bail!(
+            "Alpaca equity order {} must use DAY time in force, was {:?}",
+            order.client_order_id(),
+            order.time_in_force()
+        );
+    }
+    if order.is_quote_quantity() {
+        anyhow::bail!(
+            "Alpaca equity order {} cannot use quote quantity",
+            order.client_order_id()
+        );
+    }
+    if matches!(order.order_side(), OrderSide::NoOrderSide) {
+        anyhow::bail!(
+            "Alpaca equity order {} missing order side",
+            order.client_order_id()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live")]
 fn validate_mleg_leg_order(order: &OrderAny) -> anyhow::Result<()> {
     if order.instrument_id().venue != Venue::new(ALPACA_VENUE) {
         anyhow::bail!(
@@ -2143,6 +2251,15 @@ fn alpaca_position_intent(
         (OrderSide::Buy, true) => Ok(AlpacaPositionIntent::BuyToClose),
         (OrderSide::Sell, true) => Ok(AlpacaPositionIntent::SellToClose),
         (OrderSide::NoOrderSide, _) => anyhow::bail!("Alpaca MLeg leg missing order side"),
+    }
+}
+
+#[cfg(feature = "live")]
+fn alpaca_order_side(side: OrderSide) -> anyhow::Result<crate::orders::AlpacaOrderSide> {
+    match side {
+        OrderSide::Buy => Ok(crate::orders::AlpacaOrderSide::Buy),
+        OrderSide::Sell => Ok(crate::orders::AlpacaOrderSide::Sell),
+        OrderSide::NoOrderSide => anyhow::bail!("Alpaca equity order missing order side"),
     }
 }
 
@@ -2486,6 +2603,10 @@ mod tests {
     use nautilus_model::{
         events::OrderInitialized,
         identifiers::{OrderListId, StrategyId, TraderId},
+        instruments::{
+            stubs::{equity_aapl, option_contract_appl},
+            InstrumentAny,
+        },
         orders::OrderList,
     };
     #[cfg(feature = "live")]
@@ -2763,13 +2884,52 @@ mod tests {
     fn build_simple_payload_from_order_uses_position_intent() {
         let order = mleg_limit_order("O-1", "SPY260508P00500000", OrderSide::Sell, 0.75, false);
 
-        let payload = build_simple_payload_from_order(&order).unwrap();
+        let instrument = InstrumentAny::OptionContract(option_contract_appl());
+
+        let payload = build_simple_payload_from_order(&order, &instrument).unwrap();
+        let AlpacaSimplePayload::Option(payload) = payload else {
+            panic!("expected option simple payload");
+        };
 
         assert_eq!(payload.symbol, "SPY260508P00500000");
         assert_eq!(payload.side, crate::orders::AlpacaOrderSide::Sell);
         assert_eq!(payload.position_intent, AlpacaPositionIntent::SellToOpen);
         assert_eq!(payload.limit_price.as_deref(), Some("0.75"));
         assert_eq!(payload.client_order_id.as_deref(), Some("O-1"));
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn build_simple_payload_from_order_routes_equity_instruments() {
+        let order = mleg_limit_order("O-1", "AAPL", OrderSide::Buy, 212.34, false);
+        let instrument = InstrumentAny::Equity(equity_aapl());
+
+        let payload = build_simple_payload_from_order(&order, &instrument).unwrap();
+        let AlpacaSimplePayload::Equity(payload) = payload else {
+            panic!("expected equity simple payload");
+        };
+
+        assert_eq!(payload.symbol, "AAPL");
+        assert_eq!(payload.side, crate::orders::AlpacaOrderSide::Buy);
+        assert_eq!(payload.limit_price.as_deref(), Some("212.34"));
+        assert_eq!(payload.client_order_id.as_deref(), Some("O-1"));
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn build_simple_payload_from_order_routes_equity_sell_orders() {
+        let order = mleg_limit_order("O-2", "AAPL", OrderSide::Sell, 211.11, true);
+        let instrument = InstrumentAny::Equity(equity_aapl());
+
+        let payload = build_simple_payload_from_order(&order, &instrument).unwrap();
+        let AlpacaSimplePayload::Equity(payload) = payload else {
+            panic!("expected equity simple payload");
+        };
+
+        assert_eq!(payload.symbol, "AAPL");
+        assert_eq!(payload.side, crate::orders::AlpacaOrderSide::Sell);
+        assert_eq!(payload.limit_price.as_deref(), Some("211.11"));
+        assert_eq!(payload.client_order_id.as_deref(), Some("O-2"));
     }
 
     #[cfg(feature = "live")]

@@ -39,7 +39,7 @@ use crate::{
             StockBarsRequest, StockBarsResponse, StockSnapshotsRequest, StockSnapshotsResponse,
         },
     },
-    orders::{MlegOrderPayload, SimpleOrderPayload},
+    orders::{EquityOrderPayload, MlegOrderPayload, SimpleOrderPayload},
 };
 
 const APCA_API_KEY_HEADER: &str = "APCA-API-KEY-ID";
@@ -538,6 +538,17 @@ impl AlpacaHttpClient {
     /// Returns an error if the payload fails local validation, the request fails, or the response
     /// cannot be decoded.
     pub async fn submit_simple_order(&self, payload: &SimpleOrderPayload) -> Result<AlpacaOrder> {
+        payload.validate()?;
+        self.post_trading_json("/v2/orders", &[], payload).await
+    }
+
+    /// Submits a validated Alpaca simple equity order payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload fails local validation, the request fails, or the response
+    /// cannot be decoded.
+    pub async fn submit_equity_order(&self, payload: &EquityOrderPayload) -> Result<AlpacaOrder> {
         payload.validate()?;
         self.post_trading_json("/v2/orders", &[], payload).await
     }

@@ -16,6 +16,12 @@
 Alpaca strategy scaffolds.
 """
 
+from nautilus_trader.adapters.alpaca.strategies.gap_down_fragile_rebound import (
+    GapDownFragileRebound,
+)
+from nautilus_trader.adapters.alpaca.strategies.gap_down_fragile_rebound import (
+    GapDownFragileReboundConfig,
+)
 from nautilus_trader.adapters.alpaca.strategies.put_credit import AlpacaPutCreditStrategy
 from nautilus_trader.adapters.alpaca.strategies.put_credit import AlpacaPutCreditStrategyConfig
 
@@ -23,4 +29,6 @@ from nautilus_trader.adapters.alpaca.strategies.put_credit import AlpacaPutCredi
 __all__ = [
     "AlpacaPutCreditStrategy",
     "AlpacaPutCreditStrategyConfig",
+    "GapDownFragileRebound",
+    "GapDownFragileReboundConfig",
 ]

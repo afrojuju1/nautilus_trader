@@ -219,6 +219,108 @@ impl SimpleOrderPayload {
     }
 }
 
+/// Alpaca simple equity order payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EquityOrderPayload {
+    /// Alpaca equity or ETF symbol.
+    pub symbol: String,
+    /// Number of whole shares.
+    pub qty: String,
+    /// Order side.
+    pub side: AlpacaOrderSide,
+    /// Alpaca order type.
+    #[serde(rename = "type")]
+    pub order_type: String,
+    /// Time in force.
+    pub time_in_force: String,
+    /// Optional client order ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,
+    /// Limit price for limit orders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_price: Option<String>,
+}
+
+impl EquityOrderPayload {
+    /// Creates a simple equity limit order payload and validates it locally.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload is malformed.
+    pub fn new_limit(
+        symbol: impl Into<String>,
+        quantity: u64,
+        side: AlpacaOrderSide,
+        limit_price: f64,
+    ) -> Result<Self> {
+        let payload = Self {
+            symbol: symbol.into(),
+            qty: quantity.to_string(),
+            side,
+            order_type: "limit".to_string(),
+            time_in_force: "day".to_string(),
+            client_order_id: None,
+            limit_price: Some(format!("{limit_price:.2}")),
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    /// Returns a copy of the payload with a client order ID set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the client order ID is empty or non-ASCII.
+    pub fn with_client_order_id(mut self, client_order_id: impl Into<String>) -> Result<Self> {
+        let client_order_id = client_order_id.into();
+        if client_order_id.trim().is_empty() {
+            return Err(validation("client_order_id must not be empty"));
+        }
+        if !client_order_id.is_ascii() {
+            return Err(validation("client_order_id must be ASCII"));
+        }
+        self.client_order_id = Some(client_order_id);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Validates this payload without submitting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload is malformed.
+    pub fn validate(&self) -> Result<()> {
+        if self.symbol.trim().is_empty() {
+            return Err(validation("symbol must not be empty"));
+        }
+        parse_positive_u64(&self.qty, "qty")?;
+        if self.order_type != "limit" {
+            return Err(validation("only limit equity orders are supported"));
+        }
+        if self.time_in_force != "day" {
+            return Err(validation("equity simple time_in_force must be day"));
+        }
+        let limit_price = self
+            .limit_price
+            .as_ref()
+            .ok_or_else(|| validation("limit_price is required"))?
+            .parse::<f64>()
+            .map_err(|_| validation("limit_price must be numeric"))?;
+        if limit_price <= 0.0 {
+            return Err(validation("limit_price must be positive"));
+        }
+        if let Some(client_order_id) = &self.client_order_id {
+            if client_order_id.trim().is_empty() {
+                return Err(validation("client_order_id must not be empty"));
+            }
+            if !client_order_id.is_ascii() {
+                return Err(validation("client_order_id must be ASCII"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Alpaca multi-leg order payload.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct MlegOrderPayload {
@@ -770,6 +872,25 @@ mod tests {
         assert_eq!(payload.side, AlpacaOrderSide::Buy);
         assert_eq!(payload.position_intent, AlpacaPositionIntent::BuyToClose);
         assert_eq!(payload.limit_price.as_deref(), Some("0.20"));
+    }
+
+    #[test]
+    fn equity_limit_payload_omits_option_position_intent() {
+        let payload = EquityOrderPayload::new_limit("SPY", 12, AlpacaOrderSide::Buy, 510.25)
+            .unwrap()
+            .with_client_order_id("equity-buy-1")
+            .unwrap();
+
+        let value = serde_json::to_value(&payload).unwrap();
+
+        assert_eq!(value["symbol"], "SPY");
+        assert_eq!(value["qty"], "12");
+        assert_eq!(value["side"], "buy");
+        assert_eq!(value["type"], "limit");
+        assert_eq!(value["time_in_force"], "day");
+        assert_eq!(value["limit_price"], "510.25");
+        assert!(value.get("position_intent").is_none());
+        assert!(value.get("order_class").is_none());
     }
 
     #[test]
