@@ -22,7 +22,7 @@ use std::{
 };
 
 use chrono::TimeDelta;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
     cache::Cache,
     clock::Clock,
@@ -123,6 +123,7 @@ pub struct OrderMatchingEngine {
     precision_mismatch_streak: u32,
     tob_initialized: bool,
     instrument_close: Option<InstrumentClose>,
+    pending_resolution: bool,
     settlement_price: Option<Price>,
     expiration_processed: bool,
 }
@@ -206,6 +207,7 @@ impl OrderMatchingEngine {
             precision_mismatch_streak: 0,
             tob_initialized: false,
             instrument_close: None,
+            pending_resolution: false,
             settlement_price: None,
             expiration_processed: false,
         }
@@ -261,6 +263,7 @@ impl OrderMatchingEngine {
         self.precision_mismatch_streak = 0;
         self.tob_initialized = false;
         self.instrument_close = None;
+        self.pending_resolution = false;
         self.settlement_price = None;
         self.expiration_processed = false;
         self.fill_at_market = true;
@@ -1939,6 +1942,59 @@ impl OrderMatchingEngine {
         self.expiration_processed
     }
 
+    fn requires_pending_resolution(&self) -> bool {
+        matches!(self.instrument, InstrumentAny::BinaryOption(_))
+    }
+
+    fn cancel_open_orders_for_expiration(&mut self) {
+        // Build a single de-duplicated cancellation set across the matching
+        // core and cache. Resting orders may still only be represented in the
+        // core while inflight orders can remain cache-only during the
+        // submitted/pending transition window.
+        let instrument_id = self.instrument.id();
+        let expiration_order_ids: IndexSet<ClientOrderId> = {
+            let cache = self.cache.borrow();
+            let mut order_ids = IndexSet::new();
+
+            for order_info in self.get_open_orders() {
+                order_ids.insert(order_info.client_order_id);
+            }
+
+            for order in cache.orders(None, Some(&instrument_id), None, None, None) {
+                if order.is_open() || order.is_inflight() {
+                    order_ids.insert(order.client_order_id());
+                }
+            }
+
+            order_ids
+        };
+
+        for client_order_id in expiration_order_ids {
+            let order = {
+                let cache = self.cache.borrow();
+                cache.order(&client_order_id).map(|order| order.clone())
+            };
+
+            if let Some(order) = order {
+                self.cancel_order(&order, None);
+            }
+        }
+    }
+
+    fn enter_pending_resolution(&mut self) {
+        if self.pending_resolution {
+            return;
+        }
+
+        self.pending_resolution = true;
+        self.market_status = MarketStatus::Closed;
+        self.cancel_open_orders_for_expiration();
+        log::info!(
+            "{} expired and is now pending resolution; open orders canceled and new orders blocked",
+            self.instrument.id()
+        );
+    }
+
     fn check_instrument_expiration(&mut self, timestamp_ns: UnixNanos) {
         if self.expiration_processed {
             return;
@@ -1953,21 +2009,19 @@ impl OrderMatchingEngine {
             return;
         }
 
+        if self.instrument_close.is_none()
+            && timestamp_triggered
+            && self.requires_pending_resolution()
+        {
+            self.enter_pending_resolution();
+            return;
+        }
+
         self.expiration_processed = true;
+        self.pending_resolution = false;
         let close = self.instrument_close.take();
         log::info!("{} reached expiration", self.instrument.id());
-
-        let open_orders: Vec<RestingOrder> = self.get_open_orders();
-        for order_info in &open_orders {
-            let order = {
-                let cache = self.cache.borrow();
-                cache.order(&order_info.client_order_id).map(|o| o.clone())
-            };
-
-            if let Some(order) = order {
-                self.cancel_order(&order, None);
-            }
-        }
+        self.cancel_open_orders_for_expiration();
 
         if matches!(
             self.instrument,
@@ -2006,7 +2060,7 @@ impl OrderMatchingEngine {
         for (trader_id, strategy_id, position_id, closing_side, quantity) in positions {
             let client_order_id =
                 ClientOrderId::from(format!("EXPIRATION-{}-{}", self.venue, UUID4::new()).as_str());
-            let order = OrderAny::Market(MarketOrder::new(
+            let mut order = OrderAny::Market(MarketOrder::new(
                 trader_id,
                 strategy_id,
                 instrument_id,
@@ -2030,6 +2084,7 @@ impl OrderMatchingEngine {
                     self.venue
                 ))]),
             ));
+            order.set_liquidity_side(LiquiditySide::Taker);
 
             let add_result =
                 self.cache
@@ -2051,6 +2106,7 @@ impl OrderMatchingEngine {
                     &[(fill_price, quantity)],
                     LiquiditySide::Taker,
                     Some(position_id),
+                    None,
                     None,
                 );
             } else {
@@ -2445,6 +2501,11 @@ impl OrderMatchingEngine {
             return;
         }
 
+        // Ensure expiration semantics are enforced even when no fresh market-data
+        // tick arrives for this instrument after expiry (e.g. after rotation).
+        let ts_now = self.clock.borrow().timestamp_ns();
+        self.check_instrument_expiration(ts_now);
+
         // Validate inside a cache borrow scope, collecting any rejection
         // reason rather than emitting events while the borrow is held.
         // This avoids RefCell re-entrancy panics from synchronous event
@@ -2454,6 +2515,16 @@ impl OrderMatchingEngine {
 
             // Index identifiers
             self.account_ids.insert(order.trader_id(), account_id);
+
+            if self.pending_resolution {
+                break 'validate Some(
+                    format!(
+                        "Contract {} has expired and is pending resolution",
+                        self.instrument.id()
+                    )
+                    .into(),
+                );
+            }
 
             // Check for instrument expiration or activation
             if self.instrument.has_expiration() {
@@ -4000,19 +4071,25 @@ impl OrderMatchingEngine {
         let (mut fills, from_synthetic) = self.determine_market_fill_model_price_and_volume(&order);
 
         // Apply protection price filtering at fill time (trigger-time semantics for stops)
-        if let Some(protection_points) = self.config.price_protection_points
+        let protection_price: Option<Price> = if let Some(protection_points) =
+            self.config.price_protection_points
             && matches!(
                 order.order_type(),
                 OrderType::Market | OrderType::StopMarket
-            )
-            && let Ok(protection_price) = protection_price_calculate(
+            ) {
+            protection_price_calculate(
                 self.instrument.price_increment(),
                 &order,
                 protection_points,
                 self.core.bid,
                 self.core.ask,
             )
-        {
+            .ok()
+        } else {
+            None
+        };
+
+        if let Some(protection_price) = protection_price {
             fills = self.filter_fills_by_protection(fills, &order, protection_price);
         }
 
@@ -4041,6 +4118,7 @@ impl OrderMatchingEngine {
             LiquiditySide::Taker,
             None,
             position.as_ref(),
+            protection_price,
         );
     }
 
@@ -4220,6 +4298,7 @@ impl OrderMatchingEngine {
                     liquidity_side,
                     venue_position_id,
                     position.as_ref(),
+                    None,
                 );
             }
             None => panic!("Limit order must have a price"),
@@ -4233,6 +4312,7 @@ impl OrderMatchingEngine {
         liquidity_side: LiquiditySide,
         venue_position_id: Option<PositionId>,
         position: Option<&Position>,
+        protection_price: Option<Price>,
     ) {
         if order.time_in_force() == TimeInForce::Fok {
             let mut total_size = Quantity::zero(order.quantity().precision);
@@ -4275,6 +4355,13 @@ impl OrderMatchingEngine {
         };
 
         let mut initial_market_to_limit_fill = false;
+        let mut total_filled = self
+            .cached_filled_qty
+            .get(&order.client_order_id())
+            .copied()
+            .unwrap_or_else(|| order.filled_qty());
+        let initial_total_filled = total_filled;
+        let mut last_fill_px: Option<Price> = None;
 
         for &(fill_px, fill_qty) in fills {
             let Some(mut fill_px) = self.normalize_fill_price(fill_px, order.client_order_id())
@@ -4339,6 +4426,13 @@ impl OrderMatchingEngine {
                 return;
             }
 
+            // Mirror `fill_order`'s leaves cap
+            let capped_fill_qty = min(
+                effective_fill_qty,
+                order.quantity().saturating_sub(total_filled),
+            );
+            total_filled = total_filled.add(capped_fill_qty);
+
             self.fill_order(
                 order,
                 fill_px,
@@ -4347,6 +4441,7 @@ impl OrderMatchingEngine {
                 venue_position_id,
                 position,
             );
+            last_fill_px = Some(fill_px);
 
             if order.order_type() == OrderType::MarketToLimit && initial_market_to_limit_fill {
                 // Filled initial level
@@ -4354,13 +4449,18 @@ impl OrderMatchingEngine {
             }
         }
 
-        if order.time_in_force() == TimeInForce::Ioc && order.is_open() {
-            // IOC order has filled all available size
+        let leaves_remaining = total_filled < order.quantity();
+        let filled_in_loop = total_filled > initial_total_filled;
+
+        if order.time_in_force() == TimeInForce::Ioc && leaves_remaining {
             self.cancel_order(order, None);
             return;
         }
 
-        if order.is_open()
+        // `filled_in_loop` covers the just-partially-filled case where the
+        // local clone's status has not seen the fill events yet.
+        if leaves_remaining
+            && (order.is_open() || filled_in_loop)
             && self.book_type == BookType::L1_MBP
             && matches!(
                 order.order_type(),
@@ -4370,10 +4470,38 @@ impl OrderMatchingEngine {
                     | OrderType::TrailingStopMarket
             )
         {
-            // Exhausted simulated book volume (continue aggressive filling into next level)
-            // This is a very basic implementation of slipping by a single tick, in the future
-            // we will implement more detailed fill modeling.
-            todo!("Exhausted simulated book volume")
+            // Exhausted L1 volume: slip remainder by a single price increment
+            let Some(last_fill_px) = last_fill_px else {
+                return;
+            };
+
+            let side = order.order_side().as_specified();
+            let slip_fill_px = match side {
+                OrderSideSpecified::Buy => last_fill_px.add(self.instrument.price_increment()),
+                OrderSideSpecified::Sell => last_fill_px.sub(self.instrument.price_increment()),
+            };
+
+            if let Some(protection_price) = protection_price {
+                let exceeds_boundary = match side {
+                    OrderSideSpecified::Buy => slip_fill_px.raw > protection_price.raw,
+                    OrderSideSpecified::Sell => slip_fill_px.raw < protection_price.raw,
+                };
+
+                if exceeds_boundary {
+                    return;
+                }
+            }
+
+            let leaves_qty = order.quantity().saturating_sub(total_filled);
+
+            self.fill_order(
+                order,
+                slip_fill_px,
+                leaves_qty,
+                liquidity_side,
+                venue_position_id,
+                position,
+            );
         }
     }
 
@@ -4442,7 +4570,13 @@ impl OrderMatchingEngine {
         let commission = self
             .fee_model
             .get_commission(order, last_qty, last_px, &self.instrument)
-            .unwrap();
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to compute commission for {}: {}",
+                    order.client_order_id(),
+                    e
+                );
+            });
 
         let venue_order_id = self.ids_generator.get_venue_order_id(order).unwrap();
         self.generate_order_filled(
@@ -4908,7 +5042,16 @@ impl OrderMatchingEngine {
 
         if order.status() != OrderStatus::Accepted {
             let venue_order_id = self.ids_generator.get_venue_order_id(order).unwrap();
-            self.generate_order_accepted(order, venue_order_id);
+            let event = self.create_order_accepted(order, venue_order_id);
+            // Apply locally so `cancel_order` sees `Accepted`,
+            // dispatch on apply failure so `Released` still registers with the core.
+            if let Err(e) = order.apply(event.clone()) {
+                log::warn!(
+                    "Skipping local apply of accepted event for {}: {e}",
+                    order.client_order_id(),
+                );
+            }
+            self.dispatch_order_event(event);
 
             // Activate before emitting `OrderUpdated` so `match_info` below
             // carries the activation flag.
@@ -5275,12 +5418,16 @@ impl OrderMatchingEngine {
         );
     }
 
-    fn generate_order_accepted(&self, order: &OrderAny, venue_order_id: VenueOrderId) {
+    fn create_order_accepted(
+        &self,
+        order: &OrderAny,
+        venue_order_id: VenueOrderId,
+    ) -> OrderEventAny {
         let ts_now = self.clock.borrow().timestamp_ns();
         let account_id = order
             .account_id()
             .unwrap_or(self.account_ids.get(&order.trader_id()).unwrap().to_owned());
-        let event = OrderEventAny::Accepted(OrderAccepted::new(
+        OrderEventAny::Accepted(OrderAccepted::new(
             order.trader_id(),
             order.strategy_id(),
             order.instrument_id(),
@@ -5291,8 +5438,11 @@ impl OrderMatchingEngine {
             ts_now,
             ts_now,
             false,
-        ));
+        ))
+    }
 
+    fn generate_order_accepted(&self, order: &OrderAny, venue_order_id: VenueOrderId) {
+        let event = self.create_order_accepted(order, venue_order_id);
         self.dispatch_order_event(event);
     }
 

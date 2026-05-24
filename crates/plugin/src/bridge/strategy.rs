@@ -16,7 +16,7 @@
 //! Host-side adapter that wraps a plug-in strategy cdylib as a
 //! [`Strategy`].
 //!
-//! Mirrors [`PluginActorAdapter`](crate::plugin::actor::PluginActorAdapter)
+//! Mirrors [`PluginActorAdapter`](crate::bridge::actor::PluginActorAdapter)
 //! shape but owns a [`StrategyCore`] and forwards the strategy-only
 //! callbacks (order lifecycle and position events) as well as the actor
 //! callback set. The plug-in issues `submit_order` / `cancel_order` /
@@ -42,7 +42,7 @@ use nautilus_common::{actor::DataActor, signal::Signal, timer::TimeEvent};
 use nautilus_model::{
     data::{
         Bar, FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus,
-        MarkPriceUpdate, QuoteTick, TradeTick,
+        MarkPriceUpdate, OptionChainSlice, OptionGreeks, OrderBookDeltas, QuoteTick, TradeTick,
     },
     events::{
         OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
@@ -51,19 +51,23 @@ use nautilus_model::{
         OrderUpdated, PositionChanged, PositionClosed, PositionOpened,
     },
     identifiers::ActorId,
-};
-use nautilus_plugin::{
-    boundary::{BorrowedStr, PluginResult},
-    host::{HostContext, HostVTable},
-    manifest::ValidatedStrategyVTable,
-    surfaces::strategy::PluginStrategyHandle,
+    instruments::InstrumentAny,
 };
 use nautilus_trading::{
     nautilus_strategy,
     strategy::{Strategy, StrategyConfig, StrategyCore},
 };
 
-use crate::plugin::registry::{HostContextInner, drop_host_context, leak_host_context};
+use crate::{
+    boundary::{BorrowedStr, PluginResult, Slice},
+    bridge::registry::{HostContextInner, drop_host_context, leak_host_context},
+    host::{HostContext, HostVTable},
+    manifest::ValidatedStrategyVTable,
+    surfaces::{
+        book::OrderBookDeltasHandle, instrument::InstrumentAnyHandle,
+        option_chain::OptionChainSliceHandle, strategy::PluginStrategyHandle,
+    },
+};
 
 /// Adapts a plug-in strategy (vtable + handle from a cdylib) into a host-side
 /// [`Strategy`] the live node can
@@ -287,6 +291,10 @@ nautilus_strategy!(PluginStrategyAdapter, core, {
     fn on_position_closed(&mut self, event: PositionClosed) {
         log_strategy_hook_error("on_position_closed", self.forward_position_closed(&event));
     }
+
+    fn on_market_exit(&mut self) {
+        log_strategy_hook_error("on_market_exit", self.forward_market_exit());
+    }
 });
 
 impl DataActor for PluginStrategyAdapter {
@@ -367,6 +375,36 @@ impl DataActor for PluginStrategyAdapter {
         })
     }
 
+    fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
+        let handle = OrderBookDeltasHandle::new(deltas.clone());
+        invoke_event(self, "on_book_deltas", &handle, |adapter, p| unsafe {
+            validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_book_deltas)(
+                adapter.handle,
+                p,
+            )
+        })
+    }
+
+    fn on_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
+        let handle = InstrumentAnyHandle::new(instrument.clone());
+        invoke_event(self, "on_instrument", &handle, |adapter, p| unsafe {
+            validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_instrument)(
+                adapter.handle,
+                p,
+            )
+        })
+    }
+
+    fn on_option_chain(&mut self, chain: &OptionChainSlice) -> anyhow::Result<()> {
+        let handle = OptionChainSliceHandle::new(chain.clone());
+        invoke_event(self, "on_option_chain", &handle, |adapter, p| unsafe {
+            validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_option_chain)(
+                adapter.handle,
+                p,
+            )
+        })
+    }
+
     fn on_mark_price(&mut self, mark_price: &MarkPriceUpdate) -> anyhow::Result<()> {
         invoke_event(self, "on_mark_price", mark_price, |adapter, p| unsafe {
             validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_mark_price)(
@@ -388,6 +426,15 @@ impl DataActor for PluginStrategyAdapter {
     fn on_funding_rate(&mut self, funding_rate: &FundingRateUpdate) -> anyhow::Result<()> {
         invoke_event(self, "on_funding_rate", funding_rate, |adapter, p| unsafe {
             validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_funding_rate)(
+                adapter.handle,
+                p,
+            )
+        })
+    }
+
+    fn on_option_greeks(&mut self, greeks: &OptionGreeks) -> anyhow::Result<()> {
+        invoke_event(self, "on_option_greeks", greeks, |adapter, p| unsafe {
+            validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_option_greeks)(
                 adapter.handle,
                 p,
             )
@@ -435,6 +482,86 @@ impl DataActor for PluginStrategyAdapter {
         invoke_event(self, "on_signal", signal, |adapter, p| unsafe {
             validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_signal)(adapter.handle, p)
         })
+    }
+
+    fn on_historical_quotes(&mut self, quotes: &[QuoteTick]) -> anyhow::Result<()> {
+        invoke_slice(self, "on_historical_quotes", quotes, |adapter, s| unsafe {
+            validated_slot!(
+                StrategyVTable,
+                adapter.vtable.as_ptr(),
+                on_historical_quotes
+            )(adapter.handle, s)
+        })
+    }
+
+    fn on_historical_trades(&mut self, trades: &[TradeTick]) -> anyhow::Result<()> {
+        invoke_slice(self, "on_historical_trades", trades, |adapter, s| unsafe {
+            validated_slot!(
+                StrategyVTable,
+                adapter.vtable.as_ptr(),
+                on_historical_trades
+            )(adapter.handle, s)
+        })
+    }
+
+    fn on_historical_bars(&mut self, bars: &[Bar]) -> anyhow::Result<()> {
+        invoke_slice(self, "on_historical_bars", bars, |adapter, s| unsafe {
+            validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_historical_bars)(
+                adapter.handle,
+                s,
+            )
+        })
+    }
+
+    fn on_historical_funding_rates(
+        &mut self,
+        funding_rates: &[FundingRateUpdate],
+    ) -> anyhow::Result<()> {
+        invoke_slice(
+            self,
+            "on_historical_funding_rates",
+            funding_rates,
+            |adapter, s| unsafe {
+                validated_slot!(
+                    StrategyVTable,
+                    adapter.vtable.as_ptr(),
+                    on_historical_funding_rates
+                )(adapter.handle, s)
+            },
+        )
+    }
+
+    fn on_historical_mark_prices(&mut self, mark_prices: &[MarkPriceUpdate]) -> anyhow::Result<()> {
+        invoke_slice(
+            self,
+            "on_historical_mark_prices",
+            mark_prices,
+            |adapter, s| unsafe {
+                validated_slot!(
+                    StrategyVTable,
+                    adapter.vtable.as_ptr(),
+                    on_historical_mark_prices
+                )(adapter.handle, s)
+            },
+        )
+    }
+
+    fn on_historical_index_prices(
+        &mut self,
+        index_prices: &[IndexPriceUpdate],
+    ) -> anyhow::Result<()> {
+        invoke_slice(
+            self,
+            "on_historical_index_prices",
+            index_prices,
+            |adapter, s| unsafe {
+                validated_slot!(
+                    StrategyVTable,
+                    adapter.vtable.as_ptr(),
+                    on_historical_index_prices
+                )(adapter.handle, s)
+            },
+        )
     }
 }
 
@@ -620,6 +747,12 @@ impl PluginStrategyAdapter {
             )
         })
     }
+
+    fn forward_market_exit(&self) -> anyhow::Result<()> {
+        invoke_lifecycle(self, "on_market_exit", |adapter| unsafe {
+            validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_market_exit)(adapter.handle)
+        })
+    }
 }
 
 fn log_strategy_hook_error(method: &str, r: anyhow::Result<()>) {
@@ -665,6 +798,19 @@ fn invoke_event<T>(
     finish(result, &plugin_name, &type_name, method)
 }
 
+fn invoke_slice<T>(
+    adapter: &PluginStrategyAdapter,
+    method: &str,
+    payload: &[T],
+    f: impl FnOnce(&PluginStrategyAdapter, Slice<'_, T>) -> PluginResult<()>,
+) -> anyhow::Result<()> {
+    let plugin_name = adapter.plugin_name.clone();
+    let type_name = adapter.type_name.clone();
+    let slice = Slice::from_slice(payload);
+    let result = guard_call(&plugin_name, &type_name, method, || f(adapter, slice));
+    finish(result, &plugin_name, &type_name, method)
+}
+
 fn finish(
     result: Option<PluginResult<()>>,
     plugin_name: &str,
@@ -685,13 +831,15 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use nautilus_model::identifiers::StrategyId;
-    use nautilus_plugin::surfaces::strategy::{PluginStrategy, strategy_vtable};
     use rstest::rstest;
 
     use super::*;
-    use crate::plugin::{
-        host::host_vtable,
-        registry::{host_context_live_count, host_context_test_lock},
+    use crate::{
+        bridge::{
+            host::host_vtable,
+            registry::{host_context_live_count, host_context_test_lock},
+        },
+        surfaces::strategy::{PluginStrategy, strategy_vtable},
     };
 
     struct DropTestStrategy;

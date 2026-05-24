@@ -191,6 +191,11 @@ pub trait Strategy: DataActor {
         client_id: Option<ClientId>,
         params: Option<Params>,
     ) -> anyhow::Result<()> {
+        if orders.is_empty() {
+            log::error!("OrderList denied: no orders to submit");
+            anyhow::bail!("OrderList denied: no orders to submit");
+        }
+
         for order in &orders {
             if order.status() != OrderStatus::Initialized {
                 anyhow::bail!(
@@ -226,6 +231,11 @@ pub trait Strategy: DataActor {
         } else {
             core.order_factory().create_list(&mut orders, ts_init)
         };
+
+        if let Err(e) = order_list.validate() {
+            log::error!("OrderList denied: {e}");
+            anyhow::bail!("OrderList denied: {e}");
+        }
 
         {
             let cache_rc = core.cache_rc();
@@ -2021,7 +2031,7 @@ mod tests {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
+            reconciliation: false,
             causation_id: None,
         })
     }
@@ -2037,8 +2047,8 @@ mod tests {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
-            due_post_only: 0,
+            reconciliation: false,
+            due_post_only: false,
             causation_id: None,
         })
     }
@@ -2054,7 +2064,7 @@ mod tests {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
+            reconciliation: false,
             causation_id: None,
         })
     }
@@ -2070,7 +2080,7 @@ mod tests {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
+            reconciliation: false,
             causation_id: None,
         })
     }
@@ -2313,8 +2323,8 @@ mod tests {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
-            due_post_only: 0,
+            reconciliation: false,
+            due_post_only: false,
             causation_id: None,
         });
 

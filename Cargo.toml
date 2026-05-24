@@ -9,15 +9,15 @@ members = [
   "crates/adapters/bitmex",
   "crates/adapters/blockchain",
   "crates/adapters/bybit",
+  "crates/adapters/coinbase",
   "crates/adapters/databento",
   "crates/adapters/deribit",
   "crates/adapters/dydx",
-  "crates/adapters/coinbase",
   "crates/adapters/hyperliquid",
-  "crates/adapters/kraken",
-  "crates/adapters/polymarket",
   "crates/adapters/interactive_brokers",
+  "crates/adapters/kraken",
   "crates/adapters/okx",
+  "crates/adapters/polymarket",
   "crates/adapters/sandbox",
   "crates/adapters/tardis",
   "crates/analysis",
@@ -33,9 +33,9 @@ members = [
   "crates/infrastructure",
   "crates/live",
   "crates/model",
-  "crates/persistence/macros",
   "crates/network",
   "crates/persistence",
+  "crates/persistence/macros",
   "crates/plugin",
   "crates/portfolio",
   "crates/pyo3",
@@ -254,7 +254,7 @@ serde = { version = "1.0.228", default-features = false, features = [
   "std",
   "rc",
 ] }
-serde_json = { version = "1.0.149", default-features = false, features = [
+serde_json = { version = "1.0.150", default-features = false, features = [
   "std",
 ] }
 serde_urlencoded = "0.7.1"
@@ -374,7 +374,6 @@ pretty_assertions = "1.4.1"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 rstest = "0.26.1"
 tempfile = "3.27.0"
-tracing-test = "0.2.6"
 turmoil = "0.7.2"
 
 # -----------------------------------------------------------------------------
@@ -389,7 +388,7 @@ walkdir = "2.5.0"
 # -----------------------------------------------------------------------------
 [workspace.metadata.tools]
 cargo-audit = "0.22.1"
-cargo-deny = "0.19.6"
+cargo-deny = "0.19.7"
 cargo-edit = "0.13.10"
 cargo-fuzz = "0.13.1"
 cargo-llvm-cov = "0.8.7"

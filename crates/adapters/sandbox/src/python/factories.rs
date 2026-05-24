@@ -13,7 +13,22 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! HMAC-SHA256 signing for Polymarket L2 authentication.
-//!
-//! L2 signing is implemented on [`Credential`](crate::common::credential::Credential).
-//! This module will contain EIP-712 (L1) order signing.
+//! Python bindings for sandbox factories.
+
+use pyo3::prelude::*;
+
+use crate::factory::SandboxExecutionClientFactory;
+
+#[pymethods]
+impl SandboxExecutionClientFactory {
+    /// Factory for creating sandbox execution clients.
+    #[new]
+    fn py_new() -> Self {
+        Self
+    }
+
+    #[pyo3(name = "name")]
+    fn py_name(&self) -> &'static str {
+        "SANDBOX"
+    }
+}

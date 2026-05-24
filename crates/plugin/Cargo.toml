@@ -24,8 +24,15 @@ crate-type = ["rlib"]
 
 [features]
 default = []
-# Enables host-side loading via `libloading`. Plug-in cdylibs should NOT enable this.
-host = ["dep:libloading"]
+# Enables host-side loading + the engine-side bridge adapters. Plug-in
+# cdylibs should NOT enable this; backtest and live host crates do.
+host = [
+  "dep:libloading",
+  "dep:nautilus-trading",
+  "dep:serde",
+  "dep:serde_json",
+  "dep:ustr",
+]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -36,10 +43,15 @@ nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
 nautilus-model = { workspace = true }
 
+nautilus-trading = { workspace = true, optional = true }
+
 anyhow = { workspace = true }
 libloading = { workspace = true, optional = true }
 log = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 thiserror = { workspace = true }
+ustr = { workspace = true, optional = true }
 
 [dev-dependencies]
 rstest = { workspace = true }

@@ -49,10 +49,25 @@ backends, pre-trade risk gating, event store backends, and hot reload of any
 plug-in while the live node is running. Plug-ins load at process startup and
 live for the process lifetime.
 
-`OrderBookDeltas` callbacks are also out of scope for v1. The type owns a
-`Vec<OrderBookDelta>` and cannot be `#[repr(C)]`, so passing a raw pointer
-across the cdylib boundary has no stable layout guarantee. A future revision
-will deliver book deltas through a boundary-owned representation.
+`OrderBookDeltas` cross the boundary via `OrderBookDeltasHandle`, a
+`#[repr(C)]` wrapper owned by the host that boxes the deltas for the
+duration of the callback. The plug-in's thunk dereferences the handle
+once and hands a borrowed `&OrderBookDeltas` to the trait method;
+matches the ownership contract `OrderBookDeltas_API` uses on the Cython
+side.
+
+`InstrumentAny` crosses the boundary via `InstrumentAnyHandle`, a
+`#[repr(C)]` wrapper that owns a boxed `InstrumentAny` for the duration
+of the callback. `InstrumentAny` is a Rust enum whose variant payloads
+own heap-allocated fields, so the same boundary-owned shape applies: the
+plug-in's thunk dereferences the handle once and hands a borrowed
+`&InstrumentAny` to the trait method.
+
+`OptionChainSlice` crosses the boundary via `OptionChainSliceHandle`
+for the same reason: the snapshot owns
+`BTreeMap<Price, OptionStrikeData>` call and put maps and cannot be
+`#[repr(C)]`. The host boxes the slice in the handle for the duration
+of the callback.
 
 ## NautilusTrader
 

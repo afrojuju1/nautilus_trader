@@ -14,6 +14,9 @@ __all__ = [
     "BinanceExecClientConfig",
     "BinanceExecutionClientFactory",
     "BinanceFuturesLiquidation",
+    "BinanceFuturesOpenInterest",
+    "BinanceFuturesOpenInterestHist",
+    "BinanceFuturesOpenInterestHistPoint",
     "BinanceMarginType",
     "BinancePositionSide",
     "BinanceProductType",
@@ -114,6 +117,39 @@ class BinanceFuturesLiquidation:
     def ts_event(self) -> int: ...
     @property
     def ts_init(self) -> int: ...
+
+@typing.final
+class BinanceFuturesOpenInterest:
+    @property
+    def instrument_id(self) -> model.InstrumentId: ...
+    @property
+    def open_interest(self) -> decimal.Decimal: ...
+    @property
+    def ts_event(self) -> int: ...
+    @property
+    def ts_init(self) -> int: ...
+
+@typing.final
+class BinanceFuturesOpenInterestHist:
+    @property
+    def instrument_id(self) -> model.InstrumentId: ...
+    @property
+    def period(self) -> str: ...
+    @property
+    def points(self) -> list: ...
+    @property
+    def ts_event(self) -> int: ...
+    @property
+    def ts_init(self) -> int: ...
+
+@typing.final
+class BinanceFuturesOpenInterestHistPoint:
+    @property
+    def sum_open_interest(self) -> decimal.Decimal: ...
+    @property
+    def sum_open_interest_value(self) -> decimal.Decimal: ...
+    @property
+    def ts_event(self) -> int: ...
 
 @typing.final
 class BinanceEnvironment(enum.Enum):

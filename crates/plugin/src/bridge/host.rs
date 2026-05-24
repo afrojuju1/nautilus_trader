@@ -41,20 +41,24 @@ use nautilus_model::{
     enums::{BookType, FromU8},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId},
 };
-use nautilus_plugin::{
-    NAUTILUS_PLUGIN_ABI_VERSION,
-    boundary::{BorrowedStr, OwnedBytes, PluginError, PluginErrorCode, PluginResult, Slice},
-    host::{HostContext, HostLogLevel, HostVTable},
-    loader::PluginLoader,
-};
 use nautilus_trading::strategy::Strategy;
 use serde::Serialize;
 
-use crate::plugin::{
-    actor::PluginActorAdapter,
-    commands::{CancelOrderCommand, ModifyOrderCommand, SubmitOrderCommand},
-    registry::{HostContextInner, host_context_inner},
-    strategy::PluginStrategyAdapter,
+use crate::{
+    NAUTILUS_PLUGIN_ABI_VERSION,
+    boundary::{BorrowedStr, OwnedBytes, PluginError, PluginErrorCode, PluginResult, Slice},
+    bridge::{
+        actor::PluginActorAdapter,
+        commands::{
+            CancelAllOrdersCommand, CancelOrderCommand, CancelOrdersCommand,
+            CloseAllPositionsCommand, ClosePositionCommand, ModifyOrderCommand,
+            QueryAccountCommand, QueryOrderCommand, SubmitOrderCommand, SubmitOrderListCommand,
+        },
+        registry::{HostContextInner, host_context_inner},
+        strategy::PluginStrategyAdapter,
+    },
+    host::{HostContext, HostLogLevel, HostVTable},
+    loader::PluginLoader,
 };
 
 /// Returns the process-wide `HostVTable` configured for the live node.
@@ -92,6 +96,13 @@ pub fn host_vtable() -> *const HostVTable {
         submit_order: host_submit_order,
         cancel_order: host_cancel_order,
         modify_order: host_modify_order,
+        submit_order_list: host_submit_order_list,
+        cancel_orders: host_cancel_orders,
+        cancel_all_orders: host_cancel_all_orders,
+        close_position: host_close_position,
+        close_all_positions: host_close_all_positions,
+        query_account: host_query_account,
+        query_order: host_query_order,
     }))
 }
 
@@ -795,6 +806,117 @@ unsafe extern "C" fn host_modify_order(
     })
 }
 
+unsafe extern "C" fn host_submit_order_list(
+    ctx: *const HostContext,
+    command_json: BorrowedStr<'_>,
+) -> PluginResult<()> {
+    dispatch_command(ctx, command_json, "submit_order_list", |adapter, json| {
+        let cmd: SubmitOrderListCommand = serde_json::from_str(json)?;
+        Strategy::submit_order_list(
+            adapter,
+            cmd.orders,
+            cmd.position_id,
+            cmd.client_id,
+            cmd.params,
+        )
+    })
+}
+
+unsafe extern "C" fn host_cancel_orders(
+    ctx: *const HostContext,
+    command_json: BorrowedStr<'_>,
+) -> PluginResult<()> {
+    dispatch_command(ctx, command_json, "cancel_orders", |adapter, json| {
+        let cmd: CancelOrdersCommand = serde_json::from_str(json)?;
+        Strategy::cancel_orders(adapter, cmd.client_order_ids, cmd.client_id, cmd.params)
+    })
+}
+
+unsafe extern "C" fn host_cancel_all_orders(
+    ctx: *const HostContext,
+    command_json: BorrowedStr<'_>,
+) -> PluginResult<()> {
+    dispatch_command(ctx, command_json, "cancel_all_orders", |adapter, json| {
+        let cmd: CancelAllOrdersCommand = serde_json::from_str(json)?;
+        Strategy::cancel_all_orders(
+            adapter,
+            cmd.instrument_id,
+            cmd.order_side,
+            cmd.client_id,
+            cmd.params,
+        )
+    })
+}
+
+unsafe extern "C" fn host_close_position(
+    ctx: *const HostContext,
+    command_json: BorrowedStr<'_>,
+) -> PluginResult<()> {
+    dispatch_command(ctx, command_json, "close_position", |adapter, json| {
+        let cmd: ClosePositionCommand = serde_json::from_str(json)?;
+        let position = {
+            let cache = adapter.cache();
+            cache.position(&cmd.position_id).map(|p| p.cloned())
+        };
+        let position = position
+            .ok_or_else(|| anyhow::anyhow!("position '{}' not found in cache", cmd.position_id))?;
+        Strategy::close_position(
+            adapter,
+            &position,
+            cmd.client_id,
+            cmd.tags,
+            cmd.time_in_force,
+            cmd.reduce_only,
+            cmd.quote_quantity,
+        )
+    })
+}
+
+unsafe extern "C" fn host_close_all_positions(
+    ctx: *const HostContext,
+    command_json: BorrowedStr<'_>,
+) -> PluginResult<()> {
+    dispatch_command(ctx, command_json, "close_all_positions", |adapter, json| {
+        let cmd: CloseAllPositionsCommand = serde_json::from_str(json)?;
+        Strategy::close_all_positions(
+            adapter,
+            cmd.instrument_id,
+            cmd.position_side,
+            cmd.client_id,
+            cmd.tags,
+            cmd.time_in_force,
+            cmd.reduce_only,
+            cmd.quote_quantity,
+        )
+    })
+}
+
+unsafe extern "C" fn host_query_account(
+    ctx: *const HostContext,
+    command_json: BorrowedStr<'_>,
+) -> PluginResult<()> {
+    dispatch_command(ctx, command_json, "query_account", |adapter, json| {
+        let cmd: QueryAccountCommand = serde_json::from_str(json)?;
+        Strategy::query_account(adapter, cmd.account_id, cmd.client_id, cmd.params)
+    })
+}
+
+unsafe extern "C" fn host_query_order(
+    ctx: *const HostContext,
+    command_json: BorrowedStr<'_>,
+) -> PluginResult<()> {
+    dispatch_command(ctx, command_json, "query_order", |adapter, json| {
+        let cmd: QueryOrderCommand = serde_json::from_str(json)?;
+        let order = {
+            let cache = adapter.cache();
+            cache.order(&cmd.client_order_id).map(|o| o.cloned())
+        };
+        let order = order
+            .ok_or_else(|| anyhow::anyhow!("order '{}' not found in cache", cmd.client_order_id))?;
+        Strategy::query_order(adapter, &order, cmd.client_id, cmd.params)
+    })
+}
+
 fn dispatch_command(
     ctx: *const HostContext,
     command_json: BorrowedStr<'_>,
@@ -1267,7 +1389,7 @@ mod tests {
         // actor contexts with InvalidArgument.
         use nautilus_model::identifiers::ActorId;
 
-        use crate::plugin::registry::{
+        use crate::bridge::registry::{
             HostContextInner, drop_host_context, host_context_test_lock, leak_host_context,
         };
 
@@ -1300,7 +1422,7 @@ mod tests {
         // host vtable's try_get_actor_unchecked lookup returns None.
         use nautilus_model::identifiers::ActorId;
 
-        use crate::plugin::registry::{
+        use crate::bridge::registry::{
             HostContextInner, drop_host_context, host_context_test_lock, leak_host_context,
         };
 

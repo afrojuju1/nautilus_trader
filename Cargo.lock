@@ -5413,6 +5413,7 @@ dependencies = [
  "nautilus-indicators",
  "nautilus-model",
  "nautilus-persistence",
+ "nautilus-plugin",
  "nautilus-portfolio",
  "nautilus-risk",
  "nautilus-system",
@@ -5446,7 +5447,6 @@ dependencies = [
  "nautilus-backtest",
  "nautilus-common",
  "nautilus-core",
- "nautilus-execution",
  "nautilus-live",
  "nautilus-model",
  "nautilus-network",
@@ -6078,7 +6078,6 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "url",
  "ustr",
- "uuid",
  "zeroize",
 ]
 
@@ -6168,7 +6167,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-test",
  "ustr",
 ]
 
@@ -6445,7 +6443,9 @@ dependencies = [
  "nautilus-common",
  "nautilus-core",
  "nautilus-model",
+ "nautilus-trading",
  "rstest",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "ustr",
@@ -6482,6 +6482,7 @@ dependencies = [
  "proptest",
  "pyo3",
  "pyo3-stub-gen",
+ "rand 0.10.1",
  "rstest",
  "rust_decimal",
  "rust_decimal_macros",
@@ -6598,10 +6599,12 @@ dependencies = [
  "log",
  "nautilus-common",
  "nautilus-core",
+ "nautilus-data",
  "nautilus-databento",
  "nautilus-execution",
  "nautilus-live",
  "nautilus-model",
+ "nautilus-system",
  "nautilus-testkit",
  "nautilus-trading",
  "pyo3",
@@ -6661,11 +6664,9 @@ dependencies = [
  "nautilus-risk",
  "nautilus-trading",
  "pyo3",
- "rmp-serde",
  "rstest",
  "serde",
  "sysinfo",
- "tempfile",
  "toml 1.1.2+spec-1.1.0",
  "ustr",
 ]
@@ -8870,9 +8871,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.149"
+version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
+checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
  "itoa",
  "memchr",
@@ -10146,27 +10147,6 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
-]
-
-[[package]]
-name = "tracing-test"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19a4c448db514d4f24c5ddb9f73f2ee71bfb24c526cf0c570ba142d1119e0051"
-dependencies = [
- "tracing-core",
- "tracing-subscriber",
- "tracing-test-macro",
-]
-
-[[package]]
-name = "tracing-test-macro"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad06847b7afb65c7866a36664b75c40b895e318cea4f71299f013fb22965329d"
-dependencies = [
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]

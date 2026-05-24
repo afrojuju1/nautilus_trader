@@ -29,12 +29,11 @@ and won't need to work directly with these lower-level components.
 
 You can find live example scripts [here](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/hyperliquid/).
 
-## Builder attribution
+## Builder address
 
 Mainnet orders submitted through the adapter include a NautilusTrader builder address with a
-**zero fee rate**, so attribution adds no trading cost to your orders. This marks
-NautilusTrader‑originated order flow on‑chain, which helps us gauge real usage of the integration
-and prioritize ongoing maintenance and improvements.
+**zero fee rate**, so it adds no trading cost to your orders. This helps us gauge real usage of
+the integration and prioritize ongoing maintenance and improvements.
 
 The builder address is omitted from orders in two cases:
 
@@ -194,25 +193,28 @@ handled by the instrument provider.
 
 ### HIP-4 outcome side tokens
 
-Format: `+{encoding}` (token form) or `#{encoding}` (spot-coin form), where
-`encoding = 10 * outcome + side` and `side` is `0` for Yes, `1` for No.
+Format: `{outcome_index}-{YES|NO}-OUTCOME.HYPERLIQUID`, where `outcome_index`
+is the `outcome` field from `outcomeMeta` and the middle segment names the
+binary side. The `-OUTCOME` suffix is symmetric with `-PERP` / `-SPOT`.
 
 [HIP-4](https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-4-outcome-markets)
 side tokens are binary contracts that settle in USDH at `0` (loser) or `1`
-(winner). Nautilus uses the token form (`+{encoding}.HYPERLIQUID`); the wire
-`raw_symbol` uses the coin form (`#{encoding}`), which is what `l2Book` and
-`allMids` accept.
+(winner). The Nautilus symbol uses the human-readable form above; the wire
+`raw_symbol` uses the venue coin form `#{encoding}` (where
+`encoding = 10 * outcome_index + side`, `side` is `0` for Yes / `1` for No),
+which is what `l2Book` and `allMids` accept.
 
-Examples:
+Examples (outcome 25):
 
-- `+250.HYPERLIQUID`: Yes side of outcome 25.
-- `+251.HYPERLIQUID`: No side of outcome 25.
-- `#250`: equivalent wire symbol for market-data subscriptions.
+- `25-YES-OUTCOME.HYPERLIQUID`: Yes side. Encoding `250`, wire coin `#250`,
+  token name `+250`, action asset id `100_000_250`.
+- `25-NO-OUTCOME.HYPERLIQUID`: No side. Encoding `251`, wire coin `#251`,
+  token name `+251`, action asset id `100_000_251`.
 
 To subscribe in your strategy:
 
 ```python
-InstrumentId.from_str("+250.HYPERLIQUID")
+InstrumentId.from_str("25-YES-OUTCOME.HYPERLIQUID")
 ```
 
 :::note
@@ -359,10 +361,42 @@ HyperliquidDataClientConfig(
 ```
 
 The provider emits two `BinaryOption` instruments per outcome (one per side),
-denominated in USDH. `expiration_ns` is parsed from the venue description
-(`expiry:YYYYMMDD-HHMM`, UTC). Standalone binaries carry their own expiry;
-named and fallback outcomes inherit from their parent question. Defaults:
-`0.0001` per tick, `0.01` per lot.
+denominated in USDH. Symbols use the form
+`{outcome_index}-{YES|NO}-OUTCOME.HYPERLIQUID`. `expiration_ns` is parsed
+from the venue description (`expiry:YYYYMMDD-HHMM`, UTC). Standalone binaries
+carry their own expiry; named and fallback outcomes inherit from their
+parent question. Defaults: `0.0001` per tick, `0.01` per lot.
+
+Each instrument's `BinaryOption.info` carries the parsed venue metadata as a
+key/value map (consumed via `info["key"]` in Python or `Params.get_str(...)`
+in Rust). Derived identifiers are always populated; description-derived
+fields appear when the venue includes them.
+
+| Field              | Source                         | Notes                                             |
+|--------------------|--------------------------------|---------------------------------------------------|
+| `outcome_index`    | derived                        | `outcome` from `outcomeMeta`                      |
+| `outcome_side`     | derived                        | `0` = Yes, `1` = No                               |
+| `side_name`        | derived                        | `"Yes"` or `"No"`                                 |
+| `encoding`         | derived                        | `10 * outcome_index + side`                       |
+| `asset_id`         | derived                        | `100_000_000 + encoding`                          |
+| `market_name`      | `outcomeMeta.outcomes[*].name` | venue market label                                |
+| `class`            | description                    | `priceBinary` or `priceBucket`                    |
+| `underlying`       | description                    | underlying asset code                             |
+| `expiry`           | description                    | `YYYYMMDD-HHMM` UTC                               |
+| `target_price`     | description                    | binary settlement threshold                       |
+| `period`           | description                    | recurrence period (e.g. `1d`, `3m`)               |
+| `price_thresholds` | description                    | comma‑separated thresholds (bucket markets)       |
+| `named_index`      | named‑outcome description      | position in parent `named_outcomes` array         |
+| `is_fallback`      | fallback‑outcome description   | `true` for the `other` outcome of a question      |
+| `question`         | parent question                | question id                                       |
+| `question_name`    | parent question                | question label                                    |
+| `question_*`       | parent question description    | every parsed question field, `question_` prefixed |
+
+Description keys are lowered from venue camelCase to snake_case
+(`targetPrice` -> `target_price`, `priceThresholds` -> `price_thresholds`).
+Values are kept as strings to preserve wire fidelity; numeric identifiers
+(`outcome_index`, `outcome_side`, `encoding`, `asset_id`, `question`,
+`named_index`) are stored as JSON numbers.
 
 ### Settlement currency
 
@@ -376,11 +410,12 @@ carries USDH alongside USDC and any other non-zero spot holdings.
 
 ### Trading flow
 
-Outcome side tokens (`+{encoding}.HYPERLIQUID`, where `encoding = 10 *
-outcome_index + outcome_side`) trade through the standard order path.
-Submit `SubmitOrder` as you would for any perp or spot instrument; the
-execution client routes it through the same `Order` action against the
-venue's `#{encoding}` orderbook. No HIP-4-specific call is needed.
+Outcome side tokens (`{outcome_index}-{YES|NO}-OUTCOME.HYPERLIQUID`) trade
+through the standard order path. Submit `SubmitOrder` as you would for any
+perp or spot instrument; the execution client routes it through the same
+`Order` action against the venue's `#{encoding}` orderbook (where
+`encoding = 10 * outcome_index + outcome_side`). No HIP-4-specific call is
+needed.
 
 Settlement is venue-driven; see [Settlement dispatch](#settlement-dispatch).
 
@@ -496,17 +531,18 @@ instrument_provider=InstrumentProviderConfig(
 The adapter supports the following data subscriptions. All perpetual data types
 (mark prices, index prices, funding rates) apply to both standard and HIP-3 perps.
 
-| Data type         | Sub. | Snapshot | Hist. | Nautilus type        | Notes                        |
-|-------------------|------|----------|-------|----------------------|------------------------------|
-| Trade ticks       | ✓    | -        | -     | `TradeTick`          | WebSocket trades.            |
-| Quote ticks       | ✓    | -        | -     | `QuoteTick`          | Best bid/offer.              |
-| Order book deltas | ✓    | ✓        | -     | `OrderBookDelta`     | L2 snapshots.                |
-| Order book depth  | ✓    | -        | -     | `OrderBookDepth10`   | Top-10 L2 snapshots.         |
-| Bars              | ✓    | -        | ✓     | `Bar`                | Supported intervals below.   |
-| Mark prices       | ✓    | -        | -     | `MarkPriceUpdate`    | Perpetual mark price ticks.  |
-| Index prices      | ✓    | -        | -     | `IndexPriceUpdate`   | Underlying reference prices. |
-| Funding rates     | ✓    | -        | ✓     | `FundingRateUpdate`  | `fundingHistory` endpoint.   |
-| All mids          | ✓    | -        | -     | `HyperliquidAllMids` | Custom data from `allMids`.  |
+| Data type         | Sub. | Snapshot | Hist. | Nautilus type                 | Notes                                 |
+|-------------------|------|----------|-------|-------------------------------|---------------------------------------|
+| Trade ticks       | ✓    | -        | -     | `TradeTick`                   | WebSocket trades.                     |
+| Quote ticks       | ✓    | -        | -     | `QuoteTick`                   | Best bid/offer.                       |
+| Order book deltas | ✓    | ✓        | -     | `OrderBookDelta`              | L2 snapshots.                         |
+| Order book depth  | ✓    | -        | -     | `OrderBookDepth10`            | Top-10 L2 snapshots.                  |
+| Bars              | ✓    | -        | ✓     | `Bar`                         | Supported intervals below.            |
+| Mark prices       | ✓    | -        | -     | `MarkPriceUpdate`             | Perpetual mark price ticks.           |
+| Index prices      | ✓    | -        | -     | `IndexPriceUpdate`            | Underlying reference prices.          |
+| Funding rates     | ✓    | -        | ✓     | `FundingRateUpdate`           | `fundingHistory` endpoint.            |
+| Open interest     | ✓    | -        | -     | `HyperliquidOpenInterest`     | Custom data from `activeAssetCtx`.    |
+| All mids          | ✓    | -        | -     | `HyperliquidAllMids`          | Custom data from `allMids`.           |
 
 :::note
 Historical quote and trade requests are not supported. Hyperliquid does not publish
@@ -534,8 +570,12 @@ Omitting both params subscribes to the full-depth book.
 
 ### Hyperliquid specific data
 
-The adapter emits `HyperliquidAllMids` custom data from the WebSocket `allMids`
-feed. Each update carries all currently reported mid prices in one payload.
+The adapter emits two Hyperliquid-specific custom data types:
+
+- `HyperliquidAllMids` from the WebSocket `allMids` feed. Each update carries
+  all currently reported mid prices in one payload.
+- `HyperliquidOpenInterest` from the shared `activeAssetCtx` feed used by
+  mark prices, index prices, and funding rates.
 
 | Field      | Type             | Description                                              |
 |------------|------------------|----------------------------------------------------------|
@@ -555,6 +595,50 @@ self.subscribe_data(
     data_type=DataType(HyperliquidAllMids, metadata={"dex": "hyperliquid"}),
     client_id=HYPERLIQUID_CLIENT_ID,
 )
+```
+
+`HyperliquidOpenInterest` carries the latest open interest for one
+perpetual instrument. Subscribe with the canonical Nautilus `instrument_id`
+in `metadata["instrument_id"]`:
+
+| Field           | Type           | Description                                                                 |
+|-----------------|----------------|-----------------------------------------------------------------------------|
+| `instrument_id` | `InstrumentId` | Canonical Nautilus instrument ID.                                           |
+| `open_interest` | `Decimal`      | Open interest parsed for direct arithmetic use.                             |
+| `ts_event`      | `int`          | UNIX timestamp in nanoseconds when the update occurred. Mirrors `ts_init`. |
+| `ts_init`       | `int`          | UNIX timestamp in nanoseconds when the object was built.                    |
+
+```python
+from nautilus_trader.adapters.hyperliquid import HYPERLIQUID_CLIENT_ID
+from nautilus_trader.adapters.hyperliquid import HyperliquidOpenInterest
+from nautilus_trader.model.data import DataType
+
+self.subscribe_data(
+    data_type=DataType(
+        HyperliquidOpenInterest,
+        metadata={"instrument_id": str(self.instrument_id)},
+    ),
+    client_id=HYPERLIQUID_CLIENT_ID,
+)
+```
+
+`HyperliquidOpenInterest` reuses the same single underlying
+`activeAssetCtx` venue subscription that already backs mark prices, index
+prices, and funding rates for the same coin. Adding OI does not open a second
+parallel `activeAssetCtx` subscription.
+
+In a Python strategy running inside a `TradingNode`, the payload arrives via
+`CustomData.data` and can be downcast by `isinstance`:
+
+```python
+from decimal import Decimal
+
+from nautilus_trader.model.data import CustomData
+
+def on_data(self, data: CustomData) -> None:
+    if isinstance(data.data, HyperliquidOpenInterest):
+        if data.data.open_interest > Decimal("1000"):
+            self.log.info(f"OI {data.data.instrument_id} -> {data.data.open_interest}")
 ```
 
 ### Supported bar intervals

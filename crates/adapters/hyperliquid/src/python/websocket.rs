@@ -289,9 +289,8 @@ impl HyperliquidWebSocketClient {
         self.cache_spot_fill_coins(ahash_mapping);
     }
 
-    /// Caches a cloid (hex hash) to client_order_id mapping for order/fill resolution.
+    /// Caches a venue CLOID to client_order_id mapping for order/fill resolution.
     ///
-    /// The cloid is a keccak256 hash of the client_order_id that Hyperliquid uses internally.
     /// This mapping allows WebSocket order status and fill reports to be resolved back to
     /// the original client_order_id.
     ///
@@ -325,7 +324,7 @@ impl HyperliquidWebSocketClient {
         self.cloid_cache_len()
     }
 
-    /// Looks up a client_order_id by its cloid hash.
+    /// Looks up a client_order_id by its venue CLOID.
     ///
     /// Returns `Some(ClientOrderId)` if the mapping exists, `None` otherwise.
     #[pyo3(name = "get_cloid_mapping")]
@@ -944,6 +943,24 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Subscribe to open interest updates for an instrument.
+    #[pyo3(name = "subscribe_open_interest")]
+    fn py_subscribe_open_interest<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .subscribe_open_interest(instrument_id)
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
     /// Unsubscribe from funding rate updates for an instrument.
     #[pyo3(name = "unsubscribe_funding_rates")]
     fn py_unsubscribe_funding_rates<'py>(
@@ -956,6 +973,24 @@ impl HyperliquidWebSocketClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client
                 .unsubscribe_funding_rates(instrument_id)
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Unsubscribe from open interest updates for an instrument.
+    #[pyo3(name = "unsubscribe_open_interest")]
+    fn py_unsubscribe_open_interest<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_open_interest(instrument_id)
                 .await
                 .map_err(to_pyruntime_err)?;
             Ok(())

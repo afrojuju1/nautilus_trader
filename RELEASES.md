@@ -19,7 +19,10 @@ Released on TBD (UTC).
 - Added `host_vtable` and `plugin_loader` helpers binding submit/cancel/modify order to the strategy adapter (Rust)
 - Added `register_custom_data_from_manifest` to register plug-in custom data with `DataRegistry` at load time (Rust)
 - Added `config_json` argument to plug-in `create` thunks and `PluginActor::new`/`PluginStrategy::new` (Rust)
+- Added Rust `DataEngine` continuous futures historical bar requests and live bar subscriptions
+- Added Rust `DataEngine` response bounds-trim and request-pipeline fan-in with `RequestJoin` support
 - Added portfolio PyO3 bindings and `Strategy.portfolio` access (#4085), thanks @ms32035
+- Added beta-weighted vega greeks against volatility index instruments (#4097), thanks @faysou
 - Added Binance Futures liquidation custom data subscriptions (#4095), thanks @graceyangfan
 - Added Deribit `option_combo` and `future_combo` parsing as `OptionSpread`/`FuturesSpread` instruments
 - Added Deribit combo trade leg parsing (`legs[]`, `combo_id`, `combo_trade_id`) on public trade messages
@@ -28,28 +31,52 @@ Released on TBD (UTC).
 - Added Deribit public `TradeId` provenance prefix (`RFQ-`/`BLK-`/`COMBO-`) for block, RFQ, and combo trades
 - Added Deribit `subscribe_combo_legs` opt-in for combo leg trade streams
 - Added Hyperliquid WebSocket trading API support for submit, cancel, modify, and cancel-all actions
+- Added Hyperliquid HIP-4 outcome `BinaryOption.info` with parsed venue description and question metadata
+- Added Hyperliquid `HYPERLIQUID_ACCOUNT_ADDRESS` env var fallback for `HyperliquidExecClientConfig.account_address`
 - Added Kraken WebSocket rate limiting (#4093), thanks @filipmacek
+- Added OKX `on_instrument` write-through so data-client instrument updates refresh exec caches without restart
+- Added Polymarket Rust adapter bounded-retry auto-load (`auto_load_max_retries`, exponential backoff with jitter)
 
 ### Breaking Changes
 - Changed `PoolProfiler::initialize` and `check_if_initialized` to return `Result` rather than assert
 - Changed Rust command `new` constructors to accept `correlation_id: Option<UUID4>` (pass `None` for old behavior)
+- Changed Hyperliquid HIP-4 outcome `InstrumentId` to `{outcome_index}-{YES|NO}-OUTCOME.HYPERLIQUID`
+- Changed Deribit `DeribitWebSocketClient.with_credentials` to accept `api_key`/`api_secret` after `environment`
+- Changed order event `reconciliation` and `due_post_only` from `u8` to `bool` (changes JSON/Arrow schemas)
 
 ### Security
 None
 
 ### Fixes
+- Fixed unbounded Cache `VecDeque` memory leak in Rust (#4107), thanks @filipmacek
+- Fixed `BacktestEngine` option positions remaining open when data stops before expiry
 - Fixed `BacktestEngine` losing latency-deferred commands at shutdown (Rust) (#4062), thanks for reporting @zhanghaoda
-- Fixed blockchain adapter caching a half-initialized `PoolProfiler` when `initialize` returns `InitialTickMismatch`
+- Fixed `BacktestEngine` duplicate account state events on reset, thanks for reporting @dfjmax
+- Fixed matching engine not canceling unmatched IOC/FOK limit orders (Rust) (#4112), thanks for reporting @Jonah-Chan
+- Fixed matching engine L1 slip-through for market orders exhausting top-of-book volume (Rust)
+- Fixed NETTING reconciliation opening phantom reduce-only positions (#4106), thanks for reporting @M-at-ti-a
+- Fixed HEDGING margin scaling with fill count instead of net exposure (#4110), thanks for reporting @qaxayuan
 - Fixed Aerodrome Slipstream `AmmType` from `StableSwap` to `CLAMM`
 - Fixed `PoolProfiler::update_position` to pre-validate active liquidity so failures leave pool state unchanged
+- Fixed `DefiDataEngine` exposing zero-state pool profiler during snapshot bootstrap
+- Fixed pool profiler `AlreadyInitialized` error when hypersync replay revisits `Initialize` after snapshot restore
+- Fixed `LiveNode` signal handling during startup connection wait (#4102), thanks @filipmacek
+- Fixed Python `ShutdownSystem` dict serialization to round-trip `correlation_id` (was previously dropped)
+- Fixed Python v2 order-book wranglers writing raw fixed-point bytes in big-endian (needed little-endian) (#4111), thanks for reporting @fabz1
 - Fixed Betfair Rust adapter snapshot book deltas emitting zero-volume `Add` entries
 - Fixed Betfair Rust adapter traded volume cache to handle bet voids and non-runner adjustments
 - Fixed Betfair Rust adapter RCM custom data `ts_init` parity between live and historical streams
+- Fixed Betfair Rust adapter overfill checks for rounded stream matched sizes
+- Fixed Betfair Rust adapter unsupported unsubscribe commands logging above debug
+- Fixed Blockchain adapter caching a half-initialized `PoolProfiler` when `initialize` returns `InitialTickMismatch`
+- Fixed Deribit `DeribitExecutionClient` not forwarding config credentials to the WebSocket client
 - Fixed dYdX rate limiter being skipped due to missing keys (#4091), thanks @filipmacek
 - Fixed Hyperliquid `Alo` limit order status reports being parsed as trigger orders
-- Fixed `LiveNode` signal handling during startup connection wait (#4102), thanks @filipmacek
-- Fixed Python `ShutdownSystem` dict serialization to round-trip `correlation_id` (was previously dropped)
-- Fixed `BacktestEngine` option positions remaining open when data stops before expiry
+- Fixed Kraken Futures `feeScheduleUid` deserialization to tolerate absence ahead of the 2026-06-22 Fee Schedules deprecation
+- Fixed OKX `OKXExecutionClient` not forwarding config credentials to WebSocket clients (#4115), thanks @pusteckiy
+- Fixed OKX adapter to validate `clOrdId` rules before submission (#4116), thanks for reporting @pusteckiy
+- Fixed Polymarket Rust adapter dropping auto-load batches on Gamma chunk failures
+- Fixed Polymarket Rust adapter treating encoded-empty `clob_token_ids` as terminal instead of transient
 
 ### Internal Improvements
 - Added `cargo machete` pre-commit hook to detect unused workspace dependencies
@@ -61,6 +88,7 @@ None
 - Added Hyperliquid `flatten` binary that cancels working orders and closes perpetual positions
 - Added Hyperliquid Criterion bench groups for inbound pipeline, exec pipeline, and dispatch (Rust)
 - Added OKX Criterion bench groups for inbound pipeline, exec pipeline, dispatch, and HTTP signing (Rust)
+- Added Polymarket `auto_load_retry_delay` helper with exponential backoff and jitter (Rust)
 - Added Polymarket Criterion bench groups for inbound pipeline, exec pipeline, and signing (Rust)
 - Enabled `unreachable_pub` rustc lint workspace-wide to prevent dead public surface
 - Implemented OKX `DataClient::unsubscribe_instrument` override to silence missing-handler warning at teardown
@@ -71,11 +99,15 @@ None
 - Refined `OptionSpread`/`FuturesSpread` trait accessors to read `size_precision`/`size_increment` fields
 - Removed dead Hyperliquid WebSocket codec module
 - Removed unused `async-stream` and `indexmap` from `nautilus-interactive-brokers` dependencies
-- Optimized Hyperliquid hot paths with benchmark report
+- Optimized Hyperliquid signing and hot paths with benchmark report
 - Optimized OKX hot paths with benchmark report
 
 ### Documentation Updates
-- Added `nautilus-plugin` README early-alpha warning declaring ABI and public API are not stable
+- Added plug-in concept guide covering the C-ABI boundary, manifest, lifecycle, and live-node integration
+- Added event-sourcing concept guide covering capture, replay, snapshot recovery, and verifier behaviour
+- Refined `BacktestEngine` shutdown notes with `on_stop` venue-latency ordering and pre-stop fill caveats
+- Fixed Polymarket crate README labelling separate Gamma and Data API endpoints
+- Fixed Polymarket integration guide inaccuracies (Gamma vs Data API split, `determine_trade_id` hash by adapter)
 
 ### Deprecations
 None
