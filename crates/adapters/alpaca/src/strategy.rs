@@ -1218,6 +1218,8 @@ mod tests {
     fn call_debit_candidates_use_higher_short_strike() {
         let config = DebitSpreadScannerConfig {
             widths: vec![3.0],
+            long_delta_min: 0.20,
+            long_delta_max: 0.25,
             min_reward_to_risk: 0.01,
             max_debit_to_width: 0.90,
             ..Default::default()
@@ -1240,6 +1242,8 @@ mod tests {
     fn put_debit_candidates_use_lower_short_strike() {
         let config = DebitSpreadScannerConfig {
             widths: vec![3.0],
+            long_delta_min: 0.20,
+            long_delta_max: 0.25,
             min_reward_to_risk: 0.01,
             max_debit_to_width: 0.90,
             ..Default::default()
@@ -1279,6 +1283,8 @@ mod tests {
     fn debit_candidates_require_min_debit_to_width() {
         let config = DebitSpreadScannerConfig {
             widths: vec![3.0],
+            long_delta_min: 0.20,
+            long_delta_max: 0.25,
             min_reward_to_risk: 0.01,
             min_debit_to_width: 0.25,
             max_debit_to_width: 0.90,

@@ -23,8 +23,7 @@ use nautilus_alpaca::{
         option_underlying_symbol, order_status_from_alpaca, order_status_reports_from_alpaca,
     },
     http::models::{
-        AlpacaActivity, AlpacaOptionContract, AlpacaOrder, AlpacaPosition, OptionSnapshotsRequest,
-        OptionSnapshotsResponse,
+        AlpacaOptionContract, AlpacaOrder, OptionSnapshotsRequest, OptionSnapshotsResponse,
     },
     orders::{
         AlpacaOrderSide, AlpacaPositionIntent, MlegOrderPayload,
@@ -40,13 +39,19 @@ use nautilus_alpaca::{
         fill_reports_from_alpaca_activities, fill_reports_from_trade_update,
         position_status_reports_from_alpaca_positions,
     },
+    http::models::{AlpacaActivity, AlpacaPosition},
     websocket::messages::{AlpacaTradeUpdate, AlpacaTradeUpdateLeg},
 };
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    enums::{OptionKind, OrderSide, OrderStatus, PositionSideSpecified},
-    identifiers::{InstrumentId, TradeId, VenueOrderId},
+    enums::{OptionKind, OrderStatus},
+    identifiers::{InstrumentId, VenueOrderId},
     types::{Price, Quantity},
+};
+#[cfg(feature = "live")]
+use nautilus_model::{
+    enums::{OrderSide, PositionSideSpecified},
+    identifiers::TradeId,
 };
 use serde_json::{Value, json};
 
