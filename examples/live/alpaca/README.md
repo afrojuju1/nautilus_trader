@@ -99,6 +99,34 @@ export ALPACA_UPSIDE_GAP_CAPITAL=10000
 export ALPACA_STOCK_FEED=iex
 ```
 
+## Combined equity daily strategy node
+
+This node registers both migrated daily-bar equity strategies on one Python `TradingNode`, sharing
+one Alpaca data client, one Alpaca execution client, and the same account-level equity risk gates.
+
+```bash
+python examples/live/alpaca/equity_daily_strategies_paper.py --check-config
+python examples/live/alpaca/equity_daily_strategies_paper.py
+```
+
+Broker-paper mode:
+
+```bash
+python examples/live/alpaca/equity_daily_strategies_paper.py \
+  --broker-paper \
+  --alpaca-profile paper-directional
+```
+
+Tiny-cap paper proof:
+
+```bash
+export ALPACA_GAP_REBOUND_CAPITAL=100
+export ALPACA_UPSIDE_GAP_CAPITAL=100
+export ALPACA_EQUITY_MAX_ORDER_NOTIONAL=100
+export ALPACA_EQUITY_MAX_TOTAL_NOTIONAL=250
+export ALPACA_EQUITY_MAX_BUYING_POWER_PCT=0.05
+```
+
 ## Equity paper submit/cancel smoke test
 
 Only run this intentionally with paper credentials. This command submits one whole-share equity

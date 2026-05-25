@@ -60,6 +60,8 @@ Alpaca payloads and translate broker facts back into Nautilus execution reports.
 - Add a paper submit/cancel smoke harness for one tiny equity order.
 - Add a profile loader so Python examples can use installed Rust runtime account env files.
 - Add an `UpsideGapContinuation` Python strategy port and paper node example.
+- Add a combined equity daily strategy example with both migrated strategies sharing one Alpaca
+  data client, execution client, and account-level risk gate surface.
 
 The default paper node path is intentionally broker-safe: it runs the regular strategy and submits
 regular Nautilus orders, but the execution client is Nautilus sandbox execution. It is not a
@@ -103,7 +105,7 @@ the Alpaca paper broker account.
 1. Keep proving `GapDownFragileRebound` and `UpsideGapContinuation` against Alpaca broker-paper
    execution with tiny notional caps.
 2. Prove the shared equity risk gates with broker-paper smoke tests and strategy runs.
-3. Add a multi-strategy node example only after individual strategy runs have data, submit, fill,
-   cancel, and reconciliation coverage.
+3. Prove the combined equity daily strategy node through a longer paper session and capture broker
+   submit/cancel/fill/reconciliation behavior under tiny caps.
 4. Move options strategies into the same architecture after Python can represent the needed
    multi-leg execution lifecycle without losing Rust runtime safety.
