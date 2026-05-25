@@ -29,8 +29,7 @@ AlpacaStockFeed = Literal["iex", "sip", "delayed_sip"]
 
 class AlpacaDataClientConfig(LiveDataClientConfig, frozen=True):
     """
-    Configuration shared by Alpaca market-data utilities and future ``AlpacaDataClient``
-    instances.
+    Configuration shared by Alpaca market-data utilities and ``AlpacaDataClient`` instances.
 
     Parameters
     ----------
@@ -85,8 +84,8 @@ class AlpacaDataClientConfig(LiveDataClientConfig, frozen=True):
 
 class AlpacaExecClientConfig(LiveExecClientConfig, frozen=True):
     """
-    Configuration shared by the Alpaca Rust execution runtime and future
-    ``AlpacaExecutionClient`` instances.
+    Configuration shared by the Alpaca Rust execution runtime and ``AlpacaExecutionClient``
+    instances.
 
     Parameters
     ----------

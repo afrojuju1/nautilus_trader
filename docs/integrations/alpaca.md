@@ -7,9 +7,9 @@ trading.
 
 :::warning
 This page documents the current experimental Alpaca options runtime. The standard Python
-`TradingNode` data factory has minimal stock-bar support, but the Python execution factory is not
-wired to broker execution yet, so Alpaca should not be presented as a full Python live adapter
-alongside the stable integrations.
+`TradingNode` data factory has minimal stock-bar support and the Python execution factory supports
+simple equity/ETF DAY limit orders. Multi-leg option execution remains in the Rust runtime, so
+Alpaca should not be presented as a full Python live adapter alongside the stable integrations.
 :::
 
 ## Examples
@@ -35,9 +35,9 @@ The Rust Alpaca runtime currently includes the following implemented components:
 - Operator binaries for read-only account status, option-chain inspection, dry-run scanning,
   multi-leg payload validation, fleet status, alerts, and performance reports.
 
-The Python package exposes config objects, a minimal stock-bar data client, strategy scaffolds, and
-a placeholder execution factory. The execution factory raises `NotImplementedError` until the
-Python `TradingNode` broker execution path is deliberately wired.
+The Python package exposes config objects, a minimal stock-bar data client, an equity execution
+client, and strategy scaffolds. The Python execution client is limited to simple equity/ETF orders;
+the Rust runtime remains the supported path for multi-leg option execution.
 
 ## Alpaca documentation
 
@@ -52,7 +52,7 @@ The current documented product scope is intentionally narrow.
 | Product Type      | Supported | Notes                                                                 |
 |-------------------|-----------|-----------------------------------------------------------------------|
 | US equity options | ✓         | Primary runtime target. Supports option contracts, snapshots, and option orders. |
-| US equities/ETFs  | Partial   | Static instruments and stock bars are available for Python `TradingNode`; broker execution remains Rust-runtime only. |
+| US equities/ETFs  | Partial   | Static instruments, stock bars, and simple DAY limit broker orders are available for Python `TradingNode`. |
 | Crypto            | -         | Not part of this adapter/runtime slice.                               |
 
 ## Environments
@@ -109,7 +109,7 @@ expiration, strike, option kind, currency, and multiplier fields.
 Scanner and contract-loading commands use unqualified US equity or ETF root symbols such as `SPY`,
 `QQQ`, and `IWM` for the underlying.
 
-## Execution capabilities
+## Rust Options Runtime Capabilities
 
 | Capability                           | Supported | Notes                                                  |
 |--------------------------------------|-----------|--------------------------------------------------------|
@@ -124,7 +124,21 @@ Scanner and contract-loading commands use unqualified US equity or ETF root symb
 | Cancel order                          | ✓         | Used by smoke, stale-entry, and operator flows.        |
 | Modify/replace order                  | -         | Not documented as supported.                           |
 | Bracket/OCO/stop/trailing orders      | -         | Not documented as supported for this runtime slice.    |
-| Standard Python `TradingNode` factory | -         | Python factories are placeholders.                     |
+
+## Python TradingNode Capabilities
+
+| Capability                    | Supported | Notes                                                  |
+|-------------------------------|-----------|--------------------------------------------------------|
+| Static US equity instruments  | ✓         | Configured symbols on venue `ALPACA`.                  |
+| Stock-bar polling             | ✓         | Externally aggregated stock bars.                      |
+| Account query                 | ✓         | Trading account status and balances.                   |
+| Position query                | ✓         | Used for startup and periodic reconciliation.          |
+| Order lookup/status reports   | ✓         | By venue order ID or client order ID.                  |
+| Simple equity/ETF limit order | ✓         | Whole-share `DAY` limit buy/sell orders.               |
+| Cancel order                  | ✓         | Single order, batch cancel, and cancel-all requests.   |
+| Trade update stream           | -         | REST reconciliation only in the Python client.         |
+| Option/multi-leg execution    | -         | Use the Rust options runtime for this surface.          |
+| Bracket/OCO/stop/trailing     | -         | Not implemented for the Python client.                 |
 
 ## Options engine
 
@@ -155,11 +169,14 @@ explicit configuration, paper proof, account-level caps, and buying-power gates 
 
 The following gaps should remain explicit until they are implemented and proven:
 
-- The Python `AlpacaLiveDataClientFactory` and `AlpacaLiveExecClientFactory` are placeholders.
-- A standard Python `TradingNode` Alpaca setup is not supported yet.
+- The Python `TradingNode` path is intentionally narrow: static equities, stock bars, and
+  whole-share equity/ETF `DAY` limit orders.
+- Python execution uses REST reconciliation; trade update WebSocket handling remains in the Rust
+  runtime.
+- Python option and multi-leg broker execution remains unwired; use the Rust runtime for that
+  surface.
 - Streaming market data is not documented as a public supported client yet.
 - Historical market data is not documented as a public supported client yet.
-- Equity order support is not documented yet.
 - Assignment, exercise, and expiry require more first-class lifecycle proof before being advertised
   as complete.
 - Full Alpaca API parity is not the goal of the current runtime slice.

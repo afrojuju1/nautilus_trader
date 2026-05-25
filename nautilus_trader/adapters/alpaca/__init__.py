@@ -17,8 +17,8 @@ Alpaca Markets integration package for NautilusTrader.
 
 The Rust Alpaca options runtime is implemented in ``nautilus-alpaca`` and exposed through
 diagnostic/operator binaries plus selected PyO3 bindings. The Python ``TradingNode`` data factory
-supports static US equity instruments and Alpaca stock bars; broker execution through the Python
-``TradingNode`` factory is still intentionally not wired.
+supports static US equity instruments and Alpaca stock bars; the Python execution factory supports
+simple US equity/ETF DAY limit orders. Multi-leg option execution remains in the Rust runtime.
 """
 
 from nautilus_trader.adapters.alpaca.config import AlpacaDataClientConfig
@@ -31,6 +31,7 @@ from nautilus_trader.adapters.alpaca.constants import ALPACA_VENUE
 from nautilus_trader.adapters.alpaca.constants import APCA_API_KEY_ID_ENV
 from nautilus_trader.adapters.alpaca.constants import APCA_API_SECRET_KEY_ENV
 from nautilus_trader.adapters.alpaca.data import AlpacaDataClient
+from nautilus_trader.adapters.alpaca.execution import AlpacaExecutionClient
 from nautilus_trader.adapters.alpaca.factories import AlpacaLiveDataClientFactory
 from nautilus_trader.adapters.alpaca.factories import AlpacaLiveExecClientFactory
 from nautilus_trader.adapters.alpaca.providers import AlpacaEquityInstrumentProvider
@@ -51,6 +52,7 @@ __all__ = [
     "AlpacaDataClientConfig",
     "AlpacaEquityInstrumentProvider",
     "AlpacaExecClientConfig",
+    "AlpacaExecutionClient",
     "AlpacaLiveDataClientFactory",
     "AlpacaLiveExecClientFactory",
     "AlpacaPutCreditStrategy",

@@ -16,6 +16,7 @@
 from nautilus_trader.adapters.alpaca.config import AlpacaDataClientConfig
 from nautilus_trader.adapters.alpaca.config import AlpacaExecClientConfig
 from nautilus_trader.adapters.alpaca.data import AlpacaDataClient
+from nautilus_trader.adapters.alpaca.execution import AlpacaExecutionClient
 from nautilus_trader.adapters.alpaca.providers import AlpacaEquityInstrumentProvider
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
@@ -55,10 +56,10 @@ class AlpacaLiveDataClientFactory(LiveDataClientFactory):
 
 class AlpacaLiveExecClientFactory(LiveExecClientFactory):
     """
-    Placeholder factory for future Python ``AlpacaExecutionClient`` instances.
+    Provides an Alpaca execution client factory for Python ``TradingNode`` usage.
 
-    The Rust Alpaca options execution runtime is implemented, but the standard Python
-    ``TradingNode`` execution client is not wired yet.
+    The Python client currently supports simple US equity/ETF DAY limit orders. The Rust Alpaca
+    runtime remains the implemented surface for multi-leg option orders.
     """
 
     @staticmethod
@@ -70,8 +71,15 @@ class AlpacaLiveExecClientFactory(LiveExecClientFactory):
         cache: Cache,
         clock: LiveClock,
     ):
-        raise NotImplementedError(
-            "The Python Alpaca execution client factory is not wired yet. "
-            "Use SandboxLiveExecClientFactory for paper/simulated TradingNode runs, or the Rust "
-            "Alpaca options runtime utilities for broker-paper execution.",
+        instrument_provider = AlpacaEquityInstrumentProvider(
+            config=config.instrument_provider,
+        )
+        return AlpacaExecutionClient(
+            loop=loop,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            instrument_provider=instrument_provider,
+            config=config,
+            name=name,
         )

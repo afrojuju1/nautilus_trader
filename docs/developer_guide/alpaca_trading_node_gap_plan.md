@@ -12,8 +12,8 @@ equity/ETF daily bars.
   `LimitOrder` objects for equity/ETF buys and sells.
 - The Python Alpaca data factory supports static US equity instruments and Alpaca stock-bar
   requests/polling.
-- Python broker execution through `AlpacaLiveExecClientFactory` is still not wired. The existing
-  Rust `AlpacaExecutionClient` is not exposed as a Python `LiveExecutionClient`.
+- The Python Alpaca execution factory supports simple US equity/ETF `DAY` limit broker orders.
+  The existing Rust `AlpacaExecutionClient` still owns the richer options execution runtime.
 
 ## Target Architecture
 
@@ -30,9 +30,9 @@ TradingNode
   |     `-- later: option quotes/greeks
   |
   |-- AlpacaLiveExecClient
-  |     |-- submit/cancel/modify
-  |     |-- trade updates
-  |     `-- REST reconciliation
+  |     |-- equity submit/cancel/query
+  |     |-- REST reconciliation
+  |     `-- later: trade updates and option/multi-leg bridge
   |
   `-- Strategies
         |-- GapDownFragileRebound
@@ -51,38 +51,39 @@ Alpaca payloads and translate broker facts back into Nautilus execution reports.
 - Add a `GapDownFragileRebound` Python node example using Alpaca data plus Nautilus sandbox
   execution.
 - Add parity tests for the migrated GapDown signal gates.
+- Add Python broker-paper execution for simple whole-share equity/ETF `DAY` limit orders.
 
-The paper node path is intentionally broker-safe: it runs the regular strategy and submits regular
-Nautilus orders, but the execution client is Nautilus sandbox execution. It is not a strategy-level
-dry run.
+The default paper node path is intentionally broker-safe: it runs the regular strategy and submits
+regular Nautilus orders, but the execution client is Nautilus sandbox execution. It is not a
+strategy-level dry run. Passing `--broker-paper` deliberately routes those same Nautilus orders to
+the Alpaca paper broker account.
 
 ## Remaining Gaps
 
-1. Python Alpaca execution bridge.
+1. Equity order lifecycle hardening.
 
-   Expose or wrap the Rust `AlpacaExecutionClient` as a Python `LiveExecutionClient`, or implement
-   an equivalent Python client that generates normalized order, fill, cancel, and position reports.
-   This must include startup reconciliation and periodic repair before it can replace sandbox
-   execution.
+   Validate Python `TradingNode` DAY limit buys/sells, client order IDs, fills, cancel flows, stale
+   order handling, startup reconciliation, and periodic repair in Alpaca paper with tiny notional
+   caps.
 
-2. Equity order lifecycle parity.
-
-   The Rust Alpaca order payload path supports simple equity buy/sell limit payloads, but the
-   Python node cannot yet route orders to that Rust client. Once the execution bridge exists,
-   validate DAY limit buys/sells, client order IDs, fills, cancel flows, and stale order handling in
-   Alpaca paper.
-
-3. Shared account-level risk.
+2. Shared account-level risk.
 
    Multiple regular strategies on one account need shared admission controls. The node should own
    account-wide exposure, buying power, duplicate symbol, and kill-switch checks so strategies
    cannot bypass each other.
 
-4. Option data and multi-leg Python execution.
+3. Option data and multi-leg Python execution.
 
    The Rust options runtime already handles much of this. Moving it under Python `TradingNode`
-   requires explicit option quote subscriptions, snapshot/Greek refresh, multi-leg order-list
-   support, and reconciliation for assignment, exercise, expiration, corrections, and fills.
+   requires exposing or wrapping the Rust `AlpacaExecutionClient`, explicit option quote
+   subscriptions, snapshot/Greek refresh, multi-leg order-list support, and reconciliation for
+   assignment, exercise, expiration, corrections, and fills.
+
+4. Trade update stream parity.
+
+   The Python execution client currently uses REST reconciliation. Trade update WebSocket handling
+   should either move through the Rust bridge or be implemented with equivalent dedupe and repair
+   behavior.
 
 5. Operational projections.
 
@@ -91,10 +92,9 @@ dry run.
 
 ## Migration Order After This Slice
 
-1. Build the Python execution bridge for Alpaca equities, starting with paper DAY limit buy/sell.
-2. Run `GapDownFragileRebound` against Alpaca broker-paper execution with tiny notional caps.
-3. Add account-wide risk controls for multiple regular equity strategies.
-4. Port the next strategy only after the first strategy has data, submit, fill, cancel, and
+1. Run `GapDownFragileRebound` against Alpaca broker-paper execution with tiny notional caps.
+2. Add account-wide risk controls for multiple regular equity strategies.
+3. Port the next strategy only after the first strategy has data, submit, fill, cancel, and
    reconciliation coverage.
-5. Move options strategies into the same architecture after Python can represent the needed
+4. Move options strategies into the same architecture after Python can represent the needed
    multi-leg execution lifecycle without losing Rust runtime safety.

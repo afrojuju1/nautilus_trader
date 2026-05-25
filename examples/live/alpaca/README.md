@@ -5,8 +5,9 @@ These examples exercise the current Rust Alpaca options runtime and the minimal 
 broker orders by default.
 
 The standard Python `TradingNode` Alpaca data factory currently supports static US equity
-instruments and stock bars. Broker execution through the Python Alpaca execution factory is still
-not wired; Python node examples use the Nautilus sandbox execution client unless stated otherwise.
+instruments and stock bars. The Python execution factory supports simple US equity/ETF `DAY` limit
+orders. Python node examples use the Nautilus sandbox execution client unless `--broker-paper` is
+passed explicitly.
 
 ## Credentials
 
@@ -29,6 +30,12 @@ and routes regular Nautilus strategy orders into the Nautilus sandbox execution 
 ```bash
 python examples/live/alpaca/gap_down_fragile_rebound_paper.py --check-config
 python examples/live/alpaca/gap_down_fragile_rebound_paper.py
+```
+
+To route regular strategy orders to the Alpaca paper broker account, use:
+
+```bash
+python examples/live/alpaca/gap_down_fragile_rebound_paper.py --broker-paper
 ```
 
 Optional overrides:

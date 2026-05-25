@@ -28,7 +28,9 @@ from decimal import Decimal
 
 from nautilus_trader.adapters.alpaca import ALPACA
 from nautilus_trader.adapters.alpaca import AlpacaDataClientConfig
+from nautilus_trader.adapters.alpaca import AlpacaExecClientConfig
 from nautilus_trader.adapters.alpaca import AlpacaLiveDataClientFactory
+from nautilus_trader.adapters.alpaca import AlpacaLiveExecClientFactory
 from nautilus_trader.adapters.alpaca.strategies import GapDownFragileRebound
 from nautilus_trader.adapters.alpaca.strategies import GapDownFragileReboundConfig
 from nautilus_trader.adapters.sandbox.config import SandboxExecutionClientConfig
@@ -47,7 +49,7 @@ from nautilus_trader.model.identifiers import TraderId
 ETF_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD"]
 
 
-def build_node() -> TradingNode:
+def build_node(use_broker_paper: bool = False) -> TradingNode:
     symbols = _symbols_from_env()
     instrument_ids = [InstrumentId.from_str(f"{symbol}.{ALPACA}") for symbol in symbols]
     bar_types = [
@@ -56,6 +58,29 @@ def build_node() -> TradingNode:
     strategy_capital = Decimal(os.getenv("ALPACA_GAP_REBOUND_CAPITAL", "10000"))
     instrument_provider = InstrumentProviderConfig(load_ids=frozenset(instrument_ids))
     routing = RoutingConfig(venues=frozenset([ALPACA]))
+
+    exec_config = (
+        AlpacaExecClientConfig(
+            environment="paper",
+            instrument_provider=instrument_provider,
+            routing=routing,
+            use_trade_updates_stream=False,
+            reconciliation_poll_secs=60,
+        )
+        if use_broker_paper
+        else SandboxExecutionClientConfig(
+            venue=ALPACA,
+            starting_balances=[f"{strategy_capital * Decimal(2)} USD"],
+            base_currency="USD",
+            account_type="CASH",
+            oms_type="NETTING",
+            instrument_provider=instrument_provider,
+            routing=routing,
+            bar_execution=True,
+            trade_execution=False,
+        )
+    )
+    exec_factory = AlpacaLiveExecClientFactory if use_broker_paper else SandboxLiveExecClientFactory
 
     config_node = TradingNodeConfig(
         trader_id=TraderId(os.getenv("ALPACA_GAP_REBOUND_TRADER_ID", "GAPREB-001")),
@@ -69,19 +94,7 @@ def build_node() -> TradingNode:
                 routing=routing,
             ),
         },
-        exec_clients={
-            ALPACA: SandboxExecutionClientConfig(
-                venue=ALPACA,
-                starting_balances=[f"{strategy_capital * Decimal(2)} USD"],
-                base_currency="USD",
-                account_type="CASH",
-                oms_type="NETTING",
-                instrument_provider=instrument_provider,
-                routing=routing,
-                bar_execution=True,
-                trade_execution=False,
-            ),
-        },
+        exec_clients={ALPACA: exec_config},
         timeout_connection=30.0,
         timeout_reconciliation=5.0,
         timeout_portfolio=5.0,
@@ -99,7 +112,7 @@ def build_node() -> TradingNode:
         ),
     )
     node.add_data_client_factory(ALPACA, AlpacaLiveDataClientFactory)
-    node.add_exec_client_factory(ALPACA, SandboxLiveExecClientFactory)
+    node.add_exec_client_factory(ALPACA, exec_factory)
     node.build()
     return node
 
@@ -107,9 +120,14 @@ def build_node() -> TradingNode:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check-config", action="store_true")
+    parser.add_argument(
+        "--broker-paper",
+        action="store_true",
+        help="Route orders to the Alpaca paper broker instead of Nautilus sandbox execution.",
+    )
     args = parser.parse_args()
 
-    node = build_node()
+    node = build_node(use_broker_paper=args.broker_paper)
     if args.check_config:
         node.dispose()
         return
