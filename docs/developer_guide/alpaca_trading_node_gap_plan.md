@@ -74,7 +74,9 @@ the Alpaca paper broker account.
 
    Validate Python `TradingNode` DAY limit buys/sells, client order IDs, fills, cancel flows, stale
    order handling, startup reconciliation, and periodic repair in Alpaca paper with tiny notional
-   caps.
+   caps. A closed-market broker-paper run on May 25, 2026 proved connection, account load, bar
+   subscription, historical bar receipt, and graceful shutdown for the combined equity node; natural
+   signal/order observation still needs the next open market window.
 
 2. Shared account-level risk.
 
@@ -87,7 +89,10 @@ the Alpaca paper broker account.
    The Rust options runtime already handles much of this. Moving it under Python `TradingNode`
    requires exposing or wrapping the Rust `AlpacaExecutionClient`, explicit option quote
    subscriptions, snapshot/Greek refresh, multi-leg order-list support, and reconciliation for
-   assignment, exercise, expiration, corrections, and fills.
+   assignment, exercise, expiration, corrections, and fills. The first target is the put-credit
+   spread path because Rust already has option contract loading, snapshots, scanner scoring,
+   multi-leg order-list construction, Alpaca `mleg` payload validation, and paper submit/cancel
+   harnesses. See [Alpaca Options TradingNode Migration](alpaca_options_trading_node_migration.md).
 
 4. Trade update stream parity.
 
@@ -107,5 +112,7 @@ the Alpaca paper broker account.
 2. Prove the shared equity risk gates with broker-paper smoke tests and strategy runs.
 3. Prove the combined equity daily strategy node through a longer paper session and capture broker
    submit/cancel/fill/reconciliation behavior under tiny caps.
-4. Move options strategies into the same architecture after Python can represent the needed
-   multi-leg execution lifecycle without losing Rust runtime safety.
+4. Move the put-credit spread path into the same architecture after Python can represent the needed
+   option instruments, option snapshots, `SubmitOrderList` commands, multi-leg broker submission,
+   cancel/close flows, option positions, and account reconciliation without losing Rust runtime
+   safety.
