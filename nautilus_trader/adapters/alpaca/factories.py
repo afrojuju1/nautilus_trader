@@ -15,6 +15,8 @@
 
 from nautilus_trader.adapters.alpaca.config import AlpacaDataClientConfig
 from nautilus_trader.adapters.alpaca.config import AlpacaExecClientConfig
+from nautilus_trader.adapters.alpaca.data import AlpacaDataClient
+from nautilus_trader.adapters.alpaca.providers import AlpacaEquityInstrumentProvider
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
@@ -24,10 +26,7 @@ from nautilus_trader.live.factories import LiveExecClientFactory
 
 class AlpacaLiveDataClientFactory(LiveDataClientFactory):
     """
-    Placeholder factory for future Python ``AlpacaDataClient`` instances.
-
-    The Rust Alpaca options runtime is implemented, but the standard Python ``TradingNode`` data
-    client is not wired yet.
+    Provides an Alpaca data client factory for Python ``TradingNode`` usage.
     """
 
     @staticmethod
@@ -39,9 +38,18 @@ class AlpacaLiveDataClientFactory(LiveDataClientFactory):
         cache: Cache,
         clock: LiveClock,
     ):
-        raise NotImplementedError(
-            "The Python Alpaca data client factory is not wired yet. "
-            "Use the Rust Alpaca options runtime utilities for the current implemented surface.",
+        instrument_provider = AlpacaEquityInstrumentProvider(
+            symbols=config.equity_symbols,
+            config=config.instrument_provider,
+        )
+        return AlpacaDataClient(
+            loop=loop,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            instrument_provider=instrument_provider,
+            config=config,
+            name=name,
         )
 
 
@@ -64,5 +72,6 @@ class AlpacaLiveExecClientFactory(LiveExecClientFactory):
     ):
         raise NotImplementedError(
             "The Python Alpaca execution client factory is not wired yet. "
-            "Use the Rust Alpaca options runtime utilities for the current implemented surface.",
+            "Use SandboxLiveExecClientFactory for paper/simulated TradingNode runs, or the Rust "
+            "Alpaca options runtime utilities for broker-paper execution.",
         )

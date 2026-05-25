@@ -1,10 +1,12 @@
 # Alpaca Live Examples
 
-These examples exercise the current Rust Alpaca options runtime safely. They are designed for
-paper credentials and do not submit orders by default.
+These examples exercise the current Rust Alpaca options runtime and the minimal Python
+`TradingNode` stock-bar path safely. They are designed for paper credentials and do not submit
+broker orders by default.
 
-The standard Python `TradingNode` Alpaca factories are not wired yet, so this directory uses the
-Rust binaries from `nautilus-alpaca`.
+The standard Python `TradingNode` Alpaca data factory currently supports static US equity
+instruments and stock bars. Broker execution through the Python Alpaca execution factory is still
+not wired; Python node examples use the Nautilus sandbox execution client unless stated otherwise.
 
 ## Credentials
 
@@ -18,6 +20,24 @@ export ALPACA_TRADING_BASE_URL="https://paper-api.alpaca.markets"
 
 The runtime also accepts `ALPACA_API_KEY` for the key and `ALPACA_SECRET_KEY` or
 `ALPACA_API_SECRET` for the secret.
+
+## GapDownFragileRebound paper node
+
+This command builds a normal Python `TradingNode`, uses Alpaca stock bars for the configured ETFs,
+and routes regular Nautilus strategy orders into the Nautilus sandbox execution client.
+
+```bash
+python examples/live/alpaca/gap_down_fragile_rebound_paper.py --check-config
+python examples/live/alpaca/gap_down_fragile_rebound_paper.py
+```
+
+Optional overrides:
+
+```bash
+export ALPACA_GAP_REBOUND_SYMBOLS="SPY,QQQ,IWM,DIA,GLD"
+export ALPACA_GAP_REBOUND_CAPITAL=10000
+export ALPACA_STOCK_FEED=iex
+```
 
 ## Read-only account status
 

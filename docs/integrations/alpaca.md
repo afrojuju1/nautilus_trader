@@ -7,8 +7,9 @@ trading.
 
 :::warning
 This page documents the current experimental Alpaca options runtime. The standard Python
-`TradingNode` data and execution factories are not wired to live clients yet, so Alpaca should not
-be presented as a full Python live adapter alongside the stable integrations.
+`TradingNode` data factory has minimal stock-bar support, but the Python execution factory is not
+wired to broker execution yet, so Alpaca should not be presented as a full Python live adapter
+alongside the stable integrations.
 :::
 
 ## Examples
@@ -34,8 +35,9 @@ The Rust Alpaca runtime currently includes the following implemented components:
 - Operator binaries for read-only account status, option-chain inspection, dry-run scanning,
   multi-leg payload validation, fleet status, alerts, and performance reports.
 
-The Python package exposes config objects and placeholder live-client factories. Those factories
-raise `NotImplementedError` until the Python `TradingNode` integration path is deliberately wired.
+The Python package exposes config objects, a minimal stock-bar data client, strategy scaffolds, and
+a placeholder execution factory. The execution factory raises `NotImplementedError` until the
+Python `TradingNode` broker execution path is deliberately wired.
 
 ## Alpaca documentation
 
@@ -50,7 +52,7 @@ The current documented product scope is intentionally narrow.
 | Product Type      | Supported | Notes                                                                 |
 |-------------------|-----------|-----------------------------------------------------------------------|
 | US equity options | ✓         | Primary runtime target. Supports option contracts, snapshots, and option orders. |
-| US equities/ETFs  | -         | Account and position payloads may include equities, but public order support is not documented yet. |
+| US equities/ETFs  | Partial   | Static instruments and stock bars are available for Python `TradingNode`; broker execution remains Rust-runtime only. |
 | Crypto            | -         | Not part of this adapter/runtime slice.                               |
 
 ## Environments

@@ -16,8 +16,9 @@
 Alpaca Markets integration package for NautilusTrader.
 
 The Rust Alpaca options runtime is implemented in ``nautilus-alpaca`` and exposed through
-diagnostic/operator binaries plus selected PyO3 bindings. The Python ``TradingNode`` data and
-execution factories are still placeholders and should not be registered as live clients yet.
+diagnostic/operator binaries plus selected PyO3 bindings. The Python ``TradingNode`` data factory
+supports static US equity instruments and Alpaca stock bars; broker execution through the Python
+``TradingNode`` factory is still intentionally not wired.
 """
 
 from nautilus_trader.adapters.alpaca.config import AlpacaDataClientConfig
@@ -29,8 +30,11 @@ from nautilus_trader.adapters.alpaca.constants import ALPACA_SECRET_KEY_ENV
 from nautilus_trader.adapters.alpaca.constants import ALPACA_VENUE
 from nautilus_trader.adapters.alpaca.constants import APCA_API_KEY_ID_ENV
 from nautilus_trader.adapters.alpaca.constants import APCA_API_SECRET_KEY_ENV
+from nautilus_trader.adapters.alpaca.data import AlpacaDataClient
 from nautilus_trader.adapters.alpaca.factories import AlpacaLiveDataClientFactory
 from nautilus_trader.adapters.alpaca.factories import AlpacaLiveExecClientFactory
+from nautilus_trader.adapters.alpaca.providers import AlpacaEquityInstrumentProvider
+from nautilus_trader.adapters.alpaca.providers import make_alpaca_equity
 from nautilus_trader.adapters.alpaca.strategies import AlpacaPutCreditStrategy
 from nautilus_trader.adapters.alpaca.strategies import AlpacaPutCreditStrategyConfig
 
@@ -43,10 +47,13 @@ __all__ = [
     "ALPACA_VENUE",
     "APCA_API_KEY_ID_ENV",
     "APCA_API_SECRET_KEY_ENV",
+    "AlpacaDataClient",
     "AlpacaDataClientConfig",
+    "AlpacaEquityInstrumentProvider",
     "AlpacaExecClientConfig",
     "AlpacaLiveDataClientFactory",
     "AlpacaLiveExecClientFactory",
     "AlpacaPutCreditStrategy",
     "AlpacaPutCreditStrategyConfig",
+    "make_alpaca_equity",
 ]

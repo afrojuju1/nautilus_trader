@@ -15,6 +15,8 @@
 
 from typing import Literal
 
+import msgspec
+
 from nautilus_trader.common.config import PositiveInt
 from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.config import LiveExecClientConfig
@@ -50,10 +52,17 @@ class AlpacaDataClientConfig(LiveDataClientConfig, frozen=True):
         Stock feed to request.
     option_feed : {"indicative", "opra"}, default "indicative"
         Option feed to request.
+    equity_symbols : list[str], default []
+        US equity/ETF symbols to model as Alpaca equity instruments for the Python
+        ``TradingNode`` data client.
     max_option_subscriptions : PositiveInt, default 1000
         Maximum option symbols to subscribe in one WebSocket request.
     request_timeout_secs : PositiveInt, default 30
         HTTP request timeout in seconds.
+    bar_poll_interval_secs : PositiveInt, default 300
+        Poll interval for externally aggregated stock bars.
+    bars_timestamp_on_close : bool, default True
+        If bar timestamps should be shifted to the close of the aggregation interval.
     snapshot_greeks_poll_secs : PositiveInt, optional
         Optional polling interval for option snapshot Greeks and IV.
 
@@ -66,8 +75,11 @@ class AlpacaDataClientConfig(LiveDataClientConfig, frozen=True):
     trading_base_url: str | None = None
     stock_feed: AlpacaStockFeed = "iex"
     option_feed: AlpacaOptionFeed = "indicative"
+    equity_symbols: list[str] = msgspec.field(default_factory=list)
     max_option_subscriptions: PositiveInt = 1_000
     request_timeout_secs: PositiveInt = 30
+    bar_poll_interval_secs: PositiveInt = 300
+    bars_timestamp_on_close: bool = True
     snapshot_greeks_poll_secs: PositiveInt | None = None
 
 
