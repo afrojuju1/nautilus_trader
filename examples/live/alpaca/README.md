@@ -114,7 +114,8 @@ Broker-paper mode:
 ```bash
 python examples/live/alpaca/equity_daily_strategies_paper.py \
   --broker-paper \
-  --alpaca-profile paper-directional
+  --alpaca-profile paper-directional \
+  --run-seconds 3600
 ```
 
 Tiny-cap paper proof:

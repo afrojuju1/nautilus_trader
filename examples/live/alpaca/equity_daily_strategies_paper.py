@@ -153,6 +153,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check-config", action="store_true")
     parser.add_argument(
+        "--run-seconds",
+        type=float,
+        help="Stop the node gracefully after this many seconds.",
+    )
+    parser.add_argument(
         "--broker-paper",
         action="store_true",
         help="Route orders to the Alpaca paper broker instead of Nautilus sandbox execution.",
@@ -165,6 +170,10 @@ def main() -> None:
     if args.check_config:
         node.dispose()
         return
+    if args.run_seconds is not None:
+        if args.run_seconds <= 0:
+            raise ValueError("--run-seconds must be positive")
+        node.get_event_loop().call_later(args.run_seconds, node.stop)
 
     try:
         node.run()
