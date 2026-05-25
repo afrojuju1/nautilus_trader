@@ -13,10 +13,12 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from decimal import Decimal
 from typing import Literal
 
 import msgspec
 
+from nautilus_trader.common.config import NonNegativeFloat
 from nautilus_trader.common.config import PositiveInt
 from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.config import LiveExecClientConfig
@@ -113,6 +115,22 @@ class AlpacaExecClientConfig(LiveExecClientConfig, frozen=True):
         If execution reports for client order IDs outside the prefix should be ignored.
     reconciliation_poll_secs : PositiveInt, optional
         Optional interval for REST reconciliation repair polling.
+    risk_kill_switch : bool, default False
+        If True then all new broker order submissions are denied by the execution client.
+    max_order_notional : Decimal, optional
+        Maximum notional for any single risk-increasing equity order.
+    max_total_notional : Decimal, optional
+        Maximum account-level equity notional exposure including open broker positions and orders.
+    enforce_buying_power : bool, default True
+        If True then risk-increasing orders are denied when their notional exceeds the last
+        observed Alpaca buying power.
+    allow_duplicate_symbol_exposure : bool, default False
+        If False then risk-increasing orders are denied when the account already has an open order
+        or position for the same symbol.
+    allow_short_selling : bool, default False
+        If False then sell orders are only allowed when they can close existing long quantity.
+    max_buying_power_pct : NonNegativeFloat, optional
+        Maximum fraction of last observed buying power one risk-increasing equity order may use.
 
     """
 
@@ -126,3 +144,10 @@ class AlpacaExecClientConfig(LiveExecClientConfig, frozen=True):
     client_order_id_prefix: str = "nautilus"
     external_order_filtering: bool = False
     reconciliation_poll_secs: PositiveInt | None = 60
+    risk_kill_switch: bool = False
+    max_order_notional: Decimal | None = None
+    max_total_notional: Decimal | None = None
+    enforce_buying_power: bool = True
+    allow_duplicate_symbol_exposure: bool = False
+    allow_short_selling: bool = False
+    max_buying_power_pct: NonNegativeFloat | None = None

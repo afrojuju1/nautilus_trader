@@ -158,6 +158,13 @@ class AlpacaExecutionClient(LiveExecutionClient):
         self._accepted_venue_order_ids: set[VenueOrderId] = set()
         self._terminal_venue_order_ids: set[VenueOrderId] = set()
         self._filled_qty_by_venue_order_id: dict[VenueOrderId, Decimal] = {}
+        self._last_buying_power: Decimal | None = None
+        self._remote_risk_state_loaded = False
+        self._remote_position_qty_by_symbol: dict[str, Decimal] = {}
+        self._remote_position_notional_by_symbol: dict[str, Decimal] = {}
+        self._remote_open_order_qty_by_symbol_side: dict[tuple[str, OrderSide], Decimal] = {}
+        self._remote_open_order_notional_by_symbol: dict[str, Decimal] = {}
+        self._remote_open_client_order_ids: set[ClientOrderId] = set()
         self._poll_task: asyncio.Task | None = None
 
         self._log.info(f"environment={config.environment}", LogColor.BLUE)
@@ -166,6 +173,14 @@ class AlpacaExecutionClient(LiveExecutionClient):
             f"reconciliation_poll_secs={config.reconciliation_poll_secs}",
             LogColor.BLUE,
         )
+        self._log.info(f"risk_kill_switch={config.risk_kill_switch}", LogColor.BLUE)
+        self._log.info(f"max_order_notional={config.max_order_notional}", LogColor.BLUE)
+        self._log.info(f"max_total_notional={config.max_total_notional}", LogColor.BLUE)
+        self._log.info(
+            f"allow_duplicate_symbol_exposure={config.allow_duplicate_symbol_exposure}",
+            LogColor.BLUE,
+        )
+        self._log.info(f"allow_short_selling={config.allow_short_selling}", LogColor.BLUE)
         if config.use_trade_updates_stream:
             self._log.warning(
                 "Python Alpaca execution uses REST reconciliation; trade update WebSocket "
@@ -175,6 +190,7 @@ class AlpacaExecutionClient(LiveExecutionClient):
     async def _connect(self) -> None:
         await self._instrument_provider.load_all_async()
         await self._update_account_state()
+        await self._sync_remote_risk_state()
         await self._sync_open_cached_orders()
 
         if self._config.reconciliation_poll_secs:
@@ -205,6 +221,29 @@ class AlpacaExecutionClient(LiveExecutionClient):
                 instrument_id=order.instrument_id,
                 client_order_id=order.client_order_id,
                 reason=error,
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+
+        try:
+            await self._sync_remote_risk_state()
+        except Exception as e:
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=f"RISK_STATE_UNAVAILABLE: {e}",
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+
+        risk_reason = self._risk_denial_reason(order)
+        if risk_reason is not None:
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=risk_reason,
                 ts_event=self._clock.timestamp_ns(),
             )
             return
@@ -424,6 +463,7 @@ class AlpacaExecutionClient(LiveExecutionClient):
             await asyncio.sleep(interval)
             try:
                 await self._update_account_state()
+                await self._sync_remote_risk_state()
                 await self._sync_open_cached_orders()
             except asyncio.CancelledError:
                 raise
@@ -434,8 +474,10 @@ class AlpacaExecutionClient(LiveExecutionClient):
         account = await self._get_json("/v2/account")
         if not isinstance(account, dict):
             raise RuntimeError("Alpaca account response was not an object")
+        balance = _account_balance_from_alpaca(account)
+        self._last_buying_power = balance.free.as_decimal()
         self.generate_account_state(
-            balances=[_account_balance_from_alpaca(account)],
+            balances=[balance],
             margins=[],
             reported=True,
             ts_event=self._clock.timestamp_ns(),
@@ -446,12 +488,174 @@ class AlpacaExecutionClient(LiveExecutionClient):
             },
         )
 
+    async def _sync_remote_risk_state(self) -> None:
+        positions = await self._get_json("/v2/positions")
+        if not isinstance(positions, list):
+            positions = []
+
+        position_qty_by_symbol: dict[str, Decimal] = {}
+        position_notional_by_symbol: dict[str, Decimal] = {}
+        for position in positions:
+            if not isinstance(position, dict):
+                continue
+            symbol = _normalize_symbol(_required_str(position, "symbol"))
+            quantity = _signed_position_qty_from_alpaca(position)
+            avg_entry_price = _decimal_from_optional(position.get("avg_entry_price")) or Decimal(0)
+            position_qty_by_symbol[symbol] = (
+                position_qty_by_symbol.get(symbol, Decimal(0)) + quantity
+            )
+            position_notional_by_symbol[symbol] = position_notional_by_symbol.get(
+                symbol,
+                Decimal(0),
+            ) + abs(quantity * avg_entry_price)
+
+        open_orders = await self._get_json(
+            "/v2/orders",
+            {
+                "status": "open",
+                "limit": ALPACA_ORDER_PAGE_LIMIT,
+                "direction": "desc",
+            },
+        )
+        if not isinstance(open_orders, list):
+            open_orders = []
+
+        order_qty_by_symbol_side: dict[tuple[str, OrderSide], Decimal] = {}
+        order_notional_by_symbol: dict[str, Decimal] = {}
+        open_client_order_ids: set[ClientOrderId] = set()
+        for open_order in open_orders:
+            if not isinstance(open_order, dict):
+                continue
+            symbol = _normalize_symbol(_required_str(open_order, "symbol"))
+            side = _order_side_from_alpaca(_required_str(open_order, "side"))
+            quantity = _required_decimal(open_order, "qty")
+            price = (
+                _decimal_from_optional(open_order.get("limit_price"))
+                or _decimal_from_optional(open_order.get("stop_price"))
+                or Decimal(0)
+            )
+            order_qty_by_symbol_side[(symbol, side)] = (
+                order_qty_by_symbol_side.get((symbol, side), Decimal(0)) + quantity
+            )
+            order_notional_by_symbol[symbol] = order_notional_by_symbol.get(
+                symbol,
+                Decimal(0),
+            ) + abs(quantity * price)
+            client_order_id = _client_order_id(open_order)
+            if client_order_id is not None:
+                open_client_order_ids.add(client_order_id)
+
+        self._remote_position_qty_by_symbol = position_qty_by_symbol
+        self._remote_position_notional_by_symbol = position_notional_by_symbol
+        self._remote_open_order_qty_by_symbol_side = order_qty_by_symbol_side
+        self._remote_open_order_notional_by_symbol = order_notional_by_symbol
+        self._remote_open_client_order_ids = open_client_order_ids
+        self._remote_risk_state_loaded = True
+
     async def _sync_open_cached_orders(self) -> None:
         for order in self._cache.orders_open(venue=ALPACA_VENUE, account_id=self.account_id):
             remote = await self._order_by_client_order_id(order.client_order_id)
             if remote is None:
                 continue
             self._emit_order_snapshot(order, remote)
+
+    def _risk_denial_reason(self, order: Order) -> str | None:
+        symbol = _normalize_symbol(order.instrument_id.symbol.value)
+        return _equity_risk_denial_reason(
+            order=order,
+            config=self._config,
+            order_notional=_order_notional(order),
+            current_total_notional=self._current_total_notional(order.client_order_id),
+            current_symbol_position_qty=self._current_symbol_position_qty(symbol),
+            same_symbol_exposure_exists=self._same_symbol_exposure_exists(
+                symbol,
+                order.client_order_id,
+            ),
+            same_symbol_open_buy_qty=self._same_symbol_open_order_qty(
+                symbol,
+                OrderSide.BUY,
+                order.client_order_id,
+            ),
+            same_symbol_open_sell_qty=self._same_symbol_open_order_qty(
+                symbol,
+                OrderSide.SELL,
+                order.client_order_id,
+            ),
+            available_buying_power=self._last_buying_power,
+        )
+
+    def _current_total_notional(
+        self,
+        exclude_client_order_id: ClientOrderId | None = None,
+    ) -> Decimal:
+        if self._remote_risk_state_loaded:
+            total = sum(self._remote_position_notional_by_symbol.values(), Decimal(0)) + sum(
+                self._remote_open_order_notional_by_symbol.values(),
+                Decimal(0),
+            )
+        else:
+            total = Decimal(0)
+            for position in self._cache.positions_open(
+                venue=ALPACA_VENUE,
+                account_id=self.account_id,
+            ):
+                total += _position_notional(position)
+        for open_order in self._cache.orders_open(venue=ALPACA_VENUE, account_id=self.account_id):
+            if (
+                exclude_client_order_id is not None
+                and open_order.client_order_id == exclude_client_order_id
+            ):
+                continue
+            if open_order.client_order_id in self._remote_open_client_order_ids:
+                continue
+            total += _order_notional(open_order)
+        return total
+
+    def _current_symbol_position_qty(self, symbol: str) -> Decimal:
+        if self._remote_risk_state_loaded:
+            return self._remote_position_qty_by_symbol.get(symbol, Decimal(0))
+
+        quantity = Decimal(0)
+        for position in self._cache.positions_open(venue=ALPACA_VENUE, account_id=self.account_id):
+            if _normalize_symbol(position.instrument_id.symbol.value) == symbol:
+                quantity += _signed_position_qty(position)
+        return quantity
+
+    def _same_symbol_exposure_exists(
+        self,
+        symbol: str,
+        exclude_client_order_id: ClientOrderId | None = None,
+    ) -> bool:
+        if self._current_symbol_position_qty(symbol) != 0:
+            return True
+        return (
+            self._same_symbol_open_order_qty(symbol, OrderSide.BUY, exclude_client_order_id) > 0
+            or self._same_symbol_open_order_qty(symbol, OrderSide.SELL, exclude_client_order_id) > 0
+        )
+
+    def _same_symbol_open_order_qty(
+        self,
+        symbol: str,
+        side: OrderSide,
+        exclude_client_order_id: ClientOrderId | None = None,
+    ) -> Decimal:
+        quantity = Decimal(0)
+        if self._remote_risk_state_loaded:
+            quantity += self._remote_open_order_qty_by_symbol_side.get((symbol, side), Decimal(0))
+
+        for open_order in self._cache.orders_open(venue=ALPACA_VENUE, account_id=self.account_id):
+            if (
+                exclude_client_order_id is not None
+                and open_order.client_order_id == exclude_client_order_id
+            ):
+                continue
+            if open_order.client_order_id in self._remote_open_client_order_ids:
+                continue
+            if _normalize_symbol(open_order.instrument_id.symbol.value) != symbol:
+                continue
+            if open_order.side == side:
+                quantity += _order_qty(open_order)
+        return quantity
 
     async def _order_by_client_order_id(
         self,
@@ -712,6 +916,119 @@ def _validate_equity_limit_order(order: Order) -> str | None:
     return None
 
 
+def _equity_risk_denial_reason(
+    *,
+    order: Order,
+    config: AlpacaExecClientConfig,
+    order_notional: Decimal,
+    current_total_notional: Decimal,
+    current_symbol_position_qty: Decimal,
+    same_symbol_exposure_exists: bool,
+    same_symbol_open_buy_qty: Decimal,
+    same_symbol_open_sell_qty: Decimal,
+    available_buying_power: Decimal | None,
+) -> str | None:
+    if config.risk_kill_switch:
+        return "RISK_KILL_SWITCH"
+
+    quantity = _order_qty(order)
+    signed_order_qty = quantity if order.side == OrderSide.BUY else -quantity
+    short_sale_reason = _short_sale_denial_reason(
+        order=order,
+        config=config,
+        quantity=quantity,
+        current_symbol_position_qty=current_symbol_position_qty,
+        same_symbol_open_sell_qty=same_symbol_open_sell_qty,
+    )
+    if short_sale_reason is not None:
+        return short_sale_reason
+
+    if order.side == OrderSide.BUY and current_symbol_position_qty < 0:
+        closeable_short_qty = abs(current_symbol_position_qty) - same_symbol_open_buy_qty
+        if quantity <= max(Decimal(0), closeable_short_qty):
+            return None
+
+    projected_symbol_qty = current_symbol_position_qty + signed_order_qty
+    risk_increasing = abs(projected_symbol_qty) > abs(current_symbol_position_qty)
+    if not risk_increasing:
+        return None
+
+    if config.max_order_notional is not None and order_notional > config.max_order_notional:
+        return (
+            "RISK_MAX_ORDER_NOTIONAL: "
+            f"order_notional={order_notional} max_order_notional={config.max_order_notional}"
+        )
+
+    if not config.allow_duplicate_symbol_exposure and same_symbol_exposure_exists:
+        return f"RISK_DUPLICATE_SYMBOL_EXPOSURE: {order.instrument_id.symbol.value}"
+
+    projected_total_notional = current_total_notional + order_notional
+    if (
+        config.max_total_notional is not None
+        and projected_total_notional > config.max_total_notional
+    ):
+        return (
+            "RISK_MAX_TOTAL_NOTIONAL: "
+            f"projected_total_notional={projected_total_notional} "
+            f"max_total_notional={config.max_total_notional}"
+        )
+
+    return _buying_power_denial_reason(
+        config=config,
+        order_notional=order_notional,
+        available_buying_power=available_buying_power,
+    )
+
+
+def _short_sale_denial_reason(
+    *,
+    order: Order,
+    config: AlpacaExecClientConfig,
+    quantity: Decimal,
+    current_symbol_position_qty: Decimal,
+    same_symbol_open_sell_qty: Decimal,
+) -> str | None:
+    if config.allow_short_selling or order.side != OrderSide.SELL:
+        return None
+
+    closeable_long_qty = max(Decimal(0), current_symbol_position_qty - same_symbol_open_sell_qty)
+    if quantity <= closeable_long_qty:
+        return None
+
+    return (
+        f"RISK_SHORT_SELLING_DISABLED: sell_qty={quantity} closeable_long_qty={closeable_long_qty}"
+    )
+
+
+def _buying_power_denial_reason(
+    *,
+    config: AlpacaExecClientConfig,
+    order_notional: Decimal,
+    available_buying_power: Decimal | None,
+) -> str | None:
+    if available_buying_power is None or not config.enforce_buying_power:
+        return None
+
+    if config.max_buying_power_pct is not None:
+        max_buying_power_notional = available_buying_power * Decimal(
+            str(config.max_buying_power_pct)
+        )
+        if order_notional > max_buying_power_notional:
+            return (
+                "RISK_MAX_BUYING_POWER_PCT: "
+                f"order_notional={order_notional} "
+                f"max_buying_power_notional={max_buying_power_notional}"
+            )
+
+    if order_notional > available_buying_power:
+        return (
+            "RISK_BUYING_POWER: "
+            f"order_notional={order_notional} available_buying_power={available_buying_power}"
+        )
+
+    return None
+
+
 def _equity_limit_payload_from_order(order: Order) -> dict[str, str]:
     error = _validate_equity_limit_order(order)
     if error is not None:
@@ -725,6 +1042,36 @@ def _equity_limit_payload_from_order(order: Order) -> dict[str, str]:
         "limit_price": str(order.price),
         "client_order_id": str(order.client_order_id),
     }
+
+
+def _order_qty(order: Order) -> Decimal:
+    return Decimal(str(order.quantity))
+
+
+def _order_notional(order: Order) -> Decimal:
+    price = getattr(order, "price", None)
+    if price is None:
+        return Decimal(0)
+    return abs(_order_qty(order) * Decimal(str(price)))
+
+
+def _position_notional(position: Any) -> Decimal:
+    return abs(_signed_position_qty(position) * Decimal(str(position.avg_px_open)))
+
+
+def _signed_position_qty(position: Any) -> Decimal:
+    quantity = Decimal(str(position.quantity))
+    if position.side == PositionSide.SHORT:
+        return -quantity
+    return quantity
+
+
+def _signed_position_qty_from_alpaca(data: dict[str, Any]) -> Decimal:
+    quantity = _required_decimal(data, "qty")
+    side = _position_side_from_alpaca(data.get("side"), quantity)
+    if side == PositionSide.SHORT:
+        return -abs(quantity)
+    return abs(quantity)
 
 
 def _account_balance_from_alpaca(data: dict[str, Any]) -> AccountBalance:
@@ -793,6 +1140,13 @@ def _required_str(data: dict[str, Any], key: str) -> str:
     if value is None or str(value).strip() == "":
         raise ValueError(f"Alpaca response missing {key}")
     return str(value)
+
+
+def _normalize_symbol(symbol: str) -> str:
+    normalized = symbol.strip().upper()
+    if not normalized:
+        raise ValueError("symbol must not be empty")
+    return normalized
 
 
 def _quantity_from_decimal(instrument: Instrument, value: Decimal) -> Quantity:

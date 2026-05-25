@@ -52,6 +52,9 @@ Alpaca payloads and translate broker facts back into Nautilus execution reports.
   execution.
 - Add parity tests for the migrated GapDown signal gates.
 - Add Python broker-paper execution for simple whole-share equity/ETF `DAY` limit orders.
+- Add adapter-level shared equity risk gates for kill switch, max order notional, max total
+  notional, buying power, duplicate symbol exposure, and short-sale blocking.
+- Add a paper submit/cancel smoke harness for one tiny equity order.
 
 The default paper node path is intentionally broker-safe: it runs the regular strategy and submits
 regular Nautilus orders, but the execution client is Nautilus sandbox execution. It is not a
@@ -68,9 +71,9 @@ the Alpaca paper broker account.
 
 2. Shared account-level risk.
 
-   Multiple regular strategies on one account need shared admission controls. The node should own
-   account-wide exposure, buying power, duplicate symbol, and kill-switch checks so strategies
-   cannot bypass each other.
+   The first adapter-level gates are in place for equities. The remaining work is to prove them in
+   paper, decide policy defaults per account, add operator visibility, and promote any broader
+   portfolio rules out of strategy-local code.
 
 3. Option data and multi-leg Python execution.
 
@@ -93,7 +96,7 @@ the Alpaca paper broker account.
 ## Migration Order After This Slice
 
 1. Run `GapDownFragileRebound` against Alpaca broker-paper execution with tiny notional caps.
-2. Add account-wide risk controls for multiple regular equity strategies.
+2. Prove the shared equity risk gates with broker-paper smoke tests and strategy runs.
 3. Port the next strategy only after the first strategy has data, submit, fill, cancel, and
    reconciliation coverage.
 4. Move options strategies into the same architecture after Python can represent the needed

@@ -38,6 +38,18 @@ To route regular strategy orders to the Alpaca paper broker account, use:
 python examples/live/alpaca/gap_down_fragile_rebound_paper.py --broker-paper
 ```
 
+The broker-paper path applies shared account-level equity risk gates in the Alpaca execution
+client. Optional overrides:
+
+```bash
+export ALPACA_EQUITY_KILL_SWITCH=false
+export ALPACA_EQUITY_MAX_ORDER_NOTIONAL=100
+export ALPACA_EQUITY_MAX_TOTAL_NOTIONAL=250
+export ALPACA_EQUITY_MAX_BUYING_POWER_PCT=0.05
+export ALPACA_EQUITY_ALLOW_DUPLICATE_SYMBOL_EXPOSURE=false
+export ALPACA_EQUITY_ALLOW_SHORT_SELLING=false
+```
+
 Optional overrides:
 
 ```bash
@@ -45,6 +57,26 @@ export ALPACA_GAP_REBOUND_SYMBOLS="SPY,QQQ,IWM,DIA,GLD"
 export ALPACA_GAP_REBOUND_CAPITAL=10000
 export ALPACA_STOCK_FEED=iex
 ```
+
+## Equity paper submit/cancel smoke test
+
+Only run this intentionally with paper credentials. This command submits one whole-share equity
+`DAY` limit order, requests cancellation if it is accepted and non-terminal, then checks account,
+positions, and open orders.
+
+Use a far-from-market limit and verify the account has no unexpected open orders afterward:
+
+```bash
+export ALPACA_TRADING_BASE_URL="https://paper-api.alpaca.markets"
+
+python examples/live/alpaca/alpaca_equity_broker_smoke.py \
+  --confirm-submit \
+  --symbol SPY \
+  --qty 1 \
+  --limit-price 1.00
+```
+
+If a smoke order remains open, cancel it in the Alpaca paper dashboard or API before continuing.
 
 ## Read-only account status
 

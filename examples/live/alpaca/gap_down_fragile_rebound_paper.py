@@ -62,10 +62,29 @@ def build_node(use_broker_paper: bool = False) -> TradingNode:
     exec_config = (
         AlpacaExecClientConfig(
             environment="paper",
+            trading_base_url=os.getenv("ALPACA_TRADING_BASE_URL"),
             instrument_provider=instrument_provider,
             routing=routing,
             use_trade_updates_stream=False,
             reconciliation_poll_secs=60,
+            risk_kill_switch=_bool_from_env("ALPACA_EQUITY_KILL_SWITCH", default=False),
+            max_order_notional=_decimal_from_env(
+                "ALPACA_EQUITY_MAX_ORDER_NOTIONAL",
+                default=str(strategy_capital),
+            ),
+            max_total_notional=_decimal_from_env(
+                "ALPACA_EQUITY_MAX_TOTAL_NOTIONAL",
+                default=str(strategy_capital * Decimal(2)),
+            ),
+            max_buying_power_pct=_float_from_env("ALPACA_EQUITY_MAX_BUYING_POWER_PCT"),
+            allow_duplicate_symbol_exposure=_bool_from_env(
+                "ALPACA_EQUITY_ALLOW_DUPLICATE_SYMBOL_EXPOSURE",
+                default=False,
+            ),
+            allow_short_selling=_bool_from_env(
+                "ALPACA_EQUITY_ALLOW_SHORT_SELLING",
+                default=False,
+            ),
         )
         if use_broker_paper
         else SandboxExecutionClientConfig(
@@ -143,6 +162,23 @@ def _symbols_from_env() -> list[str]:
     if raw is None:
         return ETF_SYMBOLS
     return [symbol.strip().upper() for symbol in raw.split(",") if symbol.strip()]
+
+
+def _decimal_from_env(name: str, default: str | None = None) -> Decimal | None:
+    raw = os.getenv(name, default)
+    return Decimal(raw) if raw is not None and raw.strip() else None
+
+
+def _float_from_env(name: str) -> float | None:
+    raw = os.getenv(name)
+    return float(raw) if raw is not None and raw.strip() else None
+
+
+def _bool_from_env(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 if __name__ == "__main__":

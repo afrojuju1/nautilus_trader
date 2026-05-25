@@ -136,6 +136,7 @@ Scanner and contract-loading commands use unqualified US equity or ETF root symb
 | Order lookup/status reports   | ✓         | By venue order ID or client order ID.                  |
 | Simple equity/ETF limit order | ✓         | Whole-share `DAY` limit buy/sell orders.               |
 | Cancel order                  | ✓         | Single order, batch cancel, and cancel-all requests.   |
+| Shared equity risk gates      | ✓         | Kill switch, notional caps, buying power, duplicate symbol, and short-sale gates. |
 | Trade update stream           | -         | REST reconciliation only in the Python client.         |
 | Option/multi-leg execution    | -         | Use the Rust options runtime for this surface.          |
 | Bracket/OCO/stop/trailing     | -         | Not implemented for the Python client.                 |
@@ -171,6 +172,7 @@ The following gaps should remain explicit until they are implemented and proven:
 
 - The Python `TradingNode` path is intentionally narrow: static equities, stock bars, and
   whole-share equity/ETF `DAY` limit orders.
+- Python shared risk gates are adapter-level guardrails, not a complete portfolio risk system.
 - Python execution uses REST reconciliation; trade update WebSocket handling remains in the Rust
   runtime.
 - Python option and multi-leg broker execution remains unwired; use the Rust runtime for that
