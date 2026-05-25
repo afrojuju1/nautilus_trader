@@ -22,6 +22,20 @@ export ALPACA_TRADING_BASE_URL="https://paper-api.alpaca.markets"
 The runtime also accepts `ALPACA_API_KEY` for the key and `ALPACA_SECRET_KEY` or
 `ALPACA_API_SECRET` for the secret.
 
+Python examples can also load the installed Rust runtime account env files directly:
+
+```bash
+python examples/live/alpaca/gap_down_fragile_rebound_paper.py \
+  --check-config \
+  --broker-paper \
+  --alpaca-profile paper-directional
+```
+
+`--alpaca-profile paper-directional` resolves to
+`~/.config/nautilus-trader/alpaca/accounts/paper-directional.env`. Use `--alpaca-profile
+paper-main` for `~/.config/nautilus-trader/alpaca/options-engine.env`, or pass
+`--alpaca-env-file <path>` for an explicit env file.
+
 ## GapDownFragileRebound paper node
 
 This command builds a normal Python `TradingNode`, uses Alpaca stock bars for the configured ETFs,
@@ -58,6 +72,33 @@ export ALPACA_GAP_REBOUND_CAPITAL=10000
 export ALPACA_STOCK_FEED=iex
 ```
 
+## UpsideGapContinuation paper node
+
+This is the rule-based ETF strategy ported from `spreads_notebook` package
+`upside_gap_continuation_v1`. It uses Alpaca daily bars for `FXI`, `SMH`, and `SOXX`, submits
+normal long-only Nautilus orders, and shares the same broker-paper risk gates.
+
+```bash
+python examples/live/alpaca/upside_gap_continuation_paper.py --check-config
+python examples/live/alpaca/upside_gap_continuation_paper.py
+```
+
+Broker-paper mode:
+
+```bash
+python examples/live/alpaca/upside_gap_continuation_paper.py \
+  --broker-paper \
+  --alpaca-profile paper-directional
+```
+
+Optional overrides:
+
+```bash
+export ALPACA_UPSIDE_GAP_SYMBOLS="FXI,SMH,SOXX"
+export ALPACA_UPSIDE_GAP_CAPITAL=10000
+export ALPACA_STOCK_FEED=iex
+```
+
 ## Equity paper submit/cancel smoke test
 
 Only run this intentionally with paper credentials. This command submits one whole-share equity
@@ -71,6 +112,7 @@ export ALPACA_TRADING_BASE_URL="https://paper-api.alpaca.markets"
 
 python examples/live/alpaca/alpaca_equity_broker_smoke.py \
   --confirm-submit \
+  --alpaca-profile paper-directional \
   --symbol SPY \
   --qty 1 \
   --limit-price 1.00

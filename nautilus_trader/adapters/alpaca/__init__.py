@@ -34,10 +34,16 @@ from nautilus_trader.adapters.alpaca.data import AlpacaDataClient
 from nautilus_trader.adapters.alpaca.execution import AlpacaExecutionClient
 from nautilus_trader.adapters.alpaca.factories import AlpacaLiveDataClientFactory
 from nautilus_trader.adapters.alpaca.factories import AlpacaLiveExecClientFactory
+from nautilus_trader.adapters.alpaca.profiles import add_alpaca_profile_args
+from nautilus_trader.adapters.alpaca.profiles import alpaca_env_file_for_profile
+from nautilus_trader.adapters.alpaca.profiles import load_alpaca_env_file
+from nautilus_trader.adapters.alpaca.profiles import load_alpaca_profile_from_args
 from nautilus_trader.adapters.alpaca.providers import AlpacaEquityInstrumentProvider
 from nautilus_trader.adapters.alpaca.providers import make_alpaca_equity
 from nautilus_trader.adapters.alpaca.strategies import AlpacaPutCreditStrategy
 from nautilus_trader.adapters.alpaca.strategies import AlpacaPutCreditStrategyConfig
+from nautilus_trader.adapters.alpaca.strategies import UpsideGapContinuation
+from nautilus_trader.adapters.alpaca.strategies import UpsideGapContinuationConfig
 
 
 __all__ = [
@@ -57,5 +63,11 @@ __all__ = [
     "AlpacaLiveExecClientFactory",
     "AlpacaPutCreditStrategy",
     "AlpacaPutCreditStrategyConfig",
+    "UpsideGapContinuation",
+    "UpsideGapContinuationConfig",
+    "add_alpaca_profile_args",
+    "alpaca_env_file_for_profile",
+    "load_alpaca_env_file",
+    "load_alpaca_profile_from_args",
     "make_alpaca_equity",
 ]

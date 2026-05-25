@@ -24,6 +24,10 @@ from nautilus_trader.adapters.alpaca.strategies.gap_down_fragile_rebound import 
 )
 from nautilus_trader.adapters.alpaca.strategies.put_credit import AlpacaPutCreditStrategy
 from nautilus_trader.adapters.alpaca.strategies.put_credit import AlpacaPutCreditStrategyConfig
+from nautilus_trader.adapters.alpaca.strategies.upside_gap_continuation import UpsideGapContinuation
+from nautilus_trader.adapters.alpaca.strategies.upside_gap_continuation import (
+    UpsideGapContinuationConfig,
+)
 
 
 __all__ = [
@@ -31,4 +35,6 @@ __all__ = [
     "AlpacaPutCreditStrategyConfig",
     "GapDownFragileRebound",
     "GapDownFragileReboundConfig",
+    "UpsideGapContinuation",
+    "UpsideGapContinuationConfig",
 ]

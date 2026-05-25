@@ -10,6 +10,8 @@ equity/ETF daily bars.
   management actions, and operator commands.
 - Python now has a regular `GapDownFragileRebound` strategy which submits normal Nautilus
   `LimitOrder` objects for equity/ETF buys and sells.
+- Python also has a regular `UpsideGapContinuation` strategy port for the next equity/ETF
+  daily-bar package.
 - The Python Alpaca data factory supports static US equity instruments and Alpaca stock-bar
   requests/polling.
 - The Python Alpaca execution factory supports simple US equity/ETF `DAY` limit broker orders.
@@ -36,6 +38,7 @@ TradingNode
   |
   `-- Strategies
         |-- GapDownFragileRebound
+        |-- UpsideGapContinuation
         `-- later migrated strategies
 ```
 
@@ -55,6 +58,8 @@ Alpaca payloads and translate broker facts back into Nautilus execution reports.
 - Add adapter-level shared equity risk gates for kill switch, max order notional, max total
   notional, buying power, duplicate symbol exposure, and short-sale blocking.
 - Add a paper submit/cancel smoke harness for one tiny equity order.
+- Add a profile loader so Python examples can use installed Rust runtime account env files.
+- Add an `UpsideGapContinuation` Python strategy port and paper node example.
 
 The default paper node path is intentionally broker-safe: it runs the regular strategy and submits
 regular Nautilus orders, but the execution client is Nautilus sandbox execution. It is not a
@@ -95,9 +100,10 @@ the Alpaca paper broker account.
 
 ## Migration Order After This Slice
 
-1. Run `GapDownFragileRebound` against Alpaca broker-paper execution with tiny notional caps.
+1. Keep proving `GapDownFragileRebound` and `UpsideGapContinuation` against Alpaca broker-paper
+   execution with tiny notional caps.
 2. Prove the shared equity risk gates with broker-paper smoke tests and strategy runs.
-3. Port the next strategy only after the first strategy has data, submit, fill, cancel, and
-   reconciliation coverage.
+3. Add a multi-strategy node example only after individual strategy runs have data, submit, fill,
+   cancel, and reconciliation coverage.
 4. Move options strategies into the same architecture after Python can represent the needed
    multi-leg execution lifecycle without losing Rust runtime safety.

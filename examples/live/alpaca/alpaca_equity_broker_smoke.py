@@ -39,6 +39,8 @@ from nautilus_trader.adapters.alpaca.constants import APCA_API_KEY_ID_ENV
 from nautilus_trader.adapters.alpaca.constants import APCA_API_SECRET_KEY_ENV
 from nautilus_trader.adapters.alpaca.data import APCA_API_KEY_HEADER
 from nautilus_trader.adapters.alpaca.data import APCA_API_SECRET_HEADER
+from nautilus_trader.adapters.alpaca.profiles import add_alpaca_profile_args
+from nautilus_trader.adapters.alpaca.profiles import load_alpaca_profile_from_args
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.uuid import UUID4
 
@@ -56,8 +58,10 @@ async def main() -> None:
     parser.add_argument("--poll-delay-secs", type=float, default=1.0)
     parser.add_argument("--confirm-submit", action="store_true")
     parser.add_argument("--allow-live", action="store_true")
+    add_alpaca_profile_args(parser)
     args = parser.parse_args()
 
+    load_alpaca_profile_from_args(args)
     if not args.confirm_submit:
         raise SystemExit("Pass --confirm-submit to submit a real Alpaca paper order.")
     if args.qty <= 0:

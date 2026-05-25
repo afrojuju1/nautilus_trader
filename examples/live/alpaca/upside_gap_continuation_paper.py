@@ -14,10 +14,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Run GapDownFragileRebound through a Python TradingNode with Alpaca data and sandbox execution.
-
-The strategy submits regular Nautilus orders. This example routes those orders to the Nautilus
-sandbox execution client, not to the Alpaca broker-paper account.
+Run UpsideGapContinuation through a Python TradingNode with Alpaca data and sandbox execution.
 """
 
 from __future__ import annotations
@@ -33,8 +30,8 @@ from nautilus_trader.adapters.alpaca import AlpacaLiveDataClientFactory
 from nautilus_trader.adapters.alpaca import AlpacaLiveExecClientFactory
 from nautilus_trader.adapters.alpaca import add_alpaca_profile_args
 from nautilus_trader.adapters.alpaca import load_alpaca_profile_from_args
-from nautilus_trader.adapters.alpaca.strategies import GapDownFragileRebound
-from nautilus_trader.adapters.alpaca.strategies import GapDownFragileReboundConfig
+from nautilus_trader.adapters.alpaca.strategies import UpsideGapContinuation
+from nautilus_trader.adapters.alpaca.strategies import UpsideGapContinuationConfig
 from nautilus_trader.adapters.sandbox.config import SandboxExecutionClientConfig
 from nautilus_trader.adapters.sandbox.factory import SandboxLiveExecClientFactory
 from nautilus_trader.config import InstrumentProviderConfig
@@ -48,7 +45,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import TraderId
 
 
-ETF_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD"]
+ETF_SYMBOLS = ["FXI", "SMH", "SOXX"]
 
 
 def build_node(use_broker_paper: bool = False) -> TradingNode:
@@ -57,7 +54,7 @@ def build_node(use_broker_paper: bool = False) -> TradingNode:
     bar_types = [
         BarType.from_str(f"{instrument_id}-1-DAY-LAST-EXTERNAL") for instrument_id in instrument_ids
     ]
-    strategy_capital = Decimal(os.getenv("ALPACA_GAP_REBOUND_CAPITAL", "10000"))
+    strategy_capital = Decimal(os.getenv("ALPACA_UPSIDE_GAP_CAPITAL", "10000"))
     instrument_provider = InstrumentProviderConfig(load_ids=frozenset(instrument_ids))
     routing = RoutingConfig(venues=frozenset([ALPACA]))
 
@@ -104,7 +101,7 @@ def build_node(use_broker_paper: bool = False) -> TradingNode:
     exec_factory = AlpacaLiveExecClientFactory if use_broker_paper else SandboxLiveExecClientFactory
 
     config_node = TradingNodeConfig(
-        trader_id=TraderId(os.getenv("ALPACA_GAP_REBOUND_TRADER_ID", "GAPREB-001")),
+        trader_id=TraderId(os.getenv("ALPACA_UPSIDE_GAP_TRADER_ID", "UPGAP-001")),
         logging=LoggingConfig(log_level=os.getenv("NAUTILUS_LOG_LEVEL", "INFO"), use_pyo3=True),
         exec_engine=LiveExecEngineConfig(reconciliation=False),
         data_clients={
@@ -125,8 +122,8 @@ def build_node(use_broker_paper: bool = False) -> TradingNode:
 
     node = TradingNode(config=config_node)
     node.trader.add_strategy(
-        GapDownFragileRebound(
-            GapDownFragileReboundConfig(
+        UpsideGapContinuation(
+            UpsideGapContinuationConfig(
                 bar_types=bar_types,
                 strategy_capital=strategy_capital,
             ),
@@ -162,7 +159,7 @@ def main() -> None:
 
 
 def _symbols_from_env() -> list[str]:
-    raw = os.getenv("ALPACA_GAP_REBOUND_SYMBOLS")
+    raw = os.getenv("ALPACA_UPSIDE_GAP_SYMBOLS")
     if raw is None:
         return ETF_SYMBOLS
     return [symbol.strip().upper() for symbol in raw.split(",") if symbol.strip()]
