@@ -155,7 +155,10 @@ def main() -> None:
     parser.add_argument(
         "--run-seconds",
         type=float,
-        help="Stop the node gracefully after this many seconds.",
+        help=(
+            "Stop the node gracefully after this many seconds. Defaults to "
+            "ALPACA_EQUITY_DAILY_RUN_SECONDS when set."
+        ),
     )
     parser.add_argument(
         "--broker-paper",
@@ -170,10 +173,15 @@ def main() -> None:
     if args.check_config:
         node.dispose()
         return
-    if args.run_seconds is not None:
-        if args.run_seconds <= 0:
-            raise ValueError("--run-seconds must be positive")
-        node.get_event_loop().call_later(args.run_seconds, node.stop)
+    run_seconds = (
+        args.run_seconds
+        if args.run_seconds is not None
+        else _float_from_env("ALPACA_EQUITY_DAILY_RUN_SECONDS")
+    )
+    if run_seconds is not None:
+        if run_seconds <= 0:
+            raise ValueError("--run-seconds or ALPACA_EQUITY_DAILY_RUN_SECONDS must be positive")
+        node.get_event_loop().call_later(run_seconds, node.stop)
 
     try:
         node.run()

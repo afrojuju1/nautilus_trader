@@ -36,6 +36,24 @@ python examples/live/alpaca/gap_down_fragile_rebound_paper.py \
 paper-main` for `~/.config/nautilus-trader/alpaca/options-engine.env`, or pass
 `--alpaca-env-file <path>` for an explicit env file.
 
+Keep account-specific broker-paper risk gates and strategy sizing in the same profile env file:
+
+```bash
+ALPACA_EQUITY_KILL_SWITCH=false
+ALPACA_EQUITY_MAX_ORDER_NOTIONAL=100
+ALPACA_EQUITY_MAX_TOTAL_NOTIONAL=250
+ALPACA_EQUITY_MAX_BUYING_POWER_PCT=0.05
+ALPACA_EQUITY_ALLOW_DUPLICATE_SYMBOL_EXPOSURE=false
+ALPACA_EQUITY_ALLOW_SHORT_SELLING=false
+
+ALPACA_GAP_REBOUND_SYMBOLS="SPY,QQQ,IWM,DIA,GLD"
+ALPACA_GAP_REBOUND_CAPITAL=100
+ALPACA_UPSIDE_GAP_SYMBOLS="FXI,SMH,SOXX"
+ALPACA_UPSIDE_GAP_CAPITAL=100
+ALPACA_STOCK_FEED=iex
+ALPACA_EQUITY_DAILY_RUN_SECONDS=3600
+```
+
 ## GapDownFragileRebound paper node
 
 This command builds a normal Python `TradingNode`, uses Alpaca stock bars for the configured ETFs,
@@ -53,23 +71,12 @@ python examples/live/alpaca/gap_down_fragile_rebound_paper.py --broker-paper
 ```
 
 The broker-paper path applies shared account-level equity risk gates in the Alpaca execution
-client. Optional overrides:
+client. Strategy overrides are read from the selected env file:
 
 ```bash
-export ALPACA_EQUITY_KILL_SWITCH=false
-export ALPACA_EQUITY_MAX_ORDER_NOTIONAL=100
-export ALPACA_EQUITY_MAX_TOTAL_NOTIONAL=250
-export ALPACA_EQUITY_MAX_BUYING_POWER_PCT=0.05
-export ALPACA_EQUITY_ALLOW_DUPLICATE_SYMBOL_EXPOSURE=false
-export ALPACA_EQUITY_ALLOW_SHORT_SELLING=false
-```
-
-Optional overrides:
-
-```bash
-export ALPACA_GAP_REBOUND_SYMBOLS="SPY,QQQ,IWM,DIA,GLD"
-export ALPACA_GAP_REBOUND_CAPITAL=10000
-export ALPACA_STOCK_FEED=iex
+ALPACA_GAP_REBOUND_SYMBOLS="SPY,QQQ,IWM,DIA,GLD"
+ALPACA_GAP_REBOUND_CAPITAL=10000
+ALPACA_STOCK_FEED=iex
 ```
 
 ## UpsideGapContinuation paper node
@@ -91,12 +98,12 @@ python examples/live/alpaca/upside_gap_continuation_paper.py \
   --alpaca-profile paper-directional
 ```
 
-Optional overrides:
+Strategy overrides are read from the selected env file:
 
 ```bash
-export ALPACA_UPSIDE_GAP_SYMBOLS="FXI,SMH,SOXX"
-export ALPACA_UPSIDE_GAP_CAPITAL=10000
-export ALPACA_STOCK_FEED=iex
+ALPACA_UPSIDE_GAP_SYMBOLS="FXI,SMH,SOXX"
+ALPACA_UPSIDE_GAP_CAPITAL=10000
+ALPACA_STOCK_FEED=iex
 ```
 
 ## Combined equity daily strategy node
@@ -114,18 +121,7 @@ Broker-paper mode:
 ```bash
 python examples/live/alpaca/equity_daily_strategies_paper.py \
   --broker-paper \
-  --alpaca-profile paper-directional \
-  --run-seconds 3600
-```
-
-Tiny-cap paper proof:
-
-```bash
-export ALPACA_GAP_REBOUND_CAPITAL=100
-export ALPACA_UPSIDE_GAP_CAPITAL=100
-export ALPACA_EQUITY_MAX_ORDER_NOTIONAL=100
-export ALPACA_EQUITY_MAX_TOTAL_NOTIONAL=250
-export ALPACA_EQUITY_MAX_BUYING_POWER_PCT=0.05
+  --alpaca-profile paper-directional
 ```
 
 ## Equity paper submit/cancel smoke test
