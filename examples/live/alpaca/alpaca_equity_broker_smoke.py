@@ -105,9 +105,10 @@ async def main() -> None:
         {"nested": "true"},
     )
 
-    cancel_response = None
+    cancel_requested = False
     if queried.get("status") not in TERMINAL_STATUSES:
-        cancel_response = await _delete(client, base_url, f"/v2/orders/{venue_order_id}", headers)
+        cancel_requested = True
+        await _delete(client, base_url, f"/v2/orders/{venue_order_id}", headers)
 
     final_order = queried
     for _ in range(args.poll_attempts):
@@ -145,7 +146,7 @@ async def main() -> None:
                 "venue_order_id": venue_order_id,
                 "submitted_status": submitted.get("status"),
                 "queried_status": queried.get("status"),
-                "cancel_requested": cancel_response is not None,
+                "cancel_requested": cancel_requested,
                 "final_status": final_order.get("status"),
                 "positions_count": len(positions) if isinstance(positions, list) else None,
                 "smoke_open_orders": smoke_open_orders,
