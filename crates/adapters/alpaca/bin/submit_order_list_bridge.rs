@@ -26,13 +26,19 @@ use nautilus_alpaca::{
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
     config::AlpacaExecClientConfig,
     http::{client::AlpacaHttpClient, error::Error, models::AlpacaOrder},
-    submit::{MlegSubmitLeg, MlegSubmitOrderListRequest, build_mleg_submit_order_list},
+    submit::{
+        MlegSubmitLeg, MlegSubmitOrderListRequest, SimpleSubmitOrderRequest,
+        build_mleg_submit_order_list, build_simple_submit_order,
+    },
 };
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
     live::runner::replace_exec_event_sender,
-    messages::{ExecutionEvent, execution::SubmitOrderList},
+    messages::{
+        ExecutionEvent,
+        execution::{SubmitOrder, SubmitOrderList},
+    },
 };
 use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_live::ExecutionClientCore;
@@ -40,8 +46,11 @@ use nautilus_model::{
     enums::{AccountType, OmsType, OrderSide},
     events::OrderEventAny,
     identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TraderId, Venue,
+        AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol,
+        TraderId, Venue,
     },
+    instruments::{Equity, InstrumentAny},
+    types::Currency,
     types::{Price, Quantity},
 };
 use serde::{Deserialize, Serialize};
@@ -56,9 +65,29 @@ const DEFAULT_LOOKUP_POLL_SECS: u64 = 1;
 
 #[derive(Debug, Deserialize)]
 struct BridgeHandoff {
-    order_list_id: String,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    order_list_id: Option<String>,
+    #[serde(default)]
+    client_order_id: Option<String>,
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(default)]
+    instrument_id: Option<String>,
+    #[serde(default)]
+    side: Option<String>,
+    #[serde(default)]
+    quantity: Option<u64>,
+    #[serde(default)]
+    limit_price: Option<f64>,
+    #[serde(default)]
+    order_type: Option<String>,
+    #[serde(default)]
+    time_in_force: Option<String>,
     #[serde(default)]
     strategy_family: Option<String>,
+    #[serde(default)]
     legs: Vec<BridgeLeg>,
 }
 
@@ -78,7 +107,9 @@ struct BridgeLeg {
 #[derive(Debug, Serialize)]
 struct BridgeResult {
     status: String,
+    command: String,
     order_list_id: String,
+    client_order_id: String,
     parent_order_id: Option<String>,
     parent_client_order_id: Option<String>,
     order_snapshot: Option<AlpacaOrder>,
@@ -117,6 +148,10 @@ async fn main() -> anyhow::Result<()> {
     let client_id = ClientId::from(ALPACA_CLIENT_ID);
     let account_id = AccountId::from("ALPACA-001");
     let strategy_id = strategy_id_from_handoff(&handoff);
+    let command = handoff_command(&handoff);
+    if command == "SubmitOrder" {
+        add_equity_instrument(&cache, &handoff)?;
+    }
     let core = ExecutionClientCore::new(
         trader_id,
         client_id,
@@ -131,13 +166,20 @@ async fn main() -> anyhow::Result<()> {
     client.start()?;
     client.connect().await?;
 
-    let order_list_id = handoff.order_list_id.clone();
-    let cmd = build_submit_order_list(&handoff, trader_id, Some(client_id), strategy_id)?;
-    client.submit_order_list(cmd)?;
+    let client_order_id = primary_client_order_id(&handoff)?;
+    let expected_events = if command == "SubmitOrder" {
+        let cmd = build_submit_order(&handoff, trader_id, Some(client_id), strategy_id)?;
+        client.submit_order(cmd)?;
+        1
+    } else {
+        let cmd = build_submit_order_list(&handoff, trader_id, Some(client_id), strategy_id)?;
+        client.submit_order_list(cmd)?;
+        handoff.legs.len()
+    };
 
-    let events = collect_execution_events(&mut rx, handoff.legs.len()).await;
+    let events = collect_execution_events(&mut rx, expected_events).await;
     let http_client = AlpacaHttpClient::from_exec_config(&exec_config)?;
-    let order_snapshot = lookup_parent_order(&http_client, &order_list_id).await?;
+    let order_snapshot = lookup_parent_order(&http_client, &client_order_id).await?;
     let cleanup = cleanup_if_requested(
         &http_client,
         order_snapshot.as_ref(),
@@ -153,8 +195,10 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .and_then(|order| order.client_order_id.clone());
     let result = BridgeResult {
-        status: bridge_status(&events, handoff.legs.len(), order_snapshot.as_ref()),
-        order_list_id,
+        status: bridge_status(&events, expected_events, order_snapshot.as_ref()),
+        command,
+        order_list_id: client_order_id.clone(),
+        client_order_id,
         parent_order_id,
         parent_client_order_id,
         order_snapshot,
@@ -175,6 +219,33 @@ fn read_handoff() -> anyhow::Result<BridgeHandoff> {
     Ok(serde_json::from_str(&input)?)
 }
 
+fn handoff_command(handoff: &BridgeHandoff) -> String {
+    handoff
+        .command
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("SubmitOrderList")
+        .trim()
+        .to_string()
+}
+
+fn primary_client_order_id(handoff: &BridgeHandoff) -> anyhow::Result<String> {
+    if handoff_command(handoff) == "SubmitOrder" {
+        return handoff
+            .client_order_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("SubmitOrder handoff requires client_order_id"));
+    }
+    handoff
+        .order_list_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("SubmitOrderList handoff requires order_list_id"))
+}
+
 fn strategy_id_from_handoff(handoff: &BridgeHandoff) -> StrategyId {
     let suffix = handoff
         .strategy_family
@@ -186,12 +257,69 @@ fn strategy_id_from_handoff(handoff: &BridgeHandoff) -> StrategyId {
     StrategyId::from(format!("SPREADS-{suffix}").as_str())
 }
 
+fn build_submit_order(
+    handoff: &BridgeHandoff,
+    trader_id: TraderId,
+    client_id: Option<ClientId>,
+    strategy_id: StrategyId,
+) -> anyhow::Result<SubmitOrder> {
+    let client_order_id = primary_client_order_id(handoff)?;
+    let quantity = handoff
+        .quantity
+        .filter(|quantity| *quantity > 0)
+        .ok_or_else(|| anyhow::anyhow!("SubmitOrder handoff requires positive quantity"))?;
+    let limit_price = handoff
+        .limit_price
+        .filter(|price| *price > 0.0)
+        .ok_or_else(|| anyhow::anyhow!("SubmitOrder handoff requires positive limit_price"))?;
+    if !matches!(
+        handoff
+            .order_type
+            .as_deref()
+            .unwrap_or("limit")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "limit"
+    ) {
+        anyhow::bail!("SubmitOrder bridge supports limit orders only");
+    }
+    if !matches!(
+        handoff
+            .time_in_force
+            .as_deref()
+            .unwrap_or("day")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "day"
+    ) {
+        anyhow::bail!("SubmitOrder bridge supports DAY orders only");
+    }
+    build_simple_submit_order(SimpleSubmitOrderRequest {
+        trader_id,
+        client_id,
+        strategy_id,
+        client_order_id: ClientOrderId::from(client_order_id.as_str()),
+        instrument_id: simple_instrument_id(handoff)?,
+        order_side: parse_order_side(
+            handoff.side.as_deref().unwrap_or(""),
+            client_order_id.as_str(),
+        )?,
+        quantity: Quantity::new(quantity as f64, 0),
+        limit_price: Price::new(limit_price, 2),
+        reduce_only: false,
+        ts_init: get_atomic_clock_realtime().get_time_ns(),
+    })
+}
+
 fn build_submit_order_list(
     handoff: &BridgeHandoff,
     trader_id: TraderId,
     client_id: Option<ClientId>,
     strategy_id: StrategyId,
 ) -> anyhow::Result<SubmitOrderList> {
+    let order_list_id = primary_client_order_id(handoff)?;
     if handoff.legs.len() < 2 {
         anyhow::bail!("Nautilus bridge requires at least two legs");
     }
@@ -221,10 +349,27 @@ fn build_submit_order_list(
         trader_id,
         client_id,
         strategy_id,
-        order_list_id: OrderListId::from(handoff.order_list_id.as_str()),
+        order_list_id: OrderListId::from(order_list_id.as_str()),
         legs,
         ts_init: get_atomic_clock_realtime().get_time_ns(),
     })
+}
+
+fn simple_instrument_id(handoff: &BridgeHandoff) -> anyhow::Result<InstrumentId> {
+    let value = handoff
+        .instrument_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            handoff
+                .symbol
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(|symbol| format!("{symbol}.{ALPACA_VENUE}"))
+        })
+        .ok_or_else(|| anyhow::anyhow!("SubmitOrder handoff requires symbol or instrument_id"))?;
+    Ok(InstrumentId::from_str(&value)?)
 }
 
 fn instrument_id(leg: &BridgeLeg) -> anyhow::Result<InstrumentId> {
@@ -238,11 +383,53 @@ fn instrument_id(leg: &BridgeLeg) -> anyhow::Result<InstrumentId> {
 }
 
 fn order_side(leg: &BridgeLeg) -> anyhow::Result<OrderSide> {
-    match leg.side.trim().to_ascii_lowercase().as_str() {
+    parse_order_side(leg.side.as_str(), leg.client_order_id.as_str())
+}
+
+fn parse_order_side(side: &str, context: &str) -> anyhow::Result<OrderSide> {
+    match side.trim().to_ascii_lowercase().as_str() {
         "buy" => Ok(OrderSide::Buy),
         "sell" => Ok(OrderSide::Sell),
-        other => anyhow::bail!("leg {} has unsupported side {other}", leg.client_order_id),
+        other => anyhow::bail!("{context} has unsupported side {other}"),
     }
+}
+
+fn add_equity_instrument(
+    cache: &Rc<RefCell<Cache>>,
+    handoff: &BridgeHandoff,
+) -> anyhow::Result<()> {
+    let instrument_id = simple_instrument_id(handoff)?;
+    let raw_symbol = handoff
+        .symbol
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| instrument_id.symbol.to_string());
+    let ts = get_atomic_clock_realtime().get_time_ns();
+    let equity = Equity::new(
+        instrument_id,
+        Symbol::from(raw_symbol.as_str()),
+        None,
+        Currency::from("USD"),
+        2,
+        Price::from("0.01"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ts,
+        ts,
+    );
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::Equity(equity))?;
+    Ok(())
 }
 
 fn is_reduce_only(leg: &BridgeLeg) -> bool {
