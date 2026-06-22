@@ -229,7 +229,7 @@ fn candidate_side(
 ) -> OptionChainCandidateSide {
     let mut side = OptionChainCandidateSide::default();
     for (strike, data) in strikes {
-        let symbol = data.quote.instrument_id.to_string();
+        let symbol = data.quote.instrument_id.symbol.to_string();
         side.contracts.push(CandidateContract {
             symbol: symbol.clone(),
             expiration_date: expiration_date.to_string(),

@@ -71,5 +71,16 @@ cargo check -p nautilus-alpaca --features live --bins
 - Paper order smoke tests: run only intentionally, preferably during market hours, and cancel accepted smoke orders unless the user explicitly asks to leave orders open.
 - Live or paper Alpaca smoke tests must be real. Do not claim execution proof unless an actual command was run and the resulting account/orders state was checked.
 - Smoke tests that submit paper orders should cancel accepted orders unless the user explicitly asks to leave orders open.
+- For Docker Alpaca rollouts, rebuild/recreate `alpaca-options` with the external env file and
+  container-readable config mounts, then verify the running stack with:
+
+```bash
+docker compose -f deploy/alpaca/compose.yml --profile engine ps
+docker exec nautilus-alpaca-alpaca-options-1 alpaca-operator-status --json
+docker exec nautilus-alpaca-alpaca-options-1 alpaca-options-engine --check-config
+```
+
+- Do not claim live Alpaca proof unless a real broker/account/status/order check was run and the
+  result is reported. Compile checks and container health are build/runtime proof only.
 - Earnings-calendar input for Alpaca earnings strategies uses Alpha Vantage only through local secrets and cache. Keep `ALPHA_VANTAGE_API_KEY` in an untracked `.env` or external env file, never commit it. Refresh with `earnings-sync`; it caches raw Alpha Vantage `EARNINGS_CALENDAR` output for 23 hours by default, writes the full normalized feed to `$XDG_STATE_HOME/nautilus_trader/earnings/earnings_events.csv` or `$HOME/.local/state/nautilus_trader/earnings/earnings_events.csv`, and writes the stricter strategy-safe feed to `earnings_events_approved.csv` in the same directory.
 - Treat Alpha Vantage earnings timing quality as mixed: `pre-market` and `post-market` can be normalized to `before_open` and `after_close`, but blank timing becomes `unknown` and must remain blocked by default unless the user explicitly approves unknown-timing entries. The approved feed should also exclude weekend dates and non-common symbol shapes before any strategy consumes it.

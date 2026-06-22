@@ -44,7 +44,11 @@ and strategies.
     snapshots.
   - Remaining live-data improvement: replace or augment REST polling with Alpaca option WebSocket
     streams when that path is added.
-- [ ] Add a REST-vs-option-chain comparison command for the same symbol, expiry, and scan time.
+- [x] Add a REST-vs-option-chain comparison command for the same symbol, expiry, and scan time.
+  - Implemented as `alpaca-compare-option-chain-scan`.
+  - It loads one Alpaca REST option snapshot for the requested underlying/expiry, scans the same
+    contracts through the legacy REST normalizer and the Nautilus `OptionChainSlice` normalizer,
+    then emits JSON parity diagnostics without submitting orders.
 - [ ] Decide whether read-only actor evidence should write to Postgres directly or publish events
   for a separate persistence consumer.
 

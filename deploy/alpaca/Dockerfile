@@ -24,6 +24,7 @@ RUN cargo build --locked --release -p nautilus-alpaca --features live \
     --bin alpaca-operator-status \
     --bin alpaca-fleet-status \
     --bin alpaca-check-account-orders \
+    --bin alpaca-compare-option-chain-scan \
     --bin alpaca-candidate-alerts \
     --bin alpaca-performance-report
 
@@ -44,6 +45,7 @@ COPY --from=builder /workspace/target/release/alpaca-options-engine /usr/local/b
 COPY --from=builder /workspace/target/release/alpaca-operator-status /usr/local/bin/
 COPY --from=builder /workspace/target/release/alpaca-fleet-status /usr/local/bin/
 COPY --from=builder /workspace/target/release/alpaca-check-account-orders /usr/local/bin/
+COPY --from=builder /workspace/target/release/alpaca-compare-option-chain-scan /usr/local/bin/
 COPY --from=builder /workspace/target/release/alpaca-candidate-alerts /usr/local/bin/
 COPY --from=builder /workspace/target/release/alpaca-performance-report /usr/local/bin/
 COPY deploy/alpaca/alpaca-options-runner.sh /usr/local/bin/alpaca-options-runner
@@ -59,6 +61,7 @@ ENV HOME=/home/nautilus \
     NAUTILUS_ALPACA_RUNNER_BIN=/usr/local/bin/alpaca-options-engine \
     NAUTILUS_ALPACA_OPERATOR_BIN=/usr/local/bin/alpaca-operator-status \
     NAUTILUS_ALPACA_FLEET_BIN=/usr/local/bin/alpaca-fleet-status \
+    NAUTILUS_ALPACA_COMPARE_SCAN_BIN=/usr/local/bin/alpaca-compare-option-chain-scan \
     NAUTILUS_ALPACA_CANDIDATE_ALERTS_BIN=/usr/local/bin/alpaca-candidate-alerts \
     NAUTILUS_ALPACA_PERFORMANCE_BIN=/usr/local/bin/alpaca-performance-report
 

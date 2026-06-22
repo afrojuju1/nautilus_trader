@@ -137,6 +137,13 @@ doc = false
 test = false
 
 [[bin]]
+name = "alpaca-compare-option-chain-scan"
+path = "bin/compare_option_chain_scan.rs"
+required-features = ["live"]
+doc = false
+test = false
+
+[[bin]]
 name = "alpaca-check-account-orders"
 path = "bin/check_account_orders.rs"
 required-features = ["live"]
