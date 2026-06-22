@@ -121,7 +121,7 @@ check_refs \
 
 check_refs \
   "Rust ${RUST_VERSION}" \
-  "rust-toolchain.toml [toolchain].version" \
+  "rust-toolchain.toml [toolchain].channel" \
   "$EXPECTED_RUST_PREFIX" \
   'rust:[^[:space:]\\]+@sha256:[0-9a-f]+' \
   ".docker/DockerfileUbuntu" \

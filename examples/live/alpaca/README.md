@@ -55,9 +55,9 @@ ALPACA_EQUITY_DAILY_RUN_SECONDS=3600
 
 ## Options multi-leg TradingNode
 
-This node registers exact OCC option instruments, subscribes option snapshot quotes and Greeks
-through the standard Python data engine, and can optionally submit one two-leg opening order list to
-the Alpaca paper broker.
+This is the standard Python adapter smoke path for options. The node registers exact OCC option
+instruments, subscribes option snapshot quotes and Greeks through the standard Python data engine,
+and can optionally submit one two-leg opening order list to the Alpaca paper broker.
 
 Data-only config check:
 
@@ -79,6 +79,7 @@ Paper broker submit mode requires an explicit confirmation flag:
 python examples/live/alpaca/options_mleg_trading_node.py \
   --broker-paper \
   --confirm-submit \
+  --cancel-after-submit \
   --alpaca-profile paper-main \
   --short-symbol SPY270115P00450000 \
   --long-symbol SPY270115P00445000 \
@@ -86,6 +87,10 @@ python examples/live/alpaca/options_mleg_trading_node.py \
   --long-leg-limit 0.10 \
   --qty 1
 ```
+
+Use `--cancel-after-submit` for smoke tests so accepted paper orders are canceled through the
+standard execution client before the node stops. If you intentionally omit it, verify and clean up
+open broker orders afterward.
 
 Useful overrides:
 
@@ -252,10 +257,12 @@ cargo run -p nautilus-alpaca --features live --bin alpaca-validate-mleg-order --
   SPY260619P00450000 SPY260619P00445000 0.40 1
 ```
 
-## Paper submit/cancel smoke test
+## Rust operator submit/cancel diagnostic
 
-Only run this intentionally with paper credentials. The smoke utility submits one multi-leg paper
-order and requests cancellation if Alpaca accepts it and the order is not already terminal.
+Only run this intentionally with paper credentials. This is the Rust runtime/operator diagnostic for
+submission lifecycle checks; prefer the Python `TradingNode` command above when validating the
+standard adapter path. The utility submits one multi-leg paper order and requests cancellation if
+Alpaca accepts it and the order is not already terminal.
 
 Use a small quantity and a conservative limit, then verify the account has no unexpected open orders
 or positions:

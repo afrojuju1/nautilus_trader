@@ -11,8 +11,9 @@ if [[ ! -f "$TOOLCHAIN_FILE" ]]; then
   exit 1
 fi
 
-# Extract toolchain version
-VERSION=$(awk -F'"' '/version[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$TOOLCHAIN_FILE")
+# Extract toolchain channel. Rustup reads the `channel` key; keep this helper aligned with the
+# actual toolchain selected at the repo root.
+VERSION=$(awk -F'"' '/channel[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$TOOLCHAIN_FILE")
 
 # Validate that we got a version
 if [[ -z "$VERSION" ]]; then

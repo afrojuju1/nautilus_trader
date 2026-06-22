@@ -402,6 +402,12 @@ class AlpacaExecutionClient(LiveExecutionClient):
             )
             return
 
+        canceled_orders = self._cached_mleg_orders_for_parent(venue_order_id)
+        if canceled_orders:
+            for order in canceled_orders:
+                self._emit_order_canceled(order=order, parent_venue_order_id=venue_order_id)
+            return
+
         self.generate_order_canceled(
             strategy_id=command.strategy_id,
             instrument_id=command.instrument_id,
@@ -439,6 +445,26 @@ class AlpacaExecutionClient(LiveExecutionClient):
     async def _batch_cancel_orders(self, command: BatchCancelOrders) -> None:
         for cancel in command.cancels:
             await self._cancel_order(cancel)
+
+    def _cached_mleg_orders_for_parent(self, parent_venue_order_id: VenueOrderId) -> list[Order]:
+        return [
+            order
+            for order in self._cache.orders_open(venue=ALPACA_VENUE, account_id=self.account_id)
+            if self._mleg_parent_venue_order_id_by_client_order_id.get(order.client_order_id)
+            == parent_venue_order_id
+        ]
+
+    def _emit_order_canceled(self, order: Order, parent_venue_order_id: VenueOrderId) -> None:
+        venue_order_id = order.venue_order_id or parent_venue_order_id
+        self.generate_order_canceled(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=venue_order_id,
+            ts_event=self._clock.timestamp_ns(),
+        )
+        self._terminal_venue_order_ids.add(parent_venue_order_id)
+        self._terminal_venue_order_ids.add(venue_order_id)
 
     async def _query_account(self, command: QueryAccount) -> None:
         await self._update_account_state()

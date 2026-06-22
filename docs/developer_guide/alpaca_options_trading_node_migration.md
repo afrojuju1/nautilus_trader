@@ -41,7 +41,7 @@ This is the right first target because it already has working pieces in the Rust
 - Put-credit candidate scoring.
 - Multi-leg order-list construction.
 - Alpaca `mleg` payload validation.
-- Paper submit/cancel harnesses.
+- One Rust paper submit/cancel harness for operator diagnostics.
 - Strategy-state, candidate, outcome, and performance ledgers in the runtime.
 
 This should not start with the `spreads_notebook` short-DTE long-call package. That research did not

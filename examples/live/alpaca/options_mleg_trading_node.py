@@ -29,9 +29,11 @@ from nautilus_trader.model.data import OptionGreeks
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import TimeInForce
+from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.model.instruments import Instrument
+from nautilus_trader.model.orders import Order
 from nautilus_trader.trading.strategy import Strategy
 
 
@@ -50,6 +52,7 @@ class AlpacaOptionsMlegExampleConfig(StrategyConfig, frozen=True):
     short_leg_limit: Decimal = Decimal("0.50")
     long_leg_limit: Decimal = Decimal("0.10")
     submit: bool = False
+    cancel_after_submit: bool = False
 
 
 class AlpacaOptionsMlegExample(Strategy):
@@ -64,7 +67,9 @@ class AlpacaOptionsMlegExample(Strategy):
             raise ValueError("leg limits must be positive")
         super().__init__(config)
         self._instruments: dict[InstrumentId, Instrument] = {}
+        self._submitted_orders: dict[str, Order] = {}
         self._submitted = False
+        self._cancel_requested = False
 
     def on_start(self) -> None:
         for instrument_id in (self.config.short_leg_id, self.config.long_leg_id):
@@ -86,6 +91,17 @@ class AlpacaOptionsMlegExample(Strategy):
             f"Greeks {option_greeks.instrument_id} "
             f"delta={option_greeks.delta:.4f} iv={option_greeks.mark_iv}",
         )
+
+    def on_order_accepted(self, event: OrderAccepted) -> None:
+        if not self.config.cancel_after_submit or self._cancel_requested:
+            return
+        order = self._submitted_orders.get(str(event.client_order_id))
+        if order is None:
+            return
+
+        self.log.info(f"Canceling accepted smoke order list via {event.client_order_id}")
+        self.cancel_order(order)
+        self._cancel_requested = True
 
     def _try_submit_order_list(self) -> None:
         if not self.config.submit or self._submitted:
@@ -111,6 +127,7 @@ class AlpacaOptionsMlegExample(Strategy):
                 time_in_force=TimeInForce.DAY,
             ),
         ]
+        self._submitted_orders = {str(order.client_order_id): order for order in orders}
         self.submit_order_list(self.order_factory.create_list(orders))
         self._submitted = True
 
@@ -124,6 +141,7 @@ def build_node(
     long_leg_limit: Decimal,
     use_broker_paper: bool,
     confirm_submit: bool,
+    cancel_after_submit: bool,
 ) -> TradingNode:
     symbols = [short_symbol.upper(), long_symbol.upper()]
     instrument_ids = [InstrumentId.from_str(f"{symbol}.{ALPACA}") for symbol in symbols]
@@ -187,6 +205,7 @@ def build_node(
                 short_leg_limit=short_leg_limit,
                 long_leg_limit=long_leg_limit,
                 submit=confirm_submit,
+                cancel_after_submit=cancel_after_submit,
             ),
         ),
     )
@@ -233,10 +252,17 @@ def main() -> None:
         action="store_true",
         help="Submit one opening two-leg option order list. Requires --broker-paper.",
     )
+    parser.add_argument(
+        "--cancel-after-submit",
+        action="store_true",
+        help="Cancel the accepted paper mleg order after submission. Requires --confirm-submit.",
+    )
     add_alpaca_profile_args(parser)
     args = parser.parse_args()
     if args.confirm_submit and not args.broker_paper:
         raise ValueError("--confirm-submit requires --broker-paper")
+    if args.cancel_after_submit and not args.confirm_submit:
+        raise ValueError("--cancel-after-submit requires --confirm-submit")
 
     load_alpaca_profile_from_args(args)
     node = build_node(
@@ -247,6 +273,7 @@ def main() -> None:
         long_leg_limit=args.long_leg_limit,
         use_broker_paper=args.broker_paper,
         confirm_submit=args.confirm_submit,
+        cancel_after_submit=args.cancel_after_submit,
     )
     if args.check_config:
         node.dispose()

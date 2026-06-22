@@ -220,8 +220,25 @@ export ALPACA_KILL_SWITCH=true
 cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- --check-config
 ```
 
-Paper order smoke tests must be explicit. Use only paper endpoints, keep size small, use the
-submit/cancel harness, and verify open orders afterward:
+Paper order smoke tests must be explicit. Use only paper endpoints and keep size small. The standard
+Python adapter smoke path is the options `TradingNode`; use `--cancel-after-submit` so accepted
+paper orders are canceled before the node stops:
+
+```bash
+python examples/live/alpaca/options_mleg_trading_node.py \
+  --broker-paper \
+  --confirm-submit \
+  --cancel-after-submit \
+  --alpaca-profile paper-main \
+  --short-symbol SPY270115P00450000 \
+  --long-symbol SPY270115P00445000 \
+  --short-leg-limit 0.50 \
+  --long-leg-limit 0.10 \
+  --qty 1 \
+  --run-seconds 30
+```
+
+Use the Rust harness only as the operator/runtime diagnostic, then verify open orders afterward:
 
 ```bash
 cargo run -p nautilus-alpaca --features live --bin alpaca-paper-execution-harness -- \
@@ -229,8 +246,8 @@ cargo run -p nautilus-alpaca --features live --bin alpaca-paper-execution-harnes
 cargo run -p nautilus-alpaca --features live --bin alpaca-check-account-orders
 ```
 
-The harness requests cancellation after an accepted non-terminal order. If any smoke order remains
-open, cancel it in the Alpaca paper dashboard or API before continuing.
+Both submit paths request cancellation after an accepted non-terminal order. If any smoke order
+remains open, cancel it in the Alpaca paper dashboard or API before continuing.
 
 Only enable paper submission deliberately, after verifying credentials, endpoints, account status,
 open orders, positions, and risk caps.

@@ -182,6 +182,8 @@ doc = false
 test = false
 
 [[bin]]
+# Internal diagnostic. Prefer the Python options TradingNode for adapter smoke tests and
+# `alpaca-paper-execution-harness` for Rust operator submit/cancel checks.
 name = "alpaca-submit-mleg-order"
 path = "bin/submit_mleg_order.rs"
 required-features = ["live"]
@@ -203,6 +205,7 @@ doc = false
 test = false
 
 [[bin]]
+# Internal diagnostic for strategy/handoff development, not the standard adapter smoke surface.
 name = "alpaca-submit-order-list-harness"
 path = "bin/submit_order_list_harness.rs"
 required-features = ["live"]
@@ -210,6 +213,7 @@ doc = false
 test = false
 
 [[bin]]
+# Internal bridge used by external handoff runtimes.
 name = "alpaca-submit-order-list-bridge"
 path = "bin/submit_order_list_bridge.rs"
 required-features = ["live"]
