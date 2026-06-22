@@ -104,6 +104,7 @@ fn main() -> anyhow::Result<()> {
         strike_range,
         snapshot_interval_ms: args.snapshot_interval_ms,
         client_id: None,
+        bootstrap_instruments: false,
         scan: scan_config,
     });
 

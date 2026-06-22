@@ -40,6 +40,7 @@ live = [
   "dep:log",
   "dep:nautilus-common",
   "dep:nautilus-live",
+  "nautilus-live/node",
   "dep:nautilus-network",
   "dep:sqlx",
   "dep:rust_decimal",
@@ -133,6 +134,13 @@ test = false
 name = "alpaca-option-chain-scan-node"
 path = "bin/option_chain_scan_node.rs"
 required-features = ["live", "backtest-node"]
+doc = false
+test = false
+
+[[bin]]
+name = "alpaca-option-chain-scan-live-node"
+path = "bin/option_chain_scan_live_node.rs"
+required-features = ["live"]
 doc = false
 test = false
 

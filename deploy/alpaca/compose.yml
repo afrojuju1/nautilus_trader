@@ -46,6 +46,18 @@ x-alpaca-runtime: &alpaca-runtime
     ALPACA_CLOSE_PRICE_CUSHION: ${ALPACA_CLOSE_PRICE_CUSHION:-}
     ALPACA_MAX_CLOSE_ATTEMPTS: ${ALPACA_MAX_CLOSE_ATTEMPTS:-}
     ALPACA_CLOSE_REPRICE_COOLDOWN_SECS: ${ALPACA_CLOSE_REPRICE_COOLDOWN_SECS:-}
+    ALPACA_COMPARE_UNDERLYING: ${ALPACA_COMPARE_UNDERLYING:-}
+    ALPACA_COMPARE_EXPIRY: ${ALPACA_COMPARE_EXPIRY:-}
+    ALPACA_OPTION_CHAIN_UNDERLYING: ${ALPACA_OPTION_CHAIN_UNDERLYING:-}
+    ALPACA_OPTION_CHAIN_EXPIRY: ${ALPACA_OPTION_CHAIN_EXPIRY:-}
+    ALPACA_OPTION_CHAIN_SETTLEMENT: ${ALPACA_OPTION_CHAIN_SETTLEMENT:-}
+    ALPACA_OPTION_CHAIN_FIXED_STRIKES: ${ALPACA_OPTION_CHAIN_FIXED_STRIKES:-}
+    ALPACA_OPTION_CHAIN_STRIKES_ABOVE: ${ALPACA_OPTION_CHAIN_STRIKES_ABOVE:-}
+    ALPACA_OPTION_CHAIN_STRIKES_BELOW: ${ALPACA_OPTION_CHAIN_STRIKES_BELOW:-}
+    ALPACA_OPTION_CHAIN_SNAPSHOT_INTERVAL_MS: ${ALPACA_OPTION_CHAIN_SNAPSHOT_INTERVAL_MS:-}
+    ALPACA_OPTION_CHAIN_SNAPSHOT_POLL_SECS: ${ALPACA_OPTION_CHAIN_SNAPSHOT_POLL_SECS:-}
+    ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS: ${ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS:-}
+    ALPACA_OPTION_CHAIN_OPTIONS_BUYING_POWER: ${ALPACA_OPTION_CHAIN_OPTIONS_BUYING_POWER:-}
   volumes:
     - alpaca-state:/state
     - ${NAUTILUS_ALPACA_DOCKER_BASE_CONFIG:-./alpaca-options-engine.base.toml.example}:/config/base-options-engine.toml:ro
@@ -82,6 +94,17 @@ services:
     <<: *alpaca-runtime
     profiles: ["status"]
     command: ["alpaca-operator-status", "--json"]
+
+  alpaca-compare-option-chain-scan:
+    <<: *alpaca-runtime
+    profiles: ["cutover"]
+    command: ["alpaca-compare-option-chain-scan", "--pretty"]
+
+  alpaca-option-chain-live:
+    <<: *alpaca-runtime
+    profiles: ["cutover"]
+    command: ["alpaca-option-chain-scan-live-node"]
+    restart: "no"
 
   alpaca-options:
     <<: *alpaca-runtime

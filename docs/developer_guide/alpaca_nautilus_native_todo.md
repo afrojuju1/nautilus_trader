@@ -23,8 +23,9 @@ and strategies.
 - `option_chain_candidates` converts Nautilus `OptionChainSlice` snapshots into the normalized
   candidate-engine model and ranks credit spreads, debit spreads, iron condors, and naked options.
 - `opportunity_scan_actor` adds a read-only `DataActor` that subscribes to option-chain slices,
-  produces `OptionsOpportunitySet`, stores the latest result in actor state, and emits structured
-  operator events.
+  can bootstrap Alpaca option instruments through the standard data-client request path, produces
+  `OptionsOpportunitySet`, stores the latest result in actor state, and emits structured operator
+  events.
 - `OptionsOpportunitySet` and `OptionsScanReport` now have narrow public constructors/mutators so
   REST-fed and Nautilus-fed scan paths share the same result shape.
 
@@ -49,8 +50,39 @@ and strategies.
   - It loads one Alpaca REST option snapshot for the requested underlying/expiry, scans the same
     contracts through the legacy REST normalizer and the Nautilus `OptionChainSlice` normalizer,
     then emits JSON parity diagnostics without submitting orders.
+- [x] Add a read-only live Nautilus node for Alpaca option-chain candidate evidence.
+  - Implemented as `alpaca-option-chain-scan-live-node`.
+  - The node registers only `AlpacaDataClientFactory`, requests Alpaca option instruments through
+    Nautilus `request_instruments`, subscribes to `OptionChainSlice` through the
+    `OptionChainOpportunityScanActor`, and never installs an execution client.
 - [ ] Decide whether read-only actor evidence should write to Postgres directly or publish events
   for a separate persistence consumer.
+
+## Cutover Readiness
+
+The system is ready for side-by-side cutover proof, not for deleting the current account engine yet.
+The old REST/account-engine path remains the order-capable runtime until the following checks are
+green during market hours for the configured paper profiles.
+
+- [x] REST-vs-option-chain scanner parity command exists.
+  - Local: `deploy/alpaca/alpaca-control.sh compare-scan --pretty SPY 2026-07-02`
+  - Docker: `ALPACA_COMPARE_UNDERLYING=SPY ALPACA_COMPARE_EXPIRY=2026-07-02 docker compose -f deploy/alpaca/compose.yml --profile cutover run --rm alpaca-compare-option-chain-scan`
+- [x] Read-only live Nautilus node exists.
+  - Local bounded run:
+    `ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS=90 deploy/alpaca/alpaca-control.sh option-chain-live SPY 2026-07-02`
+  - Docker bounded run:
+    `ALPACA_OPTION_CHAIN_UNDERLYING=SPY ALPACA_OPTION_CHAIN_EXPIRY=2026-07-02 ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS=90 docker compose -f deploy/alpaca/compose.yml --profile cutover run --rm alpaca-option-chain-live`
+- [x] One-command cutover proof exists.
+  - `deploy/alpaca/alpaca-control.sh cutover-proof SPY 2026-07-02`
+- [ ] Run the cutover proof during market hours across the paper-profile symbols and expiries.
+  - Required signal: selected candidate and scan diagnostics match, or mismatches are explained by
+    stricter Nautilus option-chain quote validity.
+  - Required signal: live node logs show Alpaca instruments loaded, option-chain subscription with
+    non-zero cached instruments, and `option_chain_opportunity_scan` events.
+  - For undefined-risk profiles, set `ALPACA_OPTION_CHAIN_OPTIONS_BUYING_POWER` or allow the live
+    node to read paper-account buying power before scanning.
+- [ ] After side-by-side proof is green, move order-intent construction behind a Nautilus strategy
+  boundary before retiring REST scanner loops.
 
 ## Next Loops To Retire
 

@@ -1,14 +1,17 @@
 //! Read-only Nautilus actor for option-chain candidate evidence.
 
+use std::collections::BTreeSet;
+
 use chrono::{Datelike, NaiveDate, Utc};
 use nautilus_common::{
     actor::{DataActor, DataActorConfig, DataActorCore},
     nautilus_actor,
 };
-use nautilus_core::UnixNanos;
+use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
     data::option_chain::{OptionChainSlice, StrikeRange},
     identifiers::{ActorId, ClientId, OptionSeriesId},
+    instruments::{Instrument, InstrumentAny},
 };
 use serde_json::{Value, json};
 
@@ -18,6 +21,7 @@ use crate::{
         NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig,
         PutCreditScannerConfig,
     },
+    common::consts::{ALPACA_OPTION_CHAIN_EXPIRATION_PARAM, ALPACA_OPTION_CHAIN_UNDERLYING_PARAM},
     option_chain_candidates::{
         option_chain_candidate_input, scan_credit_spread_option_chain,
         scan_debit_spread_option_chain, scan_iron_condor_option_chain, scan_naked_option_chain,
@@ -26,7 +30,9 @@ use crate::{
         SelectedDebitEntry, SelectedEntry, SelectedIronCondorEntry, SelectedNakedOptionEntry,
         SelectedOptionsEntry,
     },
-    options_runtime::{OptionsOpportunitySet, OptionsScanOutcome, OptionsScanReport},
+    options_runtime::{
+        OptionsEngineConfig, OptionsOpportunitySet, OptionsScanOutcome, OptionsScanReport,
+    },
     runtime::{
         credit_spread_strategy_name, debit_spread_strategy_name, emit_operator_event,
         naked_option_strategy_name,
@@ -107,6 +113,8 @@ pub struct OptionChainOpportunityScanActorConfig {
     pub snapshot_interval_ms: Option<u64>,
     /// Optional data client ID.
     pub client_id: Option<ClientId>,
+    /// Whether to request Alpaca option instruments before subscribing to option-chain slices.
+    pub bootstrap_instruments: bool,
     /// Candidate scan settings.
     pub scan: OptionChainOpportunityScanConfig,
 }
@@ -122,6 +130,7 @@ impl Default for OptionChainOpportunityScanActorConfig {
             },
             snapshot_interval_ms: Some(5_000),
             client_id: None,
+            bootstrap_instruments: false,
             scan: OptionChainOpportunityScanConfig::default(),
         }
     }
@@ -132,6 +141,7 @@ impl Default for OptionChainOpportunityScanActorConfig {
 pub struct OptionChainOpportunityScanActor {
     core: DataActorCore,
     config: OptionChainOpportunityScanActorConfig,
+    subscribed_series: BTreeSet<OptionSeriesId>,
     latest_opportunities: Option<OptionsOpportunitySet>,
 }
 
@@ -148,6 +158,7 @@ impl OptionChainOpportunityScanActor {
         Self {
             core,
             config,
+            subscribed_series: BTreeSet::new(),
             latest_opportunities: None,
         }
     }
@@ -156,6 +167,59 @@ impl OptionChainOpportunityScanActor {
     #[must_use]
     pub fn latest_opportunities(&self) -> Option<&OptionsOpportunitySet> {
         self.latest_opportunities.as_ref()
+    }
+
+    fn subscribe_series(&mut self, series_id: OptionSeriesId) {
+        if !self.subscribed_series.insert(series_id) {
+            return;
+        }
+
+        let cached = self
+            .cache()
+            .instruments(&series_id.venue, Some(&series_id.underlying))
+            .into_iter()
+            .filter(|instrument| instrument_belongs_to_series(instrument, &series_id))
+            .count();
+        log::info!(
+            "Subscribing to Alpaca option-chain series {series_id} with {cached} cached instruments"
+        );
+
+        self.subscribe_option_chain(
+            series_id,
+            self.config.strike_range.clone(),
+            self.config.snapshot_interval_ms,
+            self.config.client_id,
+            None,
+        );
+    }
+
+    fn request_series_instruments(&mut self, series_id: OptionSeriesId) -> anyhow::Result<()> {
+        let mut params = Params::new();
+        params.insert(
+            ALPACA_OPTION_CHAIN_UNDERLYING_PARAM.to_string(),
+            json!(series_id.underlying.as_str()),
+        );
+        params.insert(
+            ALPACA_OPTION_CHAIN_EXPIRATION_PARAM.to_string(),
+            json!(
+                series_id
+                    .expiration_ns
+                    .to_datetime_utc()
+                    .date_naive()
+                    .format("%Y-%m-%d")
+                    .to_string()
+            ),
+        );
+
+        log::info!("Requesting Alpaca option instruments for {series_id}");
+        self.request_instruments(
+            Some(series_id.venue),
+            None,
+            None,
+            self.config.client_id,
+            Some(params),
+        )?;
+        Ok(())
     }
 }
 
@@ -167,13 +231,24 @@ impl DataActor for OptionChainOpportunityScanActor {
         }
 
         for series_id in self.config.series.clone() {
-            self.subscribe_option_chain(
-                series_id,
-                self.config.strike_range.clone(),
-                self.config.snapshot_interval_ms,
-                self.config.client_id.clone(),
-                None,
-            );
+            if self.config.bootstrap_instruments {
+                self.request_series_instruments(series_id)?;
+            } else {
+                self.subscribe_series(series_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn on_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
+        if !self.config.bootstrap_instruments {
+            return Ok(());
+        }
+
+        for series_id in self.config.series.clone() {
+            if instrument_belongs_to_series(instrument, &series_id) {
+                self.subscribe_series(series_id);
+            }
         }
         Ok(())
     }
@@ -191,10 +266,32 @@ impl DataActor for OptionChainOpportunityScanActor {
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
-        for series_id in self.config.series.clone() {
-            self.unsubscribe_option_chain(series_id, self.config.client_id.clone());
+        for series_id in self.subscribed_series.iter().copied().collect::<Vec<_>>() {
+            self.unsubscribe_option_chain(series_id, self.config.client_id);
         }
+        self.subscribed_series.clear();
         Ok(())
+    }
+}
+
+/// Builds read-only option-chain scanner settings from the account-engine runtime config.
+#[must_use]
+pub fn option_chain_scan_config_from_engine(
+    config: &OptionsEngineConfig,
+    options_buying_power: Option<f64>,
+) -> OptionChainOpportunityScanConfig {
+    OptionChainOpportunityScanConfig {
+        spread_kinds: config.spread_kinds.clone(),
+        iron_condor_enabled: config.iron_condor_enabled,
+        debit_kinds: config.debit_kinds.clone(),
+        naked_kinds: config.naked_kinds.clone(),
+        credit_scanner: config.scanner.clone(),
+        iron_condor_scanner: config.iron_condor_scanner.clone(),
+        debit_scanner: config.debit_scanner.clone(),
+        naked_scanner: config.naked_scanner.clone(),
+        naked_1_3dte_scanner: config.naked_1_3dte_scanner.clone(),
+        options_buying_power,
+        quantity: config.quantity,
     }
 }
 
@@ -376,4 +473,15 @@ fn scan_date_from_timestamp(ts_event: UnixNanos) -> NaiveDate {
     } else {
         date
     }
+}
+
+fn instrument_belongs_to_series(instrument: &InstrumentAny, series_id: &OptionSeriesId) -> bool {
+    instrument.venue() == series_id.venue
+        && instrument
+            .underlying()
+            .is_some_and(|value| value == series_id.underlying)
+        && instrument.expiration_ns() == Some(series_id.expiration_ns)
+        && instrument.settlement_currency().code == series_id.settlement_currency
+        && instrument.strike_price().is_some()
+        && instrument.option_kind().is_some()
 }

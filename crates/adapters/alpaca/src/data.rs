@@ -27,7 +27,7 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    AtomicMap, MUTEX_POISONED, UnixNanos,
+    AtomicMap, MUTEX_POISONED, Params, UnixNanos,
     datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
@@ -41,7 +41,11 @@ use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 
 use crate::{
-    common::consts::{ALPACA_OPEN_INTEREST_INFO_KEY, ALPACA_VENUE},
+    common::consts::{
+        ALPACA_OPEN_INTEREST_INFO_KEY, ALPACA_OPTION_CHAIN_EXPIRATION_PARAM,
+        ALPACA_OPTION_CHAIN_MAX_EXPIRATION_PARAM, ALPACA_OPTION_CHAIN_MIN_EXPIRATION_PARAM,
+        ALPACA_OPTION_CHAIN_TYPE_PARAM, ALPACA_OPTION_CHAIN_UNDERLYING_PARAM, ALPACA_VENUE,
+    },
     config::AlpacaDataClientConfig,
     http::{
         client::AlpacaHttpClient,
@@ -90,6 +94,14 @@ struct AlpacaOptionSymbolParts {
     underlying_symbol: String,
     expiration_date: String,
     option_type: AlpacaOptionType,
+}
+
+#[derive(Clone, Debug)]
+struct AlpacaOptionInstrumentsRequest {
+    underlying_symbol: String,
+    min_expiration: String,
+    max_expiration: String,
+    option_type: Option<AlpacaOptionType>,
 }
 
 /// Live data client for Alpaca instruments.
@@ -525,10 +537,69 @@ impl DataClient for AlpacaDataClient {
     fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
-        let venue = self.venue();
+        let venue = request.venue.unwrap_or_else(|| self.venue());
+        anyhow::ensure!(
+            venue == self.venue(),
+            "expected Alpaca venue {}, got {}",
+            self.venue(),
+            venue,
+        );
         let start_nanos = datetime_to_unix_nanos(request.start);
         let end_nanos = datetime_to_unix_nanos(request.end);
         let params = request.params;
+
+        if let Some(option_request) = option_instruments_request(params.as_ref())? {
+            let provider = AlpacaOptionContractProvider::new(self.http_client.clone());
+            let instruments = self.instruments.clone();
+            let sender = self.data_sender.clone();
+            let clock = self.clock;
+
+            self.spawn_task("request_option_instruments", async move {
+                let data = provider
+                    .load_active_instruments(
+                        option_request.underlying_symbol.clone(),
+                        option_request.min_expiration.clone(),
+                        option_request.max_expiration.clone(),
+                        option_request.option_type,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to load active Alpaca option instruments for {} {}..{}",
+                            option_request.underlying_symbol,
+                            option_request.min_expiration,
+                            option_request.max_expiration,
+                        )
+                    })?
+                    .into_iter()
+                    .map(|instrument| instrument.into_any())
+                    .collect::<Vec<_>>();
+
+                for instrument in &data {
+                    instruments.insert(instrument.id(), instrument.clone());
+                }
+
+                let response = DataResponse::Instruments(InstrumentsResponse::new(
+                    request_id,
+                    client_id,
+                    venue,
+                    data,
+                    start_nanos,
+                    end_nanos,
+                    clock.get_time_ns(),
+                    params,
+                ));
+
+                if let Err(e) = sender.send(DataEvent::Response(response)) {
+                    log::error!("Failed to send Alpaca option instruments response: {e}");
+                }
+
+                Ok(())
+            });
+
+            return Ok(());
+        }
+
         let instruments = self.instruments.load().values().cloned().collect();
 
         let response = DataResponse::Instruments(InstrumentsResponse::new(
@@ -669,6 +740,64 @@ impl DataClient for AlpacaDataClient {
         });
 
         Ok(())
+    }
+}
+
+fn option_instruments_request(
+    params: Option<&Params>,
+) -> anyhow::Result<Option<AlpacaOptionInstrumentsRequest>> {
+    let Some(params) = params else {
+        return Ok(None);
+    };
+
+    let Some(underlying_symbol) = params.get_str(ALPACA_OPTION_CHAIN_UNDERLYING_PARAM) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        !underlying_symbol.trim().is_empty(),
+        "{ALPACA_OPTION_CHAIN_UNDERLYING_PARAM} cannot be empty",
+    );
+
+    let expiration = params
+        .get_str(ALPACA_OPTION_CHAIN_EXPIRATION_PARAM)
+        .map(str::to_string);
+    let min_expiration = params
+        .get_str(ALPACA_OPTION_CHAIN_MIN_EXPIRATION_PARAM)
+        .map(str::to_string)
+        .or_else(|| expiration.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "{ALPACA_OPTION_CHAIN_MIN_EXPIRATION_PARAM} or \
+                 {ALPACA_OPTION_CHAIN_EXPIRATION_PARAM} is required"
+            )
+        })?;
+    let max_expiration = params
+        .get_str(ALPACA_OPTION_CHAIN_MAX_EXPIRATION_PARAM)
+        .map(str::to_string)
+        .or(expiration)
+        .unwrap_or_else(|| min_expiration.clone());
+    let option_type = params
+        .get_str(ALPACA_OPTION_CHAIN_TYPE_PARAM)
+        .map(parse_option_type_param)
+        .transpose()?
+        .flatten();
+
+    Ok(Some(AlpacaOptionInstrumentsRequest {
+        underlying_symbol: underlying_symbol.trim().to_ascii_uppercase(),
+        min_expiration,
+        max_expiration,
+        option_type,
+    }))
+}
+
+fn parse_option_type_param(value: &str) -> anyhow::Result<Option<AlpacaOptionType>> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "all" | "both" | "any" => Ok(None),
+        "call" | "calls" | "c" => Ok(Some(AlpacaOptionType::Call)),
+        "put" | "puts" | "p" => Ok(Some(AlpacaOptionType::Put)),
+        other => Err(anyhow!(
+            "unsupported {ALPACA_OPTION_CHAIN_TYPE_PARAM}={other:?}, expected all, call, or put"
+        )),
     }
 }
 

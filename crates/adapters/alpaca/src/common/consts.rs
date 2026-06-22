@@ -41,3 +41,18 @@ pub const OPTION_SYMBOL_FORMAT: &str = "O:<ROOT><YYMMDD><C|P><STRIKE>";
 
 /// Instrument metadata key used to preserve Alpaca option contract open interest.
 pub const ALPACA_OPEN_INTEREST_INFO_KEY: &str = "alpaca_open_interest";
+
+/// Data-client request param for loading Alpaca option instruments for one underlying.
+pub const ALPACA_OPTION_CHAIN_UNDERLYING_PARAM: &str = "alpaca_option_chain_underlying";
+
+/// Data-client request param for loading Alpaca option instruments at one expiration date.
+pub const ALPACA_OPTION_CHAIN_EXPIRATION_PARAM: &str = "alpaca_option_chain_expiration";
+
+/// Data-client request param for loading Alpaca option instruments from an expiration date.
+pub const ALPACA_OPTION_CHAIN_MIN_EXPIRATION_PARAM: &str = "alpaca_option_chain_min_expiration";
+
+/// Data-client request param for loading Alpaca option instruments through an expiration date.
+pub const ALPACA_OPTION_CHAIN_MAX_EXPIRATION_PARAM: &str = "alpaca_option_chain_max_expiration";
+
+/// Data-client request param for limiting Alpaca option instruments to calls or puts.
+pub const ALPACA_OPTION_CHAIN_TYPE_PARAM: &str = "alpaca_option_chain_type";

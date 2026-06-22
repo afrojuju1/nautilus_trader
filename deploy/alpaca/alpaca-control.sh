@@ -13,6 +13,8 @@ REPO="${NAUTILUS_ALPACA_REPO:-$HOME/Projects/nautilus_trader}"
 ENGINE_BIN="${NAUTILUS_ALPACA_RUNNER_BIN:-$HOME/.local/bin/alpaca-options-engine}"
 OPERATOR_BIN="${NAUTILUS_ALPACA_OPERATOR_BIN:-$HOME/.local/bin/alpaca-operator-status}"
 FLEET_BIN="${NAUTILUS_ALPACA_FLEET_BIN:-$HOME/.local/bin/alpaca-fleet-status}"
+OPTION_CHAIN_LIVE_BIN="${NAUTILUS_ALPACA_OPTION_CHAIN_LIVE_BIN:-$HOME/.local/bin/alpaca-option-chain-scan-live-node}"
+COMPARE_SCAN_BIN="${NAUTILUS_ALPACA_COMPARE_SCAN_BIN:-$HOME/.local/bin/alpaca-compare-option-chain-scan}"
 CANDIDATE_ALERTS_BIN="${NAUTILUS_ALPACA_CANDIDATE_ALERTS_BIN:-$HOME/.local/bin/alpaca-candidate-alerts}"
 PERFORMANCE_BIN="${NAUTILUS_ALPACA_PERFORMANCE_BIN:-$HOME/.local/bin/alpaca-performance-report}"
 ALERTS_ENV_FILE="${NAUTILUS_ALPACA_ALERTS_ENV_FILE:-$ALPACA_CONFIG_HOME/alerts.env}"
@@ -52,6 +54,9 @@ Commands:
   alerts performance-disable     disable automatic post-market performance digest timer
   alerts performance-status      show post-market performance digest timer status
   check-config                   print resolved account config
+  compare-scan [ARGS...]         compare REST scanner output with Nautilus option-chain output
+  option-chain-live [ARGS...]    run the read-only live Nautilus option-chain scan node
+  cutover-proof [ARGS...]        compare scan output, then run a bounded read-only live node
   validate                       run Alpaca formatting, shell, test, and check commands
   deploy                         build and install local Alpaca runtime files
   rollout                        validate, deploy, restart all services, then summarize health
@@ -77,6 +82,9 @@ Examples:
   $(basename "$0") alerts performance
   $(basename "$0") alerts enable
   $(basename "$0") alerts performance-enable
+  $(basename "$0") compare-scan --pretty SPY 2026-07-02
+  $(basename "$0") option-chain-live SPY 2026-07-02
+  $(basename "$0") cutover-proof SPY 2026-07-02
   $(basename "$0") rollout
 EOF
 }
@@ -228,6 +236,8 @@ setup_account_env() {
   export NAUTILUS_ALPACA_REPO="$REPO"
   export NAUTILUS_ALPACA_RUNNER_BIN="$ENGINE_BIN"
   export NAUTILUS_ALPACA_OPERATOR_BIN="$OPERATOR_BIN"
+  export NAUTILUS_ALPACA_OPTION_CHAIN_LIVE_BIN="$OPTION_CHAIN_LIVE_BIN"
+  export NAUTILUS_ALPACA_COMPARE_SCAN_BIN="$COMPARE_SCAN_BIN"
   export NAUTILUS_ALPACA_LOG_DIR
   export NAUTILUS_ALPACA_LOCK_DIR
   export ALPACA_CONFIG_PATH
@@ -267,6 +277,8 @@ make_account_env_overlay() {
     printf 'NAUTILUS_ALPACA_REPO=%s\n' "$NAUTILUS_ALPACA_REPO"
     printf 'NAUTILUS_ALPACA_RUNNER_BIN=%s\n' "$NAUTILUS_ALPACA_RUNNER_BIN"
     printf 'NAUTILUS_ALPACA_OPERATOR_BIN=%s\n' "$NAUTILUS_ALPACA_OPERATOR_BIN"
+    printf 'NAUTILUS_ALPACA_OPTION_CHAIN_LIVE_BIN=%s\n' "$NAUTILUS_ALPACA_OPTION_CHAIN_LIVE_BIN"
+    printf 'NAUTILUS_ALPACA_COMPARE_SCAN_BIN=%s\n' "$NAUTILUS_ALPACA_COMPARE_SCAN_BIN"
     printf 'NAUTILUS_ALPACA_LOG_DIR=%s\n' "$NAUTILUS_ALPACA_LOG_DIR"
     printf 'NAUTILUS_ALPACA_LOCK_DIR=%s\n' "$NAUTILUS_ALPACA_LOCK_DIR"
     printf 'ALPACA_CONFIG_PATH=%s\n' "$ALPACA_CONFIG_PATH"
@@ -347,6 +359,35 @@ run_check_config() {
   setup_account_env "$account"
   require_executable "$ENGINE_BIN" "engine binary"
   "$ENGINE_BIN" --check-config
+}
+
+run_compare_scan() {
+  local account
+  account="$ACCOUNT"
+  setup_account_env "$account"
+  require_executable "$COMPARE_SCAN_BIN" "option-chain comparison binary"
+  "$COMPARE_SCAN_BIN" "$@"
+}
+
+run_option_chain_live() {
+  local account
+  account="$ACCOUNT"
+  setup_account_env "$account"
+  require_executable "$OPTION_CHAIN_LIVE_BIN" "option-chain live node binary"
+  "$OPTION_CHAIN_LIVE_BIN" "$@"
+}
+
+run_cutover_proof() {
+  local account max_runtime
+  account="$ACCOUNT"
+  setup_account_env "$account"
+  require_executable "$COMPARE_SCAN_BIN" "option-chain comparison binary"
+  require_executable "$OPTION_CHAIN_LIVE_BIN" "option-chain live node binary"
+  max_runtime="${ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS:-90}"
+  echo "cutover_proof account=$(normalize_account "$account") phase=compare"
+  "$COMPARE_SCAN_BIN" --pretty "$@"
+  echo "cutover_proof account=$(normalize_account "$account") phase=live_node max_runtime_secs=$max_runtime"
+  ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS="$max_runtime" "$OPTION_CHAIN_LIVE_BIN" "$@"
 }
 
 run_scan() {
@@ -1217,6 +1258,15 @@ case "$COMMAND" in
     ;;
   check-config)
     run_check_config "$ACCOUNT"
+    ;;
+  compare-scan)
+    run_compare_scan "$@"
+    ;;
+  option-chain-live)
+    run_option_chain_live "$@"
+    ;;
+  cutover-proof)
+    run_cutover_proof "$@"
     ;;
   validate)
     run_validate

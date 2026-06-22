@@ -18,7 +18,9 @@ use nautilus_alpaca::{
             AlpacaOptionType, OptionSnapshotsRequest, StockSnapshotsRequest,
         },
     },
-    opportunity_scan_actor::{OptionChainOpportunityScanConfig, scan_option_chain_opportunities},
+    opportunity_scan_actor::{
+        option_chain_scan_config_from_engine, scan_option_chain_opportunities,
+    },
     options_runtime::{
         OptionsEngineConfig, OptionsOpportunitySet, OptionsScanOutcome, OptionsScanReport,
         SelectedDebitEntry, SelectedEntry, SelectedIronCondorEntry, SelectedNakedOptionEntry,
@@ -91,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let option_chain_slice =
         option_chain_slice_from_rest(&chain, &args.underlying, args.expiry, underlying_price, ts)?;
-    let option_chain_config = option_chain_scan_config(&config, options_buying_power);
+    let option_chain_config = option_chain_scan_config_from_engine(&config, options_buying_power);
     let option_chain =
         scan_option_chain_opportunities(&option_chain_slice, &option_chain_config, &trade_date);
 
@@ -482,25 +484,6 @@ fn scan_report(
         scoreable_count,
         rejection_counts,
     )
-}
-
-fn option_chain_scan_config(
-    config: &OptionsEngineConfig,
-    options_buying_power: Option<f64>,
-) -> OptionChainOpportunityScanConfig {
-    OptionChainOpportunityScanConfig {
-        spread_kinds: config.spread_kinds.clone(),
-        iron_condor_enabled: config.iron_condor_enabled,
-        debit_kinds: config.debit_kinds.clone(),
-        naked_kinds: config.naked_kinds.clone(),
-        credit_scanner: config.scanner.clone(),
-        iron_condor_scanner: config.iron_condor_scanner.clone(),
-        debit_scanner: config.debit_scanner.clone(),
-        naked_scanner: config.naked_scanner.clone(),
-        naked_1_3dte_scanner: config.naked_1_3dte_scanner.clone(),
-        options_buying_power,
-        quantity: config.quantity,
-    }
 }
 
 fn option_chain_slice_from_rest(
