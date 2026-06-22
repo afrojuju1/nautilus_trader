@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sync Nautilus Fork"
+  short_description: "Merge upstream safely into the fork"
+  default_prompt: "Use $sync-nautilus-fork to sync my Nautilus fork with the base upstream repo."

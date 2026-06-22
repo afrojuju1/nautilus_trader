@@ -156,6 +156,12 @@ mcp/*.json
 .claude/
 claude.config.json
 .codex/
+!.codex/
+.codex/*
+!.codex/skills/
+.codex/skills/*
+!.codex/skills/sync-nautilus-fork/
+!.codex/skills/sync-nautilus-fork/**
 .cursor/
 .aider*
 .continue/

@@ -11,19 +11,28 @@
 
 ## Upstream Sync
 
-When syncing this fork with `nautechsystems/nautilus_trader`, preserve fork-only commits by merging upstream into the fork.
+When syncing this fork with the base repo `nautechsystems/nautilus_trader`, preserve fork-only
+commits by merging upstream into the fork. Use the repo-local `sync-nautilus-fork` Codex skill at
+`.codex/skills/sync-nautilus-fork` for the full workflow when available.
+
+Do this only when the user asks to proceed with a sync. For status, health, review, or "how far out
+of sync" requests, stay read-only and report the current branch, remotes, ahead/behind counts, likely
+conflict areas, and recommended next step.
 
 Recommended workflow from the repo root:
 
 ```bash
 git status --short
+git remote -v
 git fetch origin
 git fetch upstream
-git checkout develop
 git pull --ff-only origin develop
 git branch backup/develop-before-upstream-sync-$(date +%Y%m%d-%H%M%S)
 git merge --no-ff upstream/develop -m "Merge upstream develop"
 ```
+
+If `upstream` is missing, add it as `https://github.com/nautechsystems/nautilus_trader.git` only as
+part of an explicit sync workflow.
 
 After the merge:
 
@@ -36,9 +45,13 @@ git push origin develop
 Rules:
 
 - Use merge for normal syncs. Do not reset `develop` to `upstream/develop`; that discards fork-only commits.
+- Do not rebase published fork history unless the user explicitly asks for a force-push workflow.
 - Check `git log --oneline upstream/develop..develop` before pushing so fork-only commits are still visible.
 - If conflicts occur, resolve them in favor of preserving our Alpaca adapter/runtime work unless the user explicitly decides otherwise.
+- Read both sides of conflicted files before editing. Prefer upstream structure plus fork-owned Alpaca behavior when both can coexist.
+- After resolving conflicts, run `git diff --check` and the relevant build/check commands before committing or pushing.
 - Keep the backup branch until the pushed fork has been verified.
+- Do not push the merge unless the user explicitly asks to push.
 
 ## Alpaca Adapter Work
 
