@@ -160,6 +160,78 @@ alpaca-control logs
 alpaca-fleet-status --json
 ```
 
+## Dockerized Local Bring-Up
+
+The repo also provides a Docker Compose wrapper for the Alpaca Rust runtime at
+`deploy/alpaca/compose.yml`. It is intentionally split into profiles so `docker compose up` starts
+only Postgres. Read-only account checks and the trading engine require explicit service/profile
+selection.
+
+Start the Compose-local Postgres used by the containerized runtime:
+
+```bash
+docker compose -f deploy/alpaca/compose.yml up -d postgres
+```
+
+Avoid running `docker compose config` with a real Alpaca env file because Compose prints resolved
+environment values. Validate the Compose shape without `--env-file`, or use the checked
+`alpaca-options-engine.docker.env.example` template.
+
+If local TOML configs are mode-restricted, stage container-readable copies outside the repo before
+starting the service. Credentials stay in the external env file and are not copied:
+
+```bash
+install -d -m 755 ~/.local/share/nautilus-alpaca-docker-config
+install -m 644 ~/.config/nautilus-trader/alpaca/base-options-engine.toml \
+  ~/.local/share/nautilus-alpaca-docker-config/base-options-engine.toml
+install -m 644 ~/.config/nautilus-trader/alpaca/options-engine.toml \
+  ~/.local/share/nautilus-alpaca-docker-config/options-engine.toml
+```
+
+Run read-only Alpaca checks with paper credentials from an external env file:
+
+```bash
+docker compose \
+  --env-file ~/.config/nautilus-trader/alpaca/options-engine.env \
+  -f deploy/alpaca/compose.yml \
+  run --rm alpaca-check-account
+
+docker compose \
+  --env-file ~/.config/nautilus-trader/alpaca/options-engine.env \
+  -f deploy/alpaca/compose.yml \
+  run --rm alpaca-status
+```
+
+When Docker owns the runtime, prefer the Docker status commands above plus
+`docker compose -f deploy/alpaca/compose.yml --profile engine ps`. The `alpaca-control fleet`
+command is systemd-oriented and reports systemd account services as inactive when Docker is the
+active owner.
+
+The Docker defaults keep `ALPACA_SUBMIT=false`, `ALPACA_MANAGE=false`, `ALPACA_CLOSE=false`, and
+`ALPACA_KILL_SWITCH=true`. To run the actual containerized engine, make the paper-trading intent
+explicit in the env file or shell, point the Docker config mounts at reviewed local configs, keep
+paper endpoints in place, and start only the engine profile:
+
+```bash
+NAUTILUS_ALPACA_DOCKER_BASE_CONFIG=~/.local/share/nautilus-alpaca-docker-config/base-options-engine.toml \
+NAUTILUS_ALPACA_DOCKER_CONFIG=~/.local/share/nautilus-alpaca-docker-config/options-engine.toml \
+NAUTILUS_ALPACA_DOCKER_SUBMIT=true \
+NAUTILUS_ALPACA_DOCKER_MANAGE=true \
+NAUTILUS_ALPACA_DOCKER_CLOSE=true \
+NAUTILUS_ALPACA_DOCKER_KILL_SWITCH=false \
+docker compose \
+  --env-file ~/.config/nautilus-trader/alpaca/options-engine.env \
+  -f deploy/alpaca/compose.yml \
+  --profile engine \
+  up -d alpaca-options
+```
+
+Stop the containerized engine without removing Postgres data:
+
+```bash
+docker compose -f deploy/alpaca/compose.yml --profile engine stop alpaca-options
+```
+
 `scan` is a one-shot diagnostic candidate scan. It auto-loads the selected account env/config,
 forces dry-run entry decisions, disables submit/manage/close, ignores the entry window by default,
 and raises local account caps so daily submit limits do not hide candidates. Use `run-once` when the

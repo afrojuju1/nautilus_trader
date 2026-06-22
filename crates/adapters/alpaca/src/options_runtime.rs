@@ -489,45 +489,133 @@ impl OptionsEngineConfig {
     }
 }
 
-/// Selects the best allowed options entry for one iteration.
-///
-/// # Errors
-///
-/// Returns an error when Alpaca account, position, order, contract, or snapshot requests fail.
-pub async fn select_credit_spread_entry(
-    client: &AlpacaHttpClient,
-    data_config: &AlpacaDataClientConfig,
-    config: &OptionsEngineConfig,
-    state: &StrategyState,
-    trade_date: &str,
-) -> anyhow::Result<Option<SelectedEntry>> {
-    Ok(
-        select_options_entry(client, data_config, config, state, trade_date)
-            .await?
-            .and_then(|entry| match entry {
-                SelectedOptionsEntry::Credit(entry) => Some(entry),
-                SelectedOptionsEntry::IronCondor(_) => None,
-                SelectedOptionsEntry::Debit(_) => None,
-                SelectedOptionsEntry::NakedOption(_) => None,
-            }),
-    )
+/// Result of one configured options family scan for one underlying.
+#[derive(Clone, Debug)]
+pub struct OptionsScanReport {
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Stable strategy name.
+    pub strategy: &'static str,
+    /// Whether the scan produced at least one ranked candidate.
+    pub outcome: OptionsScanOutcome,
+    /// Number of ranked candidates produced by the scanner.
+    pub candidate_count: usize,
+    /// Stable no-candidate reason when no candidate was produced.
+    pub reason: Option<String>,
+    /// Number of contracts loaded.
+    pub contract_count: usize,
+    /// Number of snapshots loaded.
+    pub snapshot_count: usize,
+    /// Number of scoreable contracts.
+    pub scoreable_count: usize,
+    /// Counts of scanner rejection reasons.
+    pub rejection_counts: BTreeMap<String, usize>,
 }
 
-/// Selects the best allowed options strategy entry for one iteration.
+impl OptionsScanReport {
+    fn new(
+        underlying: &str,
+        strategy: &'static str,
+        candidate_count: usize,
+        contract_count: usize,
+        snapshot_count: usize,
+        scoreable_count: usize,
+        rejection_counts: BTreeMap<String, usize>,
+    ) -> Self {
+        let outcome = if candidate_count == 0 {
+            OptionsScanOutcome::NoCandidate
+        } else {
+            OptionsScanOutcome::Candidate
+        };
+        let reason = (outcome == OptionsScanOutcome::NoCandidate).then(|| {
+            no_candidate_reason(contract_count, snapshot_count, scoreable_count).to_string()
+        });
+        Self {
+            underlying: underlying.to_string(),
+            strategy,
+            outcome,
+            candidate_count,
+            reason,
+            contract_count,
+            snapshot_count,
+            scoreable_count,
+            rejection_counts,
+        }
+    }
+}
+
+/// Outcome for one scanner pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptionsScanOutcome {
+    /// At least one candidate passed the scanner thresholds.
+    Candidate,
+    /// No candidate passed the scanner thresholds.
+    NoCandidate,
+}
+
+/// Opportunity set produced by scanner discovery for one strategy iteration.
+#[derive(Clone, Debug)]
+pub struct OptionsOpportunitySet {
+    /// Market trade date for the opportunity set.
+    pub trade_date: String,
+    /// Per-underlying, per-strategy scanner diagnostics.
+    pub scans: Vec<OptionsScanReport>,
+    /// Ranked candidate entries across all enabled strategy families.
+    pub ranked_entries: Vec<SelectedOptionsEntry>,
+}
+
+impl OptionsOpportunitySet {
+    fn new(trade_date: &str) -> Self {
+        Self {
+            trade_date: trade_date.to_string(),
+            scans: Vec::new(),
+            ranked_entries: Vec::new(),
+        }
+    }
+
+    fn push_scan(&mut self, report: OptionsScanReport) {
+        self.scans.push(report);
+    }
+
+    fn consider_candidate(&mut self, candidate: SelectedOptionsEntry) {
+        self.ranked_entries.push(candidate);
+        self.ranked_entries
+            .sort_by(|left, right| right.score().total_cmp(&left.score()));
+    }
+
+    /// Returns the ranked entry candidates across all enabled strategy families.
+    #[must_use]
+    pub fn ranked_entries(&self) -> &[SelectedOptionsEntry] {
+        &self.ranked_entries
+    }
+
+    /// Returns the highest-scoring selected entry candidate, if any.
+    #[must_use]
+    pub fn selected_entry(&self) -> Option<&SelectedOptionsEntry> {
+        self.ranked_entries.first()
+    }
+
+    /// Consumes the opportunity set and returns the selected entry candidate.
+    #[must_use]
+    pub fn into_selected_entry(self) -> Option<SelectedOptionsEntry> {
+        self.ranked_entries.into_iter().next()
+    }
+}
+
+/// Discovers ranked option opportunities for one strategy iteration.
 ///
 /// # Errors
 ///
 /// Returns an error when Alpaca account, position, order, contract, or snapshot requests fail.
-pub async fn select_options_entry(
+pub async fn scan_options_opportunities(
     client: &AlpacaHttpClient,
     data_config: &AlpacaDataClientConfig,
     config: &OptionsEngineConfig,
-    _state: &StrategyState,
     trade_date: &str,
-) -> anyhow::Result<Option<SelectedOptionsEntry>> {
+) -> anyhow::Result<OptionsOpportunitySet> {
     let account = client.account().await?;
     let options_buying_power = account_options_buying_power(&account);
-    let mut selected: Option<SelectedOptionsEntry> = None;
+    let mut opportunities = OptionsOpportunitySet::new(trade_date);
 
     for underlying in &config.underlyings {
         for kind in &config.spread_kinds {
@@ -572,6 +660,15 @@ pub async fn select_options_entry(
                 &result.candidates,
             )
             .await;
+            opportunities.push_scan(OptionsScanReport::new(
+                underlying,
+                strategy_name,
+                result.candidates.len(),
+                result.contract_count,
+                result.snapshot_count,
+                result.scoreable_count,
+                result.rejection_counts.clone(),
+            ));
             let Some(best) = result.candidates.first() else {
                 let reason = no_candidate_reason(
                     result.contract_count,
@@ -627,16 +724,11 @@ pub async fn select_options_entry(
                 }),
             );
 
-            if selected
-                .as_ref()
-                .is_none_or(|current| best.score > current.score())
-            {
-                selected = Some(SelectedOptionsEntry::Credit(SelectedEntry {
-                    underlying: underlying.clone(),
-                    kind: *kind,
-                    candidate: best.clone(),
-                }));
-            }
+            opportunities.consider_candidate(SelectedOptionsEntry::Credit(SelectedEntry {
+                underlying: underlying.clone(),
+                kind: *kind,
+                candidate: best.clone(),
+            }));
         }
 
         if config.iron_condor_enabled {
@@ -671,6 +763,15 @@ pub async fn select_options_entry(
             .await;
             record_iron_condor_candidate_ledger(config, trade_date, underlying, &result.candidates)
                 .await;
+            opportunities.push_scan(OptionsScanReport::new(
+                underlying,
+                "iron_condor",
+                result.candidates.len(),
+                result.contract_count,
+                result.snapshot_count,
+                result.scoreable_count,
+                result.rejection_counts.clone(),
+            ));
             let Some(best) = result.candidates.first() else {
                 let reason = no_candidate_reason(
                     result.contract_count,
@@ -728,15 +829,12 @@ pub async fn select_options_entry(
                 }),
             );
 
-            if selected
-                .as_ref()
-                .is_none_or(|current| best.score > current.score())
-            {
-                selected = Some(SelectedOptionsEntry::IronCondor(SelectedIronCondorEntry {
+            opportunities.consider_candidate(SelectedOptionsEntry::IronCondor(
+                SelectedIronCondorEntry {
                     underlying: underlying.clone(),
                     candidate: best.clone(),
-                }));
-            }
+                },
+            ));
         }
 
         for kind in &config.debit_kinds {
@@ -791,6 +889,15 @@ pub async fn select_options_entry(
                 &result.candidates,
             )
             .await;
+            opportunities.push_scan(OptionsScanReport::new(
+                underlying,
+                strategy_name,
+                result.candidates.len(),
+                result.contract_count,
+                result.snapshot_count,
+                result.scoreable_count,
+                result.rejection_counts.clone(),
+            ));
             let Some(best) = result.candidates.first() else {
                 let reason = no_candidate_reason(
                     result.contract_count,
@@ -846,16 +953,11 @@ pub async fn select_options_entry(
                 }),
             );
 
-            if selected
-                .as_ref()
-                .is_none_or(|current| best.score > current.score())
-            {
-                selected = Some(SelectedOptionsEntry::Debit(SelectedDebitEntry {
-                    underlying: underlying.clone(),
-                    kind: *kind,
-                    candidate: best.clone(),
-                }));
-            }
+            opportunities.consider_candidate(SelectedOptionsEntry::Debit(SelectedDebitEntry {
+                underlying: underlying.clone(),
+                kind: *kind,
+                candidate: best.clone(),
+            }));
         }
 
         for kind in &config.naked_kinds {
@@ -903,6 +1005,15 @@ pub async fn select_options_entry(
                 &result.candidates,
             )
             .await;
+            opportunities.push_scan(OptionsScanReport::new(
+                underlying,
+                strategy_name,
+                result.candidates.len(),
+                result.contract_count,
+                result.snapshot_count,
+                result.scoreable_count,
+                result.rejection_counts.clone(),
+            ));
             let Some(best) = result.candidates.first() else {
                 let reason = no_candidate_reason(
                     result.contract_count,
@@ -1011,20 +1122,15 @@ pub async fn select_options_entry(
                 }),
             );
 
-            if selected
-                .as_ref()
-                .is_none_or(|current| best.score > current.score())
-            {
-                selected = Some(SelectedOptionsEntry::NakedOption(
-                    SelectedNakedOptionEntry {
-                        underlying: underlying.clone(),
-                        kind: *kind,
-                        candidate: best.clone(),
-                    },
-                ));
-            }
+            opportunities.consider_candidate(SelectedOptionsEntry::NakedOption(
+                SelectedNakedOptionEntry {
+                    underlying: underlying.clone(),
+                    kind: *kind,
+                    candidate: best.clone(),
+                },
+            ));
         }
     }
 
-    Ok(selected)
+    Ok(opportunities)
 }

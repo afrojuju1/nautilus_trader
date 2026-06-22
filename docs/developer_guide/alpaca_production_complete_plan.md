@@ -422,8 +422,8 @@ Current status:
 
 - `OptionsEngineConfig` now lives in library code and owns environment parsing/validation for the
   options-engine runtime.
-- Index-credit scan/admission/candidate selection now lives in library code as
-  `select_credit_spread_entry`.
+- Options opportunity discovery now lives in library code as `scan_options_opportunities`, which
+  returns an explicit opportunity set for hosted strategies to evaluate.
 - The installed `alpaca-options-engine` binary is now a thin Tokio entrypoint over
   `options_engine::run_options_engine`.
 - The account-engine loop, management orchestration, and broker submit/cancel/lookup helpers now

@@ -30,8 +30,9 @@ use crate::{
     },
     management::{credit_spread_close_reason, days_to_expiration, recorded_age_secs},
     options_runtime::{
-        OptionsEngineConfig, SelectedOptionsEntry, active_sector_count, active_underlying_count,
-        fleet_active_underlying_count, fleet_sector_limit_state, select_options_entry,
+        OptionsEngineConfig, OptionsOpportunitySet, SelectedOptionsEntry, active_sector_count,
+        active_underlying_count, fleet_active_underlying_count, fleet_sector_limit_state,
+        scan_options_opportunities,
     },
     performance::{EntryOrderIds, collect_order_ids, entry_performance},
     runtime::{
@@ -209,6 +210,31 @@ pub trait StrategyRuntime {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OptionsRuntimeStrategy;
 
+impl OptionsRuntimeStrategy {
+    async fn evaluate_opportunities(
+        &self,
+        context: &AccountEngineContext<'_>,
+        opportunities: OptionsOpportunitySet,
+    ) -> anyhow::Result<StrategyDecision> {
+        let selected = opportunities.into_selected_entry();
+        let Some(selected) = selected else {
+            return Ok(StrategyDecision::NoEntry);
+        };
+        if selected_submit_enabled(context.config, &selected)
+            && let Some(block) = submission_block_for_selected(context, &selected).await?
+        {
+            return Ok(StrategyDecision::SelectedBlocked {
+                entry: selected,
+                reason: block.reason,
+                current: block.current,
+                limit: block.limit,
+                details: block.details,
+            });
+        }
+        Ok(selected_strategy_decision(context.config, selected))
+    }
+}
+
 impl StrategyRuntime for OptionsRuntimeStrategy {
     fn name(&self) -> &'static str {
         "options_engine"
@@ -233,29 +259,14 @@ impl StrategyRuntime for OptionsRuntimeStrategy {
                 EntryGateDecision::Continue => {}
             }
 
-            let selected = select_options_entry(
+            let opportunities = scan_options_opportunities(
                 context.client,
                 context.data_config,
                 context.config,
-                context.state,
                 context.trade_date,
             )
             .await?;
-            let Some(selected) = selected else {
-                return Ok(StrategyDecision::NoEntry);
-            };
-            if selected_submit_enabled(context.config, &selected)
-                && let Some(block) = submission_block_for_selected(&context, &selected).await?
-            {
-                return Ok(StrategyDecision::SelectedBlocked {
-                    entry: selected,
-                    reason: block.reason,
-                    current: block.current,
-                    limit: block.limit,
-                    details: block.details,
-                });
-            }
-            Ok(selected_strategy_decision(context.config, selected))
+            self.evaluate_opportunities(&context, opportunities).await
         })
     }
 }

@@ -168,6 +168,10 @@ claude.config.json
 .review_scratch/
 superpowers/
 
+# Local Alpaca Docker credential files.
+deploy/alpaca/*.docker.env
+!deploy/alpaca/*.docker.env.example
+
 AGENTS.md
 CLAUDE.md
 CODEX.md

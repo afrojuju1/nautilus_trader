@@ -1,0 +1,94 @@
+name: nautilus-alpaca
+
+x-alpaca-runtime: &alpaca-runtime
+  build:
+    context: ../..
+    dockerfile: deploy/alpaca/Dockerfile
+  image: nautilus-alpaca:local
+  depends_on:
+    postgres:
+      condition: service_healthy
+  environment:
+    ALPACA_API_KEY: ${ALPACA_API_KEY:-}
+    ALPACA_SECRET_KEY: ${ALPACA_SECRET_KEY:-}
+    ALPACA_API_SECRET: ${ALPACA_API_SECRET:-}
+    APCA_API_KEY_ID: ${APCA_API_KEY_ID:-}
+    APCA_API_SECRET_KEY: ${APCA_API_SECRET_KEY:-}
+    ALPACA_TRADING_BASE_URL: ${ALPACA_TRADING_BASE_URL:-https://paper-api.alpaca.markets}
+    ALPACA_TRADE_UPDATES_WS_URL: ${ALPACA_TRADE_UPDATES_WS_URL:-wss://paper-api.alpaca.markets/stream}
+    ALPACA_DATA_BASE_URL: ${ALPACA_DATA_BASE_URL:-}
+    ALPACA_STORAGE_DATABASE_URL: postgres://nautilus:${POSTGRES_PASSWORD:-pass}@postgres:5432/${POSTGRES_DB:-nautilus}
+    ALPACA_STORAGE_SCHEMA: ${ALPACA_STORAGE_SCHEMA:-alpaca}
+    ALPACA_CONFIG_PATH: /config/options-engine.toml
+    ALPACA_STATE_PATH: /state/alpaca_options_engine_state.json
+    NAUTILUS_ALPACA_ACCOUNT: ${NAUTILUS_ALPACA_DOCKER_ACCOUNT:-paper-main}
+    NAUTILUS_ALPACA_SERVICE: ${NAUTILUS_ALPACA_DOCKER_SERVICE:-alpaca-options-container}
+    NAUTILUS_ALPACA_LOG_DIR: /state/logs
+    NAUTILUS_ALPACA_LOCK_DIR: /state/locks
+    ALPACA_SUBMIT: ${NAUTILUS_ALPACA_DOCKER_SUBMIT:-false}
+    ALPACA_MANAGE: ${NAUTILUS_ALPACA_DOCKER_MANAGE:-false}
+    ALPACA_CLOSE: ${NAUTILUS_ALPACA_DOCKER_CLOSE:-false}
+    ALPACA_KILL_SWITCH: ${NAUTILUS_ALPACA_DOCKER_KILL_SWITCH:-true}
+    ALPACA_FORCE_FLATTEN: ${NAUTILUS_ALPACA_DOCKER_FORCE_FLATTEN:-false}
+    ALPACA_CANCEL_AFTER_ACCEPT: ${NAUTILUS_ALPACA_DOCKER_CANCEL_AFTER_ACCEPT:-false}
+    ALPACA_STRATEGIES: ${ALPACA_STRATEGIES:-}
+    ALPACA_DRY_RUN_STRATEGIES: ${ALPACA_DRY_RUN_STRATEGIES:-}
+    ALPACA_MAX_ITERATIONS: ${ALPACA_MAX_ITERATIONS:-}
+    ALPACA_INTERVAL_SECS: ${ALPACA_INTERVAL_SECS:-}
+    ALPACA_IGNORE_ENTRY_WINDOW: ${ALPACA_IGNORE_ENTRY_WINDOW:-}
+    ALPACA_QTY: ${ALPACA_QTY:-}
+    ALPACA_MAX_ACTIVE_ENTRIES: ${ALPACA_MAX_ACTIVE_ENTRIES:-}
+    ALPACA_MAX_DAILY_SUBMITS: ${ALPACA_MAX_DAILY_SUBMITS:-}
+    ALPACA_MAX_OPEN_ORDERS: ${ALPACA_MAX_OPEN_ORDERS:-}
+    ALPACA_MAX_ACTIVE_ENTRIES_PER_UNDERLYING: ${ALPACA_MAX_ACTIVE_ENTRIES_PER_UNDERLYING:-}
+    ALPACA_MAX_ACTIVE_ENTRIES_PER_SECTOR: ${ALPACA_MAX_ACTIVE_ENTRIES_PER_SECTOR:-}
+    ALPACA_CLOSE_REGULAR_HOURS_ONLY: ${ALPACA_CLOSE_REGULAR_HOURS_ONLY:-}
+    ALPACA_CLOSE_PRICE_CUSHION: ${ALPACA_CLOSE_PRICE_CUSHION:-}
+    ALPACA_MAX_CLOSE_ATTEMPTS: ${ALPACA_MAX_CLOSE_ATTEMPTS:-}
+    ALPACA_CLOSE_REPRICE_COOLDOWN_SECS: ${ALPACA_CLOSE_REPRICE_COOLDOWN_SECS:-}
+  volumes:
+    - alpaca-state:/state
+    - ${NAUTILUS_ALPACA_DOCKER_BASE_CONFIG:-./alpaca-options-engine.base.toml.example}:/config/base-options-engine.toml:ro
+    - ${NAUTILUS_ALPACA_DOCKER_CONFIG:-./alpaca-options-engine.toml.example}:/config/options-engine.toml:ro
+
+services:
+  postgres:
+    container_name: nautilus-alpaca-database
+    image: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nautilus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pass}
+      POSTGRES_DB: ${POSTGRES_DB:-nautilus}
+      PGDATA: /data/postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-nautilus} -d $${POSTGRES_DB:-nautilus}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    ports:
+      - "127.0.0.1:${ALPACA_POSTGRES_PORT:-55432}:5432"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - alpaca-postgres:/data/postgres
+
+  alpaca-check-account:
+    <<: *alpaca-runtime
+    profiles: ["status"]
+    command: ["alpaca-check-account-orders"]
+
+  alpaca-status:
+    <<: *alpaca-runtime
+    profiles: ["status"]
+    command: ["alpaca-operator-status", "--json"]
+
+  alpaca-options:
+    <<: *alpaca-runtime
+    profiles: ["engine"]
+    command: ["alpaca-options-engine"]
+    restart: unless-stopped
+
+volumes:
+  alpaca-postgres:
+  alpaca-state:
