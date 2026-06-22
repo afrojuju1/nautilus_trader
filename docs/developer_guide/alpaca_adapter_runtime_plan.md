@@ -12,7 +12,8 @@ spread automation.
 Public documentation readiness is tracked in
 [Alpaca Official Docs Readiness Checklist](alpaca_official_docs_readiness_checklist.md). The
 current public-facing integration page is [Alpaca](../integrations/alpaca.md), which documents the
-implemented Rust options runtime as experimental until the Python `TradingNode` factories are wired.
+implemented Rust options runtime as experimental until the standard node path covers option data,
+multi-leg execution, and operator lifecycle parity.
 
 The first target strategy mirrors the current spreads workflow:
 
@@ -35,8 +36,9 @@ Follow Nautilus' existing live adapter pattern:
   reconciliation.
 - Python remains the user-facing configuration and strategy assembly surface.
 
-The scaffold added with this plan registers `nautilus-alpaca`, exposes venue/config constants, and
-adds factory placeholders that fail fast until real clients exist.
+The scaffold added with this plan registers `nautilus-alpaca` and exposes venue/config constants.
+The Rust crate now includes live data and execution client factories; the Python package remains the
+user-facing assembly surface for the narrower equity path while options continue to migrate.
 
 The first implementation slices add authenticated REST access, an option-contract provider for
 `/v2/options/contracts`, and batched option snapshot loading through
@@ -45,6 +47,8 @@ from `APCA_API_KEY_ID`/`APCA_API_SECRET_KEY`, then from the existing deployment 
 `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`.
 The contract provider can also convert Alpaca option contract payloads into Nautilus
 `OptionContract` instruments on venue `ALPACA`.
+The Rust `AlpacaDataClient` and factory can exact-load those option instruments through the standard
+Nautilus live data-client request/subscription surface.
 An initial diagnostic scanner (`alpaca-dry-run-put-credit`) screens active 5-10 DTE put
 credit spreads without submitting orders.
 The next runtime slice adds account, position, and open-order polling through Alpaca Trading REST
@@ -101,6 +105,8 @@ Phase 1:
 - Implement authenticated REST client. (Initial option-contract path complete.)
 - Implement contract provider for equity option instruments. (Initial Alpaca contract model and
   Nautilus `OptionContract` conversion complete.)
+- Implement native live data-client factory for option instruments. (Exact `InstrumentId` loading and
+  cached instrument replay complete.)
 - Implement latest option snapshot/quote request path. (Initial batched snapshot path complete.)
 - Implement account/position/order polling. (Initial REST polling complete.)
 - Implement paper multi-leg order submission. (Initial direct submit/cancel smoke path complete.)

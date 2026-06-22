@@ -23,6 +23,13 @@ The same profile also verified the current option surfaces:
   IV.
 - The Rust multi-leg payload builder produced a valid Alpaca `mleg` put-credit payload.
 
+On June 22, 2026, the Rust adapter gained a native `AlpacaDataClient` and
+`AlpacaDataClientFactory`. The client follows Nautilus' live `DataClient` contract for lifecycle,
+instrument subscription replay, and `DataResponse::Instrument` / `DataResponse::Instruments`
+requests. It reuses `AlpacaHttpClient`, `AlpacaOptionContractProvider`, and the existing
+`OptionContract` parser to load explicit Alpaca option instruments by `InstrumentId`, for example
+`SPY260619P00450000.ALPACA`. It intentionally does not load full option universes on connect.
+
 ## First Migration Target
 
 Start with the Alpaca put-credit spread path.
@@ -72,12 +79,13 @@ Alpaca credentials, REST clients, broker payloads, or reconciliation.
 
 ## Concrete Broker Gaps
 
-1. Option instrument loading in the Python `TradingNode` adapter.
+1. Option instrument loading in the standard node path.
 
-   Rust can parse Alpaca contracts into Nautilus `OptionContract` values, but the Python Alpaca live
-   data factory currently uses `AlpacaEquityInstrumentProvider`. The node needs an Alpaca option
-   provider that can load contracts by underlying, expiration window, option type, and explicit OCC
-   symbols, then publish those instruments into the cache before strategies submit option orders.
+   Rust can now request or subscribe explicit Alpaca option contracts through a Nautilus
+   `DataClient`, but the Python Alpaca live data factory still uses `AlpacaEquityInstrumentProvider`
+   for its public `TradingNode` path. The next node slice needs an Alpaca option provider surface
+   that can load contracts by underlying, expiration window, option type, and explicit OCC symbols,
+   then publish those instruments into the cache before strategies submit option orders.
 
 2. Option data requests and subscriptions.
 
@@ -125,8 +133,11 @@ Alpaca credentials, REST clients, broker payloads, or reconciliation.
 
 ## Implementation Order
 
+Completed foundation on June 22, 2026: add a native Rust `AlpacaDataClient` and factory that can
+exact-load Alpaca option instruments through the Nautilus `DataClient` interface.
+
 1. Add an Alpaca option instrument provider and a small paper-profile option contract check under
-   the Python adapter surface.
+   the Python adapter surface or bind the Rust data client into the standard Python node assembly.
 2. Add option snapshot polling to the Python Alpaca data client, backed by the existing Rust REST
    model where practical.
 3. Expose the Rust option-leg plan/order-list builder to Python or add an equivalent tested Python

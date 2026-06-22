@@ -16,6 +16,9 @@ equity/ETF daily bars.
   requests/polling.
 - The Python Alpaca execution factory supports simple US equity/ETF `DAY` limit broker orders.
   The existing Rust `AlpacaExecutionClient` still owns the richer options execution runtime.
+- As of June 22, 2026, Rust also has an `AlpacaDataClient` and `AlpacaDataClientFactory` that can
+  exact-load Alpaca option instruments through the Nautilus `DataClient` request/subscription
+  surface.
 
 ## Target Architecture
 
@@ -86,9 +89,10 @@ the Alpaca paper broker account.
 
 3. Option data and multi-leg Python execution.
 
-   The Rust options runtime already handles much of this. Moving it under Python `TradingNode`
-   requires exposing or wrapping the Rust `AlpacaExecutionClient`, explicit option quote
-   subscriptions, snapshot/Greek refresh, multi-leg order-list support, and reconciliation for
+   The Rust options runtime already handles much of this, and the Rust data-client foundation now
+   exact-loads option instruments through Nautilus `DataClient`. Moving the full path under Python
+   `TradingNode` still requires explicit option quote subscriptions, snapshot/Greek refresh,
+   multi-leg order-list support, execution-client exposure or wrapping, and reconciliation for
    assignment, exercise, expiration, corrections, and fills. The first target is the put-credit
    spread path because Rust already has option contract loading, snapshots, scanner scoring,
    multi-leg order-list construction, Alpaca `mleg` payload validation, and paper submit/cancel
@@ -112,7 +116,7 @@ the Alpaca paper broker account.
 2. Prove the shared equity risk gates with broker-paper smoke tests and strategy runs.
 3. Prove the combined equity daily strategy node through a longer paper session and capture broker
    submit/cancel/fill/reconciliation behavior under tiny caps.
-4. Move the put-credit spread path into the same architecture after Python can represent the needed
-   option instruments, option snapshots, `SubmitOrderList` commands, multi-leg broker submission,
-   cancel/close flows, option positions, and account reconciliation without losing Rust runtime
-   safety.
+4. Use the Rust `AlpacaDataClient` as the standard option-instrument bridge, then move the
+   put-credit spread path into the same architecture after the node can represent option snapshots,
+   `SubmitOrderList` commands, multi-leg broker submission, cancel/close flows, option positions,
+   and account reconciliation without losing Rust runtime safety.

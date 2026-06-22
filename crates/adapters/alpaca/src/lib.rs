@@ -17,13 +17,13 @@
 //! [Alpaca Markets](https://alpaca.markets/).
 //!
 //! The `nautilus-alpaca` crate currently provides shared configuration, Alpaca REST clients,
-//! option contract and snapshot access, option order payload builders, a Rust execution client, and
-//! an account-level options runtime. The first production target is US equity option workflows,
-//! including short-dated multi-leg option spreads submitted through Alpaca paper trading.
+//! option contract and snapshot access, option order payload builders, Rust data and execution
+//! clients, and an account-level options runtime. The first production target is US equity option
+//! workflows, including short-dated multi-leg option spreads submitted through Alpaca paper trading.
 //!
-//! The Python `TradingNode` data and execution factories are not wired to live clients yet. Public
-//! documentation should describe this crate as an experimental Rust Alpaca options runtime until
-//! the standard Python adapter path is implemented.
+//! Public documentation should describe this crate as an experimental Rust Alpaca options runtime
+//! until the standard adapter path can cover option snapshots, multi-leg execution, and operator
+//! lifecycle parity.
 //!
 //! # Feature flags
 //!
@@ -43,6 +43,8 @@
 pub mod candidate_payloads;
 pub mod common;
 pub mod config;
+#[cfg(feature = "live")]
+pub mod data;
 pub mod earnings;
 pub mod execution;
 #[cfg(feature = "live")]
@@ -80,6 +82,8 @@ pub mod submit;
 pub mod websocket;
 
 #[cfg(feature = "live")]
+pub use data::AlpacaDataClient;
+#[cfg(feature = "live")]
 pub use execution::AlpacaExecutionClient;
 #[cfg(feature = "live")]
-pub use factories::AlpacaExecutionClientFactory;
+pub use factories::{AlpacaDataClientFactory, AlpacaExecutionClientFactory};

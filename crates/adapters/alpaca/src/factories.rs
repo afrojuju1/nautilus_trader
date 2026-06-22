@@ -15,12 +15,13 @@
 
 //! Factory functions for creating Alpaca clients.
 
-use std::any::Any;
+use std::{any::Any, cell::RefCell, rc::Rc};
 
 use nautilus_common::{
     cache::CacheView,
-    clients::ExecutionClient,
-    factories::{ClientConfig, ExecutionClientFactory},
+    clients::{DataClient, ExecutionClient},
+    clock::Clock,
+    factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
 };
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
@@ -31,6 +32,7 @@ use nautilus_model::{
 use crate::{
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
+    data::AlpacaDataClient,
     execution::AlpacaExecutionClient,
 };
 
@@ -43,6 +45,57 @@ impl ClientConfig for AlpacaDataClientConfig {
 impl ClientConfig for AlpacaExecClientConfig {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+/// Factory for creating Alpaca data clients.
+#[derive(Debug, Clone)]
+pub struct AlpacaDataClientFactory;
+
+impl AlpacaDataClientFactory {
+    /// Creates a new [`AlpacaDataClientFactory`] instance.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for AlpacaDataClientFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DataClientFactory for AlpacaDataClientFactory {
+    fn create(
+        &self,
+        name: &str,
+        config: &dyn ClientConfig,
+        _cache: CacheView,
+        _clock: Rc<RefCell<dyn Clock>>,
+    ) -> anyhow::Result<Box<dyn DataClient>> {
+        let alpaca_config = config
+            .as_any()
+            .downcast_ref::<AlpacaDataClientConfig>()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid config type for AlpacaDataClientFactory. Expected AlpacaDataClientConfig, was {config:?}",
+                )
+            })?
+            .clone();
+
+        Ok(Box::new(AlpacaDataClient::new(
+            ClientId::from(name),
+            alpaca_config,
+        )?))
+    }
+
+    fn name(&self) -> &'static str {
+        ALPACA_CLIENT_ID
+    }
+
+    fn config_type(&self) -> &'static str {
+        "AlpacaDataClientConfig"
     }
 }
 

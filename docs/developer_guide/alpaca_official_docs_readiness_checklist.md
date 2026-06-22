@@ -10,7 +10,10 @@ for official NautilusTrader documentation.
   - [ ] Full official Alpaca adapter alongside integrations such as Bybit and Interactive Brokers.
 - [x] Keep the public wording aligned with the implementation:
   - [x] The Rust Alpaca options execution/runtime path is implemented and actively paper tested.
-  - [x] The Python `TradingNode` adapter factories are not implemented yet.
+  - [x] The standard Python `TradingNode` path is narrow and does not yet cover option/multi-leg
+        trading.
+  - [x] The Rust adapter has live data and execution factories, but public docs should not present
+        Alpaca as a full official adapter yet.
   - [x] The opinionated options strategy engine is separate from the generic adapter surface.
 
 ## Public documentation surfaces
@@ -80,9 +83,10 @@ for official NautilusTrader documentation.
 
 - [x] Implement or explicitly defer `AlpacaLiveDataClientFactory`.
 - [x] Implement or explicitly defer `AlpacaLiveExecClientFactory`.
-- [ ] Wire Python config objects into real live clients if Alpaca is promoted to a full official
-      adapter.
-- [ ] Add a standard Python `TradingNode` example once the factories are implemented.
+- [ ] Wire option-capable clients into the standard Python node path if Alpaca is promoted to a full
+      official adapter.
+- [ ] Add a standard Python `TradingNode` options example once option data and multi-leg execution
+      are implemented.
 - [x] Update package docstrings so they no longer describe completed Rust runtime work as only a
       scaffold.
 
@@ -99,8 +103,9 @@ for official NautilusTrader documentation.
 - [ ] Add a real-time option quote/trade stream cache or explicitly document why REST snapshots are
       the supported quote path for the release.
 - [ ] Add entitlement-aware feed behavior for indicative versus OPRA option data.
-- [ ] Wire an Alpaca instrument provider into the standard Nautilus cache path if publishing as a
-      normal adapter.
+- [x] Wire exact Alpaca option instrument loading into a standard Rust Nautilus data-client path.
+- [ ] Add option universe loading and snapshot/quote refresh to the standard node path if publishing
+      as a normal adapter.
 - [x] Document option data entitlement requirements.
 - [ ] Document any quote staleness, feed, or market-hours constraints.
 
@@ -112,7 +117,7 @@ for official NautilusTrader documentation.
 - [x] Add a multi-leg order validation example that does not submit orders.
 - [x] Add a paper-only options engine walkthrough with submission disabled by default.
 - [x] Add a safe paper smoke-test example that cancels accepted test orders.
-- [ ] Add a standard `TradingNode` example after Python factories exist.
+- [ ] Add a standard `TradingNode` options example after option data and multi-leg execution exist.
 - [ ] Add docs or tests that verify public examples import and run in dry-run mode.
 
 ## Operational documentation
@@ -222,7 +227,7 @@ for official NautilusTrader documentation.
 - [x] Phase 1: add API reference placeholder or implemented-runtime API page.
 - [x] Phase 1: add safe examples.
 - [x] Phase 1: clean up stale scaffold language.
-- [ ] Phase 2: implement Python `TradingNode` adapter factories.
+- [ ] Phase 2: finish standard node option data and multi-leg execution parity.
 - [ ] Phase 2: wire standard data/instrument provider behavior.
 - [x] Phase 2: add adapter integration fixtures and example smoke tests.
 - [ ] Phase 3: add account capability preflight.

@@ -2,8 +2,8 @@
 
 Alpaca Markets is a brokerage API for US equities, ETFs, and listed equity options. The current
 NautilusTrader Alpaca work is an experimental Rust options runtime with broker connectivity,
-option-chain access, multi-leg order submission, reconciliation, and operator tooling for paper
-trading.
+option-chain access, a native Rust data-client hook for option instruments, multi-leg order
+submission, reconciliation, and operator tooling for paper trading.
 
 :::warning
 This page documents the current experimental Alpaca options runtime. The standard Python
@@ -28,6 +28,8 @@ The Rust Alpaca runtime currently includes the following implemented components:
   option snapshots, account activities, cancellation, and submission endpoints.
 - `AlpacaOptionContractProvider`: Option contract loading and conversion into Nautilus
   `OptionContract` instruments on venue `ALPACA`.
+- `AlpacaDataClient`: Rust live data client for exact option-instrument requests/subscriptions and
+  cached instrument replay.
 - `AlpacaExecutionClient`: Rust execution client for simple option limit orders and multi-leg
   option limit orders, with trade-update and REST reconciliation paths.
 - `alpaca-options-engine`: Account-level options runtime for paper trading with strategy hosting,
@@ -51,7 +53,7 @@ The current documented product scope is intentionally narrow.
 
 | Product Type      | Supported | Notes                                                                 |
 |-------------------|-----------|-----------------------------------------------------------------------|
-| US equity options | ✓         | Primary runtime target. Supports option contracts, snapshots, and option orders. |
+| US equity options | ✓         | Primary runtime target. Supports option contracts, snapshots, exact instrument data-client loading, and option orders. |
 | US equities/ETFs  | Partial   | Static instruments, stock bars, and simple DAY limit broker orders are available for Python `TradingNode`. |
 | Crypto            | -         | Not part of this adapter/runtime slice.                               |
 
@@ -113,6 +115,7 @@ Scanner and contract-loading commands use unqualified US equity or ETF root symb
 
 | Capability                           | Supported | Notes                                                  |
 |--------------------------------------|-----------|--------------------------------------------------------|
+| Exact option instrument data client  | ✓         | Rust `DataClient` request/subscription hook for selected contracts. |
 | Account query                         | ✓         | Trading account status and balances.                   |
 | Position query                        | ✓         | Used for startup and periodic reconciliation.          |
 | Open order query                      | ✓         | Nested multi-leg orders are requested where available. |

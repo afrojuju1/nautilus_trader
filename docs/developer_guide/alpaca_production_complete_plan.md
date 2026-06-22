@@ -7,7 +7,8 @@ Alpaca option-spread workflow. The target state is Nautilus-native execution and
 Public documentation readiness is tracked in
 [Alpaca Official Docs Readiness Checklist](alpaca_official_docs_readiness_checklist.md). The
 current public-facing integration page is [Alpaca](../integrations/alpaca.md), which documents the
-implemented Rust options runtime as experimental until the Python `TradingNode` factories are wired.
+implemented Rust options runtime as experimental until the standard node path covers option data,
+multi-leg execution, and operator lifecycle parity.
 
 ## Target State
 
@@ -33,6 +34,8 @@ Completed foundation:
 - Alpaca adapter crate exists under `crates/adapters/alpaca`.
 - Authenticated REST clients cover account, positions, orders, option contracts, option snapshots,
   order lookup, cancel, account activities, and MLeg submission.
+- Alpaca has a native Rust `DataClient` and factory for exact option-instrument loading through the
+  standard Nautilus request/subscription interface.
 - Alpaca execution client supports option-spread `SubmitOrderList`; single-order submit is denied
   for now.
 - Trade-update websocket handling maps Alpaca parent and leg updates back to Nautilus leg client
