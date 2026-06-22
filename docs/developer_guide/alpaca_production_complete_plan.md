@@ -587,12 +587,16 @@ Required before promoting beyond experimental:
 High-value after the required platform work:
 
 5. Strategy regime router.
-   - Classify market conditions from realized volatility, trend, breadth, gap behavior, event load,
-     and volatility proxies.
-   - Enable or down-rank strategy families by regime: iron condors in quiet mean-reverting markets,
-     debit spreads in directional markets, and reduced naked exposure during event shocks.
-   - Record the selected regime and strategy-routing decision in the candidate ledger so outcomes
-     can be audited later.
+   - Build this as a Nautilus-native routing layer, not a standalone scanner. A read-only regime
+     feature actor derives features from bars, option-chain state, external signals, and approved
+     historical feature sources; a pure regime router returns labels, confidence, explanation codes,
+     and strategy-family weights.
+   - Route strategy families, not individual orders. Risk admission remains the final gate, and the
+     router must not submit orders, mutate strategy state, or call Alpaca directly.
+   - Record regime label, confidence, feature freshness, feature version, routing action, and
+     explanation codes in the candidate ledger for every scan.
+   - Use the focused [Alpaca Regime Router](alpaca_regime_router.md) design for v1 labels, feature
+     contracts, storage/evidence boundaries, failure policy, and rollout slices.
 
 6. Portfolio Greek and stress governor.
    - Track account and fleet delta, gamma, vega, theta, and buying-power usage from active option

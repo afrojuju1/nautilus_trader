@@ -9,8 +9,8 @@ features, but this workstream owns market-data persistence, backfill, query, and
 The design keeps upstream Nautilus storage boundaries intact:
 
 - `ParquetDataCatalog` remains the canonical Nautilus market-data store for replay and backtesting.
-- Postgres remains the operational store for Alpaca strategy state, candidate evidence, performance
-  ledgers, and candidate outcomes.
+- Postgres remains the slim operational control plane for Alpaca strategy state, candidate evidence,
+  performance ledgers, candidate outcomes, and ingest manifests.
 - ClickHouse becomes the dual-written analytical warehouse for high-volume quotes, trades, bars,
   Greeks, and scanner feature tables.
 
@@ -23,6 +23,8 @@ through an explicit configuration flag.
 - Provide fast SQL access to intraday quotes, trades, bars, and option Greeks.
 - Dual-write canonical market data to `ParquetDataCatalog` and ClickHouse.
 - Support scanner and research queries that are awkward or expensive against many catalog files.
+- Slim Postgres back to operational state and small audit records by moving market-data-shaped
+  caches and analytics payloads to the catalog or ClickHouse.
 - Keep replay and backtests catalog-native unless a future upstream-compatible abstraction exists.
 - Allow historical backfill from `ParquetDataCatalog` and live ClickHouse mirroring from the
   Nautilus data bus.
@@ -33,7 +35,10 @@ through an explicit configuration flag.
 ## Non-Goals
 
 - Do not replace `ParquetDataCatalog` as the replay or backtest authority.
-- Do not move candidate ledgers, strategy state, or broker evidence out of Postgres.
+- Do not move candidate ledgers, strategy state, or broker evidence out of Postgres as their source
+  of truth.
+- Do not keep bulk market data, backtest market payload caches, or scanner feature time series in
+  Postgres once ClickHouse is available.
 - Do not make ClickHouse part of order submission, execution reconciliation, or risk admission.
 - Do not build a generic storage framework before the Alpaca market-data use case proves it needs
   one.
@@ -46,8 +51,44 @@ through an explicit configuration flag.
 | --- | --- | --- | --- |
 | `ParquetDataCatalog` | Canonical Nautilus market data | Backtests, replay, catalog slices, portable archives | Uses Nautilus schemas and remains the source for engine-compatible historical data. |
 | ClickHouse | Self-hosted analytical market-data warehouse and flagged read source | Intraday SQL, scanner features, liquidity analysis, rollups, dashboards, controlled read cutover | Optimized for append-heavy columnar analytics, not transactional state. |
-| Postgres | Operational Alpaca state and evidence | Strategy state, candidate ledger, performance ledger, candidate outcomes | Keep small relational/JSONB operational records here. |
+| Postgres | Operational control plane and evidence | Strategy state, candidate ledger, performance ledger, candidate outcomes, ingest manifests | Keep small mutable state, relational constraints, and audit records here. Do not use it as a market-data warehouse. |
 | DuckDB | Local research helper | Ad hoc SQL over catalog Parquet files | Useful for notebooks and one-off analysis; not a service dependency. |
+
+## Clean Storage Boundary
+
+The target architecture keeps each store boring and narrow.
+
+Postgres stays because it is the right tool for small operational records that benefit from
+transactions, uniqueness, and simple point reads. It should not grow into a second market-data
+system.
+
+Keep in Postgres:
+
+- `strategy_state`: mutable runtime state and restart continuity.
+- `candidate_ledger`: candidate decisions, blocks, submissions, and evidence keys.
+- `performance_ledger`: performance records and report inputs.
+- `candidate_outcome`: observed outcomes tied back to candidates.
+- `ingest_manifest`: small dual-write/backfill control records, if implemented as a relational
+  table.
+
+Move out of Postgres once ClickHouse exists:
+
+- Bulk quote, trade, bar, and Greeks payloads.
+- Backtest market-data cache payloads such as option bars, option trades, and stock bars.
+- Scanner feature snapshots and time-series metrics.
+- Raw vendor response archives that are useful for analytics or replay preparation.
+
+Preferred replacements:
+
+- Use `ParquetDataCatalog` for replay/backtest-compatible market data.
+- Use ClickHouse for high-volume analytical market data and feature time series.
+- Use optional ClickHouse mirrors of candidate/performance ledgers only for analytics; Postgres
+  remains the source of truth for those records.
+
+Deletion proposal after ClickHouse is live: retire or heavily narrow Postgres
+`backtest_market_cache`. If a cache entry is really market data, write it through the catalog and
+ClickHouse. If it is a tiny operational checkpoint, rename it to match that responsibility instead
+of keeping a broad market-cache table.
 
 ## Recommended Architecture
 
@@ -75,8 +116,8 @@ flowchart LR
         Views["Materialized views and feature tables"]
     end
 
-    subgraph Ops ["Operational Stores"]
-        Postgres["Postgres ledgers and state"]
+    subgraph Ops ["Operational Control Plane"]
+        Postgres["Postgres state, ledgers, manifests"]
     end
 
     AlpacaHistorical --> Adapter
@@ -326,8 +367,9 @@ Live market data should be dispatched to both storage paths:
 - Catalog write failure is more serious because it threatens replay and audit continuity; treat it
   according to the owning runtime's durability policy.
 
-Maintain an ingest manifest so dual-write state is observable. The manifest can start in
-ClickHouse, Postgres, or a small local audit file, but it should expose the same facts:
+Maintain an ingest manifest so dual-write state is observable. Prefer Postgres for this manifest
+because it is small operational control state, not market data. A local audit file is acceptable
+only for early development before the Postgres-backed manifest exists.
 
 ```text
 IngestManifest
@@ -480,7 +522,8 @@ For scanner features:
 | 6. Shadow compare read path | Cutover rehearsal. | Add a read-source flag with `catalog`, `shadow_compare`, and `clickhouse` modes; implement parity reporting. | `shadow_compare` uses catalog for decisions and reports ClickHouse differences for sampled datasets. |
 | 7. Flagged ClickHouse read cutover | Controlled read switch. | Promote supported datasets to `clickhouse` mode with explicit fallback and rollback. | Operators can switch reads to ClickHouse and back to catalog by configuration. |
 | 8. Option data expansion | Option-specific tables and features. | Add bars, option Greeks, and option-chain liquidity features. | Candidate research can query option chain features by underlying, expiration, strike, and time. |
-| 9. Export to catalog | Replay-compatible bridge. | Export warehouse-selected ranges back into `ParquetDataCatalog` format when needed. | Backtests still consume catalog data, even if ClickHouse selected or prepared the range. |
+| 9. Postgres slimming | Operational store is narrow. | Move market-data cache payloads and scanner feature time series to catalog/ClickHouse; keep Postgres for state, ledgers, outcomes, and ingest manifests. | `backtest_market_cache` is retired or narrowed to non-market operational checkpoints. |
+| 10. Export to catalog | Replay-compatible bridge. | Export warehouse-selected ranges back into `ParquetDataCatalog` format when needed. | Backtests still consume catalog data, even if ClickHouse selected or prepared the range. |
 
 ## Provisional Answers
 
@@ -490,6 +533,7 @@ real volume, latency, or operational evidence contradicts them.
 | Question | Provisional answer | Reason |
 | --- | --- | --- |
 | Write model | Write market data to both `ParquetDataCatalog` and ClickHouse. Catalog remains the primary engine-compatible store during the initial rollout. | This gives ClickHouse analytical coverage while preserving Nautilus replay/backtest continuity. |
+| Postgres role | Keep Postgres as the operational control plane: strategy state, decision/evidence ledgers, outcomes, and ingest manifests. Do not use it for bulk market data. | Postgres gives clean transactional semantics for small mutable records; ClickHouse and the catalog are better homes for high-volume market data. |
 | First production source | Use existing `ParquetDataCatalog` files for historical backfill first. Use Alpaca historical REST only to fill catalog gaps, then write those filled ranges to both stores. | This preserves Nautilus schemas and avoids two independent historical loaders with subtly different semantics. |
 | Option and underlying quotes | Store all normalized `QuoteTick`-shaped BBO data in one `market.quote_ticks` table. Add instrument metadata or views for option-specific filtering. | Underlying and option BBO rows have the same core query shape: instrument, event time, bid, ask, sizes. One table simplifies joins, coverage checks, and scanner queries. |
 | Vendor-specific option quote payloads | Put fields that do not belong to Nautilus `QuoteTick` in a separate raw/source table such as `market.alpaca_option_quote_snapshots_raw`. | The canonical warehouse tables should mirror Nautilus semantics; raw vendor tables are useful for audits and adapter debugging. |
@@ -499,6 +543,7 @@ real volume, latency, or operational evidence contradicts them.
 | Duplicate handling | Start with plain `MergeTree` tables plus an ingest manifest, not `ReplacingMergeTree`. Treat `(dataset, source, instrument_id, start, end)` as an idempotent load range. | ClickHouse duplicate removal is eventual and can leak duplicates into normal queries. Job-level idempotency is easier to reason about for canonical market data. |
 | Backfill reloads | Prefer full-day partition loads for production backfills. Load into staging, validate counts, then replace or promote the partition. For small development reloads, explicit delete-and-reload is acceptable. | Partition-level replacement is cleaner than row-level mutations once volume grows. Development needs a simpler escape hatch. |
 | Schema and migrations location | Put ClickHouse DDL under a repo-level warehouse area such as `schema/sql/clickhouse/`. Keep Alpaca-specific loaders near the Alpaca adapter until they become generic. | Market-data warehouse schema is not Alpaca-owned long term. The adapter can own source-specific extraction while the warehouse owns normalized contracts. |
+| Postgres cleanup | Retire or narrow `backtest_market_cache` once ClickHouse and catalog writes cover those datasets. Mirror ledgers to ClickHouse only for analytics, not as the source of truth. | This removes the broad JSONB market cache path and keeps a clean split between operational truth and analytical history. |
 | First runtime integration | Build a catalog backfill command before turning on the live dual-write sink. | It validates contracts and scanner usefulness before introducing a new live-service dependency. |
 | Deployment owner | Self-host ClickHouse. Start with a local/dev stack, then prove the NUC only if storage, CPU, and memory headroom are acceptable. Move to a dedicated self-hosted analytics box if retention or ingest volume outgrows the NUC. | Quote-scale data can outgrow a small live-trading host quickly, and the warehouse must not starve trading processes. |
 
@@ -519,5 +564,5 @@ Start with catalog backfill and scanner read models. Then enable live dual-write
 operator visibility are boring. Keep reads catalog-backed until `shadow_compare` proves ClickHouse
 parity, then cut over supported reads with an explicit flag and an easy rollback.
 
-The architectural rule is simple: **catalog for replay, Postgres for operations, ClickHouse for
-analytics and flagged read cutover**.
+The architectural rule is simple: **catalog for replay, Postgres for slim operational control,
+ClickHouse for analytics and flagged read cutover**.

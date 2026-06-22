@@ -53,12 +53,14 @@ flowchart LR
 
     subgraph Decision ["Opportunity Decision Layer"]
         UniversePolicy["Universe policy"]
+        RegimeRouter["Regime router"]
         CandidateEngine["Pure candidate engine"]
         SelectionPolicy["Selection policy"]
         RiskAdmission["Risk and admission gates"]
     end
 
     subgraph Runtime ["Runtime Components"]
+        RegimeActor["RegimeFeatureActor<br/>read-only"]
         ScanActor["OpportunityScanActor<br/>read-only"]
         EntryStrategy["OptionsEntryStrategy<br/>can submit"]
         ManagementStrategy["OptionsManagementStrategy"]
@@ -68,6 +70,7 @@ flowchart LR
         CandidateLedger["Candidate ledger"]
         StrategyState["Strategy state"]
         PerformanceLedger["Performance ledger"]
+        FeatureStore["Feature store<br/>catalog or ClickHouse"]
     end
 
     AlpacaRest --> HttpClient
@@ -84,9 +87,16 @@ flowchart LR
     DataEngine --> Cache
 
     MsgBus --> ScanActor
+    MsgBus --> RegimeActor
     MsgBus --> EntryStrategy
     Cache --> UniversePolicy
     ExternalSignals --> UniversePolicy
+    Cache --> RegimeRouter
+    ExternalSignals --> RegimeRouter
+    FeatureStore --> RegimeRouter
+    RegimeActor --> RegimeRouter
+    RegimeRouter --> CandidateEngine
+    RegimeRouter --> SelectionPolicy
     UniversePolicy --> CandidateEngine
     ScanActor --> CandidateEngine
     EntryStrategy --> CandidateEngine
@@ -96,6 +106,7 @@ flowchart LR
     Cache --> RiskAdmission
 
     RiskAdmission --> CandidateLedger
+    RegimeRouter --> CandidateLedger
     ScanActor --> CandidateLedger
     EntryStrategy --> StrategyState
     EntryStrategy --> ExecEngine
@@ -104,6 +115,7 @@ flowchart LR
     ManagementStrategy --> ExecEngine
     EntryStrategy --> PerformanceLedger
     ManagementStrategy --> PerformanceLedger
+    RegimeActor --> FeatureStore
 ```
 
 ## Runtime Flow
@@ -115,6 +127,7 @@ sequenceDiagram
     participant Cache as Cache
     participant Data as DataEngine
     participant Chain as OptionChainManager
+    participant Regime as RegimeRouter
     participant Strategy as OptionsEntryStrategy
     participant Candidate as CandidateEngine
     participant Risk as RiskAdmission
@@ -127,7 +140,9 @@ sequenceDiagram
     Data->>Chain: create manager for series
     Chain->>Data: wire quote and greeks subscriptions
     Data->>Strategy: on_option_chain(slice)
-    Strategy->>Candidate: rank candidates from slice and state
+    Strategy->>Regime: classify current market context
+    Regime-->>Strategy: regime context and routing policy
+    Strategy->>Candidate: rank candidates from slice, state, and regime
     Candidate-->>Strategy: candidate set
     Strategy->>Ledger: record scanner_result and ranked candidates
     Strategy->>Risk: evaluate best candidate
@@ -149,9 +164,18 @@ other venue data without embedding strategy rules.
 `DataEngine` and `OptionChainManager` own option-chain assembly. They should produce
 `OptionChainSlice` events from cached instruments and live or replayed quote/greeks streams.
 
+`RegimeFeatureActor` is the read-only runtime surface for regime features. It should consume
+Nautilus data, query approved historical feature sources, and publish or persist normalized regime
+features. It should not select strategies or submit orders.
+
+`RegimeRouter` owns strategy-family routing from market context. It should be a pure classifier that
+accepts normalized features, optional external signals, and optional portfolio context, then returns
+a regime label plus strategy-family weights or blocks. It should not call Alpaca, query environment
+variables, write ledgers directly from deep scoring code, or submit orders.
+
 `CandidateEngine` owns pure opportunity ranking. It should accept normalized inputs such as
-`OptionChainSlice`, account-independent strategy config, and optional external signals. It should not
-read environment variables, call Alpaca, submit orders, or write ledgers.
+`OptionChainSlice`, account-independent strategy config, regime context, and optional external
+signals. It should not read environment variables, call Alpaca, submit orders, or write ledgers.
 
 `OpportunityScanActor` is the read-only runtime surface. It can run scheduled scans, publish alerts,
 and record evidence, but it does not submit orders.
@@ -166,6 +190,18 @@ losses, stale orders, expiration risk, and forced flattening.
 selected candidates, dry-run decisions, blocked decisions, submissions, broker responses, and later
 outcomes. It is not a broker-order ledger.
 
+## Regime Router
+
+Nautilus already supports strategy-local regime filters through indicators and strategy code. The
+Hurst/VPIN directional example is the useful precedent: it derives a Hurst regime filter from bars,
+combines it with flow information, and uses the result to gate entries. The Alpaca options runtime
+should generalize that pattern into a reusable strategy-family router rather than adding a generic
+Nautilus `Scanner` framework.
+
+Keep this document at the component-boundary level. The focused architecture, v1 labels, feature
+contracts, routing policy, evidence shape, and rollout slices live in
+[Alpaca Regime Router](alpaca_regime_router.md).
+
 ## Interfaces
 
 The candidate engine should be shaped around small, explicit inputs and outputs:
@@ -174,6 +210,7 @@ The candidate engine should be shaped around small, explicit inputs and outputs:
 CandidateInput
   strategy profile
   option chain slice or normalized chain snapshot
+  regime context
   underlying state
   optional external signals
   optional account/risk context for ranking only
@@ -205,9 +242,11 @@ ownership.
 | 1. Candidate engine boundary | Pure reusable scoring core. | Extract filtering, scoring, ranking, rejection counts, and candidate identity into explicit candidate-engine types. Keep the current REST scanner callers intact. | Current REST scanner behavior routes through the pure engine without changing operator output. |
 | 2. REST input adapter | Compatibility for existing operations. | Convert Alpaca contract and snapshot responses into `CandidateInput`; keep existing binaries and the options engine as diagnostic surfaces. | Dry-run scans and the current options engine keep producing the same candidate and ledger evidence. |
 | 3. Option-chain input adapter | Nautilus-native market-state input. | Convert `OptionChainSlice` and cached instruments into the same candidate input model. | The same candidate engine can rank opportunities from REST snapshots or `OptionChainSlice` events. |
-| 4. Read-only scan actor | Native scan and alert surface. | Add an `OpportunityScanActor` that runs scheduled or event-driven scans, records ledgers, and publishes alerts without order submission. | One-shot and interval scans can run inside a `TradingNode` without the standalone scanner loop. |
-| 5. Entry strategy | Standard order-capable path. | Add an `OptionsEntryStrategy` that consumes candidate sets, applies selection and risk admission, then submits through Nautilus order flow. | Paper dry-run and paper submit paths use the strategy path instead of bespoke scanner submission glue. |
-| 6. Management and cleanup | Slim runtime with fewer parallel paths. | Move close/flatten lifecycle into an `OptionsManagementStrategy`; retire one-off scanner binaries once operator commands use actor/strategy surfaces. | Active docs and operator commands point at the Nautilus-native path, with REST-only scanners kept only where they remain useful diagnostics. |
+| 4. Regime router boundary | Reusable strategy-family routing. | Add pure `RegimeInput`, `RegimeContext`, and routing-policy types with threshold-based labels and explanation codes. | Candidate ranking can accept regime context without calling venue APIs or reading operator config. |
+| 5. Regime feature actor | Native feature surface. | Add a read-only actor or service that computes feature snapshots from Nautilus data, catalog/ClickHouse history, and external signals. | A scan records regime label, feature freshness, and routing decision in the candidate ledger. |
+| 6. Read-only scan actor | Native scan and alert surface. | Add an `OpportunityScanActor` that runs scheduled or event-driven scans, records ledgers, and publishes alerts without order submission. | One-shot and interval scans can run inside a `TradingNode` without the standalone scanner loop. |
+| 7. Entry strategy | Standard order-capable path. | Add an `OptionsEntryStrategy` that consumes candidate sets, applies regime routing, selection, and risk admission, then submits through Nautilus order flow. | Paper dry-run and paper submit paths use the strategy path instead of bespoke scanner submission glue. |
+| 8. Management and cleanup | Slim runtime with fewer parallel paths. | Move close/flatten lifecycle into an `OptionsManagementStrategy`; retire one-off scanner binaries once operator commands use actor/strategy surfaces. | Active docs and operator commands point at the Nautilus-native path, with REST-only scanners kept only where they remain useful diagnostics. |
 
 Ordering rule: do not build a new runtime surface before the pure candidate engine exists, and do
 not retire the REST scanner path until the `OptionChainSlice` path can reproduce candidate evidence
@@ -221,10 +260,11 @@ candidate engine plus Nautilus actors and strategies around it.
 1. Keep the existing Alpaca REST scanners as diagnostics while extracting their scoring and candidate
    builders into a pure candidate engine.
 2. Add adapters from `OptionChainSlice` and cached instruments into the pure candidate input model.
-3. Introduce a read-only `OpportunityScanActor` for candidate evidence and alerts.
-4. Move order-capable entry logic into a Nautilus `Strategy` path that uses standard order factories,
+3. Add the pure regime router and a read-only feature actor before wiring order-capable routing.
+4. Introduce a read-only `OpportunityScanActor` for candidate evidence and alerts.
+5. Move order-capable entry logic into a Nautilus `Strategy` path that uses standard order factories,
    risk gates, and `ExecutionEngine` submission.
-5. Retire one-off scanner binaries once the actor/strategy path gives equal or better observability.
+6. Retire one-off scanner binaries once the actor/strategy path gives equal or better observability.
 
 ## Open Questions
 
