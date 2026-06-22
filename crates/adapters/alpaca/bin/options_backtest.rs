@@ -9,6 +9,9 @@ use std::{
 use anyhow::{Context, anyhow, bail};
 use chrono::{Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use nautilus_alpaca::{
+    candidate_engine::{
+        CreditSpreadKind, DebitSpreadKind, NakedOptionCapitalContext, NakedOptionKind,
+    },
     config::AlpacaDataClientConfig,
     http::{
         client::AlpacaHttpClient,
@@ -28,7 +31,6 @@ use nautilus_alpaca::{
         write_backtest_market_cache,
     },
     strategy::{
-        CreditSpreadKind, DebitSpreadKind, NakedOptionCapitalContext, NakedOptionKind,
         scan_credit_spread_snapshot_at, scan_debit_spread_snapshot_at,
         scan_iron_condor_snapshots_at, scan_naked_option_snapshot_at,
     },

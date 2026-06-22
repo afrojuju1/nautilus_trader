@@ -108,9 +108,9 @@ fn age_secs_from_rfc3339(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use crate::{
+        candidate_engine::CreditSpreadKind,
         management::{CreditSpreadManagementConfig, credit_spread_close_reason},
         runtime::{StrategyStateEntry, credit_spread_strategy_name},
-        strategy::CreditSpreadKind,
     };
 
     #[test]

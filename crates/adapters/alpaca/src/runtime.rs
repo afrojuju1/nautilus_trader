@@ -27,7 +27,7 @@ use serde_json::{Map, Value};
 #[cfg(feature = "live")]
 use crate::storage::StorageRepository;
 
-use crate::strategy::{
+use crate::candidate_engine::{
     CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, IronCondorCandidate,
     NakedOptionCandidate, NakedOptionKind, SpreadCandidate,
 };
@@ -599,6 +599,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::candidate_engine::{OptionCapitalRequirementModel, ScoredContract};
 
     #[test]
     fn strategy_state_atomic_save_round_trips() {
@@ -696,11 +697,10 @@ mod tests {
     #[test]
     fn naked_option_state_tracks_single_short_leg() {
         let mut state = StrategyState::default();
-        let candidate = crate::strategy::NakedOptionCandidate {
+        let candidate = NakedOptionCandidate {
             short: scored_contract("SPY260508P00710000", 710.0),
             credit: 0.72,
-            capital_requirement_model:
-                crate::strategy::OptionCapitalRequirementModel::CashSecuredPut,
+            capital_requirement_model: OptionCapitalRequirementModel::CashSecuredPut,
             estimated_buying_power_requirement: 71_000.0,
             buying_power_usage_pct: Some(0.071),
             return_on_buying_power: 0.001014,
@@ -818,8 +818,8 @@ mod tests {
         }
     }
 
-    fn scored_contract(symbol: &str, strike: f64) -> crate::strategy::ScoredContract {
-        crate::strategy::ScoredContract {
+    fn scored_contract(symbol: &str, strike: f64) -> ScoredContract {
+        ScoredContract {
             symbol: symbol.to_string(),
             expiration_date: "2026-05-08".to_string(),
             dte: 4,

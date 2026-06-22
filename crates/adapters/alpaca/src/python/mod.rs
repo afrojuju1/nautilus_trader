@@ -18,11 +18,10 @@
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
 use crate::{
+    candidate_engine::{CreditSpreadScanResult, PutCreditScannerConfig, SpreadCandidate},
     config::AlpacaDataClientConfig,
     http::client::AlpacaHttpClient,
-    strategy::{
-        PutCreditScanResult, PutCreditScannerConfig, SpreadCandidate, scan_put_credit_underlying,
-    },
+    strategy::scan_put_credit_underlying,
 };
 
 /// Python scanner configuration for put credit spreads.
@@ -226,8 +225,8 @@ pub struct AlpacaPutCreditScanResult {
     pub candidates: Vec<AlpacaPutCreditCandidate>,
 }
 
-impl From<PutCreditScanResult> for AlpacaPutCreditScanResult {
-    fn from(value: PutCreditScanResult) -> Self {
+impl From<CreditSpreadScanResult> for AlpacaPutCreditScanResult {
+    fn from(value: CreditSpreadScanResult) -> Self {
         Self {
             underlying: value.underlying,
             contract_count: value.contract_count,

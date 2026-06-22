@@ -19,6 +19,7 @@ use std::{cell::RefCell, env, process, rc::Rc, str::FromStr, time::Duration};
 
 use nautilus_alpaca::{
     AlpacaExecutionClient,
+    candidate_engine::PutCreditScannerConfig,
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
     http::{
@@ -26,7 +27,7 @@ use nautilus_alpaca::{
         error::Error,
         models::{AlpacaOrder, ReplaceOrderRequest},
     },
-    strategy::{PutCreditScannerConfig, scan_put_credit_underlying},
+    strategy::scan_put_credit_underlying,
     submit::{MlegSubmitLeg, MlegSubmitOrderListRequest, build_mleg_submit_order_list},
 };
 use nautilus_common::{

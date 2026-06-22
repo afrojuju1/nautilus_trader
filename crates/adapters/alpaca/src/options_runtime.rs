@@ -24,6 +24,11 @@ use serde_json::{Map, Value, json};
 #[cfg(feature = "live")]
 use crate::storage::{self, StorageRepository};
 use crate::{
+    candidate_engine::{
+        CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
+        NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig,
+        PutCreditScannerConfig, annualized_premium_yield,
+    },
     config::AlpacaDataClientConfig,
     fleet::ResolvedFleetConfig,
     http::client::AlpacaHttpClient,
@@ -33,10 +38,7 @@ use crate::{
         emit_operator_event, naked_option_strategy_name,
     },
     strategy::{
-        CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
-        NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig,
-        PutCreditScannerConfig, annualized_premium_yield, scan_call_credit_underlying,
-        scan_call_debit_underlying, scan_iron_condor_underlying,
+        scan_call_credit_underlying, scan_call_debit_underlying, scan_iron_condor_underlying,
         scan_naked_option_underlying_with_capital, scan_put_credit_underlying,
         scan_put_debit_underlying,
     },

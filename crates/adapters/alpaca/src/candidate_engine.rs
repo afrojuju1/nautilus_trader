@@ -1,25 +1,559 @@
-//! Contract scoring and candidate building for Alpaca options strategies.
+//! Pure option-candidate scoring and ranking.
 
 use std::collections::{BTreeMap, HashMap};
 
 use chrono::{NaiveDate, Utc};
 use nautilus_model::data::greeks::black_scholes_greeks;
 
-use crate::http::models::{AlpacaOptionContract, AlpacaOptionSnapshot};
+const SCANNER_RISK_FREE_RATE: f64 = 0.0425;
+const DAYS_PER_YEAR: f64 = 365.25;
+const OPTION_CONTRACT_MULTIPLIER: f64 = 100.0;
 
-use super::{
-    CreditSpreadKind, DAYS_PER_YEAR, DebitSpreadCandidate, DebitSpreadKind,
-    DebitSpreadScannerConfig, IronCondorCandidate, IronCondorScannerConfig, NakedOptionCandidate,
-    NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig,
-    OPTION_CONTRACT_MULTIPLIER, OptionCandidateMetrics, OptionCapitalRequirementModel,
-    PutCreditScannerConfig, SCANNER_RISK_FREE_RATE, ScoredContract, SpreadCandidate,
-};
+/// Vertical credit spread family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreditSpreadKind {
+    /// Put credit spread.
+    Put,
+    /// Call credit spread.
+    Call,
+}
+
+impl CreditSpreadKind {
+    fn long_strike(self, short_strike: f64, width: f64) -> f64 {
+        match self {
+            Self::Put => short_strike - width,
+            Self::Call => short_strike + width,
+        }
+    }
+}
+
+/// Vertical debit spread family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DebitSpreadKind {
+    /// Call debit spread.
+    Call,
+    /// Put debit spread.
+    Put,
+}
+
+impl DebitSpreadKind {
+    fn short_strike(self, long_strike: f64, width: f64) -> f64 {
+        match self {
+            Self::Call => long_strike + width,
+            Self::Put => long_strike - width,
+        }
+    }
+}
+
+/// Naked short option family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NakedOptionKind {
+    /// Naked short call.
+    Call,
+    /// Naked short put.
+    Put,
+    /// Naked short call using the 1-3 DTE profile.
+    CallOneToThreeDte,
+    /// Naked short put using the 1-3 DTE profile.
+    PutOneToThreeDte,
+}
+
+impl NakedOptionKind {
+    /// Returns `true` for call-side naked option strategies.
+    #[must_use]
+    pub const fn is_call(self) -> bool {
+        matches!(self, Self::Call | Self::CallOneToThreeDte)
+    }
+
+    /// Returns `true` for put-side naked option strategies.
+    #[must_use]
+    pub const fn is_put(self) -> bool {
+        matches!(self, Self::Put | Self::PutOneToThreeDte)
+    }
+
+    /// Returns `true` for the 1-3 DTE profile.
+    #[must_use]
+    pub const fn is_one_to_three_dte(self) -> bool {
+        matches!(self, Self::CallOneToThreeDte | Self::PutOneToThreeDte)
+    }
+}
+
+/// Model used to estimate short-option buying-power requirement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptionCapitalRequirementModel {
+    /// Cash-secured short put reserve.
+    CashSecuredPut,
+    /// Reg-T style short-call margin estimate.
+    RegTShortCallEstimate,
+}
+
+impl OptionCapitalRequirementModel {
+    /// Returns a stable diagnostic name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CashSecuredPut => "cash_secured_put",
+            Self::RegTShortCallEstimate => "reg_t_short_call_estimate",
+        }
+    }
+}
+
+/// Account capital context for naked-option candidate ranking.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NakedOptionCapitalContext {
+    /// Current account options buying power.
+    pub options_buying_power: Option<f64>,
+    /// Configured strategy quantity.
+    pub quantity: u64,
+}
+
+/// Configuration for the credit spread scanner.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PutCreditScannerConfig {
+    /// Minimum days to expiration.
+    pub min_dte: i64,
+    /// Maximum days to expiration.
+    pub max_dte: i64,
+    /// Minimum absolute short-leg delta.
+    pub short_delta_min: f64,
+    /// Maximum absolute short-leg delta.
+    pub short_delta_max: f64,
+    /// Allowed spread widths.
+    pub widths: Vec<f64>,
+    /// Minimum open interest per contract.
+    pub min_open_interest: u64,
+    /// Maximum bid/ask spread as a fraction of midpoint per leg.
+    pub max_leg_spread_pct: f64,
+    /// Minimum credit / max loss.
+    pub min_return_on_risk: f64,
+    /// Minimum credit as a fraction of spread width.
+    pub min_credit_to_width: f64,
+}
+
+impl Default for PutCreditScannerConfig {
+    fn default() -> Self {
+        Self {
+            min_dte: 5,
+            max_dte: 10,
+            short_delta_min: 0.18,
+            short_delta_max: 0.28,
+            widths: vec![2.0, 3.0, 5.0],
+            min_open_interest: 200,
+            max_leg_spread_pct: 0.15,
+            min_return_on_risk: 0.13,
+            min_credit_to_width: 0.08,
+        }
+    }
+}
+
+/// Configuration for the debit spread scanner.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebitSpreadScannerConfig {
+    /// Minimum days to expiration.
+    pub min_dte: i64,
+    /// Maximum days to expiration.
+    pub max_dte: i64,
+    /// Minimum absolute long-leg delta.
+    pub long_delta_min: f64,
+    /// Maximum absolute long-leg delta.
+    pub long_delta_max: f64,
+    /// Allowed spread widths.
+    pub widths: Vec<f64>,
+    /// Minimum open interest per contract.
+    pub min_open_interest: u64,
+    /// Maximum bid/ask spread as a fraction of midpoint per leg.
+    pub max_leg_spread_pct: f64,
+    /// Maximum debit as a fraction of spread width.
+    pub max_debit_to_width: f64,
+    /// Minimum debit as a fraction of spread width.
+    pub min_debit_to_width: f64,
+    /// Minimum max-profit / max-loss.
+    pub min_reward_to_risk: f64,
+}
+
+impl Default for DebitSpreadScannerConfig {
+    fn default() -> Self {
+        Self {
+            min_dte: 5,
+            max_dte: 45,
+            long_delta_min: 0.45,
+            long_delta_max: 0.65,
+            widths: vec![2.0, 3.0, 5.0],
+            min_open_interest: 200,
+            max_leg_spread_pct: 0.15,
+            max_debit_to_width: 0.55,
+            min_debit_to_width: 0.20,
+            min_reward_to_risk: 0.75,
+        }
+    }
+}
+
+/// Configuration for naked short option entries.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NakedOptionScannerConfig {
+    /// Minimum days to expiration.
+    pub min_dte: i64,
+    /// Maximum days to expiration.
+    pub max_dte: i64,
+    /// Minimum absolute short-option delta.
+    pub short_delta_min: f64,
+    /// Maximum absolute short-option delta.
+    pub short_delta_max: f64,
+    /// Minimum open interest.
+    pub min_open_interest: u64,
+    /// Maximum bid/ask spread as a fraction of midpoint.
+    pub max_spread_pct: f64,
+    /// Minimum option credit.
+    pub min_credit: f64,
+    /// Minimum displayed bid size.
+    pub min_bid_size: u64,
+    /// Minimum displayed ask size.
+    pub min_ask_size: u64,
+    /// Minimum current-day option volume.
+    pub min_daily_volume: u64,
+    /// Minimum implied volatility.
+    pub min_implied_volatility: f64,
+    /// Maximum implied volatility.
+    pub max_implied_volatility: f64,
+    /// Minimum annualized premium yield, using credit / strike / DTE.
+    pub min_annualized_premium_yield: f64,
+    /// Maximum estimated buying-power usage as a fraction of account options buying power.
+    pub max_buying_power_usage_pct: f64,
+    /// Minimum credit / estimated buying-power requirement.
+    pub min_return_on_buying_power: f64,
+    /// Minimum probability of expiring beyond breakeven.
+    pub min_breakeven_pop: f64,
+    /// Maximum estimated probability of touching the short strike.
+    pub max_probability_of_touch: f64,
+    /// Minimum distance from spot to breakeven as a fraction of spot.
+    pub min_distance_to_breakeven_pct: f64,
+    /// Minimum breakeven distance measured in one-standard-deviation expected moves.
+    pub min_expected_move_coverage: f64,
+    /// Minimum composite scanner score.
+    pub min_score: f64,
+}
+
+impl Default for NakedOptionScannerConfig {
+    fn default() -> Self {
+        Self {
+            min_dte: 5,
+            max_dte: 14,
+            short_delta_min: 0.10,
+            short_delta_max: 0.20,
+            min_open_interest: 500,
+            max_spread_pct: 0.12,
+            min_credit: 0.25,
+            min_bid_size: 1,
+            min_ask_size: 1,
+            min_daily_volume: 1,
+            min_implied_volatility: 0.0,
+            max_implied_volatility: 1.50,
+            min_annualized_premium_yield: 0.10,
+            max_buying_power_usage_pct: 0.10,
+            min_return_on_buying_power: 0.0005,
+            min_breakeven_pop: 0.65,
+            max_probability_of_touch: 0.70,
+            min_distance_to_breakeven_pct: 0.005,
+            min_expected_move_coverage: 0.75,
+            min_score: 55.0,
+        }
+    }
+}
+
+/// Configuration for the iron-condor scanner.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IronCondorScannerConfig {
+    /// Vertical credit-spread scanner configuration for both wings.
+    pub credit: PutCreditScannerConfig,
+    /// Minimum total credit / max loss.
+    pub min_return_on_risk: f64,
+    /// Whether put and call wing widths must match.
+    pub require_equal_widths: bool,
+}
+
+impl Default for IronCondorScannerConfig {
+    fn default() -> Self {
+        Self {
+            credit: PutCreditScannerConfig::default(),
+            min_return_on_risk: 0.18,
+            require_equal_widths: true,
+        }
+    }
+}
+
+/// Normalized option contract facts used by candidate scoring.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CandidateContract {
+    /// Option symbol.
+    pub symbol: String,
+    /// Contract expiration date.
+    pub expiration_date: String,
+    /// Strike price.
+    pub strike: Option<f64>,
+    /// Contract open interest, when available.
+    pub open_interest: Option<u64>,
+}
+
+/// Normalized latest quote facts used by candidate scoring.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CandidateQuote {
+    /// Bid price.
+    pub bid: Option<f64>,
+    /// Ask price.
+    pub ask: Option<f64>,
+    /// Displayed bid size.
+    pub bid_size: u64,
+    /// Displayed ask size.
+    pub ask_size: u64,
+}
+
+impl CandidateQuote {
+    fn midpoint(&self) -> Option<f64> {
+        match (self.bid, self.ask) {
+            (Some(bid), Some(ask)) if bid > 0.0 && ask > 0.0 && ask >= bid => {
+                Some((bid + ask) / 2.0)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Normalized option market snapshot facts used by candidate scoring.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CandidateMarketSnapshot {
+    /// Latest quote.
+    pub quote: Option<CandidateQuote>,
+    /// Option delta.
+    pub delta: Option<f64>,
+    /// Implied volatility.
+    pub implied_volatility: Option<f64>,
+    /// Current-day option volume.
+    pub volume: u64,
+}
+
+/// Derived option metrics used by scanner ranking and diagnostics.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OptionCandidateMetrics {
+    /// Underlying spot price used for the calculation.
+    pub underlying_price: f64,
+    /// Short-option breakeven at expiration.
+    pub breakeven: f64,
+    /// Probability of expiring in-the-money at the short strike.
+    pub strike_itm_probability: f64,
+    /// `1 - absolute delta`, useful as a fast POP proxy.
+    pub delta_pop_proxy: f64,
+    /// Probability of expiring beyond breakeven.
+    pub breakeven_pop: f64,
+    /// Estimated probability of touching the short strike before expiration.
+    pub probability_of_touch_est: f64,
+    /// One-standard-deviation expected move in price units.
+    pub expected_move: f64,
+    /// One-standard-deviation expected move as a fraction of spot.
+    pub expected_move_pct: f64,
+    /// Directional distance from spot to strike as a fraction of spot.
+    pub distance_to_strike_pct: f64,
+    /// Directional distance from spot to breakeven as a fraction of spot.
+    pub distance_to_breakeven_pct: f64,
+    /// Breakeven distance divided by one-standard-deviation expected move.
+    pub expected_move_coverage: f64,
+    /// Capital model used for the buying-power estimate.
+    pub capital_requirement_model: OptionCapitalRequirementModel,
+    /// Estimated buying-power requirement per contract.
+    pub estimated_buying_power_requirement: f64,
+    /// Credit divided by estimated buying-power requirement.
+    pub return_on_buying_power: f64,
+    /// Model absolute delta from the Nautilus Black-Scholes calculation.
+    pub model_delta_abs: f64,
+    /// Model gamma from the Nautilus Black-Scholes calculation.
+    pub model_gamma: f64,
+    /// Model theta from the Nautilus Black-Scholes calculation.
+    pub model_theta: f64,
+    /// Model vega from the Nautilus Black-Scholes calculation.
+    pub model_vega: f64,
+}
+
+/// One scored option contract eligible for strategy candidate building.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoredContract {
+    /// Option symbol.
+    pub symbol: String,
+    /// Contract expiration date.
+    pub expiration_date: String,
+    /// Calendar days to expiration from the scan date.
+    pub dte: i64,
+    /// Strike price.
+    pub strike: f64,
+    /// Bid price.
+    pub bid: f64,
+    /// Ask price.
+    pub ask: f64,
+    /// Absolute delta.
+    pub delta_abs: f64,
+    /// Bid/ask spread as a fraction of midpoint.
+    pub spread_pct: f64,
+    /// Displayed bid size.
+    pub bid_size: u64,
+    /// Displayed ask size.
+    pub ask_size: u64,
+    /// Current-day option volume.
+    pub volume: u64,
+    /// Contract open interest.
+    pub open_interest: u64,
+    /// Implied volatility, if present.
+    pub implied_volatility: Option<f64>,
+    /// Derived option metrics, when spot and IV were available.
+    pub metrics: Option<OptionCandidateMetrics>,
+}
+
+/// One vertical credit spread candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpreadCandidate {
+    /// Short leg.
+    pub short: ScoredContract,
+    /// Long hedge leg.
+    pub long: ScoredContract,
+    /// Strike width.
+    pub width: f64,
+    /// Net credit.
+    pub credit: f64,
+    /// Maximum loss.
+    pub max_loss: f64,
+    /// Credit / max loss.
+    pub return_on_risk: f64,
+    /// Scanner score.
+    pub score: f64,
+}
+
+/// One vertical debit spread candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebitSpreadCandidate {
+    /// Long option leg.
+    pub long: ScoredContract,
+    /// Short option leg.
+    pub short: ScoredContract,
+    /// Strike width.
+    pub width: f64,
+    /// Net debit.
+    pub debit: f64,
+    /// Maximum profit.
+    pub max_profit: f64,
+    /// Maximum loss.
+    pub max_loss: f64,
+    /// Max profit / max loss.
+    pub reward_to_risk: f64,
+    /// Scanner score.
+    pub score: f64,
+}
+
+/// One four-leg iron-condor candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IronCondorCandidate {
+    /// Put credit wing.
+    pub put: SpreadCandidate,
+    /// Call credit wing.
+    pub call: SpreadCandidate,
+    /// Total net credit.
+    pub credit: f64,
+    /// Maximum possible loss.
+    pub max_loss: f64,
+    /// Credit / max loss.
+    pub return_on_risk: f64,
+    /// Scanner score.
+    pub score: f64,
+}
+
+/// One naked short option candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NakedOptionCandidate {
+    /// Short option contract.
+    pub short: ScoredContract,
+    /// Entry credit.
+    pub credit: f64,
+    /// Capital model used for the buying-power estimate.
+    pub capital_requirement_model: OptionCapitalRequirementModel,
+    /// Estimated buying-power requirement for the configured quantity.
+    pub estimated_buying_power_requirement: f64,
+    /// Estimated buying-power usage as a fraction of account options buying power.
+    pub buying_power_usage_pct: Option<f64>,
+    /// Total credit divided by estimated buying-power requirement.
+    pub return_on_buying_power: f64,
+    /// Scanner score.
+    pub score: f64,
+}
+
+/// Scan result for one credit-spread underlying.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreditSpreadScanResult {
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Number of contracts loaded.
+    pub contract_count: usize,
+    /// Number of snapshots loaded.
+    pub snapshot_count: usize,
+    /// Number of scoreable contracts.
+    pub scoreable_count: usize,
+    /// Counts of scanner rejection reasons.
+    pub rejection_counts: BTreeMap<String, usize>,
+    /// Ranked candidates.
+    pub candidates: Vec<SpreadCandidate>,
+}
+
+/// Scan result for one debit-spread underlying.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebitSpreadScanResult {
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Number of contracts loaded.
+    pub contract_count: usize,
+    /// Number of snapshots loaded.
+    pub snapshot_count: usize,
+    /// Number of scoreable contracts.
+    pub scoreable_count: usize,
+    /// Counts of scanner rejection reasons.
+    pub rejection_counts: BTreeMap<String, usize>,
+    /// Ranked debit-spread candidates.
+    pub candidates: Vec<DebitSpreadCandidate>,
+}
+
+/// Scan result for one iron-condor underlying.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IronCondorScanResult {
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Number of contracts loaded across put and call scans.
+    pub contract_count: usize,
+    /// Number of snapshots loaded across put and call scans.
+    pub snapshot_count: usize,
+    /// Number of scoreable contracts across put and call scans.
+    pub scoreable_count: usize,
+    /// Counts of scanner rejection reasons.
+    pub rejection_counts: BTreeMap<String, usize>,
+    /// Ranked iron-condor candidates.
+    pub candidates: Vec<IronCondorCandidate>,
+}
+
+/// Scan result for one naked option underlying.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NakedOptionScanResult {
+    /// Underlying symbol.
+    pub underlying: String,
+    /// Number of contracts loaded.
+    pub contract_count: usize,
+    /// Number of snapshots loaded.
+    pub snapshot_count: usize,
+    /// Number of scoreable contracts.
+    pub scoreable_count: usize,
+    /// Counts of scanner rejection reasons.
+    pub rejection_counts: BTreeMap<String, usize>,
+    /// Ranked naked-option candidates.
+    pub candidates: Vec<NakedOptionCandidate>,
+}
 
 /// Scores contracts that have enough quote, Greek, and liquidity data.
 #[must_use]
 pub fn score_contracts(
-    contracts: &[AlpacaOptionContract],
-    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    contracts: &[CandidateContract],
+    snapshots: &BTreeMap<String, CandidateMarketSnapshot>,
     config: &PutCreditScannerConfig,
 ) -> Vec<ScoredContract> {
     score_contracts_with_rejections(contracts, snapshots, config).0
@@ -28,8 +562,8 @@ pub fn score_contracts(
 /// Scores contracts and counts filter rejections.
 #[must_use]
 pub fn score_contracts_with_rejections(
-    contracts: &[AlpacaOptionContract],
-    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    contracts: &[CandidateContract],
+    snapshots: &BTreeMap<String, CandidateMarketSnapshot>,
     config: &PutCreditScannerConfig,
 ) -> (Vec<ScoredContract>, BTreeMap<String, usize>) {
     score_contracts_with_rejections_at(contracts, snapshots, config, Utc::now().date_naive())
@@ -38,19 +572,15 @@ pub fn score_contracts_with_rejections(
 /// Scores contracts and counts filter rejections using an explicit scan date.
 #[must_use]
 pub fn score_contracts_with_rejections_at(
-    contracts: &[AlpacaOptionContract],
-    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    contracts: &[CandidateContract],
+    snapshots: &BTreeMap<String, CandidateMarketSnapshot>,
     config: &PutCreditScannerConfig,
     scan_date: NaiveDate,
 ) -> (Vec<ScoredContract>, BTreeMap<String, usize>) {
     let mut scored = Vec::new();
     let mut rejections = BTreeMap::new();
     for contract in contracts {
-        let Some(open_interest) = contract
-            .open_interest
-            .as_deref()
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(open_interest) = contract.open_interest else {
             record_rejection(&mut rejections, "missing_open_interest");
             continue;
         };
@@ -63,15 +593,15 @@ pub fn score_contracts_with_rejections_at(
             record_rejection(&mut rejections, "missing_snapshot");
             continue;
         };
-        let Some(quote) = snapshot.latest_quote.as_ref() else {
+        let Some(quote) = snapshot.quote.as_ref() else {
             record_rejection(&mut rejections, "missing_quote");
             continue;
         };
-        let Some(bid) = quote.bid_price else {
+        let Some(bid) = quote.bid else {
             record_rejection(&mut rejections, "missing_bid");
             continue;
         };
-        let Some(ask) = quote.ask_price else {
+        let Some(ask) = quote.ask else {
             record_rejection(&mut rejections, "missing_ask");
             continue;
         };
@@ -85,12 +615,7 @@ pub fn score_contracts_with_rejections_at(
             continue;
         }
 
-        let Some(delta_abs) = snapshot
-            .greeks
-            .as_ref()
-            .and_then(|greeks| greeks.delta)
-            .map(f64::abs)
-        else {
+        let Some(delta_abs) = snapshot.delta.map(f64::abs) else {
             record_rejection(&mut rejections, "missing_delta");
             continue;
         };
@@ -98,7 +623,7 @@ pub fn score_contracts_with_rejections_at(
             record_rejection(&mut rejections, "invalid_expiration");
             continue;
         };
-        let Ok(strike) = contract.strike_price.parse::<f64>() else {
+        let Some(strike) = contract.strike else {
             record_rejection(&mut rejections, "invalid_strike");
             continue;
         };
@@ -112,13 +637,9 @@ pub fn score_contracts_with_rejections_at(
             ask,
             delta_abs,
             spread_pct,
-            bid_size: quote.bid_size.unwrap_or(0),
-            ask_size: quote.ask_size.unwrap_or(0),
-            volume: snapshot
-                .daily_bar
-                .as_ref()
-                .and_then(|bar| bar.volume)
-                .unwrap_or(0),
+            bid_size: quote.bid_size,
+            ask_size: quote.ask_size,
+            volume: snapshot.volume,
             open_interest,
             implied_volatility: snapshot.implied_volatility,
             metrics: None,
@@ -130,8 +651,8 @@ pub fn score_contracts_with_rejections_at(
 /// Scores contracts for long-premium debit-spread entries.
 #[must_use]
 pub fn score_debit_contracts(
-    contracts: &[AlpacaOptionContract],
-    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    contracts: &[CandidateContract],
+    snapshots: &BTreeMap<String, CandidateMarketSnapshot>,
     config: &DebitSpreadScannerConfig,
 ) -> Vec<ScoredContract> {
     score_debit_contracts_with_rejections(contracts, snapshots, config).0
@@ -140,8 +661,8 @@ pub fn score_debit_contracts(
 /// Scores debit-spread contracts and counts filter rejections.
 #[must_use]
 pub fn score_debit_contracts_with_rejections(
-    contracts: &[AlpacaOptionContract],
-    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    contracts: &[CandidateContract],
+    snapshots: &BTreeMap<String, CandidateMarketSnapshot>,
     config: &DebitSpreadScannerConfig,
 ) -> (Vec<ScoredContract>, BTreeMap<String, usize>) {
     score_debit_contracts_with_rejections_at(contracts, snapshots, config, Utc::now().date_naive())
@@ -150,19 +671,15 @@ pub fn score_debit_contracts_with_rejections(
 /// Scores debit-spread contracts and counts filter rejections using an explicit scan date.
 #[must_use]
 pub fn score_debit_contracts_with_rejections_at(
-    contracts: &[AlpacaOptionContract],
-    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    contracts: &[CandidateContract],
+    snapshots: &BTreeMap<String, CandidateMarketSnapshot>,
     config: &DebitSpreadScannerConfig,
     scan_date: NaiveDate,
 ) -> (Vec<ScoredContract>, BTreeMap<String, usize>) {
     let mut scored = Vec::new();
     let mut rejections = BTreeMap::new();
     for contract in contracts {
-        let Some(open_interest) = contract
-            .open_interest
-            .as_deref()
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(open_interest) = contract.open_interest else {
             record_rejection(&mut rejections, "missing_open_interest");
             continue;
         };
@@ -175,15 +692,15 @@ pub fn score_debit_contracts_with_rejections_at(
             record_rejection(&mut rejections, "missing_snapshot");
             continue;
         };
-        let Some(quote) = snapshot.latest_quote.as_ref() else {
+        let Some(quote) = snapshot.quote.as_ref() else {
             record_rejection(&mut rejections, "missing_quote");
             continue;
         };
-        let Some(bid) = quote.bid_price else {
+        let Some(bid) = quote.bid else {
             record_rejection(&mut rejections, "missing_bid");
             continue;
         };
-        let Some(ask) = quote.ask_price else {
+        let Some(ask) = quote.ask else {
             record_rejection(&mut rejections, "missing_ask");
             continue;
         };
@@ -197,12 +714,7 @@ pub fn score_debit_contracts_with_rejections_at(
             continue;
         }
 
-        let Some(delta_abs) = snapshot
-            .greeks
-            .as_ref()
-            .and_then(|greeks| greeks.delta)
-            .map(f64::abs)
-        else {
+        let Some(delta_abs) = snapshot.delta.map(f64::abs) else {
             record_rejection(&mut rejections, "missing_delta");
             continue;
         };
@@ -210,7 +722,7 @@ pub fn score_debit_contracts_with_rejections_at(
             record_rejection(&mut rejections, "invalid_expiration");
             continue;
         };
-        let Ok(strike) = contract.strike_price.parse::<f64>() else {
+        let Some(strike) = contract.strike else {
             record_rejection(&mut rejections, "invalid_strike");
             continue;
         };
@@ -224,13 +736,9 @@ pub fn score_debit_contracts_with_rejections_at(
             ask,
             delta_abs,
             spread_pct,
-            bid_size: quote.bid_size.unwrap_or(0),
-            ask_size: quote.ask_size.unwrap_or(0),
-            volume: snapshot
-                .daily_bar
-                .as_ref()
-                .and_then(|bar| bar.volume)
-                .unwrap_or(0),
+            bid_size: quote.bid_size,
+            ask_size: quote.ask_size,
+            volume: snapshot.volume,
             open_interest,
             implied_volatility: snapshot.implied_volatility,
             metrics: None,
@@ -242,8 +750,8 @@ pub fn score_debit_contracts_with_rejections_at(
 /// Scores contracts for naked short option entries.
 #[must_use]
 pub fn score_naked_option_contracts(
-    contracts: &[AlpacaOptionContract],
-    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    contracts: &[CandidateContract],
+    snapshots: &BTreeMap<String, CandidateMarketSnapshot>,
     config: &NakedOptionScannerConfig,
     kind: NakedOptionKind,
     underlying_price: f64,
@@ -261,8 +769,8 @@ pub fn score_naked_option_contracts(
 /// Scores naked-option contracts and counts filter rejections.
 #[must_use]
 pub fn score_naked_option_contracts_with_rejections(
-    contracts: &[AlpacaOptionContract],
-    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    contracts: &[CandidateContract],
+    snapshots: &BTreeMap<String, CandidateMarketSnapshot>,
     config: &NakedOptionScannerConfig,
     kind: NakedOptionKind,
     underlying_price: f64,
@@ -280,8 +788,8 @@ pub fn score_naked_option_contracts_with_rejections(
 /// Scores naked-option contracts and counts filter rejections using an explicit scan date.
 #[must_use]
 pub fn score_naked_option_contracts_with_rejections_at(
-    contracts: &[AlpacaOptionContract],
-    snapshots: &BTreeMap<String, AlpacaOptionSnapshot>,
+    contracts: &[CandidateContract],
+    snapshots: &BTreeMap<String, CandidateMarketSnapshot>,
     config: &NakedOptionScannerConfig,
     kind: NakedOptionKind,
     underlying_price: f64,
@@ -290,10 +798,7 @@ pub fn score_naked_option_contracts_with_rejections_at(
     let mut scored = Vec::new();
     let mut rejections = BTreeMap::new();
     for contract in contracts {
-        let open_interest = contract
-            .open_interest
-            .as_deref()
-            .and_then(|value| value.parse::<u64>().ok());
+        let open_interest = contract.open_interest;
         if open_interest.is_some_and(|value| value < config.min_open_interest) {
             record_rejection(&mut rejections, "min_open_interest");
             continue;
@@ -303,15 +808,15 @@ pub fn score_naked_option_contracts_with_rejections_at(
             record_rejection(&mut rejections, "missing_snapshot");
             continue;
         };
-        let Some(quote) = snapshot.latest_quote.as_ref() else {
+        let Some(quote) = snapshot.quote.as_ref() else {
             record_rejection(&mut rejections, "missing_quote");
             continue;
         };
-        let Some(bid) = quote.bid_price else {
+        let Some(bid) = quote.bid else {
             record_rejection(&mut rejections, "missing_bid");
             continue;
         };
-        let Some(ask) = quote.ask_price else {
+        let Some(ask) = quote.ask else {
             record_rejection(&mut rejections, "missing_ask");
             continue;
         };
@@ -319,8 +824,8 @@ pub fn score_naked_option_contracts_with_rejections_at(
             record_rejection(&mut rejections, "missing_midpoint");
             continue;
         };
-        let bid_size = quote.bid_size.unwrap_or(0);
-        let ask_size = quote.ask_size.unwrap_or(0);
+        let bid_size = quote.bid_size;
+        let ask_size = quote.ask_size;
         if bid_size < config.min_bid_size {
             record_rejection(&mut rejections, "min_bid_size");
             continue;
@@ -329,11 +834,7 @@ pub fn score_naked_option_contracts_with_rejections_at(
             record_rejection(&mut rejections, "min_ask_size");
             continue;
         }
-        let volume = snapshot
-            .daily_bar
-            .as_ref()
-            .and_then(|bar| bar.volume)
-            .unwrap_or(0);
+        let volume = snapshot.volume;
         if volume < config.min_daily_volume {
             record_rejection(&mut rejections, "min_daily_volume");
             continue;
@@ -372,7 +873,7 @@ pub fn score_naked_option_contracts_with_rejections_at(
             record_rejection(&mut rejections, "max_implied_volatility");
             continue;
         }
-        let Ok(strike) = contract.strike_price.parse::<f64>() else {
+        let Some(strike) = contract.strike else {
             record_rejection(&mut rejections, "invalid_strike");
             continue;
         };
@@ -386,12 +887,7 @@ pub fn score_naked_option_contracts_with_rejections_at(
             continue;
         }
 
-        let Some(delta_abs) = snapshot
-            .greeks
-            .as_ref()
-            .and_then(|greeks| greeks.delta)
-            .map(f64::abs)
-        else {
+        let Some(delta_abs) = snapshot.delta.map(f64::abs) else {
             record_rejection(&mut rejections, "missing_delta");
             continue;
         };
@@ -1039,7 +1535,7 @@ fn allow_missing_open_interest_for_naked_option(
         && spread_pct <= max_fallback_spread_pct
 }
 
-pub(super) fn merge_rejection_counts(
+pub(crate) fn merge_rejection_counts(
     target: &mut BTreeMap<String, usize>,
     source: &BTreeMap<String, usize>,
 ) {
@@ -1086,7 +1582,7 @@ fn capped_ratio_score(value: f64, minimum: f64, full_score_multiple: f64) -> f64
     (value / (minimum * full_score_multiple.max(1.0))).clamp(0.0, 1.0)
 }
 
-pub(super) fn directional_distance_pct(
+pub(crate) fn directional_distance_pct(
     kind: NakedOptionKind,
     underlying_price: f64,
     threshold: f64,

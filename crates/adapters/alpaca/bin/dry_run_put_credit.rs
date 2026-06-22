@@ -20,9 +20,8 @@
 use std::{env, str::FromStr};
 
 use nautilus_alpaca::{
-    config::AlpacaDataClientConfig,
-    http::client::AlpacaHttpClient,
-    strategy::{PutCreditScannerConfig, scan_put_credit_underlying},
+    candidate_engine::PutCreditScannerConfig, config::AlpacaDataClientConfig,
+    http::client::AlpacaHttpClient, strategy::scan_put_credit_underlying,
 };
 
 #[tokio::main]

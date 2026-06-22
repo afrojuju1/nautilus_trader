@@ -22,6 +22,7 @@
 use std::{collections::BTreeSet, env, future::Future, pin::Pin, time::Duration};
 
 use crate::{
+    candidate_engine::{CreditSpreadKind, NakedOptionScannerConfig},
     config::AlpacaDataClientConfig,
     execution::check_option_spread_entry_admission,
     http::{
@@ -38,7 +39,6 @@ use crate::{
     runtime::{
         StrategyState, StrategyStateEntry, credit_spread_strategy_name, emit_operator_event,
     },
-    strategy::CreditSpreadKind,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use nautilus_core::UUID4;
@@ -693,9 +693,7 @@ fn candidate_ledger_threshold_snapshot(config: &OptionsEngineConfig) -> serde_js
     })
 }
 
-fn naked_scanner_threshold_snapshot(
-    scanner: &crate::strategy::NakedOptionScannerConfig,
-) -> serde_json::Value {
+fn naked_scanner_threshold_snapshot(scanner: &NakedOptionScannerConfig) -> serde_json::Value {
     json!({
         "min_dte": scanner.min_dte,
         "max_dte": scanner.max_dte,
@@ -1721,6 +1719,11 @@ mod tests {
 
     use super::*;
     use crate::{
+        candidate_engine::{
+            DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
+            NakedOptionCandidate, NakedOptionKind, NakedOptionScannerConfig,
+            OptionCapitalRequirementModel, PutCreditScannerConfig, ScoredContract,
+        },
         common::consts::ALPACA_CLIENT_ID,
         fleet::{AccountConfig, FleetConfig, FleetSection, ResolvedFleetConfig},
         options_runtime::SelectedNakedOptionEntry,
@@ -1728,10 +1731,6 @@ mod tests {
             debit_spread_strategy_name, naked_option_strategy_name, save_strategy_state_atomic,
         },
         storage::STORAGE_SCHEMA_DEFAULT,
-        strategy::{
-            DebitSpreadScannerConfig, IronCondorScannerConfig, NakedOptionCandidate,
-            NakedOptionKind, PutCreditScannerConfig,
-        },
     };
 
     fn config_for_gate_tests() -> OptionsEngineConfig {
@@ -1782,8 +1781,8 @@ mod tests {
             scanner: PutCreditScannerConfig::default(),
             iron_condor_scanner: IronCondorScannerConfig::default(),
             debit_scanner: DebitSpreadScannerConfig::default(),
-            naked_scanner: crate::strategy::NakedOptionScannerConfig::default(),
-            naked_1_3dte_scanner: crate::strategy::NakedOptionScannerConfig::default(),
+            naked_scanner: NakedOptionScannerConfig::default(),
+            naked_1_3dte_scanner: NakedOptionScannerConfig::default(),
             fleet: None,
             fleet_account_id: None,
             fleet_policy_blocks: Vec::new(),
@@ -2202,8 +2201,7 @@ mod tests {
             .format("%y%m%d")
             .to_string();
         let mut entry = state_entry();
-        entry.strategy =
-            debit_spread_strategy_name(crate::strategy::DebitSpreadKind::Call).to_string();
+        entry.strategy = debit_spread_strategy_name(DebitSpreadKind::Call).to_string();
         entry.short_symbol = format!("SPY{expiration}C00713000");
         entry.long_symbol = format!("SPY{expiration}C00710000");
         entry.credit = 0.0;
@@ -2213,7 +2211,7 @@ mod tests {
 
     fn naked_option_candidate() -> NakedOptionCandidate {
         NakedOptionCandidate {
-            short: crate::strategy::ScoredContract {
+            short: ScoredContract {
                 symbol: "SPY260512P00708000".to_string(),
                 expiration_date: "2026-05-12".to_string(),
                 dte: 7,
@@ -2230,8 +2228,7 @@ mod tests {
                 metrics: None,
             },
             credit: 0.71,
-            capital_requirement_model:
-                crate::strategy::OptionCapitalRequirementModel::CashSecuredPut,
+            capital_requirement_model: OptionCapitalRequirementModel::CashSecuredPut,
             estimated_buying_power_requirement: 70_800.0,
             buying_power_usage_pct: Some(0.0708),
             return_on_buying_power: 0.001003,

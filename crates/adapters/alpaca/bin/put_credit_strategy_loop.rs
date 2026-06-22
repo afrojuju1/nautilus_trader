@@ -20,10 +20,11 @@
 use std::{env, str::FromStr, time::Duration};
 
 use nautilus_alpaca::{
+    candidate_engine::PutCreditScannerConfig,
     config::AlpacaDataClientConfig,
     execution::check_put_credit_entry_admission,
     http::{client::AlpacaHttpClient, models::ListOrdersRequest},
-    strategy::{PutCreditScannerConfig, scan_put_credit_underlying},
+    strategy::scan_put_credit_underlying,
 };
 use tokio::time::sleep;
 
