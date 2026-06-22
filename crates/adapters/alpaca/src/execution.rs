@@ -906,7 +906,7 @@ fn unix_nanos_from_activity_timestamp(value: &str) -> Result<UnixNanos> {
         return unix_nanos_from_rfc3339(value);
     }
 
-    let format = time::format_description::parse("[year]-[month]-[day]")
+    let format = time::format_description::parse_borrowed::<3>("[year]-[month]-[day]")
         .map_err(|e| Error::Parse(format!("invalid Alpaca date format: {e}")))?;
     let date = time::Date::parse(value, &format)
         .map_err(|e| Error::Parse(format!("invalid Alpaca date {value}: {e}")))?;
