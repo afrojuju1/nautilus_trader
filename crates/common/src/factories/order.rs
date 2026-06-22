@@ -25,8 +25,8 @@ use nautilus_model::{
         ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId, StrategyId, TraderId,
     },
     orders::{
-        LimitIfTouchedOrder, LimitOrder, MarketIfTouchedOrder, MarketOrder, Order, OrderAny,
-        OrderList, StopLimitOrder, StopMarketOrder, TrailingStopLimitOrder,
+        LimitIfTouchedOrder, LimitOrder, MarketIfTouchedOrder, MarketOrder, MarketToLimitOrder,
+        Order, OrderAny, OrderList, StopLimitOrder, StopMarketOrder, TrailingStopLimitOrder,
         TrailingStopMarketOrder,
     },
     types::{Price, Quantity},
@@ -90,9 +90,21 @@ impl OrderFactory {
         self.order_id_generator.set_count(count);
     }
 
+    /// Returns the client order ID generator count.
+    #[must_use]
+    pub const fn client_order_id_count(&self) -> usize {
+        self.order_id_generator.count()
+    }
+
     /// Sets the order list ID generator count.
     pub const fn set_order_list_id_count(&mut self, count: usize) {
         self.order_list_id_generator.set_count(count);
+    }
+
+    /// Returns the order list ID generator count.
+    #[must_use]
+    pub const fn order_list_id_count(&self) -> usize {
+        self.order_list_id_generator.count()
     }
 
     /// Generates a new client order ID.
@@ -112,6 +124,10 @@ impl OrderFactory {
     }
 
     /// Creates a new market order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the order parameters fail validation.
     #[expect(clippy::too_many_arguments)]
     pub fn market(
         &mut self,
@@ -126,13 +142,42 @@ impl OrderFactory {
         tags: Option<Vec<Ustr>>,
         client_order_id: Option<ClientOrderId>,
     ) -> OrderAny {
+        self.try_market(
+            instrument_id,
+            order_side,
+            quantity,
+            time_in_force,
+            reduce_only,
+            quote_quantity,
+            exec_algorithm_id,
+            exec_algorithm_params,
+            tags,
+            client_order_id,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn try_market(
+        &mut self,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        quantity: Quantity,
+        time_in_force: Option<TimeInForce>,
+        reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
+        exec_algorithm_id: Option<ExecAlgorithmId>,
+        exec_algorithm_params: Option<IndexMap<Ustr, Ustr>>,
+        tags: Option<Vec<Ustr>>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> anyhow::Result<OrderAny> {
         let client_order_id = client_order_id.unwrap_or_else(|| self.generate_client_order_id());
         let exec_spawn_id: Option<ClientOrderId> = if exec_algorithm_id.is_none() {
             None
         } else {
             Some(client_order_id)
         };
-        let order = MarketOrder::new(
+        let order = MarketOrder::new_checked(
             self.trader_id,
             self.strategy_id,
             instrument_id,
@@ -152,11 +197,15 @@ impl OrderFactory {
             exec_algorithm_params,
             exec_spawn_id,
             tags,
-        );
-        OrderAny::Market(order)
+        )?;
+        Ok(OrderAny::Market(order))
     }
 
     /// Creates a new limit order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the order parameters fail validation.
     #[expect(clippy::too_many_arguments)]
     pub fn limit(
         &mut self,
@@ -177,13 +226,54 @@ impl OrderFactory {
         tags: Option<Vec<Ustr>>,
         client_order_id: Option<ClientOrderId>,
     ) -> OrderAny {
+        self.try_limit(
+            instrument_id,
+            order_side,
+            quantity,
+            price,
+            time_in_force,
+            expire_time,
+            post_only,
+            reduce_only,
+            quote_quantity,
+            display_qty,
+            emulation_trigger,
+            trigger_instrument_id,
+            exec_algorithm_id,
+            exec_algorithm_params,
+            tags,
+            client_order_id,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn try_limit(
+        &mut self,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        time_in_force: Option<TimeInForce>,
+        expire_time: Option<nautilus_core::UnixNanos>,
+        post_only: Option<bool>,
+        reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
+        display_qty: Option<Quantity>,
+        emulation_trigger: Option<TriggerType>,
+        trigger_instrument_id: Option<InstrumentId>,
+        exec_algorithm_id: Option<ExecAlgorithmId>,
+        exec_algorithm_params: Option<IndexMap<Ustr, Ustr>>,
+        tags: Option<Vec<Ustr>>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> anyhow::Result<OrderAny> {
         let client_order_id = client_order_id.unwrap_or_else(|| self.generate_client_order_id());
         let exec_spawn_id: Option<ClientOrderId> = if exec_algorithm_id.is_none() {
             None
         } else {
             Some(client_order_id)
         };
-        let order = LimitOrder::new(
+        let order = LimitOrder::new_checked(
             self.trader_id,
             self.strategy_id,
             instrument_id,
@@ -209,11 +299,15 @@ impl OrderFactory {
             tags,
             UUID4::new(),
             self.clock.borrow().timestamp_ns(),
-        );
-        OrderAny::Limit(order)
+        )?;
+        Ok(OrderAny::Limit(order))
     }
 
     /// Creates a new stop-market order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the order parameters fail validation.
     #[expect(clippy::too_many_arguments)]
     pub fn stop_market(
         &mut self,
@@ -234,13 +328,54 @@ impl OrderFactory {
         tags: Option<Vec<Ustr>>,
         client_order_id: Option<ClientOrderId>,
     ) -> OrderAny {
+        self.try_stop_market(
+            instrument_id,
+            order_side,
+            quantity,
+            trigger_price,
+            trigger_type,
+            time_in_force,
+            expire_time,
+            reduce_only,
+            quote_quantity,
+            display_qty,
+            emulation_trigger,
+            trigger_instrument_id,
+            exec_algorithm_id,
+            exec_algorithm_params,
+            tags,
+            client_order_id,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn try_stop_market(
+        &mut self,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        quantity: Quantity,
+        trigger_price: Price,
+        trigger_type: Option<TriggerType>,
+        time_in_force: Option<TimeInForce>,
+        expire_time: Option<nautilus_core::UnixNanos>,
+        reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
+        display_qty: Option<Quantity>,
+        emulation_trigger: Option<TriggerType>,
+        trigger_instrument_id: Option<InstrumentId>,
+        exec_algorithm_id: Option<ExecAlgorithmId>,
+        exec_algorithm_params: Option<IndexMap<Ustr, Ustr>>,
+        tags: Option<Vec<Ustr>>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> anyhow::Result<OrderAny> {
         let client_order_id = client_order_id.unwrap_or_else(|| self.generate_client_order_id());
         let exec_spawn_id: Option<ClientOrderId> = if exec_algorithm_id.is_none() {
             None
         } else {
             Some(client_order_id)
         };
-        let order = StopMarketOrder::new(
+        let order = StopMarketOrder::new_checked(
             self.trader_id,
             self.strategy_id,
             instrument_id,
@@ -266,11 +401,15 @@ impl OrderFactory {
             tags,
             UUID4::new(),
             self.clock.borrow().timestamp_ns(),
-        );
-        OrderAny::StopMarket(order)
+        )?;
+        Ok(OrderAny::StopMarket(order))
     }
 
     /// Creates a new stop-limit order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the order parameters fail validation.
     #[expect(clippy::too_many_arguments)]
     pub fn stop_limit(
         &mut self,
@@ -293,13 +432,58 @@ impl OrderFactory {
         tags: Option<Vec<Ustr>>,
         client_order_id: Option<ClientOrderId>,
     ) -> OrderAny {
+        self.try_stop_limit(
+            instrument_id,
+            order_side,
+            quantity,
+            price,
+            trigger_price,
+            trigger_type,
+            time_in_force,
+            expire_time,
+            post_only,
+            reduce_only,
+            quote_quantity,
+            display_qty,
+            emulation_trigger,
+            trigger_instrument_id,
+            exec_algorithm_id,
+            exec_algorithm_params,
+            tags,
+            client_order_id,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn try_stop_limit(
+        &mut self,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        trigger_price: Price,
+        trigger_type: Option<TriggerType>,
+        time_in_force: Option<TimeInForce>,
+        expire_time: Option<nautilus_core::UnixNanos>,
+        post_only: Option<bool>,
+        reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
+        display_qty: Option<Quantity>,
+        emulation_trigger: Option<TriggerType>,
+        trigger_instrument_id: Option<InstrumentId>,
+        exec_algorithm_id: Option<ExecAlgorithmId>,
+        exec_algorithm_params: Option<IndexMap<Ustr, Ustr>>,
+        tags: Option<Vec<Ustr>>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> anyhow::Result<OrderAny> {
         let client_order_id = client_order_id.unwrap_or_else(|| self.generate_client_order_id());
         let exec_spawn_id: Option<ClientOrderId> = if exec_algorithm_id.is_none() {
             None
         } else {
             Some(client_order_id)
         };
-        let order = StopLimitOrder::new(
+        let order = StopLimitOrder::new_checked(
             self.trader_id,
             self.strategy_id,
             instrument_id,
@@ -327,11 +511,102 @@ impl OrderFactory {
             tags,
             UUID4::new(),
             self.clock.borrow().timestamp_ns(),
-        );
-        OrderAny::StopLimit(order)
+        )?;
+        Ok(OrderAny::StopLimit(order))
+    }
+
+    /// Creates a new market-to-limit order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the order parameters fail validation.
+    #[expect(clippy::too_many_arguments)]
+    pub fn market_to_limit(
+        &mut self,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        quantity: Quantity,
+        time_in_force: Option<TimeInForce>,
+        expire_time: Option<nautilus_core::UnixNanos>,
+        reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
+        display_qty: Option<Quantity>,
+        exec_algorithm_id: Option<ExecAlgorithmId>,
+        exec_algorithm_params: Option<IndexMap<Ustr, Ustr>>,
+        tags: Option<Vec<Ustr>>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> OrderAny {
+        self.try_market_to_limit(
+            instrument_id,
+            order_side,
+            quantity,
+            time_in_force,
+            expire_time,
+            reduce_only,
+            quote_quantity,
+            display_qty,
+            exec_algorithm_id,
+            exec_algorithm_params,
+            tags,
+            client_order_id,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn try_market_to_limit(
+        &mut self,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        quantity: Quantity,
+        time_in_force: Option<TimeInForce>,
+        expire_time: Option<nautilus_core::UnixNanos>,
+        reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
+        display_qty: Option<Quantity>,
+        exec_algorithm_id: Option<ExecAlgorithmId>,
+        exec_algorithm_params: Option<IndexMap<Ustr, Ustr>>,
+        tags: Option<Vec<Ustr>>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> anyhow::Result<OrderAny> {
+        let client_order_id = client_order_id.unwrap_or_else(|| self.generate_client_order_id());
+        let exec_spawn_id: Option<ClientOrderId> = if exec_algorithm_id.is_none() {
+            None
+        } else {
+            Some(client_order_id)
+        };
+        let order = MarketToLimitOrder::new_checked(
+            self.trader_id,
+            self.strategy_id,
+            instrument_id,
+            client_order_id,
+            order_side,
+            quantity,
+            time_in_force.unwrap_or(TimeInForce::Gtc),
+            expire_time,
+            false, // post_only
+            reduce_only.unwrap_or(false),
+            quote_quantity.unwrap_or(false),
+            display_qty,
+            Some(ContingencyType::NoContingency),
+            None,
+            None,
+            None,
+            exec_algorithm_id,
+            exec_algorithm_params,
+            exec_spawn_id,
+            tags,
+            UUID4::new(),
+            self.clock.borrow().timestamp_ns(),
+        )?;
+        Ok(OrderAny::MarketToLimit(order))
     }
 
     /// Creates a new market-if-touched order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the order parameters fail validation.
     #[expect(clippy::too_many_arguments)]
     pub fn market_if_touched(
         &mut self,
@@ -351,13 +626,52 @@ impl OrderFactory {
         tags: Option<Vec<Ustr>>,
         client_order_id: Option<ClientOrderId>,
     ) -> OrderAny {
+        self.try_market_if_touched(
+            instrument_id,
+            order_side,
+            quantity,
+            trigger_price,
+            trigger_type,
+            time_in_force,
+            expire_time,
+            reduce_only,
+            quote_quantity,
+            emulation_trigger,
+            trigger_instrument_id,
+            exec_algorithm_id,
+            exec_algorithm_params,
+            tags,
+            client_order_id,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn try_market_if_touched(
+        &mut self,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        quantity: Quantity,
+        trigger_price: Price,
+        trigger_type: Option<TriggerType>,
+        time_in_force: Option<TimeInForce>,
+        expire_time: Option<nautilus_core::UnixNanos>,
+        reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
+        emulation_trigger: Option<TriggerType>,
+        trigger_instrument_id: Option<InstrumentId>,
+        exec_algorithm_id: Option<ExecAlgorithmId>,
+        exec_algorithm_params: Option<IndexMap<Ustr, Ustr>>,
+        tags: Option<Vec<Ustr>>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> anyhow::Result<OrderAny> {
         let client_order_id = client_order_id.unwrap_or_else(|| self.generate_client_order_id());
         let exec_spawn_id: Option<ClientOrderId> = if exec_algorithm_id.is_none() {
             None
         } else {
             Some(client_order_id)
         };
-        let order = MarketIfTouchedOrder::new(
+        let order = MarketIfTouchedOrder::new_checked(
             self.trader_id,
             self.strategy_id,
             instrument_id,
@@ -382,11 +696,15 @@ impl OrderFactory {
             tags,
             UUID4::new(),
             self.clock.borrow().timestamp_ns(),
-        );
-        OrderAny::MarketIfTouched(order)
+        )?;
+        Ok(OrderAny::MarketIfTouched(order))
     }
 
     /// Creates a new limit-if-touched order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the order parameters fail validation.
     #[expect(clippy::too_many_arguments)]
     pub fn limit_if_touched(
         &mut self,
@@ -409,13 +727,58 @@ impl OrderFactory {
         tags: Option<Vec<Ustr>>,
         client_order_id: Option<ClientOrderId>,
     ) -> OrderAny {
+        self.try_limit_if_touched(
+            instrument_id,
+            order_side,
+            quantity,
+            price,
+            trigger_price,
+            trigger_type,
+            time_in_force,
+            expire_time,
+            post_only,
+            reduce_only,
+            quote_quantity,
+            display_qty,
+            emulation_trigger,
+            trigger_instrument_id,
+            exec_algorithm_id,
+            exec_algorithm_params,
+            tags,
+            client_order_id,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn try_limit_if_touched(
+        &mut self,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        trigger_price: Price,
+        trigger_type: Option<TriggerType>,
+        time_in_force: Option<TimeInForce>,
+        expire_time: Option<nautilus_core::UnixNanos>,
+        post_only: Option<bool>,
+        reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
+        display_qty: Option<Quantity>,
+        emulation_trigger: Option<TriggerType>,
+        trigger_instrument_id: Option<InstrumentId>,
+        exec_algorithm_id: Option<ExecAlgorithmId>,
+        exec_algorithm_params: Option<IndexMap<Ustr, Ustr>>,
+        tags: Option<Vec<Ustr>>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> anyhow::Result<OrderAny> {
         let client_order_id = client_order_id.unwrap_or_else(|| self.generate_client_order_id());
         let exec_spawn_id: Option<ClientOrderId> = if exec_algorithm_id.is_none() {
             None
         } else {
             Some(client_order_id)
         };
-        let order = LimitIfTouchedOrder::new(
+        let order = LimitIfTouchedOrder::new_checked(
             self.trader_id,
             self.strategy_id,
             instrument_id,
@@ -443,8 +806,8 @@ impl OrderFactory {
             tags,
             UUID4::new(),
             self.clock.borrow().timestamp_ns(),
-        );
-        OrderAny::LimitIfTouched(order)
+        )?;
+        Ok(OrderAny::LimitIfTouched(order))
     }
 
     /// Creates a new trailing-stop-market order.
@@ -475,6 +838,53 @@ impl OrderFactory {
         tags: Option<Vec<Ustr>>,
         client_order_id: Option<ClientOrderId>,
     ) -> OrderAny {
+        self.try_trailing_stop_market(
+            instrument_id,
+            order_side,
+            quantity,
+            trailing_offset,
+            trailing_offset_type,
+            activation_price,
+            trigger_price,
+            trigger_type,
+            time_in_force,
+            expire_time,
+            reduce_only,
+            quote_quantity,
+            display_qty,
+            emulation_trigger,
+            trigger_instrument_id,
+            exec_algorithm_id,
+            exec_algorithm_params,
+            tags,
+            client_order_id,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn try_trailing_stop_market(
+        &mut self,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        quantity: Quantity,
+        trailing_offset: Decimal,
+        trailing_offset_type: Option<TrailingOffsetType>,
+        activation_price: Option<Price>,
+        trigger_price: Option<Price>,
+        trigger_type: Option<TriggerType>,
+        time_in_force: Option<TimeInForce>,
+        expire_time: Option<nautilus_core::UnixNanos>,
+        reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
+        display_qty: Option<Quantity>,
+        emulation_trigger: Option<TriggerType>,
+        trigger_instrument_id: Option<InstrumentId>,
+        exec_algorithm_id: Option<ExecAlgorithmId>,
+        exec_algorithm_params: Option<IndexMap<Ustr, Ustr>>,
+        tags: Option<Vec<Ustr>>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> anyhow::Result<OrderAny> {
         let client_order_id = client_order_id.unwrap_or_else(|| self.generate_client_order_id());
         let exec_spawn_id: Option<ClientOrderId> = if exec_algorithm_id.is_none() {
             None
@@ -484,11 +894,11 @@ impl OrderFactory {
 
         // Trailing stops need an initial trigger level: prefer explicit trigger_price,
         // fall back to activation_price which serves as the initial trigger on OKX
-        let trigger_price = trigger_price
-            .or(activation_price)
-            .expect("TrailingStopMarket requires either trigger_price or activation_price");
+        let trigger_price = trigger_price.or(activation_price).ok_or_else(|| {
+            anyhow::anyhow!("TrailingStopMarket requires either trigger_price or activation_price")
+        })?;
 
-        let order = TrailingStopMarketOrder::new(
+        let order = TrailingStopMarketOrder::new_checked(
             self.trader_id,
             self.strategy_id,
             instrument_id,
@@ -516,7 +926,7 @@ impl OrderFactory {
             tags,
             UUID4::new(),
             self.clock.borrow().timestamp_ns(),
-        );
+        )?;
 
         let mut order = OrderAny::TrailingStopMarket(order);
 
@@ -526,28 +936,181 @@ impl OrderFactory {
             tsm.activation_price = Some(activation_price);
         }
 
-        order
+        Ok(order)
+    }
+
+    /// Creates a new trailing-stop-limit order.
+    ///
+    /// # Panics
+    ///
+    /// If neither `trigger_price` nor `activation_price` is provided.
+    #[expect(clippy::too_many_arguments)]
+    pub fn trailing_stop_limit(
+        &mut self,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        limit_offset: Decimal,
+        trailing_offset: Decimal,
+        trailing_offset_type: Option<TrailingOffsetType>,
+        activation_price: Option<Price>,
+        trigger_price: Option<Price>,
+        trigger_type: Option<TriggerType>,
+        time_in_force: Option<TimeInForce>,
+        expire_time: Option<nautilus_core::UnixNanos>,
+        post_only: Option<bool>,
+        reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
+        display_qty: Option<Quantity>,
+        emulation_trigger: Option<TriggerType>,
+        trigger_instrument_id: Option<InstrumentId>,
+        exec_algorithm_id: Option<ExecAlgorithmId>,
+        exec_algorithm_params: Option<IndexMap<Ustr, Ustr>>,
+        tags: Option<Vec<Ustr>>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> OrderAny {
+        self.try_trailing_stop_limit(
+            instrument_id,
+            order_side,
+            quantity,
+            price,
+            limit_offset,
+            trailing_offset,
+            trailing_offset_type,
+            activation_price,
+            trigger_price,
+            trigger_type,
+            time_in_force,
+            expire_time,
+            post_only,
+            reduce_only,
+            quote_quantity,
+            display_qty,
+            emulation_trigger,
+            trigger_instrument_id,
+            exec_algorithm_id,
+            exec_algorithm_params,
+            tags,
+            client_order_id,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn try_trailing_stop_limit(
+        &mut self,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        limit_offset: Decimal,
+        trailing_offset: Decimal,
+        trailing_offset_type: Option<TrailingOffsetType>,
+        activation_price: Option<Price>,
+        trigger_price: Option<Price>,
+        trigger_type: Option<TriggerType>,
+        time_in_force: Option<TimeInForce>,
+        expire_time: Option<nautilus_core::UnixNanos>,
+        post_only: Option<bool>,
+        reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
+        display_qty: Option<Quantity>,
+        emulation_trigger: Option<TriggerType>,
+        trigger_instrument_id: Option<InstrumentId>,
+        exec_algorithm_id: Option<ExecAlgorithmId>,
+        exec_algorithm_params: Option<IndexMap<Ustr, Ustr>>,
+        tags: Option<Vec<Ustr>>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> anyhow::Result<OrderAny> {
+        let client_order_id = client_order_id.unwrap_or_else(|| self.generate_client_order_id());
+        let exec_spawn_id: Option<ClientOrderId> = if exec_algorithm_id.is_none() {
+            None
+        } else {
+            Some(client_order_id)
+        };
+
+        // Trailing stops need an initial trigger level: prefer explicit trigger_price,
+        // fall back to activation_price which serves as the initial trigger on OKX
+        let trigger_price = trigger_price.or(activation_price).ok_or_else(|| {
+            anyhow::anyhow!("TrailingStopLimit requires either trigger_price or activation_price")
+        })?;
+
+        let order = TrailingStopLimitOrder::new_checked(
+            self.trader_id,
+            self.strategy_id,
+            instrument_id,
+            client_order_id,
+            order_side,
+            quantity,
+            price,
+            trigger_price,
+            trigger_type.unwrap_or(TriggerType::Default),
+            limit_offset,
+            trailing_offset,
+            trailing_offset_type.unwrap_or(TrailingOffsetType::Price),
+            time_in_force.unwrap_or(TimeInForce::Gtc),
+            expire_time,
+            post_only.unwrap_or(false),
+            reduce_only.unwrap_or(false),
+            quote_quantity.unwrap_or(false),
+            display_qty,
+            emulation_trigger,
+            trigger_instrument_id,
+            Some(ContingencyType::NoContingency),
+            None,
+            None,
+            None,
+            exec_algorithm_id,
+            exec_algorithm_params,
+            exec_spawn_id,
+            tags,
+            UUID4::new(),
+            self.clock.borrow().timestamp_ns(),
+        )?;
+
+        let mut order = OrderAny::TrailingStopLimit(order);
+
+        if let (Some(activation_price), OrderAny::TrailingStopLimit(tsl)) =
+            (activation_price, &mut order)
+        {
+            tsl.activation_price = Some(activation_price);
+        }
+
+        Ok(order)
     }
 
     /// Creates a new [`OrderList`] from the given orders, generating a fresh
     /// order list ID and propagating it back to each order.
     ///
-    /// Construction is infallible; the caller is responsible for passing
-    /// orders with a consistent `instrument_id` and the factory's
-    /// `strategy_id`. The returned list's invariants are checked by
-    /// [`OrderList::validate`] at submission time.
+    /// All orders must share the same venue; the caller is responsible for
+    /// passing orders with the factory's `strategy_id`. The returned list's
+    /// invariants are checked by [`OrderList::validate`] at submission time.
     ///
     /// # Panics
     ///
-    /// Panics if `orders` is empty. Callers are expected to guard
-    /// non-empty input; `Strategy::submit_order_list` filters out the
-    /// empty case before reaching this constructor.
+    /// Panics if `orders` is empty or if orders span more than one venue.
+    /// Callers are expected to guard non-empty input; `Strategy::submit_order_list`
+    /// filters out the empty case and bails on mixed venues before reaching
+    /// this constructor.
     #[must_use]
     pub fn create_list(&mut self, orders: &mut [OrderAny], ts_init: UnixNanos) -> OrderList {
         let instrument_id = orders
             .first()
             .expect("OrderFactory::create_list requires non-empty orders")
             .instrument_id();
+        let venue = instrument_id.venue;
+
+        for order in orders.iter() {
+            assert!(
+                order.instrument_id().venue == venue,
+                "OrderFactory::create_list requires all orders to share the same venue; \
+                 expected {venue}, found {} on {}",
+                order.instrument_id().venue,
+                order.client_order_id(),
+            );
+        }
+
         let order_list_id = self.generate_order_list_id();
         let order_ids: Vec<ClientOrderId> = orders.iter().map(OrderAny::client_order_id).collect();
 
@@ -578,7 +1141,6 @@ impl OrderFactory {
     ///
     /// Panics if `entry_order_type`, `tp_order_type`, or `sl_order_type` is not one of the
     /// supported variants, or if a required price/trigger field is missing for the chosen type.
-    #[expect(clippy::too_many_lines)]
     #[builder]
     pub fn bracket(
         &mut self,
@@ -628,6 +1190,103 @@ impl OrderFactory {
         #[builder(default = vec![Ustr::from("STOP_LOSS")])] sl_tags: Vec<Ustr>,
         sl_client_order_id: Option<ClientOrderId>,
     ) -> Vec<OrderAny> {
+        self.try_bracket()
+            .instrument_id(instrument_id)
+            .order_side(order_side)
+            .quantity(quantity)
+            .quote_quantity(quote_quantity)
+            .maybe_emulation_trigger(emulation_trigger)
+            .maybe_trigger_instrument_id(trigger_instrument_id)
+            .contingency_type(contingency_type)
+            .entry_order_type(entry_order_type)
+            .maybe_entry_price(entry_price)
+            .maybe_entry_trigger_price(entry_trigger_price)
+            .maybe_expire_time(expire_time)
+            .time_in_force(time_in_force)
+            .entry_post_only(entry_post_only)
+            .maybe_entry_exec_algorithm_id(entry_exec_algorithm_id)
+            .maybe_entry_exec_algorithm_params(entry_exec_algorithm_params)
+            .entry_tags(entry_tags)
+            .maybe_entry_client_order_id(entry_client_order_id)
+            .tp_order_type(tp_order_type)
+            .maybe_tp_price(tp_price)
+            .maybe_tp_trigger_price(tp_trigger_price)
+            .tp_trigger_type(tp_trigger_type)
+            .maybe_tp_activation_price(tp_activation_price)
+            .maybe_tp_trailing_offset(tp_trailing_offset)
+            .tp_trailing_offset_type(tp_trailing_offset_type)
+            .maybe_tp_limit_offset(tp_limit_offset)
+            .tp_time_in_force(tp_time_in_force)
+            .tp_post_only(tp_post_only)
+            .maybe_tp_exec_algorithm_id(tp_exec_algorithm_id)
+            .maybe_tp_exec_algorithm_params(tp_exec_algorithm_params)
+            .tp_tags(tp_tags)
+            .maybe_tp_client_order_id(tp_client_order_id)
+            .sl_order_type(sl_order_type)
+            .maybe_sl_trigger_price(sl_trigger_price)
+            .sl_trigger_type(sl_trigger_type)
+            .maybe_sl_activation_price(sl_activation_price)
+            .maybe_sl_trailing_offset(sl_trailing_offset)
+            .sl_trailing_offset_type(sl_trailing_offset_type)
+            .sl_time_in_force(sl_time_in_force)
+            .maybe_sl_exec_algorithm_id(sl_exec_algorithm_id)
+            .maybe_sl_exec_algorithm_params(sl_exec_algorithm_params)
+            .sl_tags(sl_tags)
+            .maybe_sl_client_order_id(sl_client_order_id)
+            .call()
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[expect(clippy::too_many_lines)]
+    #[builder]
+    pub(crate) fn try_bracket(
+        &mut self,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        quantity: Quantity,
+        #[builder(default = false)] quote_quantity: bool,
+        emulation_trigger: Option<TriggerType>,
+        trigger_instrument_id: Option<InstrumentId>,
+        #[builder(default = ContingencyType::Ouo)] contingency_type: ContingencyType,
+        // Entry order
+        #[builder(default = OrderType::Market)] entry_order_type: OrderType,
+        entry_price: Option<Price>,
+        entry_trigger_price: Option<Price>,
+        expire_time: Option<nautilus_core::UnixNanos>,
+        #[builder(default = TimeInForce::Gtc)] time_in_force: TimeInForce,
+        #[builder(default = false)] entry_post_only: bool,
+        entry_exec_algorithm_id: Option<ExecAlgorithmId>,
+        entry_exec_algorithm_params: Option<IndexMap<Ustr, Ustr>>,
+        #[builder(default = vec![Ustr::from("ENTRY")])] entry_tags: Vec<Ustr>,
+        entry_client_order_id: Option<ClientOrderId>,
+        // Take-profit order
+        #[builder(default = OrderType::Limit)] tp_order_type: OrderType,
+        tp_price: Option<Price>,
+        tp_trigger_price: Option<Price>,
+        #[builder(default = TriggerType::Default)] tp_trigger_type: TriggerType,
+        tp_activation_price: Option<Price>,
+        tp_trailing_offset: Option<Decimal>,
+        #[builder(default = TrailingOffsetType::Price)] tp_trailing_offset_type: TrailingOffsetType,
+        tp_limit_offset: Option<Decimal>,
+        #[builder(default = TimeInForce::Gtc)] tp_time_in_force: TimeInForce,
+        #[builder(default = true)] tp_post_only: bool,
+        tp_exec_algorithm_id: Option<ExecAlgorithmId>,
+        tp_exec_algorithm_params: Option<IndexMap<Ustr, Ustr>>,
+        #[builder(default = vec![Ustr::from("TAKE_PROFIT")])] tp_tags: Vec<Ustr>,
+        tp_client_order_id: Option<ClientOrderId>,
+        // Stop-loss order
+        #[builder(default = OrderType::StopMarket)] sl_order_type: OrderType,
+        sl_trigger_price: Option<Price>,
+        #[builder(default = TriggerType::Default)] sl_trigger_type: TriggerType,
+        sl_activation_price: Option<Price>,
+        sl_trailing_offset: Option<Decimal>,
+        #[builder(default = TrailingOffsetType::Price)] sl_trailing_offset_type: TrailingOffsetType,
+        #[builder(default = TimeInForce::Gtc)] sl_time_in_force: TimeInForce,
+        sl_exec_algorithm_id: Option<ExecAlgorithmId>,
+        sl_exec_algorithm_params: Option<IndexMap<Ustr, Ustr>>,
+        #[builder(default = vec![Ustr::from("STOP_LOSS")])] sl_tags: Vec<Ustr>,
+        sl_client_order_id: Option<ClientOrderId>,
+    ) -> anyhow::Result<Vec<OrderAny>> {
         let order_list_id = self.generate_order_list_id();
         let ts_init = self.clock.borrow().timestamp_ns();
 
@@ -654,7 +1313,7 @@ impl OrderFactory {
         let entry_parent_order_id: Option<ClientOrderId> = None;
 
         let entry_order = match entry_order_type {
-            OrderType::Market => OrderAny::Market(MarketOrder::new(
+            OrderType::Market => OrderAny::Market(MarketOrder::new_checked(
                 self.trader_id,
                 self.strategy_id,
                 instrument_id,
@@ -674,72 +1333,15 @@ impl OrderFactory {
                 entry_exec_algorithm_params,
                 entry_exec_spawn_id,
                 entry_tags,
-            )),
-            OrderType::Limit => OrderAny::Limit(LimitOrder::new(
+            )?),
+            OrderType::Limit => OrderAny::Limit(LimitOrder::new_checked(
                 self.trader_id,
                 self.strategy_id,
                 instrument_id,
                 entry_client_order_id,
                 order_side,
                 quantity,
-                entry_price.expect("`entry_price` is required for a LIMIT entry"),
-                time_in_force,
-                expire_time,
-                entry_post_only,
-                false, // reduce_only
-                quote_quantity,
-                None, // display_qty
-                emulation_trigger,
-                trigger_instrument_id,
-                entry_contingency_type,
-                entry_order_list_id,
-                entry_linked_order_ids,
-                entry_parent_order_id,
-                entry_exec_algorithm_id,
-                entry_exec_algorithm_params,
-                entry_exec_spawn_id,
-                entry_tags,
-                UUID4::new(),
-                ts_init,
-            )),
-            OrderType::MarketIfTouched => OrderAny::MarketIfTouched(MarketIfTouchedOrder::new(
-                self.trader_id,
-                self.strategy_id,
-                instrument_id,
-                entry_client_order_id,
-                order_side,
-                quantity,
-                entry_trigger_price
-                    .expect("`entry_trigger_price` is required for a MARKET_IF_TOUCHED entry"),
-                TriggerType::Default,
-                time_in_force,
-                expire_time,
-                false, // reduce_only
-                quote_quantity,
-                emulation_trigger,
-                trigger_instrument_id,
-                entry_contingency_type,
-                entry_order_list_id,
-                entry_linked_order_ids,
-                entry_parent_order_id,
-                entry_exec_algorithm_id,
-                entry_exec_algorithm_params,
-                entry_exec_spawn_id,
-                entry_tags,
-                UUID4::new(),
-                ts_init,
-            )),
-            OrderType::LimitIfTouched => OrderAny::LimitIfTouched(LimitIfTouchedOrder::new(
-                self.trader_id,
-                self.strategy_id,
-                instrument_id,
-                entry_client_order_id,
-                order_side,
-                quantity,
-                entry_price.expect("`entry_price` is required for a LIMIT_IF_TOUCHED entry"),
-                entry_trigger_price
-                    .expect("`entry_trigger_price` is required for a LIMIT_IF_TOUCHED entry"),
-                TriggerType::Default,
+                required(entry_price, "`entry_price` is required for a LIMIT entry")?,
                 time_in_force,
                 expire_time,
                 entry_post_only,
@@ -758,17 +1360,90 @@ impl OrderFactory {
                 entry_tags,
                 UUID4::new(),
                 ts_init,
-            )),
-            OrderType::StopLimit => OrderAny::StopLimit(StopLimitOrder::new(
+            )?),
+            OrderType::MarketIfTouched => {
+                OrderAny::MarketIfTouched(MarketIfTouchedOrder::new_checked(
+                    self.trader_id,
+                    self.strategy_id,
+                    instrument_id,
+                    entry_client_order_id,
+                    order_side,
+                    quantity,
+                    required(
+                        entry_trigger_price,
+                        "`entry_trigger_price` is required for a MARKET_IF_TOUCHED entry",
+                    )?,
+                    TriggerType::Default,
+                    time_in_force,
+                    expire_time,
+                    false, // reduce_only
+                    quote_quantity,
+                    emulation_trigger,
+                    trigger_instrument_id,
+                    entry_contingency_type,
+                    entry_order_list_id,
+                    entry_linked_order_ids,
+                    entry_parent_order_id,
+                    entry_exec_algorithm_id,
+                    entry_exec_algorithm_params,
+                    entry_exec_spawn_id,
+                    entry_tags,
+                    UUID4::new(),
+                    ts_init,
+                )?)
+            }
+            OrderType::LimitIfTouched => {
+                OrderAny::LimitIfTouched(LimitIfTouchedOrder::new_checked(
+                    self.trader_id,
+                    self.strategy_id,
+                    instrument_id,
+                    entry_client_order_id,
+                    order_side,
+                    quantity,
+                    required(
+                        entry_price,
+                        "`entry_price` is required for a LIMIT_IF_TOUCHED entry",
+                    )?,
+                    required(
+                        entry_trigger_price,
+                        "`entry_trigger_price` is required for a LIMIT_IF_TOUCHED entry",
+                    )?,
+                    TriggerType::Default,
+                    time_in_force,
+                    expire_time,
+                    entry_post_only,
+                    false, // reduce_only
+                    quote_quantity,
+                    None, // display_qty
+                    emulation_trigger,
+                    trigger_instrument_id,
+                    entry_contingency_type,
+                    entry_order_list_id,
+                    entry_linked_order_ids,
+                    entry_parent_order_id,
+                    entry_exec_algorithm_id,
+                    entry_exec_algorithm_params,
+                    entry_exec_spawn_id,
+                    entry_tags,
+                    UUID4::new(),
+                    ts_init,
+                )?)
+            }
+            OrderType::StopLimit => OrderAny::StopLimit(StopLimitOrder::new_checked(
                 self.trader_id,
                 self.strategy_id,
                 instrument_id,
                 entry_client_order_id,
                 order_side,
                 quantity,
-                entry_price.expect("`entry_price` is required for a STOP_LIMIT entry"),
-                entry_trigger_price
-                    .expect("`entry_trigger_price` is required for a STOP_LIMIT entry"),
+                required(
+                    entry_price,
+                    "`entry_price` is required for a STOP_LIMIT entry",
+                )?,
+                required(
+                    entry_trigger_price,
+                    "`entry_trigger_price` is required for a STOP_LIMIT entry",
+                )?,
                 TriggerType::Default,
                 time_in_force,
                 expire_time,
@@ -788,8 +1463,8 @@ impl OrderFactory {
                 entry_tags,
                 UUID4::new(),
                 ts_init,
-            )),
-            other => panic!("invalid `entry_order_type`, was {other}"),
+            )?),
+            other => anyhow::bail!("invalid `entry_order_type`, was {other}"),
         };
 
         let sl_tp_side = match order_side {
@@ -804,14 +1479,14 @@ impl OrderFactory {
         let tp_parent_order_id = Some(entry_client_order_id);
 
         let tp_order = match tp_order_type {
-            OrderType::Limit => OrderAny::Limit(LimitOrder::new(
+            OrderType::Limit => OrderAny::Limit(LimitOrder::new_checked(
                 self.trader_id,
                 self.strategy_id,
                 instrument_id,
                 tp_client_order_id,
                 sl_tp_side,
                 quantity,
-                tp_price.expect("`tp_price` is required for a LIMIT take-profit"),
+                required(tp_price, "`tp_price` is required for a LIMIT take-profit")?,
                 tp_time_in_force,
                 None, // expire_time
                 tp_post_only,
@@ -830,72 +1505,85 @@ impl OrderFactory {
                 tp_tags,
                 UUID4::new(),
                 ts_init,
-            )),
-            OrderType::LimitIfTouched => OrderAny::LimitIfTouched(LimitIfTouchedOrder::new(
-                self.trader_id,
-                self.strategy_id,
-                instrument_id,
-                tp_client_order_id,
-                sl_tp_side,
-                quantity,
-                tp_price.expect("`tp_price` is required for a LIMIT_IF_TOUCHED take-profit"),
-                tp_trigger_price
-                    .expect("`tp_trigger_price` is required for a LIMIT_IF_TOUCHED take-profit"),
-                tp_trigger_type,
-                tp_time_in_force,
-                None, // expire_time
-                tp_post_only,
-                true, // reduce_only
-                quote_quantity,
-                None, // display_qty
-                emulation_trigger,
-                trigger_instrument_id,
-                tp_contingency_type,
-                tp_order_list_id,
-                tp_linked_order_ids,
-                tp_parent_order_id,
-                tp_exec_algorithm_id,
-                tp_exec_algorithm_params,
-                tp_exec_spawn_id,
-                tp_tags,
-                UUID4::new(),
-                ts_init,
-            )),
-            OrderType::MarketIfTouched => OrderAny::MarketIfTouched(MarketIfTouchedOrder::new(
-                self.trader_id,
-                self.strategy_id,
-                instrument_id,
-                tp_client_order_id,
-                sl_tp_side,
-                quantity,
-                tp_trigger_price
-                    .expect("`tp_trigger_price` is required for a MARKET_IF_TOUCHED take-profit"),
-                tp_trigger_type,
-                tp_time_in_force,
-                None, // expire_time
-                true, // reduce_only
-                quote_quantity,
-                emulation_trigger,
-                trigger_instrument_id,
-                tp_contingency_type,
-                tp_order_list_id,
-                tp_linked_order_ids,
-                tp_parent_order_id,
-                tp_exec_algorithm_id,
-                tp_exec_algorithm_params,
-                tp_exec_spawn_id,
-                tp_tags,
-                UUID4::new(),
-                ts_init,
-            )),
+            )?),
+            OrderType::LimitIfTouched => {
+                OrderAny::LimitIfTouched(LimitIfTouchedOrder::new_checked(
+                    self.trader_id,
+                    self.strategy_id,
+                    instrument_id,
+                    tp_client_order_id,
+                    sl_tp_side,
+                    quantity,
+                    required(
+                        tp_price,
+                        "`tp_price` is required for a LIMIT_IF_TOUCHED take-profit",
+                    )?,
+                    required(
+                        tp_trigger_price,
+                        "`tp_trigger_price` is required for a LIMIT_IF_TOUCHED take-profit",
+                    )?,
+                    tp_trigger_type,
+                    tp_time_in_force,
+                    None, // expire_time
+                    tp_post_only,
+                    true, // reduce_only
+                    quote_quantity,
+                    None, // display_qty
+                    emulation_trigger,
+                    trigger_instrument_id,
+                    tp_contingency_type,
+                    tp_order_list_id,
+                    tp_linked_order_ids,
+                    tp_parent_order_id,
+                    tp_exec_algorithm_id,
+                    tp_exec_algorithm_params,
+                    tp_exec_spawn_id,
+                    tp_tags,
+                    UUID4::new(),
+                    ts_init,
+                )?)
+            }
+            OrderType::MarketIfTouched => {
+                OrderAny::MarketIfTouched(MarketIfTouchedOrder::new_checked(
+                    self.trader_id,
+                    self.strategy_id,
+                    instrument_id,
+                    tp_client_order_id,
+                    sl_tp_side,
+                    quantity,
+                    required(
+                        tp_trigger_price,
+                        "`tp_trigger_price` is required for a MARKET_IF_TOUCHED take-profit",
+                    )?,
+                    tp_trigger_type,
+                    tp_time_in_force,
+                    None, // expire_time
+                    true, // reduce_only
+                    quote_quantity,
+                    emulation_trigger,
+                    trigger_instrument_id,
+                    tp_contingency_type,
+                    tp_order_list_id,
+                    tp_linked_order_ids,
+                    tp_parent_order_id,
+                    tp_exec_algorithm_id,
+                    tp_exec_algorithm_params,
+                    tp_exec_spawn_id,
+                    tp_tags,
+                    UUID4::new(),
+                    ts_init,
+                )?)
+            }
             OrderType::TrailingStopMarket => {
-                let tp_trailing_offset = tp_trailing_offset.expect(
+                let tp_trailing_offset = required(
+                    tp_trailing_offset,
                     "`tp_trailing_offset` is required for a TRAILING_STOP_MARKET take-profit",
-                );
-                let trigger_price = tp_trigger_price.or(tp_activation_price).expect(
+                )?;
+                let trigger_price = required(
+                    tp_trigger_price.or(tp_activation_price),
                     "TRAILING_STOP_MARKET take-profit requires `tp_trigger_price` or `tp_activation_price`",
-                );
-                let mut order = TrailingStopMarketOrder::new(
+                )?;
+                let mut order = TrailingStopMarketOrder::new_checked(
                     self.trader_id,
                     self.strategy_id,
                     instrument_id,
@@ -923,22 +1611,28 @@ impl OrderFactory {
                     tp_tags,
                     UUID4::new(),
                     ts_init,
-                );
+                )?;
                 order.activation_price = tp_activation_price;
                 OrderAny::TrailingStopMarket(order)
             }
             OrderType::TrailingStopLimit => {
-                let tp_trailing_offset = tp_trailing_offset.expect(
+                let tp_trailing_offset = required(
+                    tp_trailing_offset,
                     "`tp_trailing_offset` is required for a TRAILING_STOP_LIMIT take-profit",
-                );
-                let tp_limit_offset = tp_limit_offset
-                    .expect("`tp_limit_offset` is required for a TRAILING_STOP_LIMIT take-profit");
-                let trigger_price = tp_trigger_price.or(tp_activation_price).expect(
+                )?;
+                let tp_limit_offset = required(
+                    tp_limit_offset,
+                    "`tp_limit_offset` is required for a TRAILING_STOP_LIMIT take-profit",
+                )?;
+                let trigger_price = required(
+                    tp_trigger_price.or(tp_activation_price),
                     "TRAILING_STOP_LIMIT take-profit requires `tp_trigger_price` or `tp_activation_price`",
-                );
-                let price =
-                    tp_price.expect("`tp_price` is required for a TRAILING_STOP_LIMIT take-profit");
-                let mut order = TrailingStopLimitOrder::new(
+                )?;
+                let price = required(
+                    tp_price,
+                    "`tp_price` is required for a TRAILING_STOP_LIMIT take-profit",
+                )?;
+                let mut order = TrailingStopLimitOrder::new_checked(
                     self.trader_id,
                     self.strategy_id,
                     instrument_id,
@@ -969,11 +1663,11 @@ impl OrderFactory {
                     tp_tags,
                     UUID4::new(),
                     ts_init,
-                );
+                )?;
                 order.activation_price = tp_activation_price;
                 OrderAny::TrailingStopLimit(order)
             }
-            other => panic!("invalid `tp_order_type`, was {other}"),
+            other => anyhow::bail!("invalid `tp_order_type`, was {other}"),
         };
 
         let sl_contingency_type = Some(contingency_type);
@@ -982,15 +1676,17 @@ impl OrderFactory {
         let sl_parent_order_id = Some(entry_client_order_id);
 
         let sl_order = match sl_order_type {
-            OrderType::StopMarket => OrderAny::StopMarket(StopMarketOrder::new(
+            OrderType::StopMarket => OrderAny::StopMarket(StopMarketOrder::new_checked(
                 self.trader_id,
                 self.strategy_id,
                 instrument_id,
                 sl_client_order_id,
                 sl_tp_side,
                 quantity,
-                sl_trigger_price
-                    .expect("`sl_trigger_price` is required for a STOP_MARKET stop-loss"),
+                required(
+                    sl_trigger_price,
+                    "`sl_trigger_price` is required for a STOP_MARKET stop-loss",
+                )?,
                 sl_trigger_type,
                 sl_time_in_force,
                 None, // expire_time
@@ -1009,15 +1705,17 @@ impl OrderFactory {
                 sl_tags,
                 UUID4::new(),
                 ts_init,
-            )),
+            )?),
             OrderType::TrailingStopMarket => {
-                let sl_trailing_offset = sl_trailing_offset.expect(
+                let sl_trailing_offset = required(
+                    sl_trailing_offset,
                     "`sl_trailing_offset` is required for a TRAILING_STOP_MARKET stop-loss",
-                );
-                let trigger_price = sl_trigger_price.or(sl_activation_price).expect(
+                )?;
+                let trigger_price = required(
+                    sl_trigger_price.or(sl_activation_price),
                     "TRAILING_STOP_MARKET stop-loss requires `sl_trigger_price` or `sl_activation_price`",
-                );
-                let mut order = TrailingStopMarketOrder::new(
+                )?;
+                let mut order = TrailingStopMarketOrder::new_checked(
                     self.trader_id,
                     self.strategy_id,
                     instrument_id,
@@ -1045,15 +1743,19 @@ impl OrderFactory {
                     sl_tags,
                     UUID4::new(),
                     ts_init,
-                );
+                )?;
                 order.activation_price = sl_activation_price;
                 OrderAny::TrailingStopMarket(order)
             }
-            other => panic!("invalid `sl_order_type`, was {other}"),
+            other => anyhow::bail!("invalid `sl_order_type`, was {other}"),
         };
 
-        vec![entry_order, sl_order, tp_order]
+        Ok(vec![entry_order, sl_order, tp_order])
     }
+}
+
+fn required<T>(value: Option<T>, message: &'static str) -> anyhow::Result<T> {
+    value.ok_or_else(|| anyhow::anyhow!(message))
 }
 
 #[cfg(test)]
@@ -1463,6 +2165,71 @@ pub mod tests {
         assert_eq!(lit_order.price(), Some(Price::from("48100.00")));
         assert_eq!(lit_order.trigger_price(), Some(Price::from("48000.00")));
         assert_eq!(lit_order.trigger_type(), Some(TriggerType::LastPrice));
+    }
+
+    #[rstest]
+    fn test_market_to_limit_order(mut order_factory: OrderFactory) {
+        let mtl_order = order_factory.market_to_limit(
+            InstrumentId::from("BTCUSDT.BINANCE"),
+            OrderSide::Buy,
+            100.into(),
+            Some(TimeInForce::Gtc),
+            None,
+            Some(false),
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(mtl_order.instrument_id(), "BTCUSDT.BINANCE".into());
+        assert_eq!(mtl_order.order_side(), OrderSide::Buy);
+        assert_eq!(mtl_order.quantity(), 100.into());
+        assert_eq!(mtl_order.order_type(), OrderType::MarketToLimit);
+        assert_eq!(
+            mtl_order.client_order_id(),
+            ClientOrderId::new("O-19700101-000000-001-001-1")
+        );
+    }
+
+    #[rstest]
+    fn test_trailing_stop_limit_order(mut order_factory: OrderFactory) {
+        let tsl_order = order_factory.trailing_stop_limit(
+            InstrumentId::from("BTCUSDT.BINANCE"),
+            OrderSide::Sell,
+            100.into(),
+            Price::from("45100.00"), // limit price
+            Decimal::new(10, 2),     // limit_offset
+            Decimal::new(50, 2),     // trailing_offset
+            Some(TrailingOffsetType::Price),
+            Some(Price::from("45000.00")), // activation_price
+            Some(Price::from("45000.00")), // trigger_price
+            Some(TriggerType::LastPrice),
+            Some(TimeInForce::Gtc),
+            None,
+            Some(false), // post_only
+            Some(true),  // reduce_only
+            Some(false), // quote_quantity
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(tsl_order.instrument_id(), "BTCUSDT.BINANCE".into());
+        assert_eq!(tsl_order.order_side(), OrderSide::Sell);
+        assert_eq!(tsl_order.order_type(), OrderType::TrailingStopLimit);
+        assert_eq!(tsl_order.price(), Some(Price::from("45100.00")));
+        assert_eq!(tsl_order.trigger_price(), Some(Price::from("45000.00")));
+        assert_eq!(tsl_order.activation_price(), Some(Price::from("45000.00")));
+        assert_eq!(tsl_order.trigger_type(), Some(TriggerType::LastPrice));
+        assert_eq!(tsl_order.trailing_offset(), Some(Decimal::new(50, 2)));
+        assert_eq!(tsl_order.limit_offset(), Some(Decimal::new(10, 2)));
     }
 
     #[rstest]
@@ -1960,6 +2727,38 @@ pub mod tests {
             .tp_price(Price::from("55000.00"))
             .sl_trigger_price(Price::from("45000.00"))
             .call();
+    }
+
+    #[rstest]
+    #[should_panic(expected = "share the same venue")]
+    fn test_create_list_panics_on_mixed_venues(mut order_factory: OrderFactory) {
+        let binance = order_factory.market(
+            InstrumentId::from("BTCUSDT.BINANCE"),
+            OrderSide::Buy,
+            100.into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let bybit = order_factory.market(
+            InstrumentId::from("BTCUSDT.BYBIT"),
+            OrderSide::Buy,
+            100.into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let mut orders = vec![binance, bybit];
+        let _ = order_factory.create_list(&mut orders, UnixNanos::default());
     }
 
     #[rstest]

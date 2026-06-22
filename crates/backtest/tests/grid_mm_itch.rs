@@ -65,7 +65,8 @@ fn create_engine(instrument: &InstrumentAny) -> BacktestEngine {
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
                 .base_currency(Currency::from("USD"))
-                .build(),
+                .build()
+                .unwrap(),
         )
         .unwrap();
     engine.add_instrument(instrument).unwrap();
@@ -114,9 +115,7 @@ fn test_grid_mm_itch_catalog_load() {
     // Write deltas to a temp catalog then query back
     let temp_dir = TempDir::new().unwrap();
     let catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
-    catalog
-        .write_to_parquet(deltas.clone(), None, None, None)
-        .unwrap();
+    catalog.write_to_parquet(&deltas, None, None, None).unwrap();
     catalog.write_instruments(vec![instrument.clone()]).unwrap();
 
     let mut catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);

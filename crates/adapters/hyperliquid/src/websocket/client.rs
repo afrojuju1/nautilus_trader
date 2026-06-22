@@ -26,7 +26,10 @@ use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use nautilus_common::{cache::fifo::FifoCacheMap, live::get_runtime};
+use nautilus_common::{
+    cache::{InstrumentLookupError, fifo::FifoCacheMap},
+    live::get_runtime,
+};
 use nautilus_core::{AtomicMap, MUTEX_POISONED};
 use nautilus_model::{
     data::BarType,
@@ -34,6 +37,7 @@ use nautilus_model::{
     identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
+    reports::OrderStatusReport,
     types::{Price, Quantity},
 };
 use nautilus_network::{
@@ -112,7 +116,7 @@ pub(super) enum AssetContextDataType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.hyperliquid")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.hyperliquid")
 )]
 pub struct HyperliquidWebSocketClient {
     url: String,
@@ -125,6 +129,7 @@ pub struct HyperliquidWebSocketClient {
     instruments: Arc<AtomicMap<Ustr, InstrumentAny>>,
     bar_types: Arc<AtomicMap<String, BarType>>,
     asset_context_subs: Arc<DashMap<Ustr, AHashSet<AssetContextDataType>>>,
+    all_dex_asset_ctxs_instrument_ids: Arc<AtomicMap<Ustr, Vec<Option<InstrumentId>>>>,
     cloid_cache: CloidCache,
     post_router: Arc<PostRouter>,
     post_ids: Arc<PostIds>,
@@ -149,6 +154,7 @@ impl Clone for HyperliquidWebSocketClient {
             instruments: Arc::clone(&self.instruments),
             bar_types: Arc::clone(&self.bar_types),
             asset_context_subs: Arc::clone(&self.asset_context_subs),
+            all_dex_asset_ctxs_instrument_ids: Arc::clone(&self.all_dex_asset_ctxs_instrument_ids),
             cloid_cache: Arc::clone(&self.cloid_cache),
             post_router: Arc::clone(&self.post_router),
             post_ids: Arc::clone(&self.post_ids),
@@ -190,6 +196,7 @@ impl HyperliquidWebSocketClient {
             instruments: Arc::new(AtomicMap::new()),
             bar_types: Arc::new(AtomicMap::new()),
             asset_context_subs: Arc::new(DashMap::new()),
+            all_dex_asset_ctxs_instrument_ids: Arc::new(AtomicMap::new()),
             cloid_cache: Arc::new(Mutex::new(FifoCacheMap::new())),
             post_router: PostRouter::new(),
             post_ids: Arc::new(PostIds::new(1)),
@@ -260,6 +267,19 @@ impl HyperliquidWebSocketClient {
             log::error!("Failed to send InitializeInstruments: {e}");
         }
 
+        let all_dex_asset_ctxs_instrument_ids = self
+            .all_dex_asset_ctxs_instrument_ids
+            .load()
+            .iter()
+            .map(|(dex, instrument_ids)| (*dex, instrument_ids.clone()))
+            .collect();
+
+        if let Err(e) = cmd_tx.send(HandlerCommand::CacheAllDexAssetCtxsInstrumentIds(
+            all_dex_asset_ctxs_instrument_ids,
+        )) {
+            log::error!("Failed to send CacheAllDexAssetCtxsInstrumentIds: {e}");
+        }
+
         // Spawn handler task
         let signal = Arc::clone(&self.signal);
         let account_id = self.account_id;
@@ -318,7 +338,11 @@ impl HyperliquidWebSocketClient {
                     }
                     Some(msg) => {
                         if handler.send(msg).is_err() {
-                            log::error!("Failed to send message (receiver dropped)");
+                            if handler.is_stopped() {
+                                log::debug!("Failed to send message (receiver dropped)");
+                            } else {
+                                log::error!("Failed to send message (receiver dropped)");
+                            }
                             break;
                         }
                     }
@@ -464,6 +488,12 @@ impl HyperliquidWebSocketClient {
     ///
     /// The HTTP client supplies signing credentials, builder attribution, and
     /// cached instrument metadata. The action itself is sent over WebSocket.
+    ///
+    /// Returns an [`OrderStatusReport`] describing the venue's immediate
+    /// response (`Filled` for an atomic IOC fill, `Accepted` for a resting
+    /// order), or `None` when the venue deferred the order without an oid (for
+    /// example a `waitingForFill` trigger child): the order stays `SUBMITTED`
+    /// until the user-events stream delivers the first `OrderAccepted`.
     #[allow(
         clippy::too_many_arguments,
         reason = "matches the Python and HTTP order submit surface"
@@ -481,15 +511,15 @@ impl HyperliquidWebSocketClient {
         trigger_price: Option<Price>,
         post_only: bool,
         reduce_only: bool,
-    ) -> HyperliquidResult<()> {
-        let symbol = instrument_id.symbol.as_str();
-        let asset = signer.get_asset_index(symbol).ok_or_else(|| {
+    ) -> HyperliquidResult<Option<OrderStatusReport>> {
+        let symbol = instrument_id.symbol.inner();
+        let asset = signer.get_asset_index_for_symbol(symbol).ok_or_else(|| {
             HyperliquidError::bad_request(format!(
                 "Asset index not found for symbol: {symbol}. Ensure instruments are loaded."
             ))
         })?;
         let is_buy = matches!(order_side, OrderSide::Buy);
-        let price_precision = signer.get_price_precision(symbol).unwrap_or(2);
+        let price_precision = signer.get_price_precision_for_symbol(symbol).unwrap_or(2);
 
         let price_decimal = match price {
             Some(px) if signer.normalize_prices() => {
@@ -552,27 +582,54 @@ impl HyperliquidWebSocketClient {
         };
         let response = self.post_action_exec(signer, &action).await?;
 
-        ensure_ws_action_accepted(&response, "Order submission")
+        // Verdict first: a real rejection must still error
+        ensure_ws_action_accepted(&response, "Order submission")?;
+
+        // Past the verdict, a build failure is local; defer to WS, never reject
+        match signer.build_submit_order_report(
+            instrument_id,
+            client_order_id,
+            order_side,
+            order_type,
+            quantity,
+            time_in_force,
+            price,
+            trigger_price,
+            response,
+        ) {
+            Ok(report) => Ok(report),
+            Err(e) => {
+                log::warn!(
+                    "Failed to build submit report for {client_order_id}: {e}; awaiting WS reconciliation"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Submit multiple orders through the Hyperliquid WebSocket post API.
+    ///
+    /// Returns one [`OrderStatusReport`] per accepted order in submission
+    /// order. Deferred trigger children of a `normalTpsl` bracket are absent
+    /// from the result; they stay `SUBMITTED` until the user-events stream
+    /// delivers an `OrderAccepted` with the real oid.
     pub async fn submit_orders(
         &self,
         signer: &HyperliquidHttpClient,
         orders: &[&OrderAny],
-    ) -> HyperliquidResult<()> {
+    ) -> HyperliquidResult<Vec<OrderStatusReport>> {
         let mut hyperliquid_orders = Vec::with_capacity(orders.len());
         let mut client_order_ids = Vec::with_capacity(orders.len());
 
         for order in orders {
             let instrument_id = order.instrument_id();
-            let symbol = instrument_id.symbol.as_str();
-            let asset = signer.get_asset_index(symbol).ok_or_else(|| {
+            let symbol = instrument_id.symbol.inner();
+            let asset = signer.get_asset_index_for_symbol(symbol).ok_or_else(|| {
                 HyperliquidError::bad_request(format!(
                     "Asset index not found for symbol: {symbol}. Ensure instruments are loaded."
                 ))
             })?;
-            let price_decimals = signer.get_price_precision(symbol).unwrap_or(2);
+            let price_decimals = signer.get_price_precision_for_symbol(symbol).unwrap_or(2);
             let request = order_to_hyperliquid_request_with_asset_and_cloid(
                 order,
                 asset,
@@ -601,7 +658,18 @@ impl HyperliquidWebSocketClient {
         };
         let response = self.post_action_exec(signer, &action).await?;
 
-        ensure_ws_action_accepted(&response, "Order list submission")
+        ensure_ws_action_accepted(&response, "Order list submission")?;
+
+        // Past the verdict, a build failure is local; defer to WS, never reject
+        match signer.build_submit_orders_reports(orders, grouping, response) {
+            Ok(reports) => Ok(reports),
+            Err(e) => {
+                log::warn!(
+                    "Failed to build submit reports for order list: {e}; awaiting WS reconciliation"
+                );
+                Ok(Vec::new())
+            }
+        }
     }
 
     /// Cancel an order through the Hyperliquid WebSocket post API.
@@ -612,8 +680,8 @@ impl HyperliquidWebSocketClient {
         client_order_id: Option<ClientOrderId>,
         venue_order_id: Option<VenueOrderId>,
     ) -> HyperliquidResult<()> {
-        let symbol = instrument_id.symbol.as_str();
-        let asset = signer.get_asset_index(symbol).ok_or_else(|| {
+        let symbol = instrument_id.symbol.inner();
+        let asset = signer.get_asset_index_for_symbol(symbol).ok_or_else(|| {
             HyperliquidError::bad_request(format!(
                 "Asset index not found for symbol: {symbol}. Ensure instruments are loaded."
             ))
@@ -669,8 +737,8 @@ impl HyperliquidWebSocketClient {
 
         for (index, (instrument_id, client_order_id, venue_order_id)) in cancels.iter().enumerate()
         {
-            let symbol = instrument_id.symbol.as_str();
-            let Some(asset) = signer.get_asset_index(symbol) else {
+            let symbol = instrument_id.symbol.inner();
+            let Some(asset) = signer.get_asset_index_for_symbol(symbol) else {
                 results[index] = Some(format!(
                     "Asset index not found for symbol: {symbol}. Ensure instruments are loaded."
                 ));
@@ -798,8 +866,8 @@ impl HyperliquidWebSocketClient {
         time_in_force: TimeInForce,
         client_order_id: Option<ClientOrderId>,
     ) -> HyperliquidResult<()> {
-        let symbol = instrument_id.symbol.as_str();
-        let asset = signer.get_asset_index(symbol).ok_or_else(|| {
+        let symbol = instrument_id.symbol.inner();
+        let asset = signer.get_asset_index_for_symbol(symbol).ok_or_else(|| {
             HyperliquidError::bad_request(format!(
                 "Asset index not found for symbol: {symbol}. Ensure instruments are loaded."
             ))
@@ -809,7 +877,7 @@ impl HyperliquidWebSocketClient {
             .parse::<u64>()
             .map_err(|_| HyperliquidError::bad_request("Invalid venue order ID format"))?;
         let is_buy = matches!(order_side, OrderSide::Buy);
-        let price_decimals = signer.get_price_precision(symbol).unwrap_or(2);
+        let price_decimals = signer.get_price_precision_for_symbol(symbol).unwrap_or(2);
         let price = if signer.normalize_prices() {
             normalize_price(price.as_decimal(), price_decimals).normalize()
         } else {
@@ -1069,7 +1137,7 @@ impl HyperliquidWebSocketClient {
     ) -> anyhow::Result<()> {
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
         let cmd_tx = self.cmd_tx.read().await;
@@ -1113,7 +1181,7 @@ impl HyperliquidWebSocketClient {
     ) -> anyhow::Result<()> {
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
         let cmd_tx = self.cmd_tx.read().await;
@@ -1155,7 +1223,7 @@ impl HyperliquidWebSocketClient {
     ) -> anyhow::Result<()> {
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
         self.cmd_tx
@@ -1173,7 +1241,7 @@ impl HyperliquidWebSocketClient {
     pub async fn subscribe_quotes(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
         let cmd_tx = self.cmd_tx.read().await;
@@ -1198,6 +1266,18 @@ impl HyperliquidWebSocketClient {
         self.subscribe_all_mids_with_dex(None).await
     }
 
+    /// Subscribe to aggregate asset contexts across all perp dexes.
+    pub async fn subscribe_all_dexs_asset_ctxs(&self) -> anyhow::Result<()> {
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::Subscribe {
+                subscriptions: vec![SubscriptionRequest::AllDexsAssetCtxs],
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+        Ok(())
+    }
+
     /// Subscribe to all mid prices across markets, optionally scoped to a specific dex.
     pub async fn subscribe_all_mids_with_dex(&self, dex: Option<&str>) -> anyhow::Result<()> {
         let cmd_tx = self.cmd_tx.read().await;
@@ -1217,6 +1297,18 @@ impl HyperliquidWebSocketClient {
     /// Unsubscribe from all mid prices across markets.
     pub async fn unsubscribe_all_mids(&self) -> anyhow::Result<()> {
         self.unsubscribe_all_mids_with_dex(None).await
+    }
+
+    /// Unsubscribe from aggregate asset contexts across all perp dexes.
+    pub async fn unsubscribe_all_dexs_asset_ctxs(&self) -> anyhow::Result<()> {
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::Unsubscribe {
+                subscriptions: vec![SubscriptionRequest::AllDexsAssetCtxs],
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+        Ok(())
     }
 
     /// Unsubscribe from all mid prices across markets, optionally scoped to a specific dex.
@@ -1239,7 +1331,7 @@ impl HyperliquidWebSocketClient {
     pub async fn subscribe_trades(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
         let cmd_tx = self.cmd_tx.read().await;
@@ -1273,10 +1365,10 @@ impl HyperliquidWebSocketClient {
 
     /// Subscribe to candle/bar data for a specific coin and interval.
     pub async fn subscribe_bars(&self, bar_type: BarType) -> anyhow::Result<()> {
-        // Get the instrument to extract the raw_symbol (Hyperliquid ticker)
+        let instrument_id = bar_type.instrument_id();
         let instrument = self
-            .get_instrument(&bar_type.instrument_id())
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found: {}", bar_type.instrument_id()))?;
+            .get_instrument(&instrument_id)
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
         let interval = bar_type_to_interval(&bar_type)?;
         let subscription = SubscriptionRequest::Candle { coin, interval };
@@ -1378,7 +1470,7 @@ impl HyperliquidWebSocketClient {
     pub async fn unsubscribe_book(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
         let subscription = SubscriptionRequest::L2Book {
@@ -1401,7 +1493,7 @@ impl HyperliquidWebSocketClient {
     pub async fn unsubscribe_quotes(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
         let subscription = SubscriptionRequest::Bbo { coin };
@@ -1420,7 +1512,7 @@ impl HyperliquidWebSocketClient {
     pub async fn unsubscribe_trades(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
         let subscription = SubscriptionRequest::Trades { coin };
@@ -1452,10 +1544,10 @@ impl HyperliquidWebSocketClient {
 
     /// Unsubscribe from candle/bar data.
     pub async fn unsubscribe_bars(&self, bar_type: BarType) -> anyhow::Result<()> {
-        // Get the instrument to extract the raw_symbol (Hyperliquid ticker)
+        let instrument_id = bar_type.instrument_id();
         let instrument = self
-            .get_instrument(&bar_type.instrument_id())
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found: {}", bar_type.instrument_id()))?;
+            .get_instrument(&instrument_id)
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
         let interval = bar_type_to_interval(&bar_type)?;
         let subscription = SubscriptionRequest::Candle { coin, interval };
@@ -1495,6 +1587,23 @@ impl HyperliquidWebSocketClient {
             .await
     }
 
+    /// Cache the ordered instrument IDs required to normalize `allDexsAssetCtxs`.
+    pub fn cache_all_dex_asset_ctxs_instrument_ids(
+        &self,
+        mapping: AHashMap<Ustr, Vec<Option<InstrumentId>>>,
+    ) {
+        self.all_dex_asset_ctxs_instrument_ids
+            .store(mapping.clone());
+
+        if let Ok(cmd_tx) = self.cmd_tx.try_read()
+            && let Err(e) = cmd_tx.send(HandlerCommand::CacheAllDexAssetCtxsInstrumentIds(mapping))
+        {
+            log::debug!(
+                "Failed to send CacheAllDexAssetCtxsInstrumentIds command (handler may not be connected yet): {e}"
+            );
+        }
+    }
+
     async fn subscribe_asset_context_data(
         &self,
         instrument_id: InstrumentId,
@@ -1502,7 +1611,7 @@ impl HyperliquidWebSocketClient {
     ) -> anyhow::Result<()> {
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
         let mut entry = self.asset_context_subs.entry(coin).or_default();
@@ -1548,7 +1657,7 @@ impl HyperliquidWebSocketClient {
     ) -> anyhow::Result<()> {
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
         if let Some(mut entry) = self.asset_context_subs.get_mut(&coin) {
@@ -1779,6 +1888,7 @@ fn subscription_from_topic(topic: &str) -> anyhow::Result<SubscriptionRequest> {
         HyperliquidWsChannel::AllMids => Ok(SubscriptionRequest::AllMids {
             dex: rest.map(|s| s.to_string()),
         }),
+        HyperliquidWsChannel::AllDexsAssetCtxs => Ok(SubscriptionRequest::AllDexsAssetCtxs),
         HyperliquidWsChannel::Notification => Ok(SubscriptionRequest::Notification {
             user: rest.context("Missing user")?.to_string(),
         }),

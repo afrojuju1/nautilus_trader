@@ -29,6 +29,7 @@ from nautilus_trader.model.objects import Currency
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.test_kit.rust.instruments_pyo3 import TestInstrumentProviderPyo3
+from tests.unit_tests.model.instruments import as_pyo3_instrument_dict
 
 
 _EURUSD_PERP = TestInstrumentProviderPyo3.perpetual_contract_eurusd()
@@ -85,6 +86,31 @@ _ETHUSD_PERP_QUANTO = nautilus_pyo3.PerpetualContract(
     min_price=Pyo3Price.from_str("0.05"),
 )
 
+_ETHUSD_PERP_USD_STABLE_SETTLED = nautilus_pyo3.PerpetualContract(
+    instrument_id=InstrumentId.from_str("ETHUSD-STABLE-PERP.AX"),
+    raw_symbol=Symbol("ETHUSD-STABLE-PERP"),
+    underlying="ETHUSD",
+    asset_class=AssetClass.CRYPTOCURRENCY,
+    quote_currency=Pyo3Currency.from_str("USD"),
+    settlement_currency=Pyo3Currency.from_str("USDT"),
+    is_inverse=False,
+    price_precision=2,
+    size_precision=0,
+    price_increment=Pyo3Price.from_str("0.05"),
+    size_increment=Pyo3Quantity.from_int(1),
+    maker_fee=Decimal(0),
+    taker_fee=Decimal(0),
+    margin_init=Decimal("0.01"),
+    margin_maint=Decimal("0.005"),
+    ts_event=0,
+    ts_init=0,
+    base_currency=Pyo3Currency.from_str("ETH"),
+    max_quantity=Pyo3Quantity.from_int(10_000_000),
+    min_quantity=Pyo3Quantity.from_int(1),
+    max_price=Pyo3Price.from_str("1000000.00"),
+    min_price=Pyo3Price.from_str("0.05"),
+)
+
 
 def test_equality():
     item_1 = TestInstrumentProviderPyo3.perpetual_contract_eurusd()
@@ -112,6 +138,7 @@ def test_to_dict():
         "price_precision": 5,
         "size_precision": 0,
         "price_increment": "0.00001",
+        "tick_scheme": None,
         "size_increment": "1",
         "multiplier": "1",
         "lot_size": "1",
@@ -136,10 +163,9 @@ def test_pyo3_cython_conversion():
     pyo3_dict = pyo3_inst.to_dict()
     cython_inst = PerpetualContract.from_pyo3(pyo3_inst)
     cython_dict = PerpetualContract.to_dict(cython_inst)
-    del cython_dict["tick_scheme_name"]  # TODO: Under development
     pyo3_back = nautilus_pyo3.PerpetualContract.from_dict(cython_dict)
     assert pyo3_inst == pyo3_back
-    assert pyo3_dict == cython_dict
+    assert pyo3_dict == as_pyo3_instrument_dict(cython_dict)
 
 
 def test_get_base_currency_linear():
@@ -170,6 +196,13 @@ def test_get_cost_currency_inverse():
 def test_get_cost_currency_quanto():
     quanto = PerpetualContract.from_pyo3(_ETHUSD_PERP_QUANTO)
     assert quanto.get_cost_currency() == Currency.from_str("BTC")
+
+
+def test_usd_stable_settlement_is_not_quanto():
+    instrument = PerpetualContract.from_pyo3(_ETHUSD_PERP_USD_STABLE_SETTLED)
+
+    assert instrument.is_quanto is False
+    assert instrument.get_cost_currency() == Currency.from_str("USD")
 
 
 def test_notional_value_linear():
@@ -214,6 +247,18 @@ def test_notional_value_quanto():
 
     assert notional.currency == Currency.from_str("BTC")
     expected = quantity.as_decimal() * quanto.multiplier.as_decimal() * price.as_decimal()
+    assert notional.as_decimal() == expected
+
+
+def test_notional_value_usd_stable_settlement_returns_quote():
+    instrument = PerpetualContract.from_pyo3(_ETHUSD_PERP_USD_STABLE_SETTLED)
+    quantity = Quantity.from_int(1000)
+    price = Price.from_str("2500.00")
+
+    notional = instrument.notional_value(quantity, price)
+
+    assert notional.currency == Currency.from_str("USD")
+    expected = quantity.as_decimal() * instrument.multiplier.as_decimal() * price.as_decimal()
     assert notional.as_decimal() == expected
 
 

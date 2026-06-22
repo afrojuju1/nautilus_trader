@@ -29,6 +29,7 @@ pub mod instrument;
 pub mod instrument_status;
 pub mod json;
 pub mod mark_price;
+pub mod option_greeks;
 pub mod order_event;
 pub mod position_event;
 pub mod quote;
@@ -51,8 +52,8 @@ use arrow::{
 use nautilus_model::{
     data::{
         Data, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate, bar::Bar,
-        close::InstrumentClose, delta::OrderBookDelta, depth::OrderBookDepth10, quote::QuoteTick,
-        trade::TradeTick,
+        close::InstrumentClose, delta::OrderBookDelta, depth::OrderBookDepth10,
+        option_chain::OptionGreeks, quote::QuoteTick, trade::TradeTick,
     },
     types::{
         PRICE_ERROR, PRICE_UNDEF, Price, QUANTITY_UNDEF, Quantity,
@@ -63,6 +64,7 @@ use nautilus_model::{
 };
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
+use ustr::Ustr;
 
 // Define metadata key constants constants
 const KEY_BAR_TYPE: &str = "bar_type";
@@ -457,6 +459,62 @@ pub fn extract_column<'a, T: Array + 'static>(
     Ok(downcasted_values)
 }
 
+/// Extracts a column by name when present, falling back to an index for older schemas.
+///
+/// # Errors
+///
+/// Returns an error if the resolved column is missing or has the wrong type.
+pub fn extract_column_by_name_or_index<'a, T: Array + 'static>(
+    record_batch: &'a RecordBatch,
+    column_key: &'static str,
+    fallback_index: usize,
+    expected_type: DataType,
+) -> Result<&'a T, EncodingError> {
+    let column_index = record_batch
+        .schema()
+        .index_of(column_key)
+        .unwrap_or(fallback_index);
+    extract_column::<T>(
+        record_batch.columns(),
+        column_key,
+        column_index,
+        expected_type,
+    )
+}
+
+/// Extracts an optional UTF-8 column by name.
+///
+/// # Errors
+///
+/// Returns an error if the column exists but is not UTF-8.
+pub fn extract_optional_string_column_by_name<'a>(
+    record_batch: &'a RecordBatch,
+    column_key: &'static str,
+) -> Result<Option<&'a StringArray>, EncodingError> {
+    let Ok(column_index) = record_batch.schema().index_of(column_key) else {
+        return Ok(None);
+    };
+    let column_values = record_batch
+        .columns()
+        .get(column_index)
+        .ok_or(EncodingError::MissingColumn(column_key, column_index))?;
+    let downcasted_values = column_values.as_any().downcast_ref::<StringArray>().ok_or(
+        EncodingError::InvalidColumnType(
+            column_key,
+            column_index,
+            DataType::Utf8,
+            column_values.data_type().clone(),
+        ),
+    )?;
+    Ok(Some(downcasted_values))
+}
+
+/// Returns an optional [`Ustr`] value from an optional string column.
+#[must_use]
+pub fn optional_ustr_value(values: Option<&StringArray>, row: usize) -> Option<Ustr> {
+    values.and_then(|column| (!column.is_null(row)).then(|| Ustr::from(column.value(row))))
+}
+
 /// Validates that a [`FixedSizeBinaryArray`] has the expected precision byte width.
 ///
 /// This detects precision mode mismatches that occur when catalog data was encoded
@@ -642,6 +700,26 @@ pub fn instrument_status_to_arrow_record_batch_bytes(
     let first = data.first().unwrap();
     let metadata = first.metadata();
     InstrumentStatus::encode_batch(&metadata, data).map_err(EncodingError::ArrowError)
+}
+
+/// Converts a vector of `OptionGreeks` into an Arrow `RecordBatch`.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - `data` is empty: `EncodingError::EmptyData`.
+/// - Encoding fails: `EncodingError::ArrowError`.
+#[expect(clippy::missing_panics_doc)] // Guarded by empty check
+pub fn option_greeks_to_arrow_record_batch_bytes(
+    data: &[OptionGreeks],
+) -> Result<RecordBatch, EncodingError> {
+    if data.is_empty() {
+        return Err(EncodingError::EmptyData);
+    }
+
+    let first = data.first().unwrap();
+    let metadata = first.metadata();
+    OptionGreeks::encode_batch(&metadata, data).map_err(EncodingError::ArrowError)
 }
 
 /// Converts a vector of `InstrumentClose` into an Arrow `RecordBatch`.

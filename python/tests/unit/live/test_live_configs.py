@@ -13,6 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import re
+
 import pytest
 
 from nautilus_trader.live import InstrumentProviderConfig
@@ -177,16 +179,21 @@ def test_live_exec_engine_config_rejects_unsupported_args():
     with pytest.raises(TypeError, match="purge_from_database"):
         LiveExecEngineConfig(purge_from_database=True)
 
-    with pytest.raises(TypeError, match="graceful_shutdown_on_error"):
-        LiveExecEngineConfig(graceful_shutdown_on_error=True)
-
     with pytest.raises(TypeError, match="qsize"):
         LiveExecEngineConfig(qsize=1)
 
 
 def test_live_exec_engine_config_rejects_invalid_reconciliation_instrument_ids():
-    with pytest.raises(ValueError, match="reconciliation_instrument_ids"):
+    expected_err = (
+        "invalid LiveExecEngineConfig.reconciliation_instrument_ids[0] reference instrument ID: "
+        "invalid `InstrumentId` value 'INVALID': "
+        "missing '.' separator between symbol and venue components"
+    )
+
+    with pytest.raises(ValueError, match=re.escape(expected_err)) as exc_info:
         LiveExecEngineConfig(reconciliation_instrument_ids=["INVALID"])
+
+    assert str(exc_info.value) == expected_err
 
 
 @pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), float("-inf")])
@@ -201,7 +208,19 @@ def test_live_node_config_defaults():
     assert isinstance(config, LiveNodeConfig)
     assert config.load_state is False
     assert config.save_state is False
-    assert config.timeout_connection_secs > 0
+    assert config.shutdown_on_error is False
+    assert config.timeout_connection_secs == 60.0
+
+
+def test_live_node_config_rejects_invalid_timeout_duration():
+    expected_err = (
+        "invalid timeout_connection_secs: -1 (must be finite, non-negative, and <= 86400)"
+    )
+
+    with pytest.raises(ValueError, match=re.escape(expected_err)) as exc_info:
+        LiveNodeConfig(timeout_connection_secs=-1.0)
+
+    assert str(exc_info.value) == expected_err
 
 
 def test_live_node_config_accepts_portfolio_config_argument():
@@ -229,15 +248,19 @@ def test_live_risk_engine_config_rejects_unsupported_args():
 
 
 def test_live_risk_engine_config_rejects_invalid_rate_limit():
-    with pytest.raises(ValueError, match="max_order_submit_rate"):
+    expected_err = "invalid LiveRiskEngineConfig.max_order_submit_rate: expected 'limit/HH:MM:SS'"
+
+    with pytest.raises(ValueError, match=re.escape(expected_err)) as exc_info:
         LiveRiskEngineConfig(max_order_submit_rate="bad-rate")
+
+    assert str(exc_info.value) == expected_err
 
 
 def test_live_risk_engine_config_rejects_zero_rate_limit_values():
-    with pytest.raises(ValueError, match="limit must be greater than zero"):
+    with pytest.raises(ValueError, match="Invalid limit: 0"):
         LiveRiskEngineConfig(max_order_submit_rate="0/00:00:01")
 
-    with pytest.raises(ValueError, match="interval must be greater than zero"):
+    with pytest.raises(ValueError, match="Invalid interval_ns: 0"):
         LiveRiskEngineConfig(max_order_modify_rate="100/00:00:00")
 
 
@@ -254,8 +277,16 @@ def test_live_risk_engine_config_accepts_str_notional_values():
 
 
 def test_live_risk_engine_config_rejects_invalid_max_notional_per_order():
-    with pytest.raises(ValueError, match="max_notional_per_order"):
+    expected_err = (
+        "invalid LiveRiskEngineConfig.max_notional_per_order[INVALID] reference instrument ID: "
+        "invalid `InstrumentId` value 'INVALID': "
+        "missing '.' separator between symbol and venue components"
+    )
+
+    with pytest.raises(ValueError, match=re.escape(expected_err)) as exc_info:
         LiveRiskEngineConfig(max_notional_per_order={"INVALID": "1000"})
+
+    assert str(exc_info.value) == expected_err
 
 
 def test_portfolio_config_defaults():

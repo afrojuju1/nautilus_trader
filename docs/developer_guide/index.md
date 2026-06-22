@@ -21,6 +21,7 @@ This approach combines Python's simplicity and ecosystem with Rust's performance
 - [Test Datasets](test_datasets.md)
 - [Docs Style](docs.md)
 - [Release Notes](releases.md)
+- [Release Security Architecture](release_security.md)
 - [Adapters](adapters.md)
 - [Alpaca Production Complete Plan](alpaca_production_complete_plan.md)
 - [Alpaca TradingNode Gap Plan](alpaca_trading_node_gap_plan.md)

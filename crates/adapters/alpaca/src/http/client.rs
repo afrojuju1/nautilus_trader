@@ -15,8 +15,8 @@
 
 //! Authenticated Alpaca REST client.
 
-use std::time::Duration;
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use reqwest::{
     StatusCode, Url,
@@ -31,12 +31,12 @@ use crate::{
     http::{
         error::{Error, Result},
         models::{
-            AlpacaAccount, AlpacaActivity, AlpacaOrder, AlpacaPosition, ListActivitiesRequest,
-            ListOptionContractsRequest, ListOrdersRequest, MarketCalendarRequest,
-            AlpacaMarketCalendarDay, OptionBarsRequest, OptionBarsResponse, OptionContractsResponse,
+            AlpacaAccount, AlpacaActivity, AlpacaMarketCalendarDay, AlpacaOrder, AlpacaPosition,
+            ListActivitiesRequest, ListOptionContractsRequest, ListOrdersRequest,
+            MarketCalendarRequest, OptionBarsRequest, OptionBarsResponse, OptionContractsResponse,
             OptionSnapshotsRequest, OptionSnapshotsResponse, OptionTradesRequest,
-            OptionTradesResponse, ReplaceOrderRequest,
-            StockBarsRequest, StockBarsResponse, StockSnapshotsRequest, StockSnapshotsResponse,
+            OptionTradesResponse, ReplaceOrderRequest, StockBarsRequest, StockBarsResponse,
+            StockSnapshotsRequest, StockSnapshotsResponse,
         },
     },
     orders::{EquityOrderPayload, MlegOrderPayload, SimpleOrderPayload},
@@ -244,8 +244,7 @@ impl AlpacaHttpClient {
     ///
     /// Returns an error if any request fails or cannot be decoded.
     pub async fn option_bars(&self, request: &OptionBarsRequest) -> Result<OptionBarsResponse> {
-        let mut bars: BTreeMap<String, Vec<crate::http::models::AlpacaOptionBar>> =
-            BTreeMap::new();
+        let mut bars: BTreeMap<String, Vec<crate::http::models::AlpacaOptionBar>> = BTreeMap::new();
 
         for symbol_batch in request.symbols.chunks(100) {
             let mut page_token = request.page_token.clone();
@@ -338,8 +337,7 @@ impl AlpacaHttpClient {
     ///
     /// Returns an error if any request fails or cannot be decoded.
     pub async fn stock_bars(&self, request: &StockBarsRequest) -> Result<StockBarsResponse> {
-        let mut bars: BTreeMap<String, Vec<crate::http::models::AlpacaStockBar>> =
-            BTreeMap::new();
+        let mut bars: BTreeMap<String, Vec<crate::http::models::AlpacaStockBar>> = BTreeMap::new();
 
         for symbol_batch in request.symbols.chunks(100) {
             let mut page_token = request.page_token.clone();

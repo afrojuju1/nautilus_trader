@@ -526,7 +526,10 @@ class OKXDataClient(LiveMarketDataClient):
             self._cache_instrument(pyo3_instrument)  # type: ignore[arg-type]
             instrument = transform_instrument_from_pyo3(pyo3_instrument)
         except Exception as e:
-            self._log.error(f"Failed to request instrument {request.instrument_id}: {e}")
+            if _is_instrument_definition_error(e):
+                self._log.warning(f"Failed to request instrument {request.instrument_id}: {e}")
+            else:
+                self._log.error(f"Failed to request instrument {request.instrument_id}: {e}")
             return
 
         self._handle_instrument(
@@ -596,6 +599,16 @@ class OKXDataClient(LiveMarketDataClient):
             else:
                 instruments = await self._fetch_instruments_for_type(inst_type)
                 all_instruments.extend(instruments)
+
+        if self._instrument_provider.load_spreads:
+            try:
+                pyo3_instruments = await self._http_client.request_spread_instruments()
+                for pyo3_instrument in pyo3_instruments:
+                    self._cache_instrument(pyo3_instrument)
+                    instrument = transform_instrument_from_pyo3(pyo3_instrument)
+                    all_instruments.append(instrument)
+            except Exception as e:
+                self._log.error(f"Failed to fetch spread instruments: {e}")
 
         self._handle_instruments(
             request.venue,
@@ -738,7 +751,7 @@ class OKXDataClient(LiveMarketDataClient):
 
     def _handle_msg(self, msg: Any) -> None:
         if isinstance(msg, nautilus_pyo3.OKXWebSocketError):
-            self._log.error(repr(msg))
+            self._log.warning(repr(msg))
             return
 
         try:
@@ -778,6 +791,15 @@ class OKXDataClient(LiveMarketDataClient):
         instrument = transform_instrument_from_pyo3(pyo3_instrument)
 
         self._handle_data(instrument)
+
+
+def _is_instrument_definition_error(error: Exception) -> bool:
+    message = str(error)
+    return (
+        "Failed to parse instrument" in message
+        or "instrument is in pre-open state" in message
+        or "unsupported instrument type" in message
+    )
 
 
 def _supports_funding_rates(instrument: Instrument) -> bool:

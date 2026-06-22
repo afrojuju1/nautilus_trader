@@ -54,8 +54,9 @@ use nautilus_model::{
         PositionSideSpecified, TimeInForce, TriggerType,
     },
     events::{
-        OrderEventAny, OrderFilled, OrderPendingCancel, OrderPendingUpdate,
+        OrderEventAny, OrderFilled,
         account::state::AccountState,
+        order::spec::{OrderPendingCancelSpec, OrderPendingUpdateSpec},
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId, StrategyId,
@@ -553,7 +554,8 @@ async fn test_reconcile_mass_status_publishes_external_order_initialized() {
 
     ctx.add_instrument(test_instrument());
     ctx.manager
-        .claim_external_orders(instrument_id, strategy_id);
+        .claim_external_orders(instrument_id, strategy_id)
+        .unwrap();
 
     let topic = switchboard::get_event_orders_topic(strategy_id);
     let (handler, event_messages): (_, TypedMessageSavingHandler<OrderEventAny>) =
@@ -1308,7 +1310,8 @@ async fn test_reconcile_mass_status_uses_claimed_strategy() {
 
     ctx.add_instrument(test_instrument());
     ctx.manager
-        .claim_external_orders(instrument_id, strategy_id);
+        .claim_external_orders(instrument_id, strategy_id)
+        .unwrap();
 
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
@@ -1336,6 +1339,59 @@ async fn test_reconcile_mass_status_uses_claimed_strategy() {
     assert_eq!(result.events.len(), 1);
 
     let client_order_id = ClientOrderId::from("V-EXT-001");
+    let order = ctx.get_order(&client_order_id).unwrap();
+    assert_eq!(order.strategy_id(), strategy_id);
+}
+
+#[tokio::test]
+async fn test_claim_external_orders_duplicate_fails_without_overwriting() {
+    let mut ctx = TestContext::new();
+    let instrument_id = test_instrument_id();
+    let strategy_id = StrategyId::from("MY-STRATEGY");
+    let duplicate_strategy_id = StrategyId::from("OTHER-STRATEGY");
+
+    ctx.add_instrument(test_instrument());
+    ctx.manager
+        .claim_external_orders(instrument_id, strategy_id)
+        .unwrap();
+
+    let result = ctx
+        .manager
+        .claim_external_orders(instrument_id, duplicate_strategy_id);
+
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("already exists for MY-STRATEGY")
+    );
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+    let report = create_order_status_report(
+        None,
+        VenueOrderId::from("V-EXT-DUPLICATE"),
+        instrument_id,
+        OrderStatus::Accepted,
+        Quantity::from("1.0"),
+        Quantity::from("0"),
+    );
+    mass_status.add_order_reports(vec![report]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status, ctx.exec_engine.clone())
+        .await;
+
+    assert_eq!(result.events.len(), 1);
+
+    let client_order_id = ClientOrderId::from("V-EXT-DUPLICATE");
     let order = ctx.get_order(&client_order_id).unwrap();
     assert_eq!(order.strategy_id(), strategy_id);
 }
@@ -2091,6 +2147,8 @@ fn test_observe_fill_report_without_client_order_id_uses_cache_fallback() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 5,
+        open_check_threshold_ns: 1_000_000_000,
+        max_single_order_queries_per_cycle: 5,
         ..Default::default()
     };
     let mut ctx = TestContext::with_config(config);
@@ -2100,13 +2158,7 @@ fn test_observe_fill_report_without_client_order_id_uses_cache_fallback() {
     let trade_id = TradeId::from("T-FALLBACK");
 
     ctx.add_instrument(test_instrument());
-
-    // Add order to cache so venue_order_id -> client_order_id mapping exists
-    let mut order =
-        create_submitted_order("O-001", instrument_id, OrderSide::Buy, "1.0", "3000.00");
-    let accepted = TestOrderEventStubs::accepted(&order, test_account_id(), venue_order_id);
-    order.apply(accepted).unwrap();
-    ctx.add_order(order);
+    insert_accepted_limit_order(&ctx, client_order_id, venue_order_id, test_client_id());
 
     // Register inflight so we can verify activity recording deferred the check
     ctx.manager.register_inflight(client_order_id);
@@ -2133,8 +2185,8 @@ fn test_observe_fill_report_without_client_order_id_uses_cache_fallback() {
     // observe should resolve client_order_id via cache and record activity
     ctx.manager.observe_execution_report(&report);
 
-    // Fill marking is deferred to post-dispatch in the event loop
-    assert!(!ctx.manager.is_fill_recently_processed(&trade_id));
+    let queries = ctx.manager.check_open_order_queries();
+    assert!(queries.is_empty());
 }
 
 #[tokio::test]
@@ -2292,18 +2344,16 @@ fn create_pending_update_order(
         price,
         venue_order_id,
     );
-    let pending = OrderEventAny::PendingUpdate(OrderPendingUpdate::new(
-        order.trader_id(),
-        order.strategy_id(),
-        order.instrument_id(),
-        order.client_order_id(),
-        test_account_id(),
-        UUID4::new(),
-        UnixNanos::default(),
-        UnixNanos::default(),
-        false,
-        Some(venue_order_id),
-    ));
+    let pending = OrderEventAny::PendingUpdate(
+        OrderPendingUpdateSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(order.client_order_id())
+            .account_id(test_account_id())
+            .venue_order_id(venue_order_id)
+            .build(),
+    );
     order.apply(pending).unwrap();
     order
 }
@@ -2324,18 +2374,16 @@ fn create_pending_cancel_order(
         price,
         venue_order_id,
     );
-    let pending = OrderEventAny::PendingCancel(OrderPendingCancel::new(
-        order.trader_id(),
-        order.strategy_id(),
-        order.instrument_id(),
-        order.client_order_id(),
-        test_account_id(),
-        UUID4::new(),
-        UnixNanos::default(),
-        UnixNanos::default(),
-        false,
-        Some(venue_order_id),
-    ));
+    let pending = OrderEventAny::PendingCancel(
+        OrderPendingCancelSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(order.client_order_id())
+            .account_id(test_account_id())
+            .venue_order_id(venue_order_id)
+            .build(),
+    );
     order.apply(pending).unwrap();
     order
 }
@@ -3476,8 +3524,16 @@ async fn test_reconcile_mass_status_skips_position_report_when_fills_exist() {
     let venue_order_id = VenueOrderId::from("V-001");
 
     ctx.add_instrument(test_instrument());
-    let order = create_limit_order("O-001", instrument_id, OrderSide::Buy, "5.0", "3000.00");
+    let mut order = create_limit_order("O-001", instrument_id, OrderSide::Buy, "5.0", "3000.00");
+    let submitted = TestOrderEventStubs::submitted(&order, test_account_id());
+    order.apply(submitted).unwrap();
+    let accepted = TestOrderEventStubs::accepted(&order, test_account_id(), venue_order_id);
+    order.apply(accepted).unwrap();
     ctx.add_order(order);
+    ctx.cache
+        .borrow_mut()
+        .add_venue_order_id(&client_order_id, &venue_order_id, false)
+        .unwrap();
 
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
@@ -4488,8 +4544,8 @@ async fn test_adjust_fills_creates_synthetic_for_partial_window() {
         LiquiditySide::Taker,
         None,
         None,
-        UnixNanos::from(500_000),
-        UnixNanos::from(500_000),
+        UnixNanos::from(1_000_001),
+        UnixNanos::from(1_000_001),
         None,
     );
     mass_status.add_fill_reports(vec![fill]);
@@ -4625,8 +4681,8 @@ async fn test_external_order_with_fills_but_no_avg_px_applies_real_fills_only() 
         LiquiditySide::Taker,
         None,
         None,
-        UnixNanos::from(1_000),
-        UnixNanos::from(1_000),
+        UnixNanos::from(1_000_001),
+        UnixNanos::from(1_000_001),
         None,
     );
 
@@ -5176,8 +5232,8 @@ async fn test_partial_window_adjustment_skips_hedge_mode_instruments() {
         LiquiditySide::Taker,
         None,
         None,
-        UnixNanos::from(1_000),
-        UnixNanos::from(1_000),
+        UnixNanos::from(1_000_001),
+        UnixNanos::from(1_000_001),
         None,
     );
     mass_status.add_fill_reports(vec![fill]);
@@ -5280,8 +5336,8 @@ async fn test_adjust_fills_multi_instrument_preserves_all_fills() {
         LiquiditySide::Taker,
         None,
         None,
-        UnixNanos::from(1_000),
-        UnixNanos::from(1_000),
+        UnixNanos::from(1_000_001),
+        UnixNanos::from(1_000_001),
         None,
     );
     let fill1b = FillReport::new(
@@ -5296,8 +5352,8 @@ async fn test_adjust_fills_multi_instrument_preserves_all_fills() {
         LiquiditySide::Taker,
         None,
         None,
-        UnixNanos::from(2_000),
-        UnixNanos::from(2_000),
+        UnixNanos::from(1_000_002),
+        UnixNanos::from(1_000_002),
         None,
     );
 
@@ -5346,8 +5402,8 @@ async fn test_adjust_fills_multi_instrument_preserves_all_fills() {
         LiquiditySide::Taker,
         None,
         None,
-        UnixNanos::from(1_500),
-        UnixNanos::from(1_500),
+        UnixNanos::from(1_000_003),
+        UnixNanos::from(1_000_003),
         None,
     );
     let fill2b = FillReport::new(
@@ -5362,8 +5418,8 @@ async fn test_adjust_fills_multi_instrument_preserves_all_fills() {
         LiquiditySide::Taker,
         None,
         None,
-        UnixNanos::from(2_500),
-        UnixNanos::from(2_500),
+        UnixNanos::from(1_000_004),
+        UnixNanos::from(1_000_004),
         None,
     );
 
@@ -6801,6 +6857,325 @@ impl ExecutionClient for MockExecutionClient {
 }
 
 #[rstest]
+fn test_check_open_order_queries_builds_query_for_cached_open_order() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        max_single_order_queries_per_cycle: 5,
+        ..Default::default()
+    });
+    ctx.add_instrument(test_instrument());
+
+    let client_order_id = ClientOrderId::from("O-QUERY-001");
+    let venue_order_id = VenueOrderId::from("V-QUERY-001");
+    let client_id = test_client_id();
+
+    insert_accepted_limit_order(&ctx, client_order_id, venue_order_id, client_id);
+
+    let queries = ctx.manager.check_open_order_queries();
+
+    assert_eq!(queries.len(), 1);
+    match &queries[0] {
+        TradingCommand::QueryOrder(query) => {
+            assert_eq!(query.client_id, Some(client_id));
+            assert_eq!(query.client_order_id, client_order_id);
+            assert_eq!(query.venue_order_id, Some(venue_order_id));
+        }
+        command => panic!("Expected QueryOrder, was {command:?}"),
+    }
+}
+
+#[rstest]
+fn test_check_open_order_queries_dedupes_open_inflight_order() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        max_single_order_queries_per_cycle: 5,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    });
+    ctx.add_instrument(test_instrument());
+
+    let client_order_id = ClientOrderId::from("O-QUERY-002");
+    let venue_order_id = VenueOrderId::from("V-QUERY-002");
+    let client_id = test_client_id();
+    insert_accepted_limit_order(&ctx, client_order_id, venue_order_id, client_id);
+    let order = ctx
+        .cache
+        .borrow()
+        .order(&client_order_id)
+        .map(|order| order.clone())
+        .unwrap();
+    let pending = OrderEventAny::PendingCancel(
+        OrderPendingCancelSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(order.client_order_id())
+            .account_id(test_account_id())
+            .venue_order_id(venue_order_id)
+            .build(),
+    );
+    ctx.cache.borrow_mut().update_order(&pending).unwrap();
+
+    let queries = ctx.manager.check_open_order_queries();
+
+    assert_eq!(queries.len(), 1);
+    match &queries[0] {
+        TradingCommand::QueryOrder(query) => {
+            assert_eq!(query.client_id, Some(client_id));
+            assert_eq!(query.client_order_id, client_order_id);
+            assert_eq!(query.venue_order_id, Some(venue_order_id));
+        }
+        command => panic!("Expected QueryOrder, was {command:?}"),
+    }
+}
+
+#[rstest]
+fn test_check_open_order_queries_respects_per_cycle_limit() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        max_single_order_queries_per_cycle: 1,
+        ..Default::default()
+    });
+    ctx.add_instrument(test_instrument());
+
+    insert_accepted_limit_order(
+        &ctx,
+        ClientOrderId::from("O-QUERY-003"),
+        VenueOrderId::from("V-QUERY-003"),
+        test_client_id(),
+    );
+    insert_accepted_limit_order(
+        &ctx,
+        ClientOrderId::from("O-QUERY-004"),
+        VenueOrderId::from("V-QUERY-004"),
+        test_client_id(),
+    );
+
+    let queries = ctx.manager.check_open_order_queries();
+
+    assert_eq!(queries.len(), 1);
+}
+
+#[rstest]
+fn test_check_open_order_queries_rotates_after_open_report_response() {
+    fn queried_client_order_id(queries: &[TradingCommand]) -> ClientOrderId {
+        match &queries[0] {
+            TradingCommand::QueryOrder(query) => query.client_order_id,
+            command => panic!("Expected QueryOrder, was {command:?}"),
+        }
+    }
+
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        max_single_order_queries_per_cycle: 1,
+        open_check_threshold_ns: 0,
+        ..Default::default()
+    });
+    ctx.add_instrument(test_instrument());
+
+    let first_id = ClientOrderId::from("O-QUERY-011");
+    let second_id = ClientOrderId::from("O-QUERY-012");
+    let third_id = ClientOrderId::from("O-QUERY-013");
+    let first_venue_id = VenueOrderId::from("V-QUERY-011");
+    let second_venue_id = VenueOrderId::from("V-QUERY-012");
+    let third_venue_id = VenueOrderId::from("V-QUERY-013");
+
+    insert_accepted_limit_order(&ctx, first_id, first_venue_id, test_client_id());
+    insert_accepted_limit_order(&ctx, second_id, second_venue_id, test_client_id());
+    insert_accepted_limit_order(&ctx, third_id, third_venue_id, test_client_id());
+
+    let first_queries = ctx.manager.check_open_order_queries();
+    let first_report = create_order_status_report(
+        Some(first_id),
+        first_venue_id,
+        test_instrument_id(),
+        OrderStatus::Accepted,
+        Quantity::from("10.0"),
+        Quantity::from("0.0"),
+    );
+    ctx.manager
+        .observe_execution_report(&ExecutionReport::Order(Box::new(first_report)));
+
+    let second_queries = ctx.manager.check_open_order_queries();
+    let second_report = create_order_status_report(
+        Some(second_id),
+        second_venue_id,
+        test_instrument_id(),
+        OrderStatus::Accepted,
+        Quantity::from("10.0"),
+        Quantity::from("0.0"),
+    );
+    ctx.manager
+        .observe_execution_report(&ExecutionReport::Order(Box::new(second_report)));
+
+    let third_queries = ctx.manager.check_open_order_queries();
+
+    assert_eq!(first_queries.len(), 1);
+    assert_eq!(second_queries.len(), 1);
+    assert_eq!(third_queries.len(), 1);
+    assert_eq!(queried_client_order_id(&first_queries), first_id);
+    assert_eq!(queried_client_order_id(&second_queries), second_id);
+    assert_eq!(queried_client_order_id(&third_queries), third_id);
+}
+
+#[rstest]
+fn test_check_open_order_queries_returns_empty_when_cycle_limit_is_zero() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        max_single_order_queries_per_cycle: 0,
+        ..Default::default()
+    });
+    ctx.add_instrument(test_instrument());
+
+    insert_accepted_limit_order(
+        &ctx,
+        ClientOrderId::from("O-QUERY-005"),
+        VenueOrderId::from("V-QUERY-005"),
+        test_client_id(),
+    );
+
+    let queries = ctx.manager.check_open_order_queries();
+
+    assert!(queries.is_empty());
+}
+
+#[rstest]
+fn test_check_open_order_queries_respects_query_delay() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        max_single_order_queries_per_cycle: 5,
+        single_order_query_delay_ms: 100,
+        ..Default::default()
+    });
+    ctx.add_instrument(test_instrument());
+
+    insert_accepted_limit_order(
+        &ctx,
+        ClientOrderId::from("O-QUERY-006"),
+        VenueOrderId::from("V-QUERY-006"),
+        test_client_id(),
+    );
+
+    let first_queries = ctx.manager.check_open_order_queries();
+    let delayed_queries = ctx.manager.check_open_order_queries();
+
+    assert_eq!(first_queries.len(), 1);
+    assert!(delayed_queries.is_empty());
+}
+
+#[rstest]
+fn test_check_open_order_queries_defers_with_recent_local_activity() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        max_single_order_queries_per_cycle: 5,
+        open_check_threshold_ns: 5_000_000_000,
+        ..Default::default()
+    });
+    ctx.add_instrument(test_instrument());
+
+    let client_order_id = ClientOrderId::from("O-QUERY-007");
+    insert_accepted_limit_order(
+        &ctx,
+        client_order_id,
+        VenueOrderId::from("V-QUERY-007"),
+        test_client_id(),
+    );
+    ctx.manager.record_local_activity(client_order_id);
+
+    let queries = ctx.manager.check_open_order_queries();
+
+    assert!(queries.is_empty());
+}
+
+#[rstest]
+fn test_check_open_order_queries_skips_filtered_client_order_ids() {
+    let filtered_id = ClientOrderId::from("O-QUERY-008");
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        max_single_order_queries_per_cycle: 5,
+        filtered_client_order_ids: IndexSet::from([filtered_id]),
+        ..Default::default()
+    });
+    ctx.add_instrument(test_instrument());
+
+    insert_accepted_limit_order(
+        &ctx,
+        filtered_id,
+        VenueOrderId::from("V-QUERY-008"),
+        test_client_id(),
+    );
+
+    let queries = ctx.manager.check_open_order_queries();
+
+    assert!(queries.is_empty());
+}
+
+#[rstest]
+fn test_check_open_order_queries_filters_reconciliation_instruments() {
+    let included_id = ClientOrderId::from("O-QUERY-009");
+    let excluded_id = ClientOrderId::from("O-QUERY-010");
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        max_single_order_queries_per_cycle: 5,
+        reconciliation_instrument_ids: IndexSet::from([test_instrument_id()]),
+        ..Default::default()
+    });
+    ctx.add_instrument(test_instrument());
+    ctx.add_instrument(test_instrument2());
+
+    insert_accepted_limit_order(
+        &ctx,
+        included_id,
+        VenueOrderId::from("V-QUERY-009"),
+        test_client_id(),
+    );
+    insert_accepted_limit_order_for_instrument(
+        &ctx,
+        excluded_id,
+        VenueOrderId::from("V-QUERY-010"),
+        test_instrument_id2(),
+        ClientId::from("BITMEX"),
+    );
+
+    let queries = ctx.manager.check_open_order_queries();
+
+    assert_eq!(queries.len(), 1);
+    match &queries[0] {
+        TradingCommand::QueryOrder(query) => {
+            assert_eq!(query.client_order_id, included_id);
+            assert_eq!(query.instrument_id, test_instrument_id());
+        }
+        command => panic!("Expected QueryOrder, was {command:?}"),
+    }
+}
+
+fn insert_accepted_limit_order(
+    ctx: &TestContext,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    client_id: ClientId,
+) {
+    insert_accepted_limit_order_for_instrument(
+        ctx,
+        client_order_id,
+        venue_order_id,
+        test_instrument_id(),
+        client_id,
+    );
+}
+
+fn insert_accepted_limit_order_for_instrument(
+    ctx: &TestContext,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    instrument_id: InstrumentId,
+    client_id: ClientId,
+) {
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .client_order_id(client_order_id)
+        .instrument_id(instrument_id)
+        .quantity(Quantity::from("10.0"))
+        .price(Price::from("100.0"))
+        .build();
+    let submitted = TestOrderEventStubs::submitted(&order, test_account_id());
+    ctx.add_order_with_client_id(order, client_id);
+    let order = ctx.cache.borrow_mut().update_order(&submitted).unwrap();
+    let accepted = TestOrderEventStubs::accepted(&order, test_account_id(), venue_order_id);
+    ctx.cache.borrow_mut().update_order(&accepted).unwrap();
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_check_open_orders_defers_with_recent_local_activity() {
     // Test that reconciliation is deferred when there's recent local activity
@@ -7013,6 +7388,43 @@ async fn test_check_open_orders_submitted_missing_at_venue_generates_rejected() 
 }
 
 #[tokio::test]
+async fn test_position_check_reconciles_venue_only_nonflat_report() {
+    let config = ExecutionManagerConfig {
+        position_check_retries: 3,
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+
+    ctx.add_instrument(instrument);
+
+    let venue_report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSideSpecified::Long,
+        Quantity::from("3.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None,
+        Some(dec!(3000.00)),
+    );
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+
+    let events = ctx.manager.check_positions_consistency(&clients).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Filled(_))),
+        "Expected a synthetic fill for a non-flat venue-only position report"
+    );
+}
+
+#[tokio::test]
 async fn test_position_check_retries_stops_after_max() {
     // When instrument is not in cache, check_position_discrepancy returns None
     // (can't generate fills), so retries should increment until exhausted
@@ -7159,6 +7571,7 @@ struct MockPositionExecutionClient {
     venue: Venue,
     order_reports: RefCell<Vec<OrderStatusReport>>,
     position_reports: RefCell<Vec<PositionStatusReport>>,
+    fail_position_reports: bool,
 }
 
 impl MockPositionExecutionClient {
@@ -7172,6 +7585,18 @@ impl MockPositionExecutionClient {
             venue: test_venue(),
             order_reports: RefCell::new(order_reports),
             position_reports: RefCell::new(position_reports),
+            fail_position_reports: false,
+        }
+    }
+
+    fn failing_position_reports() -> Self {
+        Self {
+            client_id: test_client_id(),
+            account_id: test_account_id(),
+            venue: test_venue(),
+            order_reports: RefCell::new(Vec::new()),
+            position_reports: RefCell::new(Vec::new()),
+            fail_position_reports: true,
         }
     }
 }
@@ -7263,8 +7688,118 @@ impl ExecutionClient for MockPositionExecutionClient {
         &self,
         _cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        if self.fail_position_reports {
+            anyhow::bail!("position reports unavailable");
+        }
+
         Ok(self.position_reports.borrow().clone())
     }
+}
+
+#[tokio::test]
+async fn test_position_check_failed_venue_query_skips_cached_position() {
+    let config = ExecutionManagerConfig {
+        position_check_retries: 3,
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-FAIL-SKIP"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_position(&position);
+
+    let ok_client = MockPositionExecutionClient::new(vec![], vec![]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&ok_client];
+    let events = ctx.manager.check_positions_consistency(&clients).await;
+
+    assert!(events.is_empty());
+    assert_eq!(
+        ctx.manager
+            .position_recon_retry_count(&(instrument_id, test_account_id())),
+        1
+    );
+
+    ctx.add_instrument(instrument);
+    let failing_client = MockPositionExecutionClient::failing_position_reports();
+    let clients: Vec<&dyn ExecutionClient> = vec![&failing_client];
+    let events = ctx.manager.check_positions_consistency(&clients).await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Filled(_))),
+        "Expected no synthetic fill when the venue position query fails"
+    );
+    assert_eq!(
+        ctx.manager
+            .position_recon_retry_count(&(instrument_id, test_account_id())),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_position_check_aggregates_hedge_positions_before_comparing_report() {
+    let config = ExecutionManagerConfig {
+        position_check_retries: 3,
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+
+    ctx.add_instrument(instrument.clone());
+    let pos_long = create_test_position(
+        &instrument,
+        PositionId::from("P-NET-LONG"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    let pos_short = create_test_position(
+        &instrument,
+        PositionId::from("P-NET-SHORT"),
+        OrderSide::Sell,
+        "3.0",
+        "3100.00",
+    );
+    ctx.add_position(&pos_long);
+    ctx.add_position(&pos_short);
+
+    let venue_report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSideSpecified::Long,
+        Quantity::from("2.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None,
+        Some(dec!(3050.00)),
+    );
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+
+    let events = ctx.manager.check_positions_consistency(&clients).await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Filled(_))),
+        "Expected no synthetic fill when cached hedge positions net to the venue report"
+    );
+    assert_eq!(
+        ctx.manager
+            .position_recon_retry_count(&(instrument_id, test_account_id())),
+        0
+    );
 }
 
 #[tokio::test]

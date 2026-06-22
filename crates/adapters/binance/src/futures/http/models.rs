@@ -35,16 +35,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ustr::Ustr;
 
-use crate::common::{
-    consts::BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-    encoder::decode_broker_id,
-    enums::{
-        BinanceAlgoStatus, BinanceAlgoType, BinanceContractStatus, BinanceFuturesOrderType,
-        BinanceIncomeType, BinanceMarginType, BinanceOrderStatus, BinancePositionSide,
-        BinancePriceMatch, BinanceSelfTradePreventionMode, BinanceSide, BinanceTimeInForce,
-        BinanceTradingStatus, BinanceWorkingType,
+use crate::{
+    common::{
+        consts::BINANCE_NAUTILUS_FUTURES_BROKER_ID,
+        encoder::decode_broker_id,
+        enums::{
+            BinanceAlgoStatus, BinanceAlgoType, BinanceContractStatus, BinanceFuturesOrderType,
+            BinanceIncomeType, BinanceMarginType, BinanceOrderStatus, BinancePositionSide,
+            BinancePriceMatch, BinanceSelfTradePreventionMode, BinanceSide, BinanceTimeInForce,
+            BinanceTradingStatus, BinanceWorkingType,
+        },
+        models::BinanceRateLimit,
+        parse::parse_required_decimal,
     },
-    models::BinanceRateLimit,
+    futures::conversions::normalize_futures_asset,
 };
 
 /// Server time response from `GET /fapi/v1/time`.
@@ -111,19 +115,46 @@ impl<'de> Deserialize<'de> for BinanceFuturesKline {
         }
 
         Ok(Self {
-            open_time: arr[0].as_i64().unwrap_or(0),
-            open: arr[1].as_str().unwrap_or("0").to_string(),
-            high: arr[2].as_str().unwrap_or("0").to_string(),
-            low: arr[3].as_str().unwrap_or("0").to_string(),
-            close: arr[4].as_str().unwrap_or("0").to_string(),
-            volume: arr[5].as_str().unwrap_or("0").to_string(),
-            close_time: arr[6].as_i64().unwrap_or(0),
-            quote_volume: arr[7].as_str().unwrap_or("0").to_string(),
-            num_trades: arr[8].as_i64().unwrap_or(0),
-            taker_buy_base_volume: arr[9].as_str().unwrap_or("0").to_string(),
-            taker_buy_quote_volume: arr[10].as_str().unwrap_or("0").to_string(),
+            open_time: required_kline_i64::<D::Error>(&arr, 0, "open_time")?,
+            open: required_kline_string::<D::Error>(&arr, 1, "open")?,
+            high: required_kline_string::<D::Error>(&arr, 2, "high")?,
+            low: required_kline_string::<D::Error>(&arr, 3, "low")?,
+            close: required_kline_string::<D::Error>(&arr, 4, "close")?,
+            volume: required_kline_string::<D::Error>(&arr, 5, "volume")?,
+            close_time: required_kline_i64::<D::Error>(&arr, 6, "close_time")?,
+            quote_volume: required_kline_string::<D::Error>(&arr, 7, "quote_volume")?,
+            num_trades: required_kline_i64::<D::Error>(&arr, 8, "num_trades")?,
+            taker_buy_base_volume: required_kline_string::<D::Error>(
+                &arr,
+                9,
+                "taker_buy_base_volume",
+            )?,
+            taker_buy_quote_volume: required_kline_string::<D::Error>(
+                &arr,
+                10,
+                "taker_buy_quote_volume",
+            )?,
         })
     }
+}
+
+fn required_kline_i64<E>(arr: &[Value], index: usize, field: &str) -> Result<i64, E>
+where
+    E: serde::de::Error,
+{
+    arr[index]
+        .as_i64()
+        .ok_or_else(|| E::custom(format!("invalid kline {field}")))
+}
+
+fn required_kline_string<E>(arr: &[Value], index: usize, field: &str) -> Result<String, E>
+where
+    E: serde::de::Error,
+{
+    arr[index]
+        .as_str()
+        .map(ToString::to_string)
+        .ok_or_else(|| E::custom(format!("invalid kline {field}")))
 }
 
 /// USD-M Futures exchange information response from `GET /fapi/v1/exchangeInfo`.
@@ -872,7 +903,7 @@ impl BinanceFuturesAccountInfo {
         // Ensure at least one balance exists
         if balances.is_empty() {
             let zero_currency = Currency::USDT();
-            let zero_money = Money::new(0.0, zero_currency);
+            let zero_money = Money::zero(zero_currency);
             let zero_balance = AccountBalance::new(zero_money, zero_money, zero_money);
             balances.push(zero_balance);
         }
@@ -966,6 +997,7 @@ pub struct BinanceFuturesOrder {
     /// Executed quantity.
     pub executed_qty: String,
     /// Cumulative quote asset transacted.
+    #[serde(default = "zero_decimal_string")]
     pub cum_quote: String,
     /// Original limit price.
     pub price: String,
@@ -1028,6 +1060,10 @@ pub struct BinanceFuturesOrder {
     pub working_type_id: Option<i64>,
 }
 
+fn zero_decimal_string() -> String {
+    "0".to_string()
+}
+
 impl BinanceFuturesOrder {
     /// Converts this Binance order to a Nautilus [`OrderStatusReport`].
     ///
@@ -1075,8 +1111,10 @@ impl BinanceFuturesOrder {
             order_type,
             time_in_force,
             order_status,
-            Quantity::new(quantity.to_string().parse()?, size_precision),
-            Quantity::new(filled_qty.to_string().parse()?, size_precision),
+            Quantity::from_decimal_dp(quantity, size_precision)
+                .context("invalid orig_qty precision")?,
+            Quantity::from_decimal_dp(filled_qty, size_precision)
+                .context("invalid executed_qty precision")?,
             ts_event,
             ts_event,
             ts_init,
@@ -1160,6 +1198,7 @@ impl BinanceUserTrade {
         instrument_id: InstrumentId,
         price_precision: u8,
         size_precision: u8,
+        bnfcr_currency: Currency,
         ts_init: UnixNanos,
     ) -> anyhow::Result<FillReport> {
         let ts_event = UnixNanos::from_millis(self.time as u64);
@@ -1181,17 +1220,18 @@ impl BinanceUserTrade {
         let last_qty: Decimal = self.qty.parse().context("invalid qty")?;
         let last_px: Decimal = self.price.parse().context("invalid price")?;
 
-        let commission = {
-            let comm_val: f64 = self
-                .commission
-                .as_ref()
-                .and_then(|c| c.parse().ok())
-                .unwrap_or(0.0);
-            let comm_asset = self
-                .commission_asset
-                .as_ref()
-                .map_or_else(Currency::USDT, Currency::from);
-            Money::new(comm_val, comm_asset)
+        let commission_currency = self
+            .commission_asset
+            .as_ref()
+            .map_or(bnfcr_currency, |asset| {
+                normalize_futures_asset(asset, bnfcr_currency)
+            });
+        let commission = match self.commission.as_ref() {
+            Some(raw) => {
+                let decimal = parse_required_decimal(raw, "commission")?;
+                Money::from_decimal(decimal, commission_currency)?
+            }
+            None => Money::zero(commission_currency),
         };
 
         Ok(FillReport::new(
@@ -1200,8 +1240,8 @@ impl BinanceUserTrade {
             venue_order_id,
             trade_id,
             order_side,
-            Quantity::new(last_qty.to_string().parse()?, size_precision),
-            Price::new(last_px.to_string().parse()?, price_precision),
+            Quantity::from_decimal_dp(last_qty, size_precision).context("invalid qty precision")?,
+            Price::from_decimal_dp(last_px, price_precision).context("invalid price precision")?,
             commission,
             liquidity_side,
             None, // client_order_id
@@ -1345,10 +1385,14 @@ impl BinanceFuturesAlgoOrder {
             &self.client_algo_id,
             BINANCE_NAUTILUS_FUTURES_BROKER_ID,
         ));
-        let venue_order_id = self.actual_order_id.as_ref().map_or_else(
-            || VenueOrderId::new(self.algo_id.to_string()),
-            |id| VenueOrderId::new(id.clone()),
-        );
+        let venue_order_id = self
+            .actual_order_id
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .map_or_else(
+                || VenueOrderId::new(self.algo_id.to_string()),
+                |id| VenueOrderId::new(id.clone()),
+            );
 
         let order_side = match self.side {
             BinanceSide::Buy => OrderSide::Buy,
@@ -1382,8 +1426,10 @@ impl BinanceFuturesAlgoOrder {
             order_type,
             time_in_force,
             order_status,
-            Quantity::new(quantity.to_string().parse()?, size_precision),
-            Quantity::new(filled_qty.to_string().parse()?, size_precision),
+            Quantity::from_decimal_dp(quantity, size_precision)
+                .context("invalid quantity precision")?,
+            Quantity::from_decimal_dp(filled_qty, size_precision)
+                .context("invalid executed_qty precision")?,
             ts_event,
             ts_event,
             ts_init,
@@ -1701,6 +1747,45 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_order_defaults_missing_cum_quote_to_zero() {
+        let json = load_fixture_string("futures/http_json/order_response.json");
+        let mut value: Value = serde_json::from_str(&json).expect("Failed to parse order fixture");
+
+        value
+            .as_object_mut()
+            .expect("Order fixture should be a JSON object")
+            .remove("cumQuote");
+
+        let order: BinanceFuturesOrder =
+            serde_json::from_value(value).expect("Failed to parse order");
+
+        assert_eq!(order.cum_quote, "0");
+    }
+
+    #[rstest]
+    fn test_parse_kline_rejects_non_string_price() {
+        let value = serde_json::json!([
+            1_625_474_304_000_i64,
+            50000.00,
+            "51000.00",
+            "49000.00",
+            "50500.00",
+            "12.5",
+            1_625_474_364_000_i64,
+            "631250.00",
+            100_i64,
+            "6.2",
+            "313100.00"
+        ]);
+
+        let error = serde_json::from_value::<BinanceFuturesKline>(value)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("open"));
+    }
+
+    #[rstest]
     fn test_parse_hedge_mode_response() {
         let json = r#"{"dualSidePosition": true}"#;
         let response: BinanceHedgeModeResponse =
@@ -1877,6 +1962,39 @@ mod tests {
     }
 
     #[rstest]
+    fn test_user_trade_to_fill_report_rejects_invalid_commission() {
+        let trade = BinanceUserTrade {
+            symbol: Ustr::from("BTCUSDT"),
+            id: 100,
+            order_id: 200,
+            price: "50000.00".to_string(),
+            qty: "0.001".to_string(),
+            quote_qty: None,
+            realized_pnl: "0".to_string(),
+            side: BinanceSide::Buy,
+            position_side: None,
+            time: 1_625_474_304_000,
+            buyer: true,
+            maker: false,
+            commission: Some("not-a-number".to_string()),
+            commission_asset: Some(Ustr::from("USDT")),
+            margin_asset: None,
+        };
+
+        let result = trade.to_fill_report(
+            AccountId::from("BINANCE-FUTURES-001"),
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            2,
+            3,
+            Currency::USDT(),
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("commission"));
+    }
+
+    #[rstest]
     fn test_algo_order_to_report_decodes_broker_id() {
         let json = r#"{
             "algoId": 123456789,
@@ -1908,6 +2026,54 @@ mod tests {
         assert_eq!(
             report.client_order_id,
             Some(ClientOrderId::from("my-algo-order-1")),
+        );
+    }
+
+    #[rstest]
+    #[case(None, "123456789")]
+    #[case(Some(""), "123456789")]
+    #[case(Some("987654321"), "987654321")]
+    fn test_algo_order_to_report_selects_valid_venue_order_id(
+        #[case] actual_order_id: Option<&str>,
+        #[case] expected_venue_order_id: &str,
+    ) {
+        let order = BinanceFuturesAlgoOrder {
+            algo_id: 123456789,
+            client_algo_id: "x-aHRE4BCj-Rmy-algo-order-1".to_string(),
+            algo_type: BinanceAlgoType::Conditional,
+            order_type: BinanceFuturesOrderType::StopMarket,
+            symbol: Ustr::from("BTCUSDT"),
+            side: BinanceSide::Buy,
+            position_side: Some(BinancePositionSide::Both),
+            time_in_force: Some(BinanceTimeInForce::Gtc),
+            quantity: Some("0.001".to_string()),
+            algo_status: Some(BinanceAlgoStatus::New),
+            trigger_price: Some("45000.00".to_string()),
+            price: None,
+            working_type: Some(BinanceWorkingType::MarkPrice),
+            close_position: Some(false),
+            price_protect: None,
+            reduce_only: Some(false),
+            activate_price: None,
+            callback_rate: None,
+            create_time: Some(1_625_474_304_765),
+            update_time: Some(1_625_474_304_765),
+            trigger_time: None,
+            actual_order_id: actual_order_id.map(str::to_string),
+            executed_qty: None,
+            avg_price: None,
+        };
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 3, ts_init)
+            .unwrap();
+
+        assert_eq!(
+            report.venue_order_id,
+            VenueOrderId::new(expected_venue_order_id)
         );
     }
 

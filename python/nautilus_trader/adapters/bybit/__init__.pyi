@@ -24,6 +24,7 @@ __all__ = [
     "BybitMarginMode",
     "BybitMarginRepayResult",
     "BybitMarginStatusResult",
+    "BybitNativeTpSlParams",
     "BybitOpenOnly",
     "BybitOrder",
     "BybitOrderCursorList",
@@ -50,6 +51,7 @@ __all__ = [
     "BybitWsPlaceOrderParams",
     "bybit_bar_spec_to_interval",
     "bybit_extract_raw_symbol",
+    "bybit_make_hedge_venue_position_id",
     "bybit_product_type_from_symbol",
     "bybit_resolve_position_idx",
     "get_bybit_http_base_url",
@@ -189,6 +191,9 @@ class BybitHttpClient:
         is_quote_quantity: bool = False,
         is_leverage: bool = False,
         position_idx: BybitPositionIdx | None = None,
+        bbo_side_type: str | None = None,
+        bbo_level: str | None = None,
+        native_tp_sl: BybitNativeTpSlParams | None = None,
     ) -> typing.Any: ...
     def modify_order(
         self,
@@ -347,6 +352,24 @@ class BybitMarginStatusResult:
     def ts_init(self) -> int: ...
 
 @typing.final
+class BybitNativeTpSlParams:
+    def __init__(
+        self,
+        take_profit: str | None = None,
+        stop_loss: str | None = None,
+        tp_trigger_by: str | None = None,
+        sl_trigger_by: str | None = None,
+        tp_order_type: str | None = None,
+        sl_order_type: str | None = None,
+        tp_limit_price: str | None = None,
+        sl_limit_price: str | None = None,
+        tpsl_mode: str | None = None,
+        close_on_trigger: bool | None = None,
+        order_iv: str | None = None,
+        mmp: bool | None = None,
+    ) -> None: ...
+
+@typing.final
 class BybitOrder: ...
 
 @typing.final
@@ -489,6 +512,8 @@ class BybitWebSocketClient:
         reduce_only: bool | None = None,
         is_leverage: bool = False,
         position_idx: BybitPositionIdx | None = None,
+        bbo_side_type: str | None = None,
+        bbo_level: str | None = None,
     ) -> typing.Any: ...
     def modify_order(
         self,
@@ -529,6 +554,8 @@ class BybitWebSocketClient:
         take_profit: model.Price | None = None,
         stop_loss: model.Price | None = None,
         position_idx: BybitPositionIdx | None = None,
+        bbo_side_type: str | None = None,
+        bbo_level: str | None = None,
     ) -> BybitWsPlaceOrderParams: ...
     def batch_cancel_orders(
         self,
@@ -639,6 +666,8 @@ class BybitWsPlaceOrderParams:
         order_iv: str | None = None,
         mmp: bool | None = None,
         position_idx: BybitPositionIdx | None = None,
+        bbo_side_type: str | None = None,
+        bbo_level: str | None = None,
     ) -> None: ...
 
 @typing.final
@@ -862,6 +891,9 @@ class BybitTriggerType(enum.Enum):
 
 def bybit_bar_spec_to_interval(aggregation: int, step: int) -> str: ...
 def bybit_extract_raw_symbol(symbol: str) -> str: ...
+def bybit_make_hedge_venue_position_id(
+    instrument_id: model.InstrumentId, position_idx: BybitPositionIdx | None = None
+) -> model.PositionId | None: ...
 def bybit_product_type_from_symbol(symbol: str) -> BybitProductType: ...
 def bybit_resolve_position_idx(
     position_mode: BybitPositionMode | None,

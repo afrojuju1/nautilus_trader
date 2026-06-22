@@ -35,7 +35,7 @@ use crate::common::{
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.hyperliquid")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.hyperliquid")
 )]
 pub struct HyperliquidDataClientConfig {
     /// Optional private key for authenticated endpoints.
@@ -113,7 +113,7 @@ impl HyperliquidDataClientConfig {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.hyperliquid")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.hyperliquid")
 )]
 pub struct HyperliquidExecClientConfig {
     /// Private key for signing transactions.
@@ -132,8 +132,8 @@ pub struct HyperliquidExecClientConfig {
     /// When set, used for balance queries, position reports, and WS subscriptions
     /// instead of the address derived from the private key.
     ///
-    /// If not provided, falls back to the `HYPERLIQUID_ACCOUNT_ADDRESS`
-    /// environment variable.
+    /// If not provided and no explicit vault address is set, falls back to
+    /// the `HYPERLIQUID_ACCOUNT_ADDRESS` environment variable.
     pub account_address: Option<String>,
     /// Override for the WebSocket URL.
     pub base_url_ws: Option<String>,
@@ -167,6 +167,9 @@ pub struct HyperliquidExecClientConfig {
     /// `SubmitOrder.params["market_order_slippage_bps"]`.
     #[builder(default = 50)]
     pub market_order_slippage_bps: u32,
+    /// If true, attach Nautilus builder attribution to eligible mainnet orders.
+    #[builder(default = true)]
+    pub include_builder_attribution: bool,
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
@@ -265,11 +268,23 @@ transport_backend = "tungstenite"
             config.market_order_slippage_bps,
             expected.market_order_slippage_bps,
         );
+        assert_eq!(
+            config.include_builder_attribution,
+            expected.include_builder_attribution,
+        );
         assert_eq!(config.transport_backend, expected.transport_backend);
         assert_eq!(config.ws_post_timeout_secs, expected.ws_post_timeout_secs);
         assert_eq!(
             config.outcome_settlement_poll_secs,
             expected.outcome_settlement_poll_secs,
         );
+    }
+
+    #[rstest]
+    fn test_exec_config_toml_include_builder_attribution_false() {
+        let config: HyperliquidExecClientConfig =
+            toml::from_str("include_builder_attribution = false").unwrap();
+
+        assert!(!config.include_builder_attribution);
     }
 }

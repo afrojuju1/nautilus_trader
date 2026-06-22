@@ -35,6 +35,7 @@ use std::{collections::HashMap, fmt::Debug, num::NonZeroU32, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
     consts::NAUTILUS_USER_AGENT, datetime::SECONDS_IN_DAY, hex, nanos::UnixNanos, time::AtomicTime,
 };
@@ -48,7 +49,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use nautilus_network::{
-    http::{HttpClient, HttpResponse, Method},
+    http::{HttpClient, HttpResponse, Method, USER_AGENT},
     ratelimiter::quota::Quota,
 };
 use serde::Serialize;
@@ -59,15 +60,15 @@ use super::{
     models::{
         AvgPrice, BatchCancelResult, BatchOrderResult, BinanceAccountInfo, BinanceAccountTrade,
         BinanceCancelOrderResponse, BinanceDepth, BinanceKlines, BinanceNewOrderResponse,
-        BinanceOrderResponse, BinanceTrades, BookTicker, ListenKeyResponse, Ticker24hr,
-        TickerPrice, TradeFee,
+        BinanceOrderResponse, BinanceTrades, BookTicker, ListenKeyResponse,
+        NewOcoOrderListResponse, Ticker24hr, TickerPrice, TradeFee,
     },
     parse,
     query::{
         AccountInfoParams, AccountTradesParams, AllOrdersParams, AvgPriceParams, BatchCancelItem,
         BatchOrderItem, CancelOpenOrdersParams, CancelOrderParams, CancelReplaceOrderParams,
-        DepthParams, KlinesParams, ListenKeyParams, NewOrderParams, OpenOrdersParams,
-        QueryOrderParams, TickerParams, TradeFeeParams, TradesParams,
+        DepthParams, KlinesParams, ListenKeyParams, NewOcoOrderListParams, NewOrderParams,
+        OpenOrdersParams, QueryOrderParams, TickerParams, TradeFeeParams, TradesParams,
     },
 };
 use crate::{
@@ -246,6 +247,33 @@ impl BinanceRawSpotHttpClient {
         self.request(Method::POST, path, params, true, true).await
     }
 
+    /// Performs a signed POST request and requests a JSON response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or the request fails.
+    pub async fn post_signed_json<P>(
+        &self,
+        path: &str,
+        params: Option<&P>,
+    ) -> BinanceSpotHttpResult<Vec<u8>>
+    where
+        P: Serialize + ?Sized,
+    {
+        self.request_with_extra_headers(
+            Method::POST,
+            path,
+            params,
+            true,
+            true,
+            Some(HashMap::from([(
+                "Accept".to_string(),
+                "application/json".to_string(),
+            )])),
+        )
+        .await
+    }
+
     /// Performs a signed DELETE request and returns raw response bytes.
     ///
     /// # Errors
@@ -273,13 +301,29 @@ impl BinanceRawSpotHttpClient {
     where
         P: Serialize + ?Sized,
     {
+        self.request_with_extra_headers(method, path, params, signed, use_order_quota, None)
+            .await
+    }
+
+    async fn request_with_extra_headers<P>(
+        &self,
+        method: Method,
+        path: &str,
+        params: Option<&P>,
+        signed: bool,
+        use_order_quota: bool,
+        extra_headers: Option<HashMap<String, String>>,
+    ) -> BinanceSpotHttpResult<Vec<u8>>
+    where
+        P: Serialize + ?Sized,
+    {
         let mut query = params
             .map(serde_urlencoded::to_string)
             .transpose()
             .map_err(|e| BinanceSpotHttpError::ValidationError(e.to_string()))?
             .unwrap_or_default();
 
-        let mut headers = HashMap::new();
+        let mut headers = extra_headers.unwrap_or_default();
 
         if signed {
             let cred = self
@@ -415,7 +459,7 @@ impl BinanceRawSpotHttpClient {
 
     fn default_headers(credential: &Option<SigningCredential>) -> HashMap<String, String> {
         let mut headers = HashMap::new();
-        headers.insert("User-Agent".to_string(), NAUTILUS_USER_AGENT.to_string());
+        headers.insert(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string());
         headers.insert("Accept".to_string(), "application/sbe".to_string());
         headers.insert("X-MBX-SBE".to_string(), SBE_SCHEMA_HEADER.to_string());
 
@@ -1146,6 +1190,19 @@ impl BinanceRawSpotHttpClient {
         Ok(response)
     }
 
+    /// Creates a new OCO order list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or JSON decoding fails.
+    pub async fn new_oco_order_list(
+        &self,
+        params: &NewOcoOrderListParams,
+    ) -> BinanceSpotHttpResult<NewOcoOrderListResponse> {
+        let bytes = self.post_signed_json("orderList/oco", Some(params)).await?;
+        serde_json::from_slice(&bytes).map_err(|e| BinanceSpotHttpError::JsonError(e.to_string()))
+    }
+
     /// Cancels an existing order and places a new order atomically.
     ///
     /// # Errors
@@ -1415,6 +1472,14 @@ impl BinanceSpotHttpClient {
         self.clock.get_time_ns()
     }
 
+    fn command_validation_error(message: impl Into<String>) -> anyhow::Error {
+        anyhow::anyhow!(BinanceSpotHttpError::ValidationError(message.into()))
+    }
+
+    fn response_parse_error(message: impl Into<String>) -> anyhow::Error {
+        anyhow::anyhow!(BinanceSpotHttpError::ResponseParseError(message.into()))
+    }
+
     /// Retrieves an instrument from the cache.
     fn instrument_from_cache(&self, symbol: Ustr) -> anyhow::Result<InstrumentAny> {
         self.instruments_cache
@@ -1520,7 +1585,7 @@ impl BinanceSpotHttpClient {
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<TradeTick>> {
         let symbol = instrument_id.symbol.inner();
-        let instrument = self.instrument_from_cache(symbol)?;
+        let instrument = self.instrument_from_cache_by_id(instrument_id)?;
         let ts_init = self.generate_ts_init();
 
         let trades = self
@@ -1564,8 +1629,9 @@ impl BinanceSpotHttpClient {
             a => anyhow::bail!("Binance does not support {a:?} aggregation"),
         };
 
-        let symbol = bar_type.instrument_id().symbol;
-        let instrument = self.instrument_from_cache(symbol.inner())?;
+        let instrument_id = bar_type.instrument_id();
+        let symbol = instrument_id.symbol;
+        let instrument = self.instrument_from_cache_by_id(instrument_id)?;
         let ts_init = self.generate_ts_init();
 
         let klines = self
@@ -1581,6 +1647,16 @@ impl BinanceSpotHttpClient {
             .map_err(|e| anyhow::anyhow!(e))?;
 
         parse_klines_to_bars(&klines, bar_type, &instrument, ts_init)
+    }
+
+    fn instrument_from_cache_by_id(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<InstrumentAny> {
+        self.instruments_cache
+            .get(&instrument_id.symbol.inner())
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id).into())
     }
 
     /// Requests the account state with Nautilus types.
@@ -1791,11 +1867,15 @@ impl BinanceSpotHttpClient {
         display_qty: Option<Quantity>,
     ) -> anyhow::Result<OrderStatusReport> {
         let symbol = instrument_id.symbol.inner();
-        let instrument = self.instrument_from_cache(symbol)?;
+        let instrument = self
+            .instrument_from_cache(symbol)
+            .map_err(|e| Self::command_validation_error(e.to_string()))?;
         let ts_init = self.generate_ts_init();
 
-        let binance_side = BinanceSide::try_from(order_side)?;
-        let binance_order_type = order_type_to_binance_spot(order_type, post_only)?;
+        let binance_side = BinanceSide::try_from(order_side)
+            .map_err(|e| Self::command_validation_error(e.to_string()))?;
+        let binance_order_type = order_type_to_binance_spot(order_type, post_only)
+            .map_err(|e| Self::command_validation_error(e.to_string()))?;
 
         // Validate trigger price for conditional orders
         let requires_trigger = matches!(
@@ -1807,7 +1887,9 @@ impl BinanceSpotHttpClient {
         );
 
         if requires_trigger && trigger_price.is_none() {
-            anyhow::bail!("Conditional orders require a trigger price");
+            return Err(Self::command_validation_error(
+                "Conditional orders require a trigger price",
+            ));
         }
 
         // Validate price for order types that require it
@@ -1820,7 +1902,9 @@ impl BinanceSpotHttpClient {
         );
 
         if requires_price && price.is_none() {
-            anyhow::bail!("{binance_order_type:?} orders require a price");
+            return Err(Self::command_validation_error(format!(
+                "{binance_order_type:?} orders require a price"
+            )));
         }
 
         // Only send TIF for order types that support it
@@ -1831,7 +1915,10 @@ impl BinanceSpotHttpClient {
                 | BinanceSpotOrderType::TakeProfitLimit
         );
         let binance_tif = if supports_tif {
-            Some(time_in_force_to_binance_spot(time_in_force)?)
+            Some(
+                time_in_force_to_binance_spot(time_in_force)
+                    .map_err(|e| Self::command_validation_error(e.to_string()))?,
+            )
         } else {
             None
         };
@@ -1843,7 +1930,9 @@ impl BinanceSpotHttpClient {
         let client_id_str = encode_broker_id(&client_order_id, BINANCE_NAUTILUS_SPOT_BROKER_ID);
 
         if quote_quantity && binance_order_type != BinanceSpotOrderType::Market {
-            anyhow::bail!("quoteOrderQty is only supported for MARKET orders");
+            return Err(Self::command_validation_error(
+                "quoteOrderQty is only supported for MARKET orders",
+            ));
         }
 
         let (base_qty, quote_qty) = if quote_quantity {
@@ -1875,6 +1964,7 @@ impl BinanceSpotHttpClient {
             BINANCE_NAUTILUS_SPOT_BROKER_ID,
             ts_init,
         )
+        .map_err(|e| Self::response_parse_error(e.to_string()))
     }
 
     /// Submits multiple orders in a single batch request.
@@ -1889,6 +1979,18 @@ impl BinanceSpotHttpClient {
         orders: &[BatchOrderItem],
     ) -> BinanceSpotHttpResult<Vec<BatchOrderResult>> {
         self.inner.batch_submit_orders(orders).await
+    }
+
+    /// Submits a Spot OCO order list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or JSON parsing fails.
+    pub async fn submit_oco_order_list(
+        &self,
+        params: &NewOcoOrderListParams,
+    ) -> BinanceSpotHttpResult<NewOcoOrderListResponse> {
+        self.inner.new_oco_order_list(params).await
     }
 
     /// Modifies an existing order (cancel and replace atomically).
@@ -1913,17 +2015,21 @@ impl BinanceSpotHttpClient {
         price: Option<Price>,
     ) -> anyhow::Result<OrderStatusReport> {
         let symbol = instrument_id.symbol.inner();
-        let instrument = self.instrument_from_cache(symbol)?;
+        let instrument = self
+            .instrument_from_cache(symbol)
+            .map_err(|e| Self::command_validation_error(e.to_string()))?;
         let ts_init = self.generate_ts_init();
 
-        let binance_side = BinanceSide::try_from(order_side)?;
-        let binance_order_type = order_type_to_binance_spot(order_type, false)?;
-        let binance_tif = time_in_force_to_binance_spot(time_in_force)?;
+        let binance_side = BinanceSide::try_from(order_side)
+            .map_err(|e| Self::command_validation_error(e.to_string()))?;
+        let binance_order_type = order_type_to_binance_spot(order_type, false)
+            .map_err(|e| Self::command_validation_error(e.to_string()))?;
+        let binance_tif = time_in_force_to_binance_spot(time_in_force)
+            .map_err(|e| Self::command_validation_error(e.to_string()))?;
 
-        let cancel_order_id: i64 = venue_order_id
-            .inner()
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid venue order ID: {venue_order_id}"))?;
+        let cancel_order_id: i64 = venue_order_id.inner().parse().map_err(|_| {
+            Self::command_validation_error(format!("Invalid venue order ID: {venue_order_id}"))
+        })?;
 
         let qty_str = quantity.to_string();
         let price_str = price.map(|p| p.to_string());
@@ -1952,6 +2058,7 @@ impl BinanceSpotHttpClient {
             BINANCE_NAUTILUS_SPOT_BROKER_ID,
             ts_init,
         )
+        .map_err(|e| Self::response_parse_error(e.to_string()))
     }
 
     /// Cancels an existing order on the venue.
@@ -1969,10 +2076,23 @@ impl BinanceSpotHttpClient {
     ) -> anyhow::Result<VenueOrderId> {
         let symbol = instrument_id.symbol.inner();
 
-        let order_id = venue_order_id
-            .map(|id| id.inner().parse::<i64>())
-            .transpose()
-            .map_err(|_| anyhow::anyhow!("Invalid venue order ID"))?;
+        let order_id = match venue_order_id {
+            Some(venue_order_id) => match venue_order_id.inner().parse::<i64>() {
+                Ok(order_id) => Some(order_id),
+                Err(e) if client_order_id.is_some() => {
+                    log::warn!(
+                        "Unable to parse venue_order_id {venue_order_id} for cancel, canceling by client_order_id: {e}"
+                    );
+                    None
+                }
+                Err(e) => {
+                    return Err(Self::command_validation_error(format!(
+                        "Invalid venue order ID: {e}"
+                    )));
+                }
+            },
+            None => None,
+        };
 
         let client_id_str =
             client_order_id.map(|id| encode_broker_id(&id, BINANCE_NAUTILUS_SPOT_BROKER_ID));

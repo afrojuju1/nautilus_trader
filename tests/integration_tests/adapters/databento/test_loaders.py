@@ -16,6 +16,7 @@
 import pytest
 
 from nautilus_trader import TEST_DATA_DIR
+from nautilus_trader.adapters.databento import loaders as loaders_module
 from nautilus_trader.adapters.databento.loaders import DatabentoDataLoader
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.model.currencies import USD
@@ -69,7 +70,7 @@ def test_get_publishers() -> None:
     result = loader.get_publishers()
 
     # Assert
-    assert len(result) == 110  # From built-in map
+    assert len(result) == 135  # From built-in map
 
 
 def test_loader_definition_glbx_futures() -> None:
@@ -295,6 +296,29 @@ def test_loader_mbp_1() -> None:
     assert quote.ask_size == Quantity.from_int(11)
     assert quote.ts_event == 1609160400006136329
     assert quote.ts_init == 1609160400006136329
+
+
+def test_loader_legacy_cython_drops_capsule(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange
+    loader = _make_loader()
+    path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.mbp-1.dbn.zst"
+    drop_call_count = 0
+    original_drop = loaders_module.drop_cvec_pycapsule
+
+    def counting_drop(capsule) -> None:
+        nonlocal drop_call_count
+        drop_call_count += 1
+        original_drop(capsule)
+
+    monkeypatch.setattr(loaders_module, "drop_cvec_pycapsule", counting_drop)
+
+    # Act
+    data = loader.from_dbn_file(path, as_legacy_cython=True)
+
+    # Assert
+    assert len(data) == 2
+    assert isinstance(data[0], QuoteTick)
+    assert drop_call_count == 1
 
 
 def test_loader_mbp_1_pyo3() -> None:
@@ -939,11 +963,9 @@ def test_loader_cbbo_1s() -> None:
     data = loader.from_dbn_file(path, instrument_id=instrument_id, as_legacy_cython=True)
 
     # Assert
-    assert len(data) == 4  # 2 quotes + 2 trades from CBBO
+    assert len(data) == 2
     assert isinstance(data[0], QuoteTick)
-    assert isinstance(data[1], TradeTick)
-    assert isinstance(data[2], QuoteTick)
-    assert isinstance(data[3], TradeTick)
+    assert isinstance(data[1], QuoteTick)
     quote = data[0]
     assert quote.instrument_id == InstrumentId.from_str("ESM4.GLBX")
     assert quote.bid_price == Price.from_str("3720.25")

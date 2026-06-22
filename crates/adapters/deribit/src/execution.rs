@@ -181,26 +181,34 @@ impl DeribitExecutionClient {
         }
         .to_string();
 
-        let time_in_force = Some(
-            match order.time_in_force() {
-                TimeInForce::Gtc => "good_til_cancelled",
-                TimeInForce::Ioc => "immediate_or_cancel",
-                TimeInForce::Fok => "fill_or_kill",
-                TimeInForce::Gtd => {
-                    if order.expire_time().is_some() {
-                        log::warn!(
-                            "Deribit GTD orders expire at 8:00 UTC only - custom expire_time is ignored. \
-                            For custom expiry times, use managed GTD with emulation_trigger"
-                        );
+        let time_in_force = if matches!(
+            order.order_type(),
+            OrderType::Market | OrderType::StopMarket | OrderType::MarketIfTouched
+        ) {
+            // Deribit rejects `time_in_force` on market-style order types
+            None
+        } else {
+            Some(
+                match order.time_in_force() {
+                    TimeInForce::Gtc => "good_til_cancelled",
+                    TimeInForce::Ioc => "immediate_or_cancel",
+                    TimeInForce::Fok => "fill_or_kill",
+                    TimeInForce::Gtd => {
+                        if order.expire_time().is_some() {
+                            log::warn!(
+                                "Deribit GTD orders expire at 8:00 UTC only - custom expire_time is ignored. \
+                                For custom expiry times, use managed GTD with emulation_trigger"
+                            );
+                        }
+                        "good_til_day"
                     }
-                    "good_til_day"
+                    other => {
+                        anyhow::bail!("Unsupported time_in_force {other:?} for Deribit");
+                    }
                 }
-                other => {
-                    anyhow::bail!("Unsupported time_in_force {other:?} for Deribit");
-                }
-            }
-            .to_string(),
-        );
+                .to_string(),
+            )
+        };
 
         // Deribit's `valid_until` is a REQUEST timeout, not order expiry.
         // Deribit's `good_til_day` expires at end of trading session (8 UTC).
@@ -271,8 +279,6 @@ impl DeribitExecutionClient {
         self.emitter.emit_order_submitted(order);
 
         let ws_client = self.ws_client.clone();
-        let emitter = self.emitter.clone();
-        let clock = self.clock;
 
         self.spawn_task(task_name, async move {
             let result = ws_client
@@ -287,14 +293,8 @@ impl DeribitExecutionClient {
                 .await;
 
             if let Err(e) = result {
-                let ts_event = clock.get_time_ns();
-                emitter.emit_order_rejected_event(
-                    strategy_id,
-                    instrument_id,
-                    client_order_id,
-                    &format!("{task_name}-error: {e}"),
-                    ts_event,
-                    false,
+                log::error!(
+                    "Submit order request failed: task={task_name}, client_order_id={client_order_id}, error={e}"
                 );
                 return Err(e.into());
             }
@@ -724,12 +724,7 @@ impl ExecutionClient for DeribitExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
-        let order = self
-            .core
-            .cache()
-            .order(&cmd.client_order_id)
-            .map(|o| o.clone())
-            .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
+        let order = self.core.cache().try_order_owned(&cmd.client_order_id)?;
         self.submit_single_order(&order, "submit_order");
         Ok(())
     }
@@ -750,7 +745,7 @@ impl ExecutionClient for DeribitExecutionClient {
         );
 
         // Deribit doesn't have native batch order submission
-        // Loop through and submit each order individually using shared helper
+        // Loop through and submit each order individually using shared logic
         for order in &orders {
             self.submit_single_order(order, "submit_order_list_item");
         }
@@ -762,11 +757,17 @@ impl ExecutionClient for DeribitExecutionClient {
         let ws_client = self.ws_client.clone();
 
         // Extract venue order ID (Deribit's order_id)
-        let order_id = cmd
-            .venue_order_id
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("venue_order_id required for modify_order"))?
-            .to_string();
+        let order_id = match cmd.venue_order_id.as_ref() {
+            Some(venue_order_id) => venue_order_id.to_string(),
+            None => {
+                return reject_modify_command(
+                    &self.emitter,
+                    self.clock,
+                    &cmd,
+                    "venue_order_id required for modify_order",
+                );
+            }
+        };
 
         // Extract quantity - if not provided, get from order in cache
         let quantity = if let Some(qty) = cmd.quantity {
@@ -774,23 +775,35 @@ impl ExecutionClient for DeribitExecutionClient {
         } else {
             // Get order from cache to use its current quantity
             let cache = self.core.cache();
-            let order = cache
-                .order(&cmd.client_order_id)
-                .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
-            order.quantity()
+            match cache.order(&cmd.client_order_id) {
+                Some(order) => order.quantity(),
+                None => {
+                    return reject_modify_command(
+                        &self.emitter,
+                        self.clock,
+                        &cmd,
+                        &format!("Order not found: {}", cmd.client_order_id),
+                    );
+                }
+            }
         };
 
-        let price = cmd
-            .price
-            .ok_or_else(|| anyhow::anyhow!("price required for modify_order"))?;
+        let price = match cmd.price {
+            Some(price) => price,
+            None => {
+                return reject_modify_command(
+                    &self.emitter,
+                    self.clock,
+                    &cmd,
+                    "price required for modify_order",
+                );
+            }
+        };
 
         let client_order_id = cmd.client_order_id;
         let trader_id = cmd.trader_id;
         let strategy_id = cmd.strategy_id;
         let instrument_id = cmd.instrument_id;
-        let venue_order_id = cmd.venue_order_id;
-        let emitter = self.emitter.clone();
-        let clock = self.clock;
 
         log::info!(
             "Modifying order: order_id={order_id}, quantity={quantity}, price={price}, client_order_id={client_order_id}"
@@ -813,17 +826,6 @@ impl ExecutionClient for DeribitExecutionClient {
                 log::error!(
                     "Modify order failed: order_id={order_id}, client_order_id={client_order_id}, error={e}"
                 );
-
-                let ts_event = clock.get_time_ns();
-                emitter.emit_order_modify_rejected_event(
-                    strategy_id,
-                    instrument_id,
-                    client_order_id,
-                    venue_order_id,
-                    &format!("modify-order-error: {e}"),
-                    ts_event,
-                );
-
                 anyhow::bail!("Modify order failed: {e}");
             }
             Ok(())
@@ -836,19 +838,21 @@ impl ExecutionClient for DeribitExecutionClient {
         let ws_client = self.ws_client.clone();
 
         // Extract venue order ID (Deribit's order_id)
-        let order_id = cmd
-            .venue_order_id
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("venue_order_id required for cancel_order"))?
-            .to_string();
+        let order_id = match cmd.venue_order_id.as_ref() {
+            Some(venue_order_id) => venue_order_id.to_string(),
+            None => {
+                log::warn!(
+                    "Cannot cancel order {} - no venue_order_id",
+                    cmd.client_order_id
+                );
+                return Ok(());
+            }
+        };
 
         let client_order_id = cmd.client_order_id;
         let trader_id = cmd.trader_id;
         let strategy_id = cmd.strategy_id;
         let instrument_id = cmd.instrument_id;
-        let venue_order_id = cmd.venue_order_id;
-        let emitter = self.emitter.clone();
-        let clock = self.clock;
 
         log::info!("Canceling order: order_id={order_id}, client_order_id={client_order_id}");
 
@@ -867,17 +871,6 @@ impl ExecutionClient for DeribitExecutionClient {
                 log::error!(
                     "Cancel order failed: order_id={order_id}, client_order_id={client_order_id}, error={e}"
                 );
-
-                let ts_event = clock.get_time_ns();
-                emitter.emit_order_cancel_rejected_event(
-                    strategy_id,
-                    instrument_id,
-                    client_order_id,
-                    venue_order_id,
-                    &format!("cancel-order-error: {e}"),
-                    ts_event,
-                );
-
                 anyhow::bail!("Cancel order failed: {e}");
             }
             Ok(())
@@ -951,14 +944,12 @@ impl ExecutionClient for DeribitExecutionClient {
         );
 
         // Cancel each matching order individually
-        for (venue_order_id_str, client_order_id, order_instrument_id, venue_order_id) in
+        for (venue_order_id_str, client_order_id, order_instrument_id, _venue_order_id) in
             orders_to_cancel
         {
             let ws_client = self.ws_client.clone();
             let trader_id = cmd.trader_id;
             let strategy_id = cmd.strategy_id;
-            let emitter = self.emitter.clone();
-            let clock = self.clock;
 
             self.spawn_task("cancel_order_by_side", async move {
                 if let Err(e) = ws_client
@@ -973,16 +964,6 @@ impl ExecutionClient for DeribitExecutionClient {
                 {
                     log::error!(
                         "Cancel order failed: order_id={venue_order_id_str}, client_order_id={client_order_id}, error={e}"
-                    );
-
-                    let ts_event = clock.get_time_ns();
-                    emitter.emit_order_cancel_rejected_event(
-                        strategy_id,
-                        order_instrument_id,
-                        client_order_id,
-                        venue_order_id,
-                        &format!("cancel-order-error: {e}"),
-                        ts_event,
                     );
                 }
                 Ok(())
@@ -1014,24 +995,11 @@ impl ExecutionClient for DeribitExecutionClient {
                         "Cannot cancel order {} - no venue_order_id",
                         cancel.client_order_id
                     );
-
-                    // Emit OrderCancelRejected event for missing venue_order_id
-                    let ts_event = self.clock.get_time_ns();
-                    self.emitter.emit_order_cancel_rejected_event(
-                        cancel.strategy_id,
-                        cancel.instrument_id,
-                        cancel.client_order_id,
-                        None,
-                        "venue_order_id required for cancel",
-                        ts_event,
-                    );
                     continue;
                 }
             };
 
             let ws_client = self.ws_client.clone();
-            let emitter = self.emitter.clone();
-            let clock = self.clock;
             let client_order_id = cancel.client_order_id;
             let trader_id = cancel.trader_id;
             let strategy_id = cancel.strategy_id;
@@ -1051,17 +1019,6 @@ impl ExecutionClient for DeribitExecutionClient {
                     log::error!(
                         "Batch cancel order failed: order_id={order_id}, client_order_id={client_order_id}, error={e}"
                     );
-
-                    let ts_event = clock.get_time_ns();
-                    emitter.emit_order_cancel_rejected_event(
-                        strategy_id,
-                        instrument_id,
-                        client_order_id,
-                        None,
-                        &format!("batch-cancel-error: {e}"),
-                        ts_event,
-                    );
-
                     anyhow::bail!("Batch cancel order failed: {e}");
                 }
                 Ok(())
@@ -1134,4 +1091,22 @@ fn dispatch_ws_message(message: NautilusWsMessage, emitter: &ExecutionEventEmitt
             log::trace!("Ignoring data message in execution client");
         }
     }
+}
+
+fn reject_modify_command(
+    emitter: &ExecutionEventEmitter,
+    clock: &AtomicTime,
+    cmd: &ModifyOrder,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let ts_event = clock.get_time_ns();
+    emitter.emit_order_modify_rejected_event(
+        cmd.strategy_id,
+        cmd.instrument_id,
+        cmd.client_order_id,
+        cmd.venue_order_id,
+        reason,
+        ts_event,
+    );
+    anyhow::bail!("{reason}");
 }

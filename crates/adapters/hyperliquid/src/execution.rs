@@ -51,8 +51,12 @@ use tokio::task::JoinHandle;
 use ustr::Ustr;
 
 use crate::{
+    account::resolve_execution_account_address,
     common::{
-        consts::HYPERLIQUID_VENUE,
+        consts::{
+            HYPERLIQUID_BUILDER_APPROVAL_DOCS_URL, HYPERLIQUID_BUILDER_FEE_NOT_APPROVED,
+            HYPERLIQUID_VENUE,
+        },
         credential::Secrets,
         enums::HyperliquidProductType,
         parse::{
@@ -68,7 +72,8 @@ use crate::{
         models::{
             ClearinghouseState, Cloid, HyperliquidExecAction, HyperliquidExecCancelByCloidRequest,
             HyperliquidExecCancelOrderRequest, HyperliquidExecGrouping,
-            HyperliquidExecModifyOrderRequest, HyperliquidExecOrderKind, SpotClearinghouseState,
+            HyperliquidExecModifyOrderRequest, HyperliquidExecOrderKind,
+            HyperliquidExecPlaceOrderRequest, SpotClearinghouseState,
         },
         parse::derive_outcome_settlements,
     },
@@ -78,7 +83,7 @@ use crate::{
         client::HyperliquidWebSocketClient,
         dispatch::{
             DispatchOutcome, OrderIdentity, WsDispatchState, dispatch_order_event,
-            dispatch_order_fill,
+            dispatch_order_fill, promote_replacement_from_query,
         },
     },
 };
@@ -158,11 +163,12 @@ impl HyperliquidExecutionClient {
         )
         .context("Hyperliquid execution client requires private key")?;
 
-        // Env var fallback mirrors `Secrets::resolve` for private_key and vault_address
-        let account_address = resolve_account_address(
+        let account_address = resolve_execution_account_address(
+            config.private_key.as_deref(),
+            config.vault_address.as_deref(),
             config.account_address.as_deref(),
-            std::env::var("HYPERLIQUID_ACCOUNT_ADDRESS").ok().as_deref(),
-        );
+            config.environment,
+        )?;
 
         let mut http_client = HyperliquidHttpClient::with_secrets(
             &secrets,
@@ -175,6 +181,7 @@ impl HyperliquidExecutionClient {
         http_client.set_account_address(account_address);
         http_client.set_normalize_prices(config.normalize_prices);
         http_client.set_market_order_slippage_bps(config.market_order_slippage_bps);
+        http_client.set_include_builder_attribution(config.include_builder_attribution);
 
         // Apply URL overrides from config (used for testing with mock servers)
         if let Some(url) = &config.base_url_http {
@@ -529,14 +536,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
-        let order = self
-            .core
-            .cache()
-            .order(&cmd.client_order_id)
-            .map(|o| o.clone())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Order not found in cache for {}", cmd.client_order_id)
-            })?;
+        let order = self.core.cache().try_order_owned(&cmd.client_order_id)?;
 
         if order.is_closed() {
             log::warn!("Cannot submit closed order {}", order.client_order_id());
@@ -550,10 +550,10 @@ impl ExecutionClient for HyperliquidExecutionClient {
         }
 
         let http_client = self.http_client.clone();
-        let symbol = order.instrument_id().symbol.to_string();
+        let symbol = order.instrument_id().symbol.inner();
 
         // Validate asset index exists before marking as submitted
-        let asset = match http_client.get_asset_index(&symbol) {
+        let asset = match http_client.get_asset_index_for_symbol(symbol) {
             Some(a) => a,
             None => {
                 self.emitter
@@ -563,7 +563,9 @@ impl ExecutionClient for HyperliquidExecutionClient {
         };
 
         // Validate order conversion before marking as submitted
-        let price_decimals = http_client.get_price_precision(&symbol).unwrap_or(2);
+        let price_decimals = http_client
+            .get_price_precision_for_symbol(symbol)
+            .unwrap_or(2);
         let slippage_bps = self.resolve_slippage_bps(cmd.params.as_ref());
         let mut hyperliquid_order = match order_to_hyperliquid_request_with_asset_and_cloid(
             &order,
@@ -704,8 +706,8 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 continue;
             }
 
-            let symbol = order.instrument_id().symbol.to_string();
-            let asset = match http_client.get_asset_index(&symbol) {
+            let symbol = order.instrument_id().symbol.inner();
+            let asset = match http_client.get_asset_index_for_symbol(symbol) {
                 Some(a) => a,
                 None => {
                     self.emitter
@@ -714,7 +716,9 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 }
             };
 
-            let price_decimals = http_client.get_price_precision(&symbol).unwrap_or(2);
+            let price_decimals = http_client
+                .get_price_precision_for_symbol(symbol)
+                .unwrap_or(2);
 
             match order_to_hyperliquid_request_with_asset_and_cloid(
                 order,
@@ -919,7 +923,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
         };
 
         let http_client = self.http_client.clone();
-        let symbol = cmd.instrument_id.symbol.to_string();
+        let symbol = cmd.instrument_id.symbol.inner();
         let should_normalize = self.config.normalize_prices;
         let slippage_bps = self.resolve_slippage_bps(cmd.params.as_ref());
 
@@ -943,8 +947,10 @@ impl ExecutionClient for HyperliquidExecutionClient {
         }
 
         let quantity = target_total_qty - filled_qty;
-        let price_decimals = http_client.get_price_precision(&symbol).unwrap_or(2);
-        let asset = match http_client.get_asset_index(&symbol) {
+        let price_decimals = http_client
+            .get_price_precision_for_symbol(symbol)
+            .unwrap_or(2);
+        let asset = match http_client.get_asset_index_for_symbol(symbol) {
             Some(a) => a,
             None => {
                 log::warn!(
@@ -1021,6 +1027,8 @@ impl ExecutionClient for HyperliquidExecutionClient {
 
         // Mark before the post await so an early CANCELED(old_voi) on the WS is suppressed.
         dispatch_state.mark_pending_modify(client_order_id, old_venue_order_id, target_total_qty);
+        // Stashed so the cancel-replace promotion can reduce the replacement on an in-flight fill
+        dispatch_state.stash_modify_request(client_order_id, hyperliquid_order.clone());
 
         self.spawn_task("modify_order", async move {
             let action = HyperliquidExecAction::Modify {
@@ -1075,20 +1083,15 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let strategy_id = cmd.strategy_id;
         let instrument_id = cmd.instrument_id;
         let venue_order_id = cmd.venue_order_id;
-        let symbol = cmd.instrument_id.symbol.to_string();
+        let symbol = cmd.instrument_id.symbol.inner();
         let ws_client = self.ws_client.clone();
 
         self.spawn_task("cancel_order", async move {
-            let asset = match http_client.get_asset_index(&symbol) {
+            let asset = match http_client.get_asset_index_for_symbol(symbol) {
                 Some(a) => a,
                 None => {
-                    emitter.emit_order_cancel_rejected_event(
-                        strategy_id,
-                        instrument_id,
-                        client_order_id,
-                        venue_order_id,
-                        &format!("Asset index not found for symbol {symbol}"),
-                        clock.get_time_ns(),
+                    log::warn!(
+                        "Local cancel validation failed for {client_order_id}: Asset index not found for symbol {symbol}"
                     );
                     return Ok(());
                 }
@@ -1105,13 +1108,8 @@ impl ExecutionClient for HyperliquidExecutionClient {
                             cancels: vec![HyperliquidExecCancelOrderRequest { asset, oid }],
                         },
                         Err(_) => {
-                            emitter.emit_order_cancel_rejected_event(
-                                strategy_id,
-                                instrument_id,
-                                client_order_id,
-                                Some(venue_order_id),
-                                "Invalid venue order ID format",
-                                clock.get_time_ns(),
+                            log::warn!(
+                                "Local cancel validation failed for {client_order_id}: Invalid venue order ID format"
                             );
                             return Ok(());
                         }
@@ -1139,13 +1137,9 @@ impl ExecutionClient for HyperliquidExecutionClient {
                             log::info!("Order cancelled successfully: {response:?}");
                         }
                     } else {
-                        emitter.emit_order_cancel_rejected_event(
-                            strategy_id,
-                            instrument_id,
-                            client_order_id,
-                            venue_order_id,
-                            &extract_error_message(&response),
-                            clock.get_time_ns(),
+                        let error_msg = extract_error_message(&response);
+                        log::warn!(
+                            "Cancel failed without per-order result for {client_order_id}, awaiting WS reconciliation: {error_msg}"
                         );
                     }
                 }
@@ -1156,13 +1150,8 @@ impl ExecutionClient for HyperliquidExecutionClient {
                              awaiting WS reconciliation",
                         );
                     } else {
-                        emitter.emit_order_cancel_rejected_event(
-                            strategy_id,
-                            instrument_id,
-                            client_order_id,
-                            venue_order_id,
-                            &format!("Cancel WebSocket post request failed: {e}"),
-                            clock.get_time_ns(),
+                        log::warn!(
+                            "Ambiguous cancel failure for {client_order_id}, awaiting WS reconciliation: {e}"
                         );
                     }
                 }
@@ -1191,7 +1180,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
             return Ok(());
         }
 
-        let symbol = cmd.instrument_id.symbol.to_string();
+        let symbol = cmd.instrument_id.symbol.inner();
         let instrument_id = cmd.instrument_id;
         let strategy_id = cmd.strategy_id;
         let entries: Vec<CancelEntry> = open_orders
@@ -1201,7 +1190,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 instrument_id,
                 client_order_id: o.client_order_id(),
                 venue_order_id: o.venue_order_id(),
-                symbol: symbol.clone(),
+                symbol,
             })
             .collect();
 
@@ -1211,23 +1200,12 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let ws_client = self.ws_client.clone();
 
         self.spawn_task("cancel_all_orders", async move {
-            let asset = match http_client.get_asset_index(&symbol) {
+            let asset = match http_client.get_asset_index_for_symbol(symbol) {
                 Some(a) => a,
                 None => {
-                    let reason = format!("Asset index not found for symbol {symbol}");
-                    log::warn!("{reason}");
-                    let ts = clock.get_time_ns();
-
-                    for entry in &entries {
-                        emitter.emit_order_cancel_rejected_event(
-                            entry.strategy_id,
-                            entry.instrument_id,
-                            entry.client_order_id,
-                            entry.venue_order_id,
-                            &reason,
-                            ts,
-                        );
-                    }
+                    log::warn!(
+                        "Local cancel-all validation failed: Asset index not found for symbol {symbol}"
+                    );
                     return Ok(());
                 }
             };
@@ -1235,7 +1213,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
             let mut cancel_dispatch = CancelDispatch::new();
 
             for entry in &entries {
-                cancel_dispatch.push(entry, asset, &http_client, &emitter, clock);
+                cancel_dispatch.push(entry, asset, &http_client);
             }
 
             if cancel_dispatch.is_empty() {
@@ -1274,7 +1252,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 instrument_id: c.instrument_id,
                 client_order_id: c.client_order_id,
                 venue_order_id: c.venue_order_id,
-                symbol: c.instrument_id.symbol.to_string(),
+                symbol: c.instrument_id.symbol.inner(),
             })
             .collect();
 
@@ -1287,24 +1265,19 @@ impl ExecutionClient for HyperliquidExecutionClient {
             let mut cancel_dispatch = CancelDispatch::new();
 
             for entry in &entries {
-                let asset = match http_client.get_asset_index(&entry.symbol) {
+                let asset = match http_client.get_asset_index_for_symbol(entry.symbol) {
                     Some(a) => a,
                     None => {
-                        let reason = format!("Asset index not found for symbol {}", entry.symbol);
-                        log::warn!("{reason}, skipping cancel for {}", entry.client_order_id);
-                        emitter.emit_order_cancel_rejected_event(
-                            entry.strategy_id,
-                            entry.instrument_id,
+                        log::warn!(
+                            "Local batch cancel validation failed for {}: Asset index not found for symbol {}",
                             entry.client_order_id,
-                            entry.venue_order_id,
-                            &reason,
-                            clock.get_time_ns(),
+                            entry.symbol,
                         );
                         continue;
                     }
                 };
 
-                cancel_dispatch.push(entry, asset, &http_client, &emitter, clock);
+                cancel_dispatch.push(entry, asset, &http_client);
             }
 
             if cancel_dispatch.is_empty() {
@@ -1374,18 +1347,26 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let account_address = self.get_account_address()?;
         let http_client = self.http_client.clone();
         let emitter = self.emitter.clone();
+        let dispatch_state = self.ws_dispatch_state.clone();
+        let clock = self.clock;
 
         self.spawn_task("query_order", async move {
             // Search open orders by cloid first so modify/cancel-replace
             // resolves to the live replacement rather than a stale cached oid.
-            // Request errors here are logged and the oid fallback is still tried;
-            // a transient frontendOpenOrders failure must not abort the whole query.
+            // Request errors here are logged, not propagated, so a transient
+            // frontendOpenOrders failure does not abort the whole query.
             match http_client
                 .request_order_status_report_by_client_order_id(&account_address, &client_order_id)
                 .await
             {
                 Ok(Some(report)) => {
-                    log::info!("Queried order status for {client_order_id}");
+                    promote_replacement_from_query(
+                        &report,
+                        &dispatch_state,
+                        &emitter,
+                        clock.get_time_ns(),
+                    );
+                    log::debug!("Queried order status for {client_order_id}");
                     emitter.send_order_status_report(report);
                     return Ok(());
                 }
@@ -1398,7 +1379,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
             }
 
             let Some(venue_order_id) = venue_order_id else {
-                log::info!("No order status report found for {client_order_id}");
+                log::debug!("No order status report found for {client_order_id}");
                 return Ok(());
             };
 
@@ -1415,11 +1396,21 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 .await
             {
                 Ok(Some(report)) => {
-                    log::info!("Queried order status for oid {oid}");
-                    emitter.send_order_status_report(report);
+                    if is_inflight_modify_old_leg_cancel(
+                        &dispatch_state,
+                        &client_order_id,
+                        &report,
+                    ) {
+                        log::debug!(
+                            "Suppressing stale old-leg Canceled for {client_order_id}: modify in flight"
+                        );
+                    } else {
+                        log::debug!("Queried order status for oid {oid}");
+                        emitter.send_order_status_report(report);
+                    }
                 }
                 Ok(None) => {
-                    log::info!("No order status report found for oid {oid}");
+                    log::debug!("No order status report found for oid {oid}");
                 }
                 Err(e) => {
                     log::warn!("Failed to query order status for oid {oid}: {e}");
@@ -1521,7 +1512,13 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 .await
             {
                 Ok(Some(report)) => {
-                    log::info!("Generated order status report for {client_order_id}");
+                    promote_replacement_from_query(
+                        &report,
+                        &self.ws_dispatch_state,
+                        &self.emitter,
+                        self.clock.get_time_ns(),
+                    );
+                    log::debug!("Generated order status report for {client_order_id}");
                     return Ok(Some(report));
                 }
                 Ok(None) => {}
@@ -1550,7 +1547,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
                     match cached_oid {
                         Some(oid) => oid,
                         None => {
-                            log::info!("No order status report found for {client_order_id}");
+                            log::debug!("No order status report found for {client_order_id}");
                             return Ok(None);
                         }
                     }
@@ -1565,10 +1562,20 @@ impl ExecutionClient for HyperliquidExecutionClient {
             .await
             .context("failed to generate order status report")?;
 
+        if let Some(report) = &report
+            && let Some(client_order_id) = &cmd.client_order_id
+            && is_inflight_modify_old_leg_cancel(&self.ws_dispatch_state, client_order_id, report)
+        {
+            log::debug!(
+                "Suppressing stale old-leg Canceled for {client_order_id}: modify in flight"
+            );
+            return Ok(None);
+        }
+
         if report.is_some() {
-            log::info!("Generated order status report for oid {oid}");
+            log::debug!("Generated order status report for oid {oid}");
         } else {
-            log::info!("No order status report found for oid {oid}");
+            log::debug!("No order status report found for oid {oid}");
         }
         Ok(report)
     }
@@ -1585,26 +1592,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
             .await
             .context("failed to generate order status reports")?;
 
-        // Filter by open_only if specified
-        let reports = if cmd.open_only {
-            reports
-                .into_iter()
-                .filter(|r| r.order_status.is_open())
-                .collect()
-        } else {
-            reports
-        };
-
-        // Filter by time range if specified
-        let reports = match (cmd.start, cmd.end) {
-            (Some(start), Some(end)) => reports
-                .into_iter()
-                .filter(|r| r.ts_last >= start && r.ts_last <= end)
-                .collect(),
-            (Some(start), None) => reports.into_iter().filter(|r| r.ts_last >= start).collect(),
-            (None, Some(end)) => reports.into_iter().filter(|r| r.ts_last <= end).collect(),
-            (None, None) => reports,
-        };
+        let reports = filter_order_status_reports_for_command(reports, cmd);
 
         log::debug!("Generated {} order status reports", reports.len());
         Ok(reports)
@@ -1782,7 +1770,7 @@ impl HyperliquidExecutionClient {
                     Some(msg) => match msg {
                         NautilusWsMessage::ExecutionReports(reports) => {
                             for report in reports {
-                                handle_execution_report(
+                                if let Some((cid, oid, order)) = handle_execution_report(
                                     report,
                                     &dispatch_state,
                                     &emitter,
@@ -1790,14 +1778,23 @@ impl HyperliquidExecutionClient {
                                     &http_client,
                                     &mut pending_filled_cloids,
                                     clock.get_time_ns(),
-                                );
+                                ) {
+                                    spawn_corrective_reduce(
+                                        &ws_client,
+                                        &http_client,
+                                        &dispatch_state,
+                                        cid,
+                                        oid,
+                                        order,
+                                    );
+                                }
                             }
                         }
                         // Reconnected is handled by WS client internally
                         // (resubscribe_all) and never forwarded here
                         NautilusWsMessage::Reconnected => {}
                         NautilusWsMessage::Error(e) => {
-                            log::error!("WebSocket error: {e}");
+                            log::warn!("WebSocket error: {e}");
                         }
                         // Handled by data client
                         NautilusWsMessage::Trades(_)
@@ -1824,13 +1821,49 @@ impl HyperliquidExecutionClient {
     }
 }
 
+fn filter_order_status_reports_for_command(
+    reports: Vec<OrderStatusReport>,
+    cmd: &GenerateOrderStatusReports,
+) -> Vec<OrderStatusReport> {
+    let reports = if cmd.open_only {
+        reports
+            .into_iter()
+            .filter(|r| r.order_status.is_open())
+            .collect()
+    } else {
+        reports
+    };
+
+    match (cmd.start, cmd.end) {
+        (Some(start), Some(end)) => reports
+            .into_iter()
+            .filter(|r| r.ts_last >= start && r.ts_last <= end)
+            .collect(),
+        (Some(start), None) => reports.into_iter().filter(|r| r.ts_last >= start).collect(),
+        (None, Some(end)) => reports.into_iter().filter(|r| r.ts_last <= end).collect(),
+        (None, None) => reports,
+    }
+}
+
+// During a tracked cancel-replace the cached venue_order_id is still the old
+// leg, so only its `Canceled` must be dropped (it would wrongly terminate the
+// live order); a late `Filled` or any other status is forwarded for recovery.
+fn is_inflight_modify_old_leg_cancel(
+    dispatch_state: &WsDispatchState,
+    client_order_id: &ClientOrderId,
+    report: &OrderStatusReport,
+) -> bool {
+    report.order_status == OrderStatus::Canceled
+        && dispatch_state.pending_modify(client_order_id) == Some(report.venue_order_id)
+}
+
 #[derive(Clone)]
 struct CancelEntry {
     strategy_id: StrategyId,
     instrument_id: InstrumentId,
     client_order_id: ClientOrderId,
     venue_order_id: Option<VenueOrderId>,
-    symbol: String,
+    symbol: Ustr,
 }
 
 struct CancelDispatch {
@@ -1854,14 +1887,7 @@ impl CancelDispatch {
         self.cloid_requests.is_empty() && self.oid_requests.is_empty()
     }
 
-    fn push(
-        &mut self,
-        entry: &CancelEntry,
-        asset: u32,
-        http_client: &HyperliquidHttpClient,
-        emitter: &ExecutionEventEmitter,
-        clock: &'static AtomicTime,
-    ) {
+    fn push(&mut self, entry: &CancelEntry, asset: u32, http_client: &HyperliquidHttpClient) {
         if let Some(cloid) = http_client.cached_client_order_id_cloid(&entry.client_order_id) {
             self.cloid_requests
                 .push(HyperliquidExecCancelByCloidRequest { asset, cloid });
@@ -1874,13 +1900,9 @@ impl CancelDispatch {
                     self.oid_entries.push(entry.clone());
                 }
                 Err(_) => {
-                    emitter.emit_order_cancel_rejected_event(
-                        entry.strategy_id,
-                        entry.instrument_id,
+                    log::warn!(
+                        "Local cancel validation failed for {}: Invalid venue order ID format",
                         entry.client_order_id,
-                        Some(venue_order_id),
-                        "Invalid venue order ID format",
-                        clock.get_time_ns(),
                     );
                 }
             }
@@ -1964,17 +1986,6 @@ async fn submit_cancel_action(
                     inner_errors.len(),
                 ) {
                     log::warn!("{reason}");
-
-                    for entry in sent_entries {
-                        emitter.emit_order_cancel_rejected_event(
-                            entry.strategy_id,
-                            entry.instrument_id,
-                            entry.client_order_id,
-                            entry.venue_order_id,
-                            &reason,
-                            ts,
-                        );
-                    }
                 } else {
                     for (i, entry) in sent_entries.iter().enumerate() {
                         if let Some(Some(error_msg)) = inner_errors.get(i) {
@@ -1995,39 +2006,16 @@ async fn submit_cancel_action(
                 }
             } else {
                 let error_msg = extract_error_message(&response);
-                log::warn!("{label} rejected by exchange: {error_msg}");
-                let ts = clock.get_time_ns();
-
-                for entry in sent_entries {
-                    emitter.emit_order_cancel_rejected_event(
-                        entry.strategy_id,
-                        entry.instrument_id,
-                        entry.client_order_id,
-                        entry.venue_order_id,
-                        &error_msg,
-                        ts,
-                    );
-                }
+                log::warn!(
+                    "{label} failed without per-order results, awaiting WS reconciliation: {error_msg}"
+                );
             }
         }
         Err(e) => {
             if e.is_transport_error() {
                 log::warn!("{label} transport failure: {e}; awaiting WS reconciliation");
             } else {
-                let reason = format!("{label} WebSocket post request failed: {e}");
-                log::warn!("{reason}");
-                let ts = clock.get_time_ns();
-
-                for entry in sent_entries {
-                    emitter.emit_order_cancel_rejected_event(
-                        entry.strategy_id,
-                        entry.instrument_id,
-                        entry.client_order_id,
-                        entry.venue_order_id,
-                        &reason,
-                        ts,
-                    );
-                }
+                log::warn!("{label} ambiguous failure, awaiting WS reconciliation: {e}");
             }
         }
     }
@@ -2186,6 +2174,13 @@ impl PostRejectionRoute {
             return false;
         }
 
+        if reason.contains(HYPERLIQUID_BUILDER_FEE_NOT_APPROVED) {
+            log::warn!(
+                "Builder fee not approved: complete the one-time 0% builder approval \
+                 (signed by the master wallet). See: {HYPERLIQUID_BUILDER_APPROVAL_DOCS_URL}",
+            );
+        }
+
         self.emitter
             .emit_order_rejected(order, reason, ts_event, false);
         self.dispatch_state
@@ -2213,7 +2208,7 @@ fn handle_execution_report(
     http_client: &HyperliquidHttpClient,
     pending_filled_cloids: &mut FifoCache<ClientOrderId, 10_000>,
     ts_init: UnixNanos,
-) {
+) -> Option<(ClientOrderId, u64, HyperliquidExecPlaceOrderRequest)> {
     match report {
         ExecutionReport::Order(order_report) => {
             let is_filled_marker = matches!(order_report.order_status, OrderStatus::Filled);
@@ -2250,6 +2245,14 @@ fn handle_execution_report(
                     }
                 }
             }
+
+            // Hand any queued corrective reduce to the loop to post; this
+            // cache-free task cannot rebuild the order spec itself.
+            client_order_id.and_then(|id| {
+                dispatch_state
+                    .take_corrective(&id)
+                    .map(|(oid, order)| (id, oid, order))
+            })
         }
         ExecutionReport::Fill(fill_report) => {
             let client_order_id = fill_report.client_order_id;
@@ -2269,8 +2272,71 @@ fn handle_execution_report(
                 pending_filled_cloids.remove(&id);
                 remove_cloid_mapping_for_client_order_id(ws_client, http_client, &id);
             }
+
+            // Hand a fill-path promotion's corrective reduce to the loop to post
+            client_order_id.and_then(|id| {
+                dispatch_state
+                    .take_corrective(&id)
+                    .map(|(oid, order)| (id, oid, order))
+            })
         }
     }
+}
+
+/// Posts a corrective reduce queued by the cancel-replace promotion.
+///
+/// Runs on the runtime (not the WS receive loop) so the post does not block
+/// event processing. Keeps the re-armed pending-modify marker only while the
+/// reduce may still be live (a clean ack, or a transport failure the WS may
+/// reconcile); clears it otherwise so a stale marker cannot suppress a later
+/// real `CANCELED(oid)` as a cancel-before-accept leg.
+fn spawn_corrective_reduce(
+    ws_client: &HyperliquidWebSocketClient,
+    http_client: &HyperliquidHttpClient,
+    dispatch_state: &Arc<WsDispatchState>,
+    client_order_id: ClientOrderId,
+    oid: u64,
+    order: HyperliquidExecPlaceOrderRequest,
+) {
+    let ws_client = ws_client.clone();
+    let http_client = http_client.clone();
+    let dispatch_state = dispatch_state.clone();
+
+    get_runtime().spawn(async move {
+        let action = HyperliquidExecAction::Modify {
+            modify: HyperliquidExecModifyOrderRequest { oid, order },
+        };
+
+        let keep_marker = match ws_client.post_action_exec(&http_client, &action).await {
+            Ok(resp) if resp.is_ok() && extract_inner_error(&resp).is_none() => {
+                log::info!("Corrective reduce acknowledged for {client_order_id} on oid {oid}");
+                true
+            }
+            Ok(resp) => {
+                let reason =
+                    extract_inner_error(&resp).unwrap_or_else(|| extract_error_message(&resp));
+                log::warn!(
+                    "Corrective reduce rejected for {client_order_id} on oid {oid}: {reason}"
+                );
+                false
+            }
+            Err(e) if e.is_transport_error() => {
+                log::warn!(
+                    "Corrective reduce transport failure for {client_order_id} on oid {oid}: \
+                     {e}; awaiting WS reconciliation",
+                );
+                true
+            }
+            Err(e) => {
+                log::warn!("Corrective reduce failed for {client_order_id} on oid {oid}: {e}");
+                false
+            }
+        };
+
+        if !keep_marker {
+            dispatch_state.clear_pending_modify(&client_order_id);
+        }
+    });
 }
 
 fn remove_cloid_mapping_for_client_order_id(
@@ -2278,25 +2344,16 @@ fn remove_cloid_mapping_for_client_order_id(
     http_client: &HyperliquidHttpClient,
     client_order_id: &ClientOrderId,
 ) {
+    let generated_cloid = Cloid::from_client_order_id(*client_order_id);
+
     if let Some(cloid) = http_client.remove_client_order_id_cloid(client_order_id) {
         ws_client.remove_cloid_mapping(&Ustr::from(&cloid.to_hex()));
-    } else {
-        let cloid = Cloid::from_client_order_id(*client_order_id);
-        ws_client.remove_cloid_mapping(&Ustr::from(&cloid.to_hex()));
+        if cloid == generated_cloid {
+            return;
+        }
     }
 
-    let legacy_cloid = Cloid::from_legacy_client_order_id(*client_order_id);
-    ws_client.remove_cloid_mapping(&Ustr::from(&legacy_cloid.to_hex()));
-}
-
-fn resolve_account_address(config_value: Option<&str>, env_value: Option<&str>) -> Option<String> {
-    let trim_nonempty = |s: &str| {
-        let trimmed = s.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    };
-    config_value
-        .and_then(trim_nonempty)
-        .or_else(|| env_value.and_then(trim_nonempty))
+    ws_client.remove_cloid_mapping(&Ustr::from(&generated_cloid.to_hex()));
 }
 
 use crate::common::parse::determine_order_list_grouping;
@@ -2305,7 +2362,7 @@ use crate::common::parse::determine_order_list_grouping;
 mod tests {
     use std::sync::Arc;
 
-    use nautilus_common::messages::ExecutionEvent;
+    use nautilus_common::messages::{ExecutionEvent, execution::GenerateOrderStatusReports};
     use nautilus_core::{UUID4, UnixNanos, time::get_atomic_clock_realtime};
     use nautilus_live::ExecutionEventEmitter;
     use nautilus_model::{
@@ -2323,17 +2380,21 @@ mod tests {
     };
     use nautilus_network::websocket::TransportBackend;
     use rstest::rstest;
+    use rust_decimal::Decimal;
     use ustr::Ustr;
 
     use super::{
         ExecutionReport, FifoCache, HyperliquidHttpClient, HyperliquidWebSocketClient,
         OrderIdentity, PostRejectionRoute, WsDispatchState, determine_order_list_grouping,
-        handle_execution_report, register_order_identity_into, resolve_account_address,
-        validate_order_for_hyperliquid,
+        filter_order_status_reports_for_command, handle_execution_report,
+        register_order_identity_into, validate_order_for_hyperliquid,
     };
     use crate::{
         common::enums::HyperliquidEnvironment,
-        http::models::{Cloid, HyperliquidExecGrouping},
+        http::models::{
+            Cloid, HyperliquidExecGrouping, HyperliquidExecLimitParams, HyperliquidExecOrderKind,
+            HyperliquidExecPlaceOrderRequest, HyperliquidExecTif,
+        },
     };
 
     const TEST_INSTRUMENT_ID: &str = "BTC-USD-PERP.HYPERLIQUID";
@@ -2436,13 +2497,27 @@ mod tests {
         venue_order_id: &str,
         trade_id: &str,
     ) -> FillReport {
+        make_fill_report_with_qty(
+            client_order_id,
+            venue_order_id,
+            trade_id,
+            Quantity::from("0.0001"),
+        )
+    }
+
+    fn make_fill_report_with_qty(
+        client_order_id: Option<&str>,
+        venue_order_id: &str,
+        trade_id: &str,
+        last_qty: Quantity,
+    ) -> FillReport {
         FillReport::new(
             AccountId::from("HYPERLIQUID-001"),
             InstrumentId::from(TEST_INSTRUMENT_ID),
             VenueOrderId::new(venue_order_id),
             TradeId::new(trade_id),
             OrderSide::Buy,
-            Quantity::from("0.0001"),
+            last_qty,
             Price::from("56730.0"),
             Money::new(0.0, Currency::USD()),
             LiquiditySide::Taker,
@@ -2457,6 +2532,107 @@ mod tests {
     fn cloid_for(id: &str) -> Ustr {
         let cloid = Cloid::from_client_order_id(ClientOrderId::from(id));
         Ustr::from(&cloid.to_hex())
+    }
+
+    #[rstest]
+    fn test_filter_order_status_reports_for_command_filters_open_only() {
+        let open_report =
+            make_status_report(Some("O-HER-FILTER-OPEN"), "v-open", OrderStatus::Accepted);
+        let closed_report =
+            make_status_report(Some("O-HER-FILTER-CLOSED"), "v-closed", OrderStatus::Filled);
+        let cmd = order_reports_command(true, None, None);
+
+        let filtered =
+            filter_order_status_reports_for_command(vec![open_report, closed_report], &cmd);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered[0].client_order_id,
+            Some(ClientOrderId::from("O-HER-FILTER-OPEN"))
+        );
+    }
+
+    #[rstest]
+    fn test_filter_order_status_reports_for_command_filters_time_range_inclusively() {
+        let mut before = make_status_report(
+            Some("O-HER-FILTER-BEFORE"),
+            "v-before",
+            OrderStatus::Accepted,
+        );
+        let mut at_start =
+            make_status_report(Some("O-HER-FILTER-START"), "v-start", OrderStatus::Accepted);
+        let mut at_end =
+            make_status_report(Some("O-HER-FILTER-END"), "v-end", OrderStatus::Accepted);
+        let mut after =
+            make_status_report(Some("O-HER-FILTER-AFTER"), "v-after", OrderStatus::Accepted);
+        before.ts_last = UnixNanos::from(9);
+        at_start.ts_last = UnixNanos::from(10);
+        at_end.ts_last = UnixNanos::from(20);
+        after.ts_last = UnixNanos::from(21);
+        let cmd =
+            order_reports_command(false, Some(UnixNanos::from(10)), Some(UnixNanos::from(20)));
+
+        let filtered =
+            filter_order_status_reports_for_command(vec![before, at_start, at_end, after], &cmd);
+        let filtered_ids: Vec<Option<ClientOrderId>> = filtered
+            .iter()
+            .map(|report| report.client_order_id)
+            .collect();
+
+        assert_eq!(
+            filtered_ids,
+            vec![
+                Some(ClientOrderId::from("O-HER-FILTER-START")),
+                Some(ClientOrderId::from("O-HER-FILTER-END")),
+            ]
+        );
+    }
+
+    #[rstest]
+    fn test_filter_order_status_reports_for_command_without_filters_preserves_reports() {
+        let open_report = make_status_report(
+            Some("O-HER-FILTER-KEEP-OPEN"),
+            "v-keep-open",
+            OrderStatus::Accepted,
+        );
+        let closed_report = make_status_report(
+            Some("O-HER-FILTER-KEEP-CLOSED"),
+            "v-keep-closed",
+            OrderStatus::Canceled,
+        );
+        let cmd = order_reports_command(false, None, None);
+
+        let filtered =
+            filter_order_status_reports_for_command(vec![open_report, closed_report], &cmd);
+        let filtered_ids: Vec<Option<ClientOrderId>> = filtered
+            .iter()
+            .map(|report| report.client_order_id)
+            .collect();
+
+        assert_eq!(
+            filtered_ids,
+            vec![
+                Some(ClientOrderId::from("O-HER-FILTER-KEEP-OPEN")),
+                Some(ClientOrderId::from("O-HER-FILTER-KEEP-CLOSED")),
+            ]
+        );
+    }
+
+    fn order_reports_command(
+        open_only: bool,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+    ) -> GenerateOrderStatusReports {
+        GenerateOrderStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            open_only,
+            None,
+            start,
+            end,
+            None,
+            None,
+        )
     }
 
     fn limit_order(
@@ -2897,12 +3073,12 @@ mod tests {
         assert_eq!(ws_client.get_cloid_mapping(&cloid_for("O-HER-FILL")), None);
     }
 
-    /// GH-3972: when a status-only `FILLED` marker arrives before both the
-    /// buffered fill and the replacement `ACCEPTED(new_voi)`, the cloid
-    /// mapping must NOT be evicted on the buffered fill: otherwise the later
-    /// `ACCEPTED` cannot resolve the cloid and the buffered fill is stranded.
+    /// GH-4270: when a status-only `FILLED` marker arrives before the
+    /// replacement fill and the `ACCEPTED(new_voi)` is dropped, the fill itself
+    /// promotes the binding (OrderUpdated then OrderFilled) and, being terminal
+    /// and no longer buffered, completes the deferred cloid eviction.
     #[rstest]
-    fn test_handle_execution_report_buffered_fill_preserves_cloid_under_filled_marker() {
+    fn test_handle_execution_report_fill_under_filled_marker_promotes_and_evicts_cloid() {
         let ws_client = make_ws_client();
         let (emitter, mut rx) = test_emitter();
         let state = WsDispatchState::new();
@@ -2933,9 +3109,9 @@ mod tests {
             Some(cid)
         );
 
-        // Fill carrying the new venue_order_id arrives before ACCEPTED. It is
-        // buffered; the cloid mapping must be preserved so the eventual
-        // ACCEPTED can still resolve and drain the buffer.
+        // The replacement fill arrives with the new venue_order_id; the ACCEPTED
+        // was dropped. It promotes the binding, applies the fill, and -- being
+        // terminal and no longer buffered -- completes the deferred eviction.
         let fill = make_fill_report(Some("O-HER-BUF"), "new-voi", "trade-buf");
         handle_execution_report(
             ExecutionReport::Fill(fill),
@@ -2947,16 +3123,25 @@ mod tests {
             UnixNanos::default(),
         );
 
-        assert_eq!(state.buffered_fill_count(&cid), 1);
-        assert!(drain_events(&mut rx).is_empty());
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            ExecutionEvent::Order(OrderEventAny::Updated(_))
+        ));
+        assert!(matches!(
+            events[1],
+            ExecutionEvent::Order(OrderEventAny::Filled(_))
+        ));
+        assert_eq!(state.buffered_fill_count(&cid), 0);
         assert!(
-            pending_cloids.contains(&cid),
-            "deferred cleanup must remain armed until the buffered fill drains",
+            !pending_cloids.contains(&cid),
+            "deferred cleanup must complete once the promoting fill lands",
         );
         assert_eq!(
             ws_client.get_cloid_mapping(&cloid_for("O-HER-BUF")),
-            Some(cid),
-            "cloid mapping must survive a buffered fill so the later ACCEPTED resolves",
+            None,
+            "cloid mapping must be evicted after the terminal fill",
         );
     }
 
@@ -3066,6 +3251,343 @@ mod tests {
             }
             other => panic!("expected OrderUpdated, found {other:?}"),
         }
+    }
+
+    fn limit_request(size: Decimal) -> HyperliquidExecPlaceOrderRequest {
+        HyperliquidExecPlaceOrderRequest {
+            asset: 0,
+            is_buy: true,
+            price: "88.949".parse::<Decimal>().unwrap(),
+            size,
+            reduce_only: false,
+            kind: HyperliquidExecOrderKind::Limit {
+                limit: HyperliquidExecLimitParams {
+                    tif: HyperliquidExecTif::Gtc,
+                },
+            },
+            cloid: None,
+        }
+    }
+
+    /// A partial fill landing mid-modify leaves the cancel-replace replacement
+    /// oversized (sized at the full target). The promotion must queue a
+    /// corrective reduce to `target - filled` and re-arm the marker.
+    #[rstest]
+    fn test_cancel_replace_queues_corrective_reduce_on_in_flight_fill() {
+        let ws_client = make_ws_client();
+        let (emitter, mut rx) = test_emitter();
+        let state = WsDispatchState::new();
+        let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
+
+        let cid = ClientOrderId::from("O-HER-4154");
+        let target_total = Quantity::from("1.000");
+        let old_voi = "445117664938";
+        let new_voi = "445117686214";
+
+        let mut identity = test_identity();
+        identity.quantity = target_total;
+        state.register_identity(cid, identity);
+        state.insert_accepted(cid);
+        state.record_venue_order_id(cid, VenueOrderId::new(old_voi));
+
+        // Modify dispatched while nothing had filled: marker plus the exact
+        // request sent to the venue, sized at the full target.
+        state.mark_pending_modify(cid, VenueOrderId::new(old_voi), target_total);
+        state.stash_modify_request(cid, limit_request(Decimal::from(1)));
+
+        // A 0.165 fill lands on the old leg after the modify was dispatched
+        state.record_filled_qty(cid, Quantity::from("0.165"));
+
+        // Replacement ACCEPTED(new_voi) arrives: promotion runs
+        let accepted = make_status_report_with_quantity(
+            Some("O-HER-4154"),
+            new_voi,
+            OrderStatus::Accepted,
+            Quantity::from("0.835"),
+        );
+        let corrective = handle_execution_report(
+            ExecutionReport::Order(accepted),
+            &state,
+            &emitter,
+            &ws_client,
+            &make_http_client(),
+            &mut pending_cloids,
+            UnixNanos::default(),
+        );
+
+        // OrderUpdated still carries the absolute target total
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ExecutionEvent::Order(OrderEventAny::Updated(updated)) => {
+                assert_eq!(updated.quantity, target_total);
+                assert_eq!(updated.venue_order_id, Some(VenueOrderId::new(new_voi)));
+            }
+            other => panic!("expected OrderUpdated, found {other:?}"),
+        }
+
+        let (corr_cid, oid, request) =
+            corrective.expect("oversized replacement must queue a corrective reduce");
+        assert_eq!(corr_cid, cid);
+        assert_eq!(oid, 445_117_686_214);
+        assert_eq!(request.size, "0.835".parse::<Decimal>().unwrap());
+        // Marker re-armed on the new voi so the corrective's own cancel leg
+        // is suppressed and a further in-flight fill chains another reduce.
+        assert_eq!(state.pending_modify(&cid), Some(VenueOrderId::new(new_voi)));
+        assert_eq!(state.pending_modify_target_qty(&cid), Some(target_total));
+    }
+
+    /// GH-4270: when the replacement ACCEPTED is dropped, a fill on the new leg
+    /// promotes the binding and (parity with the ACCEPTED path) queues a corrective
+    /// reduce when an earlier old-leg fill left the replacement oversized.
+    #[rstest]
+    fn test_cancel_replace_fill_promotion_queues_corrective_reduce() {
+        let ws_client = make_ws_client();
+        let (emitter, mut rx) = test_emitter();
+        let state = WsDispatchState::new();
+        let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
+
+        let cid = ClientOrderId::from("O-HER-FILL-CORR");
+        let target_total = Quantity::from("1.000");
+        let old_voi = "445117664938";
+        let new_voi = "445117686214";
+
+        let mut identity = test_identity();
+        identity.quantity = target_total;
+        state.register_identity(cid, identity);
+        state.insert_accepted(cid);
+        state.record_venue_order_id(cid, VenueOrderId::new(old_voi));
+        // Modify dispatched while nothing had filled: request sized at the full target
+        state.mark_pending_modify(cid, VenueOrderId::new(old_voi), target_total);
+        state.stash_modify_request(cid, limit_request(Decimal::from(1)));
+        // An old-leg fill raced the modify; the replacement ACCEPTED was dropped
+        state.record_filled_qty(cid, Quantity::from("0.165"));
+
+        // A fill lands on the replacement leg: it must promote and queue the reduce
+        let fill = make_fill_report_with_qty(
+            Some("O-HER-FILL-CORR"),
+            new_voi,
+            "T-FILL-CORR",
+            Quantity::from("0.100"),
+        );
+        let corrective = handle_execution_report(
+            ExecutionReport::Fill(fill),
+            &state,
+            &emitter,
+            &ws_client,
+            &make_http_client(),
+            &mut pending_cloids,
+            UnixNanos::default(),
+        );
+
+        // The fill promoted: OrderUpdated then OrderFilled
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            ExecutionEvent::Order(OrderEventAny::Updated(_))
+        ));
+        assert!(matches!(
+            events[1],
+            ExecutionEvent::Order(OrderEventAny::Filled(_))
+        ));
+
+        // Corrective reduce queued to target - cumulative (1.000 - 0.265 = 0.735)
+        let (corr_cid, oid, request) =
+            corrective.expect("oversized replacement must queue a corrective reduce");
+        assert_eq!(corr_cid, cid);
+        assert_eq!(oid, 445_117_686_214);
+        assert_eq!(request.size, "0.735".parse::<Decimal>().unwrap());
+        assert_eq!(state.pending_modify(&cid), Some(VenueOrderId::new(new_voi)));
+    }
+
+    /// Without an in-flight fill the replacement is correctly sized, so the
+    /// promotion must not queue a corrective reduce and must clear the marker.
+    #[rstest]
+    fn test_cancel_replace_no_corrective_without_in_flight_fill() {
+        let ws_client = make_ws_client();
+        let (emitter, mut rx) = test_emitter();
+        let state = WsDispatchState::new();
+        let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
+
+        let cid = ClientOrderId::from("O-HER-4154-NOFILL");
+        let target_total = Quantity::from("1.000");
+
+        let mut identity = test_identity();
+        identity.quantity = target_total;
+        state.register_identity(cid, identity);
+        state.insert_accepted(cid);
+        state.record_venue_order_id(cid, VenueOrderId::new("445117664938"));
+        state.mark_pending_modify(cid, VenueOrderId::new("445117664938"), target_total);
+        state.stash_modify_request(cid, limit_request(Decimal::from(1)));
+
+        let accepted = make_status_report_with_quantity(
+            Some("O-HER-4154-NOFILL"),
+            "445117686214",
+            OrderStatus::Accepted,
+            target_total,
+        );
+        let corrective = handle_execution_report(
+            ExecutionReport::Order(accepted),
+            &state,
+            &emitter,
+            &ws_client,
+            &make_http_client(),
+            &mut pending_cloids,
+            UnixNanos::default(),
+        );
+
+        let _ = drain_events(&mut rx);
+        assert!(corrective.is_none());
+        assert!(state.pending_modify(&cid).is_none());
+        assert!(state.take_corrective(&cid).is_none());
+        // Promotion clears the stashed request along with the marker
+        assert!(state.modify_request(&cid).is_none());
+    }
+
+    /// A fill buffered during the in-flight cancel-replace is drained before
+    /// the corrective is computed, so the corrective must size from the
+    /// post-drain cumulative. A pre-drain read would see 0 filled and skip it.
+    #[rstest]
+    fn test_cancel_replace_corrective_uses_post_drain_buffered_fill() {
+        let ws_client = make_ws_client();
+        let (emitter, mut rx) = test_emitter();
+        let state = WsDispatchState::new();
+        let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
+
+        let cid = ClientOrderId::from("O-HER-4154-BUF");
+        let target_total = Quantity::from("1.000");
+        let new_voi = "445117686214";
+
+        let mut identity = test_identity();
+        identity.quantity = target_total;
+        state.register_identity(cid, identity);
+        state.insert_accepted(cid);
+        state.record_venue_order_id(cid, VenueOrderId::new("445117664938"));
+        state.mark_pending_modify(cid, VenueOrderId::new("445117664938"), target_total);
+        state.stash_modify_request(cid, limit_request(Decimal::from(1)));
+
+        // Nothing recorded yet; the only fill arrives buffered on the new leg
+        let buffered = make_fill_report_with_qty(
+            Some("O-HER-4154-BUF"),
+            new_voi,
+            "trade-buf-4154",
+            Quantity::from("0.165"),
+        );
+        state.buffer_fill(cid, buffered);
+
+        let accepted = make_status_report_with_quantity(
+            Some("O-HER-4154-BUF"),
+            new_voi,
+            OrderStatus::Accepted,
+            Quantity::from("0.835"),
+        );
+        let corrective = handle_execution_report(
+            ExecutionReport::Order(accepted),
+            &state,
+            &emitter,
+            &ws_client,
+            &make_http_client(),
+            &mut pending_cloids,
+            UnixNanos::default(),
+        );
+
+        let _ = drain_events(&mut rx);
+        let (_, _, request) =
+            corrective.expect("buffered fill drained before compute must still queue a corrective");
+        assert_eq!(request.size, "0.835".parse::<Decimal>().unwrap());
+    }
+
+    /// When an in-flight fill brings cumulative filled to exactly the target,
+    /// the remaining is zero, so no corrective (a reduce-to-zero is not valid)
+    /// must be queued and the marker is cleared.
+    #[rstest]
+    fn test_cancel_replace_no_corrective_when_filled_equals_target() {
+        let ws_client = make_ws_client();
+        let (emitter, mut rx) = test_emitter();
+        let state = WsDispatchState::new();
+        let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
+
+        let cid = ClientOrderId::from("O-HER-4154-EXACT");
+        let target_total = Quantity::from("1.000");
+
+        let mut identity = test_identity();
+        identity.quantity = target_total;
+        state.register_identity(cid, identity);
+        state.insert_accepted(cid);
+        state.record_venue_order_id(cid, VenueOrderId::new("445117664938"));
+        state.mark_pending_modify(cid, VenueOrderId::new("445117664938"), target_total);
+        state.stash_modify_request(cid, limit_request(Decimal::from(1)));
+        state.record_filled_qty(cid, target_total);
+
+        let accepted = make_status_report_with_quantity(
+            Some("O-HER-4154-EXACT"),
+            "445117686214",
+            OrderStatus::Accepted,
+            target_total,
+        );
+        let corrective = handle_execution_report(
+            ExecutionReport::Order(accepted),
+            &state,
+            &emitter,
+            &ws_client,
+            &make_http_client(),
+            &mut pending_cloids,
+            UnixNanos::default(),
+        );
+
+        let _ = drain_events(&mut rx);
+        assert!(corrective.is_none());
+        assert!(state.pending_modify(&cid).is_none());
+    }
+
+    /// A further in-flight fill during the corrective's own modify chains
+    /// another reduce: the second promotion sizes from the new cumulative.
+    #[rstest]
+    fn test_cancel_replace_chains_second_corrective_reduce() {
+        let ws_client = make_ws_client();
+        let (emitter, mut rx) = test_emitter();
+        let state = WsDispatchState::new();
+        let mut pending_cloids: FifoCache<ClientOrderId, 10_000> = FifoCache::new();
+
+        let cid = ClientOrderId::from("O-HER-4154-CHAIN");
+        let target_total = Quantity::from("1.000");
+        let voi3 = "445117699999";
+
+        // State after the first corrective: marker re-armed on the prior
+        // replacement, stashed request reduced to 0.835, 0.165 already filled.
+        let mut identity = test_identity();
+        identity.quantity = target_total;
+        state.register_identity(cid, identity);
+        state.insert_accepted(cid);
+        state.record_venue_order_id(cid, VenueOrderId::new("445117686214"));
+        state.mark_pending_modify(cid, VenueOrderId::new("445117686214"), target_total);
+        state.stash_modify_request(cid, limit_request("0.835".parse::<Decimal>().unwrap()));
+        // A further 0.300 lands in-flight: cumulative now 0.465
+        state.record_filled_qty(cid, Quantity::from("0.465"));
+
+        let accepted = make_status_report_with_quantity(
+            Some("O-HER-4154-CHAIN"),
+            voi3,
+            OrderStatus::Accepted,
+            Quantity::from("0.535"),
+        );
+        let corrective = handle_execution_report(
+            ExecutionReport::Order(accepted),
+            &state,
+            &emitter,
+            &ws_client,
+            &make_http_client(),
+            &mut pending_cloids,
+            UnixNanos::default(),
+        );
+
+        let _ = drain_events(&mut rx);
+        let (_, oid, request) =
+            corrective.expect("a further in-flight fill must chain another corrective");
+        assert_eq!(oid, 445_117_699_999);
+        assert_eq!(request.size, "0.535".parse::<Decimal>().unwrap());
+        assert_eq!(state.pending_modify(&cid), Some(VenueOrderId::new(voi3)));
     }
 
     #[rstest]
@@ -3328,25 +3850,5 @@ mod tests {
                 .contains("Unsupported instrument symbol format"),
             "unexpected error: {err}",
         );
-    }
-
-    #[rstest]
-    #[case(Some("0xABC"), None, Some("0xABC"))]
-    #[case(None, Some("0xDEF"), Some("0xDEF"))]
-    #[case(Some("0xABC"), Some("0xDEF"), Some("0xABC"))]
-    #[case(Some(""), Some("0xDEF"), Some("0xDEF"))]
-    #[case(Some("   "), Some("0xDEF"), Some("0xDEF"))]
-    #[case(None, Some(""), None)]
-    #[case(None, Some("   "), None)]
-    #[case(None, None, None)]
-    #[case(Some(" 0xABC "), None, Some("0xABC"))]
-    #[case(None, Some(" 0xDEF "), Some("0xDEF"))]
-    fn test_resolve_account_address(
-        #[case] config_value: Option<&str>,
-        #[case] env_value: Option<&str>,
-        #[case] expected: Option<&str>,
-    ) {
-        let result = resolve_account_address(config_value, env_value);
-        assert_eq!(result.as_deref(), expected);
     }
 }

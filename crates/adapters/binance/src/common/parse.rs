@@ -38,7 +38,7 @@ use nautilus_model::{
     reports::{FillReport, OrderStatusReport},
     types::{Currency, Money, Price, Quantity},
 };
-use rust_decimal::{Decimal, prelude::ToPrimitive};
+use rust_decimal::Decimal;
 use serde_json::Value;
 
 use crate::{
@@ -97,6 +97,20 @@ fn parse_filter_quantity(filter: &Value, field: &str) -> anyhow::Result<Quantity
         .map_err(|e| anyhow::anyhow!("Failed to parse {field}='{value}': {e}"))
 }
 
+/// Parses the futures `MIN_NOTIONAL` filter into a `Money` value in `currency`.
+///
+/// Returns `None` when the filter is absent, the `notional` field cannot be
+/// parsed, or the value is non-positive.
+fn parse_futures_min_notional(filters: &[Value], currency: Currency) -> Option<Money> {
+    let filter = get_filter(filters, "MIN_NOTIONAL")?;
+    let raw = filter.get("notional").and_then(|v| v.as_str())?;
+    let amount = f64::from_str(raw).ok()?;
+    if amount <= 0.0 {
+        return None;
+    }
+    Some(Money::new(amount, currency))
+}
+
 /// Parses a venue quantity string into a `Quantity` at the given precision.
 ///
 /// Returns `None` for unparsable, zero, or negative values. Goes through
@@ -124,6 +138,33 @@ pub(crate) fn parse_price_at_precision(raw: &str, precision: u8) -> Option<Price
     }
 
     Price::from_decimal_dp(decimal, precision).ok()
+}
+
+/// Parses a required venue decimal string.
+pub(crate) fn parse_required_decimal(raw: &str, field: &str) -> anyhow::Result<Decimal> {
+    Decimal::from_str(raw).map_err(|e| anyhow::anyhow!("invalid {field}='{raw}': {e}"))
+}
+
+/// Parses a required venue quantity string into a `Quantity` at the given precision.
+pub(crate) fn parse_required_quantity_at_precision(
+    raw: &str,
+    precision: u8,
+    field: &str,
+) -> anyhow::Result<Quantity> {
+    let decimal = parse_required_decimal(raw, field)?;
+    Quantity::from_decimal_dp(decimal, precision)
+        .map_err(|e| anyhow::anyhow!("invalid {field}='{raw}' at precision {precision}: {e}"))
+}
+
+/// Parses a required venue price string into a `Price` at the given precision.
+pub(crate) fn parse_required_price_at_precision(
+    raw: &str,
+    precision: u8,
+    field: &str,
+) -> anyhow::Result<Price> {
+    let decimal = parse_required_decimal(raw, field)?;
+    Price::from_decimal_dp(decimal, precision)
+        .map_err(|e| anyhow::anyhow!("invalid {field}='{raw}' at precision {precision}: {e}"))
 }
 
 /// Re-precisions an existing `Quantity` to the given precision via `Decimal`.
@@ -199,6 +240,8 @@ pub fn parse_usdm_instrument(
     let max_quantity = parse_filter_quantity(lot_filter, "maxQty").ok();
     let min_quantity = parse_filter_quantity(lot_filter, "minQty").ok();
 
+    let min_notional = parse_futures_min_notional(&symbol.filters, quote_currency);
+
     // Default margin (0.1 = 10x leverage)
     let default_margin = Decimal::new(1, 1);
 
@@ -218,13 +261,14 @@ pub fn parse_usdm_instrument(
         max_quantity,
         min_quantity,
         None, // max_notional
-        None, // min_notional
+        min_notional,
         max_price,
         min_price,
         Some(default_margin),
         Some(default_margin),
         None, // maker_fee
         None, // taker_fee
+        None, // tick_scheme
         None, // info
         ts_event,
         ts_init,
@@ -301,6 +345,8 @@ pub fn parse_coinm_instrument(
     // COIN-M has contract_size as the multiplier
     let multiplier = Quantity::new(symbol.contract_size as f64, 0);
 
+    let min_notional = parse_futures_min_notional(&symbol.filters, quote_currency);
+
     // Default margin (0.1 = 10x leverage)
     let default_margin = Decimal::new(1, 1);
 
@@ -320,13 +366,14 @@ pub fn parse_coinm_instrument(
         max_quantity,
         min_quantity,
         None, // max_notional
-        None, // min_notional
+        min_notional,
         max_price,
         min_price,
         Some(default_margin),
         Some(default_margin),
         None, // maker_fee
         None, // taker_fee
+        None, // tick_scheme
         None, // info
         ts_event,
         ts_init,
@@ -365,65 +412,70 @@ fn sbe_mantissa_precision(mantissa: i64, exponent: i8) -> u8 {
 }
 
 /// Parses an SBE price filter into tick_size, max_price, min_price.
-fn parse_sbe_price_filter(filter: &BinancePriceFilterSbe) -> (Price, Option<Price>, Option<Price>) {
+fn parse_sbe_price_filter(
+    filter: &BinancePriceFilterSbe,
+) -> anyhow::Result<(Price, Option<Price>, Option<Price>)> {
     let precision = sbe_mantissa_precision(filter.tick_size, filter.price_exponent);
 
     let tick_size =
-        Price::from_mantissa_exponent(filter.tick_size, filter.price_exponent, precision);
+        Price::from_mantissa_exponent_checked(filter.tick_size, filter.price_exponent, precision)?;
 
     let max_price = if filter.max_price != 0 {
-        Some(Price::from_mantissa_exponent(
+        Some(Price::from_mantissa_exponent_checked(
             filter.max_price,
             filter.price_exponent,
             precision,
-        ))
+        )?)
     } else {
         None
     };
 
     let min_price = if filter.min_price != 0 {
-        Some(Price::from_mantissa_exponent(
+        Some(Price::from_mantissa_exponent_checked(
             filter.min_price,
             filter.price_exponent,
             precision,
-        ))
+        )?)
     } else {
         None
     };
 
-    (tick_size, max_price, min_price)
+    Ok((tick_size, max_price, min_price))
 }
 
 /// Parses an SBE lot size filter into step_size, max_qty, min_qty.
 fn parse_sbe_lot_size_filter(
     filter: &BinanceLotSizeFilterSbe,
-) -> (Quantity, Option<Quantity>, Option<Quantity>) {
+) -> anyhow::Result<(Quantity, Option<Quantity>, Option<Quantity>)> {
     let precision = sbe_mantissa_precision(filter.step_size, filter.qty_exponent);
 
-    let step_size =
-        Quantity::from_mantissa_exponent(filter.step_size as u64, filter.qty_exponent, precision);
+    let step_size = Quantity::from_mantissa_exponent_checked(
+        filter.step_size as u64,
+        filter.qty_exponent,
+        precision,
+    )?;
 
     let max_qty = if filter.max_qty != 0 {
-        Some(Quantity::from_mantissa_exponent(
+        Some(Quantity::from_mantissa_exponent_checked(
             filter.max_qty as u64,
             filter.qty_exponent,
             precision,
-        ))
+        )?)
     } else {
         None
     };
 
     let min_qty = if filter.min_qty != 0 {
-        Some(Quantity::from_mantissa_exponent(
+        Some(Quantity::from_mantissa_exponent_checked(
             filter.min_qty as u64,
             filter.qty_exponent,
             precision,
-        ))
+        )?)
     } else {
         None
     };
 
-    (step_size, max_qty, min_qty)
+    Ok((step_size, max_qty, min_qty))
 }
 
 /// Parses a Binance Spot SBE symbol into a Nautilus CurrencyPair instrument.
@@ -462,7 +514,7 @@ pub fn parse_spot_instrument_sbe(
         .as_ref()
         .context("Missing PRICE_FILTER in symbol filters")?;
 
-    let (tick_size, max_price, min_price) = parse_sbe_price_filter(price_filter);
+    let (tick_size, max_price, min_price) = parse_sbe_price_filter(price_filter)?;
 
     let lot_filter = symbol
         .filters
@@ -470,7 +522,7 @@ pub fn parse_spot_instrument_sbe(
         .as_ref()
         .context("Missing LOT_SIZE in symbol filters")?;
 
-    let (step_size, max_quantity, min_quantity) = parse_sbe_lot_size_filter(lot_filter);
+    let (step_size, max_quantity, min_quantity) = parse_sbe_lot_size_filter(lot_filter)?;
 
     // Spot has no leverage, use 1.0 margin
     let default_margin = Decimal::new(1, 0);
@@ -496,6 +548,7 @@ pub fn parse_spot_instrument_sbe(
         Some(default_margin),
         None, // maker_fee
         None, // taker_fee
+        None, // tick_scheme
         None, // info
         ts_event,
         ts_init,
@@ -923,10 +976,9 @@ pub fn parse_fill_report_sbe(
         size_precision,
     );
 
-    // Commission still uses Decimal → f64 since Money::new takes f64
     let comm_exp = trade.commission_exponent as i32;
     let comm_dec = Decimal::new(trade.commission_mantissa, (-comm_exp) as u32);
-    let commission = Money::new(comm_dec.to_f64().unwrap_or(0.0), commission_currency);
+    let commission = Money::from_decimal(comm_dec, commission_currency)?;
 
     // Determine order side from is_buyer
     let order_side = if trade.is_buyer {
@@ -992,11 +1044,10 @@ pub fn parse_klines_to_bars(
             price_precision,
         );
 
-        // Volume is 128-bit so we still use Decimal path for now
         let volume_mantissa = i128::from_le_bytes(kline.volume);
         let volume_dec =
             Decimal::from_i128_with_scale(volume_mantissa, (-klines.qty_exponent as i32) as u32);
-        let volume = Quantity::new(volume_dec.to_f64().unwrap_or(0.0), size_precision);
+        let volume = Quantity::from_decimal_dp(volume_dec, size_precision)?;
 
         let ts_event = UnixNanos::from_micros(kline.open_time as u64);
 
@@ -1060,6 +1111,7 @@ pub fn bar_spec_to_binance_interval(
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
     use serde_json::json;
     use ustr::Ustr;
 
@@ -1152,6 +1204,10 @@ mod tests {
                     "maxQty": "1000",
                     "minQty": "0.001"
                 }),
+                json!({
+                    "filterType": "MIN_NOTIONAL",
+                    "notional": "5"
+                }),
             ],
         }
     }
@@ -1192,6 +1248,10 @@ mod tests {
                     "stepSize": "1",
                     "maxQty": "1000",
                     "minQty": "1"
+                }),
+                json!({
+                    "filterType": "MIN_NOTIONAL",
+                    "notional": "1"
                 }),
             ],
         }
@@ -1261,6 +1321,10 @@ mod tests {
                 assert!(!perp.is_inverse);
                 assert_eq!(perp.price_increment, Price::from_str("0.10").unwrap());
                 assert_eq!(perp.size_increment, Quantity::from_str("0.001").unwrap());
+                assert_eq!(
+                    perp.min_notional,
+                    Some(Money::new(5.0, perp.quote_currency)),
+                );
             }
             other => panic!("Expected CryptoPerpetual, was {other:?}"),
         }
@@ -1320,6 +1384,10 @@ mod tests {
                 assert!(perp.is_inverse);
                 assert_eq!(perp.price_increment, Price::from_str("0.10").unwrap());
                 assert_eq!(perp.size_increment, Quantity::from_str("1").unwrap());
+                assert_eq!(
+                    perp.min_notional,
+                    Some(Money::new(1.0, perp.quote_currency)),
+                );
             }
             other => panic!("Expected CryptoPerpetual, was {other:?}"),
         }
@@ -1747,12 +1815,16 @@ mod tests {
                 tick_size: 1_000_000,
             };
 
-            let (tick_size, max_price, min_price) = parse_sbe_price_filter(&filter);
+            let (tick_size, max_price, min_price) = parse_sbe_price_filter(&filter).unwrap();
+            let max_price = max_price.unwrap();
+            let min_price = min_price.unwrap();
 
             assert_eq!(tick_size.precision, 2, "tick_size precision");
-            assert_eq!(tick_size.as_f64(), 0.01);
-            assert_eq!(max_price.unwrap().precision, 2);
-            assert_eq!(min_price.unwrap().precision, 2);
+            assert_eq!(tick_size.as_decimal(), dec!(0.01));
+            assert_eq!(max_price.precision, 2);
+            assert_eq!(max_price.as_decimal(), dec!(1000000.00));
+            assert_eq!(min_price.precision, 2);
+            assert_eq!(min_price.as_decimal(), dec!(0.01));
         }
 
         #[rstest]
@@ -1764,10 +1836,10 @@ mod tests {
                 tick_size: 1,
             };
 
-            let (tick_size, _, _) = parse_sbe_price_filter(&filter);
+            let (tick_size, _, _) = parse_sbe_price_filter(&filter).unwrap();
 
             assert_eq!(tick_size.precision, 8);
-            assert_eq!(tick_size.as_f64(), 0.00000001);
+            assert_eq!(tick_size.as_decimal(), dec!(0.00000001));
         }
 
         #[rstest]
@@ -1779,11 +1851,16 @@ mod tests {
                 step_size: 10_000,
             };
 
-            let (step_size, max_qty, min_qty) = parse_sbe_lot_size_filter(&filter);
+            let (step_size, max_qty, min_qty) = parse_sbe_lot_size_filter(&filter).unwrap();
+            let max_qty = max_qty.unwrap();
+            let min_qty = min_qty.unwrap();
 
             assert_eq!(step_size.precision, 4, "step_size precision");
-            assert_eq!(min_qty.unwrap().precision, 4);
-            assert_eq!(max_qty.unwrap().precision, 4);
+            assert_eq!(step_size.as_decimal(), dec!(0.0001));
+            assert_eq!(min_qty.precision, 4);
+            assert_eq!(min_qty.as_decimal(), dec!(0.0001));
+            assert_eq!(max_qty.precision, 4);
+            assert_eq!(max_qty.as_decimal(), dec!(9000.0000));
         }
     }
 }

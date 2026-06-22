@@ -32,6 +32,7 @@ use nautilus_model::{
 };
 
 use crate::{
+    actor::DataActorNative,
     cache::{Cache, refs::PositionRef},
     clock::Clock,
     msgbus,
@@ -327,6 +328,15 @@ impl GreeksCalculator {
         }
     }
 
+    /// Creates a new [`GreeksCalculator`] from a registered native actor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the actor has not been registered with a trader.
+    pub fn from_actor(actor: &impl DataActorNative) -> Self {
+        Self::new(actor.cache_rc(), actor.clock_rc())
+    }
+
     /// Calculates option or underlying greeks for a given instrument and a quantity of 1.
     ///
     /// Additional features:
@@ -336,11 +346,8 @@ impl GreeksCalculator {
     ///
     /// # Errors
     ///
-    /// Returns an error if the instrument definition is not found or greeks calculation fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the instrument has no underlying identifier.
+    /// Returns an error if the instrument definition is not found, an option instrument
+    /// has no underlying identifier, or greeks calculation fails.
     #[expect(clippy::too_many_arguments)]
     pub fn instrument_greeks(
         &self,
@@ -377,10 +384,7 @@ impl GreeksCalculator {
 
         let instrument = {
             let cache = self.cache.borrow();
-            match cache.instrument(&instrument_id) {
-                Some(instrument) => instrument.clone(),
-                None => anyhow::bail!("Instrument definition for {instrument_id} not found"),
-            }
+            cache.try_instrument(&instrument_id)?.clone()
         };
 
         if instrument.instrument_class() != InstrumentClass::Option {
@@ -396,9 +400,8 @@ impl GreeksCalculator {
             );
         }
 
-        let underlying = instrument.underlying().unwrap();
-        let underlying_str = format!("{}.{}", underlying, instrument_id.venue);
-        let underlying_instrument_id = InstrumentId::from(underlying_str);
+        let underlying_instrument_id =
+            Self::resolve_underlying_instrument_id(&instrument, instrument_id)?;
         let mut greeks_data = self.calculate_option_greeks(
             &instrument,
             instrument_id,
@@ -439,6 +442,20 @@ impl GreeksCalculator {
         }
 
         Ok(greeks_data)
+    }
+
+    fn resolve_underlying_instrument_id(
+        instrument: &InstrumentAny,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<InstrumentId> {
+        let Some(underlying) = instrument.underlying() else {
+            anyhow::bail!("Instrument {instrument_id} has no underlying identifier");
+        };
+
+        Ok(InstrumentId::from(format!(
+            "{}.{}",
+            underlying, instrument_id.venue
+        )))
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -834,7 +851,7 @@ impl GreeksCalculator {
             }
 
             if let Some(ref mut idx_price) = used_index_price {
-                #[allow(clippy::float_cmp, reason = "exact-equality baseline check")]
+                #[expect(clippy::float_cmp, reason = "exact-equality baseline check")]
                 if underlying_price != unshocked_underlying_price {
                     *idx_price += 1.0 / beta
                         * (*idx_price / unshocked_underlying_price)
@@ -864,12 +881,11 @@ impl GreeksCalculator {
             if let Some(ref mut idx_vol) = used_index_vol {
                 *idx_vol *= 0.01;
 
-                #[allow(clippy::float_cmp, reason = "exact-equality baseline check")]
+                #[expect(clippy::float_cmp, reason = "exact-equality baseline check")]
                 if vol != used_vol && used_vol != 0.0 {
                     *idx_vol += 1.0 / vega_beta * (*idx_vol / used_vol) * (vol - used_vol);
                 }
 
-                #[allow(clippy::float_cmp, reason = "zero price guard")]
                 if *idx_vol != 0.0 {
                     vega *= vega_beta * vol / *idx_vol;
                 }
@@ -917,7 +933,6 @@ impl GreeksCalculator {
     /// Returns an error if any underlying greeks calculation fails.
     ///
     #[expect(clippy::too_many_arguments)]
-    #[expect(clippy::missing_panics_doc)] // Guarded by is_none check
     pub fn portfolio_greeks(
         &self,
         underlyings: Option<&[String]>,
@@ -1015,7 +1030,7 @@ impl GreeksCalculator {
             let position_greeks = quantity * &instrument_greeks;
 
             // Apply greeks filter if provided
-            if greeks_filter.is_none() || greeks_filter.unwrap()(&position_greeks) {
+            if greeks_filter.is_none_or(|filter| filter(&position_greeks)) {
                 portfolio_greeks = portfolio_greeks + PortfolioGreeks::from(position_greeks);
             }
         }
@@ -1747,6 +1762,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             UnixNanos::default(),
             UnixNanos::default(),
         )
@@ -1770,9 +1786,25 @@ mod tests {
             None,
             None,
             None,
+            None,
             UnixNanos::default(),
             UnixNanos::default(),
         )
+    }
+
+    #[rstest]
+    fn test_resolve_underlying_instrument_id_errors_without_underlying() {
+        let instrument = InstrumentAny::Equity(equity_aapl_opra());
+        let error = GreeksCalculator::resolve_underlying_instrument_id(
+            &instrument,
+            InstrumentId::from("AAPL.OPRA"),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Instrument AAPL.OPRA has no underlying identifier"
+        );
     }
 
     fn future_with_expiration(
@@ -1793,6 +1825,7 @@ mod tests {
             Price::from("0.25"),
             Quantity::from(1),
             Quantity::from(1),
+            None,
             None,
             None,
             None,
@@ -1830,6 +1863,7 @@ mod tests {
             Price::from("0.01"),
             Quantity::from(1),
             Quantity::from(1),
+            None,
             None,
             None,
             None,

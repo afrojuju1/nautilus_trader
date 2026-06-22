@@ -75,7 +75,11 @@ use crate::{
     },
     config::DydxDataClientConfig,
     http::client::DydxHttpClient,
-    websocket::{client::DydxWebSocketClient, enums::DydxWsOutputMessage, parse as ws_parse},
+    websocket::{
+        client::{DydxWebSocketClient, candle_ids_from_topics},
+        enums::DydxWsOutputMessage,
+        parse as ws_parse,
+    },
 };
 
 struct WsMessageContext {
@@ -1287,10 +1291,12 @@ impl DydxDataClient {
                 log::debug!("Ignoring block height on data client");
             }
             DydxWsOutputMessage::Error(err) => {
-                log::error!("dYdX WS error: {err}");
+                log::warn!("dYdX WS error: {err}");
             }
-            DydxWsOutputMessage::Reconnected => {
-                ctx.pending_bars.clear();
+            DydxWsOutputMessage::Reconnected { topics } => {
+                let reconnected_candles = candle_ids_from_topics(&topics);
+                ctx.pending_bars
+                    .retain(|id, _| !reconnected_candles.contains(id));
 
                 let total_subs = ctx.active_quote_subs.len()
                     + ctx.active_delta_subs.len()
@@ -1366,30 +1372,35 @@ impl DydxDataClient {
             let instrument_id = Self::instrument_id_from_ticker(ticker);
 
             if let Some(status) = &update.status {
-                let action = MarketStatusAction::from(*status);
-                let is_trading = matches!(status, crate::common::enums::DydxMarketStatus::Active);
+                if *status == crate::common::enums::DydxMarketStatus::Unknown {
+                    log::warn!("Skipping unmodeled dYdX market status for {instrument_id}");
+                } else {
+                    let action = MarketStatusAction::from(*status);
+                    let is_trading =
+                        matches!(status, crate::common::enums::DydxMarketStatus::Active);
 
-                let instrument_status = InstrumentStatus::new(
-                    instrument_id,
-                    action,
-                    ts_init,
-                    ts_init,
-                    None,
-                    None,
-                    Some(is_trading),
-                    None,
-                    None,
-                );
+                    let instrument_status = InstrumentStatus::new(
+                        instrument_id,
+                        action,
+                        ts_init,
+                        ts_init,
+                        None,
+                        None,
+                        Some(is_trading),
+                        None,
+                        None,
+                    );
 
-                ctx.last_instrument_statuses
-                    .insert(instrument_id, instrument_status);
+                    ctx.last_instrument_statuses
+                        .insert(instrument_id, instrument_status);
 
-                if ctx.active_instrument_status_subs.contains(&instrument_id)
-                    && let Err(e) = ctx
-                        .data_sender
-                        .send(DataEvent::InstrumentStatus(instrument_status))
-                {
-                    log::error!("Failed to emit instrument status for {instrument_id}: {e}");
+                    if ctx.active_instrument_status_subs.contains(&instrument_id)
+                        && let Err(e) = ctx
+                            .data_sender
+                            .send(DataEvent::InstrumentStatus(instrument_status))
+                    {
+                        log::error!("Failed to emit instrument status for {instrument_id}: {e}");
+                    }
                 }
             }
 
@@ -1848,6 +1859,7 @@ mod tests {
             8,                   // size_precision (wide enough to reveal f64 rounding)
             Price::new(0.01, 2), // price_increment
             Quantity::new(0.00000001, 8),
+            None,
             None,
             None,
             None,

@@ -40,6 +40,8 @@
 ///   [`PluginActor`](crate::surfaces::actor::PluginActor).
 /// - `strategies`: array of types implementing
 ///   [`PluginStrategy`](crate::surfaces::strategy::PluginStrategy).
+/// - `controllers`: array of types implementing
+///   [`PluginController`](crate::surfaces::controller::PluginController).
 ///
 /// # Example
 ///
@@ -70,6 +72,7 @@ macro_rules! nautilus_plugin {
         $(custom_data: [$($cd:ty),* $(,)?] ,)?
         $(actors: [$($act:ty),* $(,)?] ,)?
         $(strategies: [$($strategy:ty),* $(,)?] ,)?
+        $(controllers: [$($controller:ty),* $(,)?] ,)?
     ) => {
         $crate::__nautilus_plugin_impl! {
             @parse
@@ -79,6 +82,7 @@ macro_rules! nautilus_plugin {
             custom_data = ($($($cd),*)?),
             actors = ($($($act),*)?),
             strategies = ($($($strategy),*)?),
+            controllers = ($($($controller),*)?),
         }
     };
 }
@@ -87,6 +91,25 @@ macro_rules! nautilus_plugin {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __nautilus_plugin_impl {
+    // Required-field arms: without these, omitting `name` or `version`
+    // fails the main matcher with an opaque "no rules expected this token"
+    // error instead of naming the missing field.
+    (
+        @parse
+        name = (),
+        $($rest:tt)*
+    ) => {
+        ::core::compile_error!("`nautilus_plugin!` requires a `name` field");
+    };
+    (
+        @parse
+        name = ($name:expr),
+        vendor = ($($vendor:expr)?),
+        version = (),
+        $($rest:tt)*
+    ) => {
+        ::core::compile_error!("`nautilus_plugin!` requires a `version` field");
+    };
     (
         @parse
         name = ($name:expr),
@@ -95,6 +118,7 @@ macro_rules! __nautilus_plugin_impl {
         custom_data = ($($cd:ty),*),
         actors = ($($act:ty),*),
         strategies = ($($strategy:ty),*),
+        controllers = ($($controller:ty),*),
     ) => {
         const _: () = {
             // Compile-time guard: every listed type implements the trait. The
@@ -107,6 +131,8 @@ macro_rules! __nautilus_plugin_impl {
             use $crate::surfaces::actor::PluginActor as _PluginActor;
             #[allow(unused_imports)]
             use $crate::surfaces::strategy::PluginStrategy as _PluginStrategy;
+            #[allow(unused_imports)]
+            use $crate::surfaces::controller::PluginController as _PluginController;
 
             static CUSTOM_DATA: ::std::sync::LazyLock<
                 [$crate::manifest::CustomDataRegistration; $crate::__nautilus_plugin_impl!(@count $($cd),*)]
@@ -153,6 +179,21 @@ macro_rules! __nautilus_plugin_impl {
                 ]
             });
 
+            static CONTROLLERS: ::std::sync::LazyLock<
+                [$crate::manifest::ControllerRegistration; $crate::__nautilus_plugin_impl!(@count $($controller),*)]
+            > = ::std::sync::LazyLock::new(|| {
+                [
+                    $(
+                        $crate::manifest::ControllerRegistration {
+                            type_name: $crate::boundary::BorrowedStr::from_str(
+                                <$controller as $crate::surfaces::controller::PluginController>::TYPE_NAME,
+                            ),
+                            vtable: $crate::surfaces::controller::controller_vtable::<$controller>(),
+                        },
+                    )*
+                ]
+            });
+
             static MANIFEST: ::std::sync::LazyLock<$crate::manifest::PluginManifest> =
                 ::std::sync::LazyLock::new(|| $crate::manifest::PluginManifest {
                     abi_version: $crate::NAUTILUS_PLUGIN_ABI_VERSION,
@@ -165,6 +206,7 @@ macro_rules! __nautilus_plugin_impl {
                     custom_data: $crate::boundary::Slice::from_slice(&*CUSTOM_DATA),
                     actors: $crate::boundary::Slice::from_slice(&*ACTORS),
                     strategies: $crate::boundary::Slice::from_slice(&*STRATEGIES),
+                    controllers: $crate::boundary::Slice::from_slice(&*CONTROLLERS),
                 });
 
             #[unsafe(no_mangle)]
@@ -175,12 +217,13 @@ macro_rules! __nautilus_plugin_impl {
                     if host.is_null() {
                         return ::core::ptr::null::<$crate::manifest::PluginManifest>();
                     }
-                    // SAFETY: host pointer is non-null and the host commits
-                    // to keeping the vtable live for the process lifetime.
-                    let host_ref = unsafe { &*host };
-                    if host_ref.abi_version != $crate::NAUTILUS_PLUGIN_ABI_VERSION {
-                        return ::core::ptr::null();
-                    }
+                    // The manifest is returned even when the host's ABI
+                    // version differs: init calls no host services, and the
+                    // host's own check on `PluginManifest::abi_version`
+                    // (anchored at offset zero) rejects the plug-in with a
+                    // proper `AbiMismatch` error and build diagnostics.
+                    // Returning null here would degrade that to an opaque
+                    // `NullManifest` report.
                     &*MANIFEST as *const _
                 });
 

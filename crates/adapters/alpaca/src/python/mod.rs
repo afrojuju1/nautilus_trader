@@ -27,7 +27,7 @@ use crate::{
 
 /// Python scanner configuration for put credit spreads.
 #[derive(Clone, Debug)]
-#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.alpaca")]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.alpaca")]
 #[pyclass(module = "nautilus_trader.core.nautilus_pyo3.alpaca", from_py_object)]
 pub struct AlpacaPutCreditScannerConfig {
     /// Minimum days to expiration.
@@ -146,7 +146,7 @@ impl From<AlpacaPutCreditScannerConfig> for PutCreditScannerConfig {
 
 /// Python representation of a spread candidate.
 #[derive(Clone, Debug)]
-#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.alpaca")]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.alpaca")]
 #[pyclass(
     module = "nautilus_trader.core.nautilus_pyo3.alpaca",
     skip_from_py_object
@@ -203,7 +203,7 @@ impl From<SpreadCandidate> for AlpacaPutCreditCandidate {
 
 /// Python representation of a put credit scan result.
 #[derive(Clone, Debug)]
-#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.alpaca")]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.alpaca")]
 #[pyclass(
     module = "nautilus_trader.core.nautilus_pyo3.alpaca",
     skip_from_py_object
@@ -242,7 +242,7 @@ impl From<PutCreditScanResult> for AlpacaPutCreditScanResult {
 ///
 /// This binding is synchronous because Nautilus strategy callbacks are synchronous today.
 #[pyfunction]
-#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.alpaca")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.alpaca")]
 #[pyo3(name = "scan_put_credit_once", signature = (underlyings, config=None))]
 pub fn scan_put_credit_once(
     py: Python<'_>,

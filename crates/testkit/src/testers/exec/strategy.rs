@@ -13,20 +13,29 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_common::{actor::DataActor, enums::LogColor, log_info, log_warn, timer::TimeEvent};
-use nautilus_core::{UnixNanos, datetime::secs_to_nanos_unchecked};
+use std::num::NonZeroUsize;
+
+use ahash::AHashSet;
+use nautilus_common::{
+    actor::{DataActor, DataActorNative},
+    config::ConfigError,
+    enums::LogColor,
+    log_info, log_warn,
+    timer::TimeEvent,
+};
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, IndexPriceUpdate, MarkPriceUpdate, OrderBookDeltas, QuoteTick, TradeTick},
-    enums::{OrderSide, OrderType, TimeInForce},
-    identifiers::{ClientOrderId, InstrumentId, StrategyId},
+    enums::{ContingencyType, OrderSide, OrderType, TimeInForce},
+    identifiers::{ClientId, ClientOrderId, InstrumentId, StrategyId},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
     orders::{Order, OrderAny},
-    types::{Price, price::PriceRaw},
+    types::Price,
 };
 use nautilus_trading::{
     nautilus_strategy,
-    strategy::{Strategy, StrategyCore},
+    strategy::{Strategy, StrategyCore, StrategyNative},
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 
@@ -41,6 +50,10 @@ use super::config::ExecTesterConfig;
 /// **WARNING**: This strategy has no alpha advantage whatsoever.
 /// It is not intended to be used for live trading with real money.
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "tester state tracks independent execution scenarios"
+)]
 pub struct ExecTester {
     pub(super) core: StrategyCore,
     pub(super) config: ExecTesterConfig,
@@ -53,10 +66,16 @@ pub struct ExecTester {
     pub(super) sell_order: Option<OrderAny>,
     pub(super) buy_stop_order: Option<OrderAny>,
     pub(super) sell_stop_order: Option<OrderAny>,
+    pub(super) open_position_submitted: bool,
 
     // One-shot guard for `test_modify_rejected`: ensures the programmatic
     // modify is attempted at most once across the strategy's lifetime.
     pub(super) modify_rejected_attempted: bool,
+    pub(super) pending_open_position_qty: Option<Decimal>,
+    pub(super) buy_cancel_replace_attempted: bool,
+    pub(super) sell_cancel_replace_attempted: bool,
+    pub(super) buy_stop_cancel_replace_attempted: bool,
+    pub(super) sell_stop_cancel_replace_attempted: bool,
 }
 
 nautilus_strategy!(ExecTester, {
@@ -72,10 +91,7 @@ impl DataActor for ExecTester {
         let instrument_id = self.config.instrument_id;
         let client_id = self.config.client_id;
 
-        let instrument = {
-            let cache = self.cache();
-            cache.instrument(&instrument_id).cloned()
-        };
+        let instrument = self.cache().instrument(&instrument_id);
 
         if let Some(inst) = instrument {
             self.initialize_with_instrument(inst, true)?;
@@ -116,39 +132,15 @@ impl DataActor for ExecTester {
 
         let instrument_id = self.config.instrument_id;
         let client_id = self.config.client_id;
+        let strategy_id = StrategyId::from(
+            DataActorNative::core(&self.core)
+                .actor_id()
+                .inner()
+                .as_str(),
+        );
 
         if self.config.cancel_orders_on_stop {
-            let strategy_id = StrategyId::from(self.core.actor_id.inner().as_str());
-
-            if self.config.use_individual_cancels_on_stop {
-                let cache = self.cache();
-                let open_orders: Vec<OrderAny> = cache
-                    .orders_open(None, Some(&instrument_id), Some(&strategy_id), None, None)
-                    .iter()
-                    .map(|o| (*o).clone())
-                    .collect();
-                drop(cache);
-
-                for order in open_orders {
-                    if let Err(e) = self.cancel_order(order.client_order_id(), client_id, None) {
-                        log::error!("Failed to cancel order: {e}");
-                    }
-                }
-            } else if self.config.use_batch_cancel_on_stop {
-                let cache = self.cache();
-                let open_order_ids: Vec<ClientOrderId> = cache
-                    .orders_open(None, Some(&instrument_id), Some(&strategy_id), None, None)
-                    .iter()
-                    .map(|o| o.client_order_id())
-                    .collect();
-                drop(cache);
-
-                if let Err(e) = self.cancel_orders(open_order_ids, client_id, None) {
-                    log::error!("Failed to batch cancel orders: {e}");
-                }
-            } else if let Err(e) = self.cancel_all_orders(instrument_id, None, client_id, None) {
-                log::error!("Failed to cancel all orders: {e}");
-            }
+            self.cancel_active_orders(instrument_id, strategy_id, client_id);
         }
 
         if self.config.close_positions_on_stop {
@@ -182,7 +174,9 @@ impl DataActor for ExecTester {
             if self.config.subscribe_book {
                 self.unsubscribe_book_at_interval(
                     instrument_id,
-                    self.config.book_interval_ms,
+                    NonZeroUsize::new(self.config.book_interval_ms).ok_or_else(|| {
+                        ConfigError::range("book_interval_ms", "must be positive, was 0")
+                    })?,
                     client_id,
                     None,
                 );
@@ -195,6 +189,12 @@ impl DataActor for ExecTester {
     fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
         if self.config.log_data {
             log_info!("{quote:?}", color = LogColor::Cyan);
+        }
+
+        if quote.instrument_id == self.config.instrument_id
+            && self.config.open_position_on_first_quote
+        {
+            self.submit_pending_open_position();
         }
 
         self.maintain_orders(quote.bid_price, quote.ask_price);
@@ -216,7 +216,7 @@ impl DataActor for ExecTester {
             log_info!("\n{instrument_id}\n{book_str}", color = LogColor::Cyan);
 
             // Log own order book if available
-            if self.is_registered() {
+            if DataActorNative::core(&self.core).is_registered() {
                 let cache = self.cache();
                 if let Some(own_book) = cache.own_order_book(&instrument_id) {
                     let own_book_str = own_book.pprint(num_levels, None);
@@ -276,6 +276,8 @@ impl ExecTester {
     /// Creates a new [`ExecTester`] instance.
     #[must_use]
     pub fn new(config: ExecTesterConfig) -> Self {
+        let pending_open_position_qty = config.open_position_on_start_qty;
+
         Self {
             core: StrategyCore::new(config.base.clone()),
             config,
@@ -286,7 +288,13 @@ impl ExecTester {
             sell_order: None,
             buy_stop_order: None,
             sell_stop_order: None,
+            open_position_submitted: false,
             modify_rejected_attempted: false,
+            pending_open_position_qty,
+            buy_cancel_replace_attempted: false,
+            sell_cancel_replace_attempted: false,
+            buy_stop_cancel_replace_attempted: false,
+            sell_stop_cancel_replace_attempted: false,
         }
     }
 
@@ -313,15 +321,38 @@ impl ExecTester {
             self.subscribe_book_at_interval(
                 instrument_id,
                 self.config.book_type,
-                self.config.book_depth,
-                self.config.book_interval_ms,
+                self.config
+                    .book_depth
+                    .map(|depth| {
+                        NonZeroUsize::new(depth).ok_or_else(|| {
+                            ConfigError::range("book_depth", "must be positive, was 0")
+                        })
+                    })
+                    .transpose()?,
+                NonZeroUsize::new(self.config.book_interval_ms).ok_or_else(|| {
+                    ConfigError::range("book_interval_ms", "must be positive, was 0")
+                })?,
                 client_id,
                 None,
             );
         }
 
-        if let Some(qty) = self.config.open_position_on_start_qty {
-            self.open_position(qty)?;
+        if let Some(qty) = self.pending_open_position_qty {
+            let quote_ready = {
+                let cache = self.cache();
+                cache.quote(&instrument_id).is_some()
+            };
+
+            if self.config.open_position_on_first_quote
+                && self.config.subscribe_quotes
+                && !quote_ready
+            {
+                log::info!("Waiting for first quote before opening {instrument_id} position");
+            } else {
+                self.pending_open_position_qty = None;
+                self.open_position(qty)?;
+                self.open_position_submitted = true;
+            }
         }
 
         Ok(())
@@ -332,8 +363,8 @@ impl ExecTester {
     }
 
     fn expire_time_from_delta(&self, mins: u64) -> UnixNanos {
-        let current_ns = self.timestamp_ns();
-        let delta_ns = secs_to_nanos_unchecked((mins * 60) as f64);
+        let current_ns = DataActorNative::core(&self.core).timestamp_ns();
+        let delta_ns = mins.saturating_mul(60).saturating_mul(1_000_000_000);
         UnixNanos::from(current_ns.as_u64() + delta_ns)
     }
 
@@ -357,11 +388,46 @@ impl ExecTester {
         }
     }
 
-    pub(super) fn is_order_active(&self, order: &OrderAny) -> bool {
+    fn submit_pending_open_position(&mut self) {
+        if self.instrument.is_none() {
+            return;
+        }
+
+        let Some(qty) = self.pending_open_position_qty.take() else {
+            return;
+        };
+
+        if let Err(e) = self.open_position(qty) {
+            log::error!("Failed to submit pending open position: {e}");
+        } else {
+            self.open_position_submitted = true;
+        }
+    }
+
+    pub(super) fn is_order_active(order: &OrderAny) -> bool {
         order.is_active_local() || order.is_inflight() || order.is_open()
     }
 
-    pub(super) fn get_order_trigger_price(&self, order: &OrderAny) -> Option<Price> {
+    pub(super) fn limit_order_is_one_shot(&self) -> bool {
+        self.config.test_reject_post_only
+            || self.config.limit_aggressive
+            || self.config.order_expire_time_delta_mins.is_some()
+            || matches!(
+                self.config.limit_time_in_force,
+                Some(TimeInForce::Ioc | TimeInForce::Fok)
+            )
+    }
+
+    pub(super) fn stop_order_is_one_shot(&self) -> bool {
+        self.config.order_expire_time_delta_mins.is_some()
+            || matches!(
+                self.config.stop_time_in_force,
+                Some(TimeInForce::Ioc | TimeInForce::Fok)
+            )
+            || matches!(self.config.stop_order_type, OrderType::TrailingStopMarket)
+    }
+
+    pub(super) fn get_order_trigger_price(order: &OrderAny) -> Option<Price> {
         order.trigger_price()
     }
 
@@ -399,7 +465,7 @@ impl ExecTester {
         }
     }
 
-    /// Submit an order, applying order_params if configured.
+    /// Submit an order, applying `order_params` if configured.
     fn submit_order_apply_params(&mut self, order: OrderAny) -> anyhow::Result<()> {
         let client_id = self.config.client_id;
         if let Some(params) = &self.config.order_params {
@@ -445,19 +511,38 @@ impl ExecTester {
     /// latest event-driven state instead of the stale clone captured at submit.
     fn refresh_tracked_order(&mut self, side: OrderSide) {
         let cid = match side {
-            OrderSide::Buy => self.buy_order.as_ref().map(|o| o.client_order_id()),
-            OrderSide::Sell => self.sell_order.as_ref().map(|o| o.client_order_id()),
-            _ => None,
+            OrderSide::Buy => self.buy_order.as_ref().map(OrderAny::client_order_id),
+            OrderSide::Sell => self.sell_order.as_ref().map(OrderAny::client_order_id),
+            OrderSide::NoOrderSide => None,
         };
         let Some(cid) = cid else {
             return;
         };
-        let latest = self.cache().order(&cid).map(|o| o.clone());
+        let latest = self.cache().order(&cid);
         if let Some(latest) = latest {
             match side {
                 OrderSide::Buy => self.buy_order = Some(latest),
                 OrderSide::Sell => self.sell_order = Some(latest),
-                _ => {}
+                OrderSide::NoOrderSide => {}
+            }
+        }
+    }
+
+    fn refresh_tracked_stop_order(&mut self, side: OrderSide) {
+        let cid = match side {
+            OrderSide::Buy => self.buy_stop_order.as_ref().map(OrderAny::client_order_id),
+            OrderSide::Sell => self.sell_stop_order.as_ref().map(OrderAny::client_order_id),
+            OrderSide::NoOrderSide => None,
+        };
+        let Some(cid) = cid else {
+            return;
+        };
+        let latest = self.cache().order(&cid);
+        if let Some(latest) = latest {
+            match side {
+                OrderSide::Buy => self.buy_stop_order = Some(latest),
+                OrderSide::Sell => self.sell_stop_order = Some(latest),
+                OrderSide::NoOrderSide => {}
             }
         }
     }
@@ -484,15 +569,20 @@ impl ExecTester {
         // post_only=true downstream to trigger venue rejection; `limit_aggressive`
         // pairs with IOC/FOK TIF for marketable-fill scenarios.
         let cross_spread = self.config.test_reject_post_only || self.config.limit_aggressive;
-        let price = if cross_spread {
+        let unclamped_price = if cross_spread {
             add_price_ticks(best_ask, increment, price_offset_ticks, precision)
         } else {
             sub_price_ticks(best_bid, increment, price_offset_ticks, precision)
         };
+        let price = clamp_price_to_range(
+            unclamped_price,
+            instrument,
+            self.config.clamp_to_instrument_price_range,
+        );
 
         let needs_new_order = match &self.buy_order {
             None => true,
-            Some(order) => !self.is_order_active(order),
+            Some(order) => !Self::is_order_active(order) && !self.limit_order_is_one_shot(),
         };
 
         if needs_new_order {
@@ -517,7 +607,11 @@ impl ExecTester {
             if self.config.test_modify_rejected && !self.modify_rejected_attempted {
                 self.modify_rejected_attempted = true;
                 let order_clone = order.clone();
-                let bumped = add_price_ticks(price, increment, 1, precision);
+                let bumped = clamp_price_to_range(
+                    add_price_ticks(price, increment, 1, precision),
+                    instrument,
+                    self.config.clamp_to_instrument_price_range,
+                );
 
                 if let Err(e) = self.modify_order(
                     order_clone.client_order_id(),
@@ -547,7 +641,10 @@ impl ExecTester {
                     ) {
                         log::error!("Failed to modify buy order: {e}");
                     }
-                } else if self.config.cancel_replace_orders_to_maintain_tob_offset {
+                } else if self.config.cancel_replace_orders_to_maintain_tob_offset
+                    && !self.buy_cancel_replace_attempted
+                {
+                    self.buy_cancel_replace_attempted = true;
                     let order_clone = order.clone();
                     let _ = self.cancel_order(order_clone.client_order_id(), client_id, None);
 
@@ -577,15 +674,20 @@ impl ExecTester {
 
         // See `maintain_buy_orders` for the cross_spread and refresh rationale.
         let cross_spread = self.config.test_reject_post_only || self.config.limit_aggressive;
-        let price = if cross_spread {
+        let unclamped_price = if cross_spread {
             sub_price_ticks(best_bid, increment, price_offset_ticks, precision)
         } else {
             add_price_ticks(best_ask, increment, price_offset_ticks, precision)
         };
+        let price = clamp_price_to_range(
+            unclamped_price,
+            instrument,
+            self.config.clamp_to_instrument_price_range,
+        );
 
         let needs_new_order = match &self.sell_order {
             None => true,
-            Some(order) => !self.is_order_active(order),
+            Some(order) => !Self::is_order_active(order) && !self.limit_order_is_one_shot(),
         };
 
         if needs_new_order {
@@ -609,7 +711,11 @@ impl ExecTester {
             if self.config.test_modify_rejected && !self.modify_rejected_attempted {
                 self.modify_rejected_attempted = true;
                 let order_clone = order.clone();
-                let bumped = sub_price_ticks(price, increment, 1, precision);
+                let bumped = clamp_price_to_range(
+                    sub_price_ticks(price, increment, 1, precision),
+                    instrument,
+                    self.config.clamp_to_instrument_price_range,
+                );
 
                 if let Err(e) = self.modify_order(
                     order_clone.client_order_id(),
@@ -639,7 +745,10 @@ impl ExecTester {
                     ) {
                         log::error!("Failed to modify sell order: {e}");
                     }
-                } else if self.config.cancel_replace_orders_to_maintain_tob_offset {
+                } else if self.config.cancel_replace_orders_to_maintain_tob_offset
+                    && !self.sell_cancel_replace_attempted
+                {
+                    self.sell_cancel_replace_attempted = true;
                     let order_clone = order.clone();
                     let _ = self.cancel_order(order_clone.client_order_id(), client_id, None);
 
@@ -668,11 +777,11 @@ impl ExecTester {
 
         let buy_needs = match &self.buy_order {
             None => true,
-            Some(order) => !self.is_order_active(order),
+            Some(order) => !Self::is_order_active(order) && !self.limit_order_is_one_shot(),
         };
         let sell_needs = match &self.sell_order {
             None => true,
-            Some(order) => !self.is_order_active(order),
+            Some(order) => !Self::is_order_active(order) && !self.limit_order_is_one_shot(),
         };
 
         if !buy_needs || !sell_needs {
@@ -686,7 +795,7 @@ impl ExecTester {
         // pricing to cross the spread; mirrored from `maintain_buy_orders` /
         // `maintain_sell_orders` so batch mode supports the same scenarios.
         let cross_spread = self.config.test_reject_post_only || self.config.limit_aggressive;
-        let (buy_price, sell_price) = if cross_spread {
+        let (unclamped_buy_price, unclamped_sell_price) = if cross_spread {
             (
                 add_price_ticks(best_ask, increment, price_offset_ticks, precision),
                 sub_price_ticks(best_bid, increment, price_offset_ticks, precision),
@@ -697,22 +806,30 @@ impl ExecTester {
                 add_price_ticks(best_ask, increment, price_offset_ticks, precision),
             )
         };
+        let clamp = self.config.clamp_to_instrument_price_range;
+        let buy_price = clamp_price_to_range(unclamped_buy_price, instrument, clamp);
+        let sell_price = clamp_price_to_range(unclamped_sell_price, instrument, clamp);
         let quantity = instrument.make_qty(self.config.order_qty.as_f64(), None);
         let (time_in_force, expire_time) =
             self.resolve_time_in_force(self.config.limit_time_in_force);
+        let instrument_id = self.config.instrument_id;
+        let post_only = self.config.use_post_only || self.config.test_reject_post_only;
+        let quote_quantity = self.config.use_quote_quantity;
+        let display_qty = self.config.order_display_qty;
+        let emulation_trigger = self.config.emulation_trigger;
 
-        let buy_order = self.core.order_factory().limit(
-            self.config.instrument_id,
+        let buy_order = self.order_factory().limit(
+            instrument_id,
             OrderSide::Buy,
             quantity,
             buy_price,
             Some(time_in_force),
             expire_time,
-            Some(self.config.use_post_only || self.config.test_reject_post_only),
+            Some(post_only),
             None,
-            Some(self.config.use_quote_quantity),
-            self.config.order_display_qty,
-            self.config.emulation_trigger,
+            Some(quote_quantity),
+            display_qty,
+            emulation_trigger,
             None,
             None,
             None,
@@ -720,18 +837,18 @@ impl ExecTester {
             None,
         );
 
-        let sell_order = self.core.order_factory().limit(
-            self.config.instrument_id,
+        let sell_order = self.order_factory().limit(
+            instrument_id,
             OrderSide::Sell,
             quantity,
             sell_price,
             Some(time_in_force),
             expire_time,
-            Some(self.config.use_post_only || self.config.test_reject_post_only),
+            Some(post_only),
             None,
-            Some(self.config.use_quote_quantity),
-            self.config.order_display_qty,
-            self.config.emulation_trigger,
+            Some(quote_quantity),
+            display_qty,
+            emulation_trigger,
             None,
             None,
             None,
@@ -750,6 +867,8 @@ impl ExecTester {
 
     /// Maintain stop buy orders.
     fn maintain_stop_buy_orders(&mut self, best_bid: Price, best_ask: Price) {
+        self.refresh_tracked_stop_order(OrderSide::Buy);
+
         let Some(instrument) = &self.instrument else {
             return;
         };
@@ -759,7 +878,7 @@ impl ExecTester {
         let stop_offset_ticks = self.config.stop_offset_ticks;
 
         // Determine trigger price based on order type
-        let trigger_price = if matches!(
+        let unclamped_trigger_price = if matches!(
             self.config.stop_order_type,
             OrderType::LimitIfTouched | OrderType::MarketIfTouched | OrderType::TrailingStopMarket
         ) {
@@ -769,40 +888,33 @@ impl ExecTester {
             // STOP buy orders are placed ABOVE the market (stop loss on short)
             add_price_ticks(best_ask, increment, stop_offset_ticks, precision)
         };
+        let clamp = self.config.clamp_to_instrument_price_range;
+        let trigger_price = clamp_price_to_range(unclamped_trigger_price, instrument, clamp);
 
         // Calculate limit price if needed
         let limit_price = if matches!(
             self.config.stop_order_type,
             OrderType::StopLimit | OrderType::LimitIfTouched
         ) {
-            if let Some(limit_offset_ticks) = self.config.stop_limit_offset_ticks {
-                if self.config.stop_order_type == OrderType::LimitIfTouched {
-                    // BUY LIT requires trigger_price <= price.
-                    Some(add_price_ticks(
-                        trigger_price,
-                        increment,
-                        limit_offset_ticks,
-                        precision,
-                    ))
+            let unclamped_limit_price =
+                if let Some(limit_offset_ticks) = self.config.stop_limit_offset_ticks {
+                    // BUY LIT/StopLimit both require trigger_price <= price.
+                    add_price_ticks(trigger_price, increment, limit_offset_ticks, precision)
                 } else {
-                    // BUY StopLimit requires trigger_price <= price.
-                    Some(add_price_ticks(
-                        trigger_price,
-                        increment,
-                        limit_offset_ticks,
-                        precision,
-                    ))
-                }
-            } else {
-                Some(trigger_price)
-            }
+                    trigger_price
+                };
+            Some(clamp_price_to_range(
+                unclamped_limit_price,
+                instrument,
+                clamp,
+            ))
         } else {
             None
         };
 
         let needs_new_order = match &self.buy_stop_order {
             None => true,
-            Some(order) => !self.is_order_active(order),
+            Some(order) => !Self::is_order_active(order) && !self.stop_order_is_one_shot(),
         };
 
         if needs_new_order {
@@ -814,7 +926,7 @@ impl ExecTester {
             && !order.is_pending_update()
             && !order.is_pending_cancel()
         {
-            let current_trigger = self.get_order_trigger_price(order);
+            let current_trigger = Self::get_order_trigger_price(order);
             if current_trigger.is_some() && current_trigger != Some(trigger_price) {
                 if self.config.modify_stop_orders_to_maintain_offset {
                     let order_clone = order.clone();
@@ -822,7 +934,10 @@ impl ExecTester {
                     {
                         log::error!("Failed to modify buy stop order: {e}");
                     }
-                } else if self.config.cancel_replace_stop_orders_to_maintain_offset {
+                } else if self.config.cancel_replace_stop_orders_to_maintain_offset
+                    && !self.buy_stop_cancel_replace_attempted
+                {
+                    self.buy_stop_cancel_replace_attempted = true;
                     let order_clone = order.clone();
                     let _ = self.cancel_order(
                         order_clone.client_order_id(),
@@ -842,6 +957,8 @@ impl ExecTester {
 
     /// Maintain stop sell orders.
     fn maintain_stop_sell_orders(&mut self, best_bid: Price, best_ask: Price) {
+        self.refresh_tracked_stop_order(OrderSide::Sell);
+
         let Some(instrument) = &self.instrument else {
             return;
         };
@@ -851,7 +968,7 @@ impl ExecTester {
         let stop_offset_ticks = self.config.stop_offset_ticks;
 
         // Determine trigger price based on order type
-        let trigger_price = if matches!(
+        let unclamped_trigger_price = if matches!(
             self.config.stop_order_type,
             OrderType::LimitIfTouched | OrderType::MarketIfTouched | OrderType::TrailingStopMarket
         ) {
@@ -861,40 +978,33 @@ impl ExecTester {
             // STOP sell orders are placed BELOW the market (stop loss on long)
             sub_price_ticks(best_bid, increment, stop_offset_ticks, precision)
         };
+        let clamp = self.config.clamp_to_instrument_price_range;
+        let trigger_price = clamp_price_to_range(unclamped_trigger_price, instrument, clamp);
 
         // Calculate limit price if needed
         let limit_price = if matches!(
             self.config.stop_order_type,
             OrderType::StopLimit | OrderType::LimitIfTouched
         ) {
-            if let Some(limit_offset_ticks) = self.config.stop_limit_offset_ticks {
-                if self.config.stop_order_type == OrderType::LimitIfTouched {
-                    // SELL LIT requires trigger_price >= price.
-                    Some(sub_price_ticks(
-                        trigger_price,
-                        increment,
-                        limit_offset_ticks,
-                        precision,
-                    ))
+            let unclamped_limit_price =
+                if let Some(limit_offset_ticks) = self.config.stop_limit_offset_ticks {
+                    // SELL LIT/StopLimit both require trigger_price >= price.
+                    sub_price_ticks(trigger_price, increment, limit_offset_ticks, precision)
                 } else {
-                    // SELL StopLimit requires trigger_price >= price.
-                    Some(sub_price_ticks(
-                        trigger_price,
-                        increment,
-                        limit_offset_ticks,
-                        precision,
-                    ))
-                }
-            } else {
-                Some(trigger_price)
-            }
+                    trigger_price
+                };
+            Some(clamp_price_to_range(
+                unclamped_limit_price,
+                instrument,
+                clamp,
+            ))
         } else {
             None
         };
 
         let needs_new_order = match &self.sell_stop_order {
             None => true,
-            Some(order) => !self.is_order_active(order),
+            Some(order) => !Self::is_order_active(order) && !self.stop_order_is_one_shot(),
         };
 
         if needs_new_order {
@@ -906,7 +1016,7 @@ impl ExecTester {
             && !order.is_pending_update()
             && !order.is_pending_cancel()
         {
-            let current_trigger = self.get_order_trigger_price(order);
+            let current_trigger = Self::get_order_trigger_price(order);
             if current_trigger.is_some() && current_trigger != Some(trigger_price) {
                 if self.config.modify_stop_orders_to_maintain_offset {
                     let order_clone = order.clone();
@@ -914,7 +1024,10 @@ impl ExecTester {
                     {
                         log::error!("Failed to modify sell stop order: {e}");
                     }
-                } else if self.config.cancel_replace_stop_orders_to_maintain_offset {
+                } else if self.config.cancel_replace_stop_orders_to_maintain_offset
+                    && !self.sell_stop_cancel_replace_attempted
+                {
+                    self.sell_stop_cancel_replace_attempted = true;
                     let order_clone = order.clone();
                     let _ = self.cancel_order(
                         order_clone.client_order_id(),
@@ -963,19 +1076,24 @@ impl ExecTester {
             self.resolve_time_in_force(self.config.limit_time_in_force);
 
         let quantity = instrument.make_qty(self.config.order_qty.as_f64(), None);
+        let instrument_id = self.config.instrument_id;
+        let post_only = self.config.use_post_only || self.config.test_reject_post_only;
+        let quote_quantity = self.config.use_quote_quantity;
+        let display_qty = self.config.order_display_qty;
+        let emulation_trigger = self.config.emulation_trigger;
 
-        let order = self.core.order_factory().limit(
-            self.config.instrument_id,
+        let order = self.order_factory().limit(
+            instrument_id,
             order_side,
             quantity,
             price,
             Some(time_in_force),
             expire_time,
-            Some(self.config.use_post_only || self.config.test_reject_post_only),
+            Some(post_only),
             None, // reduce_only
-            Some(self.config.use_quote_quantity),
-            self.config.order_display_qty,
-            self.config.emulation_trigger,
+            Some(quote_quantity),
+            display_qty,
+            emulation_trigger,
             None, // trigger_instrument_id
             None, // exec_algorithm_id
             None, // exec_algorithm_params
@@ -997,6 +1115,10 @@ impl ExecTester {
     /// # Errors
     ///
     /// Returns an error if order creation or submission fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "stop order submission covers all supported stop order scenarios"
+    )]
     pub(super) fn submit_stop_order(
         &mut self,
         order_side: OrderSide,
@@ -1025,22 +1147,30 @@ impl ExecTester {
 
         // Use instrument's make_qty to ensure correct precision
         let quantity = instrument.make_qty(self.config.order_qty.as_f64(), None);
+        let instrument_id = self.config.instrument_id;
+        let trigger_type = self.config.stop_trigger_type;
+        let quote_quantity = self.config.use_quote_quantity;
+        let display_qty = self.config.order_display_qty;
+        let emulation_trigger = self.config.emulation_trigger;
+        let stop_order_type = self.config.stop_order_type;
+        let trailing_offset = self.config.trailing_offset;
+        let trailing_offset_type = self.config.trailing_offset_type;
 
-        let factory = self.core.order_factory();
+        let mut factory = self.order_factory();
 
-        let mut order: OrderAny = match self.config.stop_order_type {
+        let mut order: OrderAny = match stop_order_type {
             OrderType::StopMarket => factory.stop_market(
-                self.config.instrument_id,
+                instrument_id,
                 order_side,
                 quantity,
                 trigger_price,
-                Some(self.config.stop_trigger_type),
+                Some(trigger_type),
                 Some(time_in_force),
                 expire_time,
                 None, // reduce_only
-                Some(self.config.use_quote_quantity),
+                Some(quote_quantity),
                 None, // display_qty
-                self.config.emulation_trigger,
+                emulation_trigger,
                 None, // trigger_instrument_id
                 None, // exec_algorithm_id
                 None, // exec_algorithm_params
@@ -1052,19 +1182,19 @@ impl ExecTester {
                     anyhow::bail!("STOP_LIMIT order requires limit_price");
                 };
                 factory.stop_limit(
-                    self.config.instrument_id,
+                    instrument_id,
                     order_side,
                     quantity,
                     limit_price,
                     trigger_price,
-                    Some(self.config.stop_trigger_type),
+                    Some(trigger_type),
                     Some(time_in_force),
                     expire_time,
                     None, // post_only
                     None, // reduce_only
-                    Some(self.config.use_quote_quantity),
-                    self.config.order_display_qty,
-                    self.config.emulation_trigger,
+                    Some(quote_quantity),
+                    display_qty,
+                    emulation_trigger,
                     None, // trigger_instrument_id
                     None, // exec_algorithm_id
                     None, // exec_algorithm_params
@@ -1073,16 +1203,16 @@ impl ExecTester {
                 )
             }
             OrderType::MarketIfTouched => factory.market_if_touched(
-                self.config.instrument_id,
+                instrument_id,
                 order_side,
                 quantity,
                 trigger_price,
-                Some(self.config.stop_trigger_type),
+                Some(trigger_type),
                 Some(time_in_force),
                 expire_time,
                 None, // reduce_only
-                Some(self.config.use_quote_quantity),
-                self.config.emulation_trigger,
+                Some(quote_quantity),
+                emulation_trigger,
                 None, // trigger_instrument_id
                 None, // exec_algorithm_id
                 None, // exec_algorithm_params
@@ -1094,19 +1224,19 @@ impl ExecTester {
                     anyhow::bail!("LIMIT_IF_TOUCHED order requires limit_price");
                 };
                 factory.limit_if_touched(
-                    self.config.instrument_id,
+                    instrument_id,
                     order_side,
                     quantity,
                     limit_price,
                     trigger_price,
-                    Some(self.config.stop_trigger_type),
+                    Some(trigger_type),
                     Some(time_in_force),
                     expire_time,
                     None, // post_only
                     None, // reduce_only
-                    Some(self.config.use_quote_quantity),
-                    self.config.order_display_qty,
-                    self.config.emulation_trigger,
+                    Some(quote_quantity),
+                    display_qty,
+                    emulation_trigger,
                     None, // trigger_instrument_id
                     None, // exec_algorithm_id
                     None, // exec_algorithm_params
@@ -1115,24 +1245,24 @@ impl ExecTester {
                 )
             }
             OrderType::TrailingStopMarket => {
-                let Some(trailing_offset) = self.config.trailing_offset else {
+                let Some(trailing_offset) = trailing_offset else {
                     anyhow::bail!("TRAILING_STOP_MARKET order requires trailing_offset config");
                 };
                 factory.trailing_stop_market(
-                    self.config.instrument_id,
+                    instrument_id,
                     order_side,
                     quantity,
                     trailing_offset,
-                    Some(self.config.trailing_offset_type),
+                    Some(trailing_offset_type),
                     None,
                     Some(trigger_price),
-                    Some(self.config.stop_trigger_type),
+                    Some(trigger_type),
                     Some(time_in_force),
                     expire_time,
                     None, // reduce_only
-                    Some(self.config.use_quote_quantity),
+                    Some(quote_quantity),
                     None, // display_qty
-                    self.config.emulation_trigger,
+                    emulation_trigger,
                     None, // trigger_instrument_id
                     None, // exec_algorithm_id
                     None, // exec_algorithm_params
@@ -1141,9 +1271,10 @@ impl ExecTester {
                 )
             }
             _ => {
-                anyhow::bail!("Unknown stop order type: {:?}", self.config.stop_order_type);
+                anyhow::bail!("Unknown stop order type: {stop_order_type:?}");
             }
         };
+        drop(factory);
 
         if let OrderAny::TrailingStopMarket(order) = &mut order {
             order.activation_price = Some(trigger_price);
@@ -1204,7 +1335,7 @@ impl ExecTester {
         let precision = instrument.price_precision();
         let bracket_offset_ticks = self.config.bracket_offset_ticks;
 
-        let (tp_price, sl_trigger_price) = match order_side {
+        let (unclamped_tp_price, unclamped_sl_trigger_price) = match order_side {
             OrderSide::Buy => {
                 let tp = add_price_ticks(entry_price, increment, bracket_offset_ticks, precision);
                 let sl = sub_price_ticks(entry_price, increment, bracket_offset_ticks, precision);
@@ -1215,29 +1346,37 @@ impl ExecTester {
                 let sl = add_price_ticks(entry_price, increment, bracket_offset_ticks, precision);
                 (tp, sl)
             }
-            _ => anyhow::bail!("Invalid order side for bracket: {order_side:?}"),
+            OrderSide::NoOrderSide => {
+                anyhow::bail!("Invalid order side for bracket: {order_side:?}")
+            }
         };
+        let clamp = self.config.clamp_to_instrument_price_range;
+        let tp_price = clamp_price_to_range(unclamped_tp_price, instrument, clamp);
+        let sl_trigger_price = clamp_price_to_range(unclamped_sl_trigger_price, instrument, clamp);
 
         let entry_post_only = self.config.use_post_only || self.config.test_reject_post_only;
+        let instrument_id = self.config.instrument_id;
+        let quote_quantity = self.config.use_quote_quantity;
+        let emulation_trigger = self.config.emulation_trigger;
+        let stop_trigger_type = self.config.stop_trigger_type;
         let orders = self
-            .core
             .order_factory()
             .bracket()
-            .instrument_id(self.config.instrument_id)
+            .instrument_id(instrument_id)
             .order_side(order_side)
             .quantity(quantity)
-            .quote_quantity(self.config.use_quote_quantity)
+            .quote_quantity(quote_quantity)
             .entry_order_type(OrderType::Limit)
             .entry_price(entry_price)
             .time_in_force(time_in_force)
             .entry_post_only(entry_post_only)
-            .maybe_emulation_trigger(self.config.emulation_trigger)
+            .maybe_emulation_trigger(emulation_trigger)
             .maybe_expire_time(expire_time)
             .tp_price(tp_price)
             .tp_post_only(entry_post_only)
             .tp_time_in_force(time_in_force)
             .sl_trigger_price(sl_trigger_price)
-            .sl_trigger_type(self.config.stop_trigger_type)
+            .sl_trigger_type(stop_trigger_type)
             .sl_time_in_force(sl_time_in_force)
             .call();
 
@@ -1286,14 +1425,17 @@ impl ExecTester {
         } else {
             None
         };
+        let instrument_id = self.config.instrument_id;
+        let time_in_force = self.config.open_position_time_in_force;
+        let quote_quantity = self.config.use_quote_quantity;
 
-        let order = self.core.order_factory().market(
-            self.config.instrument_id,
+        let order = self.order_factory().market(
+            instrument_id,
             order_side,
             quantity,
-            Some(self.config.open_position_time_in_force),
+            Some(time_in_force),
             reduce_only,
-            Some(self.config.use_quote_quantity),
+            Some(quote_quantity),
             None, // exec_algorithm_id
             None, // exec_algorithm_params
             None, // tags
@@ -1302,14 +1444,188 @@ impl ExecTester {
 
         self.submit_order_apply_params(order)
     }
+
+    pub(super) fn cancel_active_orders(
+        &mut self,
+        instrument_id: InstrumentId,
+        strategy_id: StrategyId,
+        client_id: Option<ClientId>,
+    ) {
+        // Reach INITIALIZED contingent legs that the open/emulated/inflight indexes
+        // miss. Skip non-bracket lists so the configured cancel mode owns them.
+        let bracket_targets: Vec<ClientOrderId> = {
+            let cache = self.cache();
+            let mut targets = Vec::new();
+
+            for order_list in
+                cache.order_lists(None, Some(&instrument_id), Some(&strategy_id), None)
+            {
+                let is_bracket = order_list.client_order_ids.iter().any(|cid| {
+                    cache
+                        .order(cid)
+                        .is_some_and(|o| is_in_contingency_group(&o))
+                });
+
+                if !is_bracket {
+                    continue;
+                }
+
+                for cid in &order_list.client_order_ids {
+                    if let Some(order) = cache.order(cid)
+                        && !order.is_closed()
+                        && !order.is_pending_cancel()
+                    {
+                        targets.push(*cid);
+                    }
+                }
+            }
+            targets
+        };
+
+        for cid in bracket_targets {
+            if let Err(e) = self.cancel_order(cid, client_id, None) {
+                log::error!("Failed to cancel bracket leg {cid}: {e}");
+            }
+        }
+
+        if self.config.use_individual_cancels_on_stop {
+            for cid in self.collect_cancellable_order_ids(instrument_id, strategy_id) {
+                if let Err(e) = self.cancel_order(cid, client_id, None) {
+                    log::error!("Failed to cancel order {cid}: {e}");
+                }
+            }
+        } else if self.config.use_batch_cancel_on_stop {
+            let candidates = self.collect_cancellable_orders(instrument_id, strategy_id);
+            let mut batchable: Vec<ClientOrderId> = Vec::new();
+
+            for order in candidates {
+                let cid = order.client_order_id();
+                if order.is_emulated() || order.is_active_local() {
+                    if let Err(e) = self.cancel_order(cid, client_id, None) {
+                        log::error!("Failed to cancel local order {cid}: {e}");
+                    }
+                } else {
+                    batchable.push(cid);
+                }
+            }
+
+            if !batchable.is_empty()
+                && let Err(e) = self.cancel_orders(batchable, client_id, None)
+            {
+                log::error!("Failed to batch cancel orders: {e}");
+            }
+        } else {
+            // `cancel_all_orders` does not reach active-local orders; cancel those
+            // individually first. Brackets are handled by the sweep above.
+            let local_ids: Vec<ClientOrderId> = {
+                let cache = self.cache();
+                cache
+                    .orders_active_local(None, Some(&instrument_id), Some(&strategy_id), None, None)
+                    .into_iter()
+                    .filter(|o| {
+                        !o.is_closed() && !o.is_pending_cancel() && !is_in_contingency_group(o)
+                    })
+                    .map(|o| o.client_order_id())
+                    .collect()
+            };
+
+            for cid in local_ids {
+                if let Err(e) = self.cancel_order(cid, client_id, None) {
+                    log::error!("Failed to cancel active-local order {cid}: {e}");
+                }
+            }
+
+            if let Err(e) = self.cancel_all_orders(instrument_id, None, client_id, None) {
+                log::error!("Failed to cancel all orders: {e}");
+            }
+        }
+    }
+
+    pub(super) fn collect_cancellable_orders(
+        &self,
+        instrument_id: InstrumentId,
+        strategy_id: StrategyId,
+    ) -> Vec<OrderAny> {
+        let cache = self.cache();
+        let mut seen: AHashSet<ClientOrderId> = AHashSet::new();
+        let mut candidates: Vec<OrderAny> = Vec::new();
+        // `orders_active_local` catches just-submitted orders not yet in the other
+        // indexes. Bracket legs are excluded; the sweep in `cancel_active_orders` owns them.
+        let sources = [
+            cache.orders_active_local(None, Some(&instrument_id), Some(&strategy_id), None, None),
+            cache.orders_emulated(None, Some(&instrument_id), Some(&strategy_id), None, None),
+            cache.orders_inflight(None, Some(&instrument_id), Some(&strategy_id), None, None),
+            cache.orders_open(None, Some(&instrument_id), Some(&strategy_id), None, None),
+        ];
+
+        for orders in sources {
+            for order in orders {
+                if order.is_closed() || order.is_pending_cancel() || is_in_contingency_group(&order)
+                {
+                    continue;
+                }
+                let cid = order.client_order_id();
+                if seen.insert(cid) {
+                    candidates.push(order);
+                }
+            }
+        }
+        candidates
+    }
+
+    pub(super) fn collect_cancellable_order_ids(
+        &self,
+        instrument_id: InstrumentId,
+        strategy_id: StrategyId,
+    ) -> Vec<ClientOrderId> {
+        self.collect_cancellable_orders(instrument_id, strategy_id)
+            .into_iter()
+            .map(|o| o.client_order_id())
+            .collect()
+    }
 }
 
 fn add_price_ticks(base: Price, increment: Price, ticks: u64, precision: u8) -> Price {
-    let offset_raw = increment.raw * ticks as PriceRaw;
-    Price::from_raw(base.raw + offset_raw, precision)
+    let offset = price_tick_offset(increment, ticks, precision);
+    base + offset
 }
 
 fn sub_price_ticks(base: Price, increment: Price, ticks: u64, precision: u8) -> Price {
-    let offset_raw = increment.raw * ticks as PriceRaw;
-    Price::from_raw(base.raw - offset_raw, precision)
+    let offset = price_tick_offset(increment, ticks, precision);
+    base - offset
+}
+
+fn price_tick_offset(increment: Price, ticks: u64, precision: u8) -> Price {
+    let offset = increment * Decimal::from(ticks);
+    Price::from_decimal_dp(offset, precision)
+        .unwrap_or_else(|e| panic!("Failed to calculate price tick offset: {e}"))
+}
+
+// `OrderAny::is_contingency` returns true for `Some(NoContingency)` (the factory
+// default on every order), so match the variant directly to distinguish bracket legs.
+fn is_in_contingency_group(order: &OrderAny) -> bool {
+    matches!(
+        order.contingency_type(),
+        Some(ContingencyType::Oto | ContingencyType::Oco | ContingencyType::Ouo)
+    )
+}
+
+fn clamp_price_to_range(price: Price, instrument: &InstrumentAny, enabled: bool) -> Price {
+    if !enabled {
+        return price;
+    }
+    let mut clamped = price;
+    if let Some(min) = instrument.min_price()
+        && clamped < min
+    {
+        clamped = min;
+    }
+
+    if let Some(max) = instrument.max_price()
+        && clamped > max
+    {
+        clamped = max;
+    }
+
+    clamped
 }

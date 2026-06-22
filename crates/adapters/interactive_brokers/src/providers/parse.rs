@@ -17,6 +17,7 @@
 
 use std::str::FromStr;
 
+use anyhow::Context;
 use ibapi::contracts::SecurityType;
 use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
@@ -168,7 +169,9 @@ pub fn parse_ib_contract_to_instrument(
         SecurityType::Stock => Ok(parse_equity_contract(details, instrument_id)),
         SecurityType::ForexPair => Ok(parse_forex_contract(details, instrument_id)),
         SecurityType::Crypto => Ok(parse_crypto_contract(details, instrument_id)),
-        SecurityType::Future => Ok(parse_futures_contract(details, instrument_id)),
+        SecurityType::Future | SecurityType::ContinuousFuture => {
+            Ok(parse_futures_contract(details, instrument_id))
+        }
         SecurityType::Option => parse_option_contract(details, instrument_id),
         SecurityType::FuturesOption => parse_option_contract(details, instrument_id), // FOP uses same parsing as OPT
         SecurityType::Index => Ok(parse_index_contract(details, instrument_id)),
@@ -189,6 +192,10 @@ fn ib_contract_info(details: &ibapi::contracts::ContractDetails) -> nautilus_cor
     }
 
     info.insert("contract".to_string(), serde_json::Value::Object(contract));
+    info.insert(
+        "priceMagnifier".to_string(),
+        serde_json::Value::from(details.price_magnifier),
+    );
     info
 }
 
@@ -244,6 +251,7 @@ fn parse_equity_contract(
         None,                            // margin_maint
         None,                            // maker_fee
         None,                            // taker_fee
+        None,                            // tick_scheme
         Some(ib_contract_info(details)), // info
         timestamp,
         timestamp,
@@ -282,6 +290,7 @@ fn parse_forex_contract(
         None,                            // margin_maint
         None,                            // maker_fee
         None,                            // taker_fee
+        None,                            // tick_scheme
         Some(ib_contract_info(details)), // info
         timestamp,
         timestamp,
@@ -322,6 +331,7 @@ fn parse_crypto_contract(
         None,                            // margin_maint
         None,                            // maker_fee
         None,                            // taker_fee
+        None,                            // tick_scheme
         Some(ib_contract_info(details)), // info
         timestamp,
         timestamp,
@@ -374,9 +384,19 @@ fn parse_futures_contract(
 
     let multiplier = parse_contract_multiplier(&details.contract.multiplier, 1.0);
 
+    let raw_symbol = if matches!(
+        details.contract.security_type,
+        SecurityType::ContinuousFuture
+    ) && !details.contract.symbol.as_str().is_empty()
+    {
+        details.contract.symbol.as_str()
+    } else {
+        details.contract.local_symbol.as_str()
+    };
+
     let instrument = FuturesContract::new(
         instrument_id,
-        Symbol::from(details.contract.local_symbol.as_str()),
+        Symbol::from(raw_symbol),
         sec_type_to_asset_class(details.under_security_type.as_str()),
         None, // exchange
         Ustr::from(details.under_symbol.as_str()),
@@ -395,6 +415,7 @@ fn parse_futures_contract(
         None,                            // margin_maint
         None,                            // maker_fee
         None,                            // taker_fee
+        None,                            // tick_scheme
         Some(ib_contract_info(details)), // info
         timestamp,
         timestamp,
@@ -433,7 +454,13 @@ fn parse_option_contract(
         .unwrap_or(UnixNanos::from(0)); // -90 days or 0 if underflow
 
     // Parse option kind (CALL or PUT)
-    let option_kind = IbOptionRight::from_str(details.contract.right.as_str())?.option_kind();
+    let option_kind = details
+        .contract
+        .right
+        .map(|right| IbOptionRight::from_str(right.as_str()))
+        .transpose()?
+        .context("Option contract missing right")?
+        .option_kind();
 
     let multiplier = parse_contract_multiplier(&details.contract.multiplier, 100.0);
     let asset_class = sec_type_to_asset_class(details.under_security_type.as_str());
@@ -467,6 +494,7 @@ fn parse_option_contract(
         None,                            // margin_maint
         None,                            // maker_fee
         None,                            // taker_fee
+        None,                            // tick_scheme
         Some(ib_contract_info(details)), // info
         timestamp,
         timestamp,
@@ -478,17 +506,22 @@ fn parse_option_contract(
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
-    use ibapi::contracts::{Contract, ContractDetails, Currency, Exchange, SecurityType, Symbol};
+    use ibapi::contracts::{
+        Contract, ContractDetails, Currency, Exchange, OptionRight, SecurityType, Symbol,
+    };
     use nautilus_model::{
         enums::AssetClass,
         identifiers::{InstrumentId, Symbol as NautilusSymbol, Venue},
         instruments::{Instrument, InstrumentAny},
-        types::Quantity,
+        types::{Price, Quantity},
     };
     use rstest::rstest;
     use ustr::Ustr;
 
-    use super::{parse_contract_multiplier, parse_ib_contract_to_instrument};
+    use super::{
+        parse_contract_multiplier, parse_ib_contract_to_instrument,
+        parse_option_spread_instrument_id,
+    };
 
     #[rstest]
     fn test_parse_option_contract_prefixes_index_underlying() {
@@ -500,7 +533,7 @@ mod tests {
                 currency: Currency::from("USD"),
                 local_symbol: "SPXW  260313P06630000".to_string(),
                 last_trade_date_or_contract_month: "20260313".to_string(),
-                right: "P".to_string(),
+                right: Some(OptionRight::Put),
                 strike: 6630.0,
                 multiplier: "100".to_string(),
                 ..Default::default()
@@ -526,6 +559,35 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_contract_preserves_price_magnifier_in_info() {
+        let details = ContractDetails {
+            contract: Contract {
+                symbol: Symbol::from("AAPL"),
+                security_type: SecurityType::Stock,
+                exchange: Exchange::from("SMART"),
+                primary_exchange: Exchange::from("NASDAQ"),
+                currency: Currency::from("USD"),
+                local_symbol: String::from("AAPL"),
+                ..Default::default()
+            },
+            min_tick: 0.01,
+            price_magnifier: 100,
+            ..Default::default()
+        };
+        let instrument_id = InstrumentId::new(NautilusSymbol::from("AAPL"), Venue::from("XNAS"));
+
+        let instrument = parse_ib_contract_to_instrument(&details, instrument_id).unwrap();
+        let InstrumentAny::Equity(equity) = instrument else {
+            panic!("expected equity");
+        };
+
+        assert_eq!(
+            equity.info.unwrap().get("priceMagnifier"),
+            Some(&serde_json::Value::from(100))
+        );
+    }
+
+    #[rstest]
     #[case("100", 100.0)]
     #[case("", 1.0)]
     #[case("not-a-number", 1.0)]
@@ -537,6 +599,79 @@ mod tests {
             parse_contract_multiplier(multiplier, 1.0),
             Quantity::new(expected, 0)
         );
+    }
+
+    #[rstest]
+    fn test_parse_continuous_future_contract_uses_symbol_as_raw_symbol() {
+        let details = ContractDetails {
+            contract: Contract {
+                symbol: Symbol::from("ES"),
+                security_type: SecurityType::ContinuousFuture,
+                exchange: Exchange::from("CME"),
+                currency: Currency::from("USD"),
+                local_symbol: String::new(),
+                multiplier: "50".to_string(),
+                ..Default::default()
+            },
+            min_tick: 0.25,
+            under_symbol: "ES".to_string(),
+            under_security_type: "IND".to_string(),
+            ..Default::default()
+        };
+        let instrument_id = InstrumentId::new(NautilusSymbol::from("ES"), Venue::from("CME"));
+
+        let instrument = parse_ib_contract_to_instrument(&details, instrument_id).unwrap();
+
+        let InstrumentAny::FuturesContract(future) = instrument else {
+            panic!("expected futures contract");
+        };
+
+        assert_eq!(future.raw_symbol().as_str(), "ES");
+    }
+
+    #[rstest]
+    fn test_parse_option_spread_uses_minimum_leg_tick() {
+        let leg1 = ContractDetails {
+            contract: Contract {
+                symbol: Symbol::from("SPY"),
+                security_type: SecurityType::Option,
+                exchange: Exchange::from("SMART"),
+                currency: Currency::from("USD"),
+                local_symbol: "SPY   260120C00400000".to_string(),
+                multiplier: "100".to_string(),
+                ..Default::default()
+            },
+            min_tick: 0.05,
+            under_symbol: "SPY".to_string(),
+            ..Default::default()
+        };
+        let leg2 = ContractDetails {
+            contract: Contract {
+                symbol: Symbol::from("SPY"),
+                security_type: SecurityType::Option,
+                exchange: Exchange::from("SMART"),
+                currency: Currency::from("USD"),
+                local_symbol: "SPY   260120C00410000".to_string(),
+                multiplier: "100".to_string(),
+                ..Default::default()
+            },
+            min_tick: 0.01,
+            under_symbol: "SPY".to_string(),
+            ..Default::default()
+        };
+        let instrument_id =
+            InstrumentId::from("(1)SPY   260120C00400000_((-1))SPY   260120C00410000.SMART");
+
+        let spread = parse_option_spread_instrument_id(
+            instrument_id,
+            &[(&leg1, 1), (&leg2, -1)],
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(spread.price_precision(), 2);
+        assert_eq!(spread.price_increment(), Price::from("0.01"));
     }
 }
 
@@ -560,6 +695,7 @@ fn parse_index_contract(
         size_precision,
         Price::new(details.min_tick, price_precision),
         Quantity::new(details.size_increment, size_precision),
+        None,
         Some(ib_contract_info(details)), // info
         timestamp,
         timestamp,
@@ -608,9 +744,13 @@ pub fn parse_spread_instrument_id(
         _ => AssetClass::Equity,                                            // Equity options
     };
 
-    // Calculate price precision and increment
-    let price_precision = tick_size_to_precision(first_details.min_tick);
-    let price_increment = Price::new(first_details.min_tick, price_precision);
+    // Calculate price precision and increment from the finest leg tick.
+    let min_tick = leg_contract_details
+        .iter()
+        .map(|(details, _)| details.min_tick)
+        .fold(first_details.min_tick, f64::min);
+    let price_precision = tick_size_to_precision(min_tick);
+    let price_increment = Price::new(min_tick, price_precision);
 
     // Use provided timestamp or current time
     let timestamp = timestamp_ns.unwrap_or_else(|| get_atomic_clock_realtime().get_time_ns());
@@ -641,6 +781,7 @@ pub fn parse_spread_instrument_id(
         Some(Decimal::ZERO), // margin_maint
         Some(Decimal::ZERO), // maker_fee
         Some(Decimal::ZERO), // taker_fee
+        None,                // tick_scheme
         None,                // info
         timestamp,
         timestamp,
@@ -680,8 +821,12 @@ pub fn parse_futures_spread_instrument_id(
     };
     let multiplier = Quantity::from_str(&first_contract.multiplier.to_string())
         .unwrap_or_else(|_| Quantity::new(1.0, 0));
-    let price_precision = tick_size_to_precision(first_details.min_tick);
-    let price_increment = Price::new(first_details.min_tick, price_precision);
+    let min_tick = leg_contract_details
+        .iter()
+        .map(|(details, _)| details.min_tick)
+        .fold(first_details.min_tick, f64::min);
+    let price_precision = tick_size_to_precision(min_tick);
+    let price_increment = Price::new(min_tick, price_precision);
     let timestamp = timestamp_ns.unwrap_or_else(|| get_atomic_clock_realtime().get_time_ns());
 
     Ok(FuturesSpread::new_checked(
@@ -706,6 +851,7 @@ pub fn parse_futures_spread_instrument_id(
         Some(Decimal::ZERO),
         Some(Decimal::ZERO),
         Some(Decimal::ZERO),
+        None,
         bag_contract.map(ib_contract_info_for_contract),
         timestamp,
         timestamp,
@@ -778,6 +924,7 @@ fn parse_cfd_contract(
         None,
         None,
         None,
+        None,
         Some(ib_contract_info(details)),
         timestamp,
         timestamp,
@@ -804,6 +951,7 @@ fn parse_commodity_contract(
         size_precision,
         Price::new(details.min_tick, price_precision),
         Quantity::new(details.size_increment, size_precision),
+        None,
         None,
         None,
         None,
@@ -849,6 +997,7 @@ fn parse_bond_contract(
         None,                            // margin_maint
         None,                            // maker_fee
         None,                            // taker_fee
+        None,                            // tick_scheme
         Some(ib_contract_info(details)), // info
         timestamp,
         timestamp,

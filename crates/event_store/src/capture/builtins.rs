@@ -35,16 +35,19 @@
 use std::collections::HashSet;
 
 use bytes::Bytes;
-use nautilus_common::messages::{
-    data::{
-        BarsResponse, BookResponse, CustomDataResponse, DataCommand, DataResponse,
-        ForwardPricesResponse, FundingRatesResponse, InstrumentResponse, InstrumentsResponse,
-        QuotesResponse, TradesResponse,
+use nautilus_common::{
+    messages::{
+        data::{
+            BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
+            DataCommand, DataResponse, ForwardPricesResponse, FundingRatesResponse,
+            InstrumentResponse, InstrumentsResponse, QuotesResponse, TradesResponse,
+        },
+        execution::{
+            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecutionReport,
+            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+        },
     },
-    execution::{
-        BatchCancelOrders, CancelAllOrders, CancelOrder, ExecutionReport, ModifyOrder,
-        QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
-    },
+    timer::TimeEvent,
 };
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
@@ -78,6 +81,8 @@ pub const PAYLOAD_TYPE_SUBMIT_ORDER: &str = "SubmitOrder";
 pub const PAYLOAD_TYPE_SUBMIT_ORDER_LIST: &str = "SubmitOrderList";
 /// The canonical `payload_type` tag for [`ModifyOrder`].
 pub const PAYLOAD_TYPE_MODIFY_ORDER: &str = "ModifyOrder";
+/// The canonical `payload_type` tag for [`BatchModifyOrders`].
+pub const PAYLOAD_TYPE_BATCH_MODIFY_ORDERS: &str = "BatchModifyOrders";
 /// The canonical `payload_type` tag for [`CancelOrder`].
 pub const PAYLOAD_TYPE_CANCEL_ORDER: &str = "CancelOrder";
 /// The canonical `payload_type` tag for [`CancelAllOrders`].
@@ -141,6 +146,8 @@ pub const PAYLOAD_TYPE_POSITION_CLOSED: &str = "PositionClosed";
 pub const PAYLOAD_TYPE_POSITION_ADJUSTED: &str = "PositionAdjusted";
 /// The canonical `payload_type` tag for [`AccountState`].
 pub const PAYLOAD_TYPE_ACCOUNT_STATE: &str = "AccountState";
+/// The canonical `payload_type` tag for [`TimeEvent`].
+pub const PAYLOAD_TYPE_TIME_EVENT: &str = "TimeEvent";
 
 /// The canonical `payload_type` tag for `RequestCommand`.
 pub const PAYLOAD_TYPE_REQUEST_COMMAND: &str = "RequestCommand";
@@ -166,6 +173,10 @@ pub const PAYLOAD_TYPE_INSTRUMENT_RESPONSE: &str = "InstrumentResponse";
 pub const PAYLOAD_TYPE_INSTRUMENTS_RESPONSE: &str = "InstrumentsResponse";
 /// The canonical `payload_type` tag for [`BookResponse`].
 pub const PAYLOAD_TYPE_BOOK_RESPONSE: &str = "BookResponse";
+/// The canonical `payload_type` tag for [`BookDeltasResponse`].
+pub const PAYLOAD_TYPE_BOOK_DELTAS_RESPONSE: &str = "BookDeltasResponse";
+/// The canonical `payload_type` tag for [`BookDepthResponse`].
+pub const PAYLOAD_TYPE_BOOK_DEPTH_RESPONSE: &str = "BookDepthResponse";
 /// The canonical `payload_type` tag for [`QuotesResponse`].
 pub const PAYLOAD_TYPE_QUOTES_RESPONSE: &str = "QuotesResponse";
 /// The canonical `payload_type` tag for [`TradesResponse`].
@@ -192,6 +203,66 @@ const PAYLOAD_TYPE_POSITION_EVENT: &str = "PositionEvent";
 const PAYLOAD_TYPE_DATA_COMMAND: &str = "DataCommand";
 
 const PAYLOAD_TYPE_DATA_RESPONSE: &str = "DataResponse";
+
+#[cfg(test)]
+pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
+    PAYLOAD_TYPE_SUBMIT_ORDER,
+    PAYLOAD_TYPE_SUBMIT_ORDER_LIST,
+    PAYLOAD_TYPE_MODIFY_ORDER,
+    PAYLOAD_TYPE_BATCH_MODIFY_ORDERS,
+    PAYLOAD_TYPE_CANCEL_ORDER,
+    PAYLOAD_TYPE_CANCEL_ALL_ORDERS,
+    PAYLOAD_TYPE_BATCH_CANCEL_ORDERS,
+    PAYLOAD_TYPE_QUERY_ORDER,
+    PAYLOAD_TYPE_QUERY_ACCOUNT,
+    PAYLOAD_TYPE_ORDER_INITIALIZED,
+    PAYLOAD_TYPE_ORDER_DENIED,
+    PAYLOAD_TYPE_ORDER_EMULATED,
+    PAYLOAD_TYPE_ORDER_RELEASED,
+    PAYLOAD_TYPE_ORDER_SUBMITTED,
+    PAYLOAD_TYPE_ORDER_ACCEPTED,
+    PAYLOAD_TYPE_ORDER_REJECTED,
+    PAYLOAD_TYPE_ORDER_CANCELED,
+    PAYLOAD_TYPE_ORDER_EXPIRED,
+    PAYLOAD_TYPE_ORDER_TRIGGERED,
+    PAYLOAD_TYPE_ORDER_PENDING_UPDATE,
+    PAYLOAD_TYPE_ORDER_PENDING_CANCEL,
+    PAYLOAD_TYPE_ORDER_MODIFY_REJECTED,
+    PAYLOAD_TYPE_ORDER_CANCEL_REJECTED,
+    PAYLOAD_TYPE_ORDER_UPDATED,
+    PAYLOAD_TYPE_ORDER_FILLED,
+    PAYLOAD_TYPE_ORDER_STATUS_REPORT,
+    PAYLOAD_TYPE_FILL_REPORT,
+    PAYLOAD_TYPE_ORDER_WITH_FILLS,
+    PAYLOAD_TYPE_POSITION_STATUS_REPORT,
+    PAYLOAD_TYPE_EXECUTION_MASS_STATUS,
+    PAYLOAD_TYPE_POSITION_OPENED,
+    PAYLOAD_TYPE_POSITION_CHANGED,
+    PAYLOAD_TYPE_POSITION_CLOSED,
+    PAYLOAD_TYPE_POSITION_ADJUSTED,
+    PAYLOAD_TYPE_ACCOUNT_STATE,
+    PAYLOAD_TYPE_TIME_EVENT,
+    PAYLOAD_TYPE_REQUEST_COMMAND,
+    PAYLOAD_TYPE_SUBSCRIBE_COMMAND,
+    PAYLOAD_TYPE_UNSUBSCRIBE_COMMAND,
+    #[cfg(feature = "defi")]
+    PAYLOAD_TYPE_DEFI_REQUEST_COMMAND,
+    #[cfg(feature = "defi")]
+    PAYLOAD_TYPE_DEFI_SUBSCRIBE_COMMAND,
+    #[cfg(feature = "defi")]
+    PAYLOAD_TYPE_DEFI_UNSUBSCRIBE_COMMAND,
+    PAYLOAD_TYPE_CUSTOM_DATA_RESPONSE,
+    PAYLOAD_TYPE_INSTRUMENT_RESPONSE,
+    PAYLOAD_TYPE_INSTRUMENTS_RESPONSE,
+    PAYLOAD_TYPE_BOOK_RESPONSE,
+    PAYLOAD_TYPE_BOOK_DELTAS_RESPONSE,
+    PAYLOAD_TYPE_BOOK_DEPTH_RESPONSE,
+    PAYLOAD_TYPE_QUOTES_RESPONSE,
+    PAYLOAD_TYPE_TRADES_RESPONSE,
+    PAYLOAD_TYPE_FUNDING_RATES_RESPONSE,
+    PAYLOAD_TYPE_FORWARD_PRICES_RESPONSE,
+    PAYLOAD_TYPE_BARS_RESPONSE,
+];
 
 /// Returns an [`EncoderRegistry`] preloaded with the default encoders.
 ///
@@ -258,6 +329,7 @@ pub fn register_default(registry: &mut EncoderRegistry) {
         payload_type(PAYLOAD_TYPE_ACCOUNT_STATE),
         encode_account_state,
     );
+    registry.register::<TimeEvent, _>(payload_type(PAYLOAD_TYPE_TIME_EVENT), encode_time_event);
     registry
         .register::<DataCommand, _>(payload_type(PAYLOAD_TYPE_DATA_COMMAND), encode_data_command);
     registry.register::<DataResponse, _>(
@@ -266,6 +338,7 @@ pub fn register_default(registry: &mut EncoderRegistry) {
     );
 
     register_default_headers(registry);
+    register_default_identities(registry);
 }
 
 /// Attaches header extractors for every type that carries `correlation_id` or
@@ -279,6 +352,7 @@ fn register_default_headers(registry: &mut EncoderRegistry) {
     registry.register_headers::<SubmitOrder, _>(extract_submit_order_headers);
     registry.register_headers::<SubmitOrderList, _>(extract_submit_order_list_headers);
     registry.register_headers::<ModifyOrder, _>(extract_modify_order_headers);
+    registry.register_headers::<BatchModifyOrders, _>(extract_batch_modify_orders_headers);
     registry.register_headers::<CancelOrder, _>(extract_cancel_order_headers);
     registry.register_headers::<CancelAllOrders, _>(extract_cancel_all_orders_headers);
     registry.register_headers::<BatchCancelOrders, _>(extract_batch_cancel_orders_headers);
@@ -287,6 +361,55 @@ fn register_default_headers(registry: &mut EncoderRegistry) {
     registry.register_headers::<TradingCommand, _>(extract_trading_command_headers);
     registry.register_headers::<DataCommand, _>(extract_data_command_headers);
     registry.register_headers::<DataResponse, _>(extract_data_response_headers);
+}
+
+/// Attaches identity extractors for the types production dispatch pushes through more
+/// than one tap-visible boundary (portfolio endpoint send plus strategy topic publish,
+/// command hops through risk to execution, account states on both dispatch paths), so
+/// the adapter captures each logical message exactly once. The venue report types
+/// deliberately carry no extractor: the raw `reconciliation.raw.*` publish and the
+/// engine-bound dispatch are distinct capture boundaries.
+fn register_default_identities(registry: &mut EncoderRegistry) {
+    registry.register_identity::<SubmitOrder, _>(|command| Some(command.command_id));
+    registry.register_identity::<OrderFilled, _>(|event| Some(event.event_id));
+    registry.register_identity::<TradingCommand, _>(|c| Some(extract_trading_command_identity(c)));
+    registry.register_identity::<OrderEventAny, _>(|e| Some(extract_order_event_any_identity(e)));
+    registry.register_identity::<AccountState, _>(|state| Some(state.event_id));
+}
+
+fn extract_trading_command_identity(command: &TradingCommand) -> UUID4 {
+    match command {
+        TradingCommand::SubmitOrder(c) => c.command_id,
+        TradingCommand::SubmitOrderList(c) => c.command_id,
+        TradingCommand::ModifyOrder(c) => c.command_id,
+        TradingCommand::ModifyOrders(c) => c.command_id,
+        TradingCommand::CancelOrder(c) => c.command_id,
+        TradingCommand::CancelOrders(c) => c.command_id,
+        TradingCommand::CancelAllOrders(c) => c.command_id,
+        TradingCommand::QueryOrder(c) => c.command_id,
+        TradingCommand::QueryAccount(c) => c.command_id,
+    }
+}
+
+fn extract_order_event_any_identity(event: &OrderEventAny) -> UUID4 {
+    match event {
+        OrderEventAny::Initialized(e) => e.event_id,
+        OrderEventAny::Denied(e) => e.event_id,
+        OrderEventAny::Emulated(e) => e.event_id,
+        OrderEventAny::Released(e) => e.event_id,
+        OrderEventAny::Submitted(e) => e.event_id,
+        OrderEventAny::Accepted(e) => e.event_id,
+        OrderEventAny::Rejected(e) => e.event_id,
+        OrderEventAny::Canceled(e) => e.event_id,
+        OrderEventAny::Expired(e) => e.event_id,
+        OrderEventAny::Triggered(e) => e.event_id,
+        OrderEventAny::PendingUpdate(e) => e.event_id,
+        OrderEventAny::PendingCancel(e) => e.event_id,
+        OrderEventAny::ModifyRejected(e) => e.event_id,
+        OrderEventAny::CancelRejected(e) => e.event_id,
+        OrderEventAny::Updated(e) => e.event_id,
+        OrderEventAny::Filled(e) => e.event_id,
+    }
 }
 
 fn headers_from_fields(correlation_id: Option<UUID4>, causation_id: Option<UUID4>) -> Headers {
@@ -305,6 +428,10 @@ fn extract_submit_order_list_headers(cmd: &SubmitOrderList) -> Headers {
 }
 
 fn extract_modify_order_headers(cmd: &ModifyOrder) -> Headers {
+    headers_from_fields(cmd.correlation_id, cmd.causation_id)
+}
+
+fn extract_batch_modify_orders_headers(cmd: &BatchModifyOrders) -> Headers {
     headers_from_fields(cmd.correlation_id, cmd.causation_id)
 }
 
@@ -336,9 +463,10 @@ fn extract_trading_command_headers(command: &TradingCommand) -> Headers {
         TradingCommand::SubmitOrder(cmd) => extract_submit_order_headers(cmd),
         TradingCommand::SubmitOrderList(cmd) => extract_submit_order_list_headers(cmd),
         TradingCommand::ModifyOrder(cmd) => extract_modify_order_headers(cmd),
+        TradingCommand::ModifyOrders(cmd) => extract_batch_modify_orders_headers(cmd),
         TradingCommand::CancelOrder(cmd) => extract_cancel_order_headers(cmd),
+        TradingCommand::CancelOrders(cmd) => extract_batch_cancel_orders_headers(cmd),
         TradingCommand::CancelAllOrders(cmd) => extract_cancel_all_orders_headers(cmd),
-        TradingCommand::BatchCancelOrders(cmd) => extract_batch_cancel_orders_headers(cmd),
         TradingCommand::QueryOrder(cmd) => extract_query_order_headers(cmd),
         TradingCommand::QueryAccount(cmd) => extract_query_account_headers(cmd),
     }
@@ -432,9 +560,10 @@ pub fn encode_trading_command(command: &TradingCommand) -> Result<EncodedPayload
         }
         TradingCommand::SubmitOrderList(cmd) => encode_submit_order_list(cmd),
         TradingCommand::ModifyOrder(cmd) => encode_modify_order(cmd),
+        TradingCommand::ModifyOrders(cmd) => encode_batch_modify_orders(cmd),
         TradingCommand::CancelOrder(cmd) => encode_cancel_order(cmd),
+        TradingCommand::CancelOrders(cmd) => encode_batch_cancel_orders(cmd),
         TradingCommand::CancelAllOrders(cmd) => encode_cancel_all_orders(cmd),
-        TradingCommand::BatchCancelOrders(cmd) => encode_batch_cancel_orders(cmd),
         TradingCommand::QueryOrder(cmd) => encode_query_order(cmd),
         TradingCommand::QueryAccount(cmd) => encode_query_account(cmd),
     }
@@ -786,6 +915,26 @@ fn encode_modify_order(cmd: &ModifyOrder) -> Result<EncodedPayload, EncodeError>
     )
 }
 
+fn encode_batch_modify_orders(cmd: &BatchModifyOrders) -> Result<EncodedPayload, EncodeError> {
+    let payload = encode_serde(cmd)?;
+    let mut index_keys = Vec::with_capacity(cmd.modifies.len() * 2);
+    for c in &cmd.modifies {
+        index_keys.push(IndexKey::new(
+            IndexKind::ClientOrderId,
+            c.client_order_id.to_string(),
+        ));
+
+        if let Some(venue) = c.venue_order_id {
+            index_keys.push(IndexKey::new(IndexKind::VenueOrderId, venue.to_string()));
+        }
+    }
+    Ok(EncodedPayload::with_payload_type(
+        payload_type(PAYLOAD_TYPE_BATCH_MODIFY_ORDERS),
+        payload,
+        index_keys,
+    ))
+}
+
 fn encode_cancel_order(cmd: &CancelOrder) -> Result<EncodedPayload, EncodeError> {
     encode_with_order_ids(
         cmd,
@@ -1044,6 +1193,33 @@ pub fn encode_account_state(message: &AccountState) -> Result<EncodedPayload, En
     Ok(EncodedPayload::new(payload, Vec::new()))
 }
 
+#[derive(Serialize)]
+struct TimeEventPayload<'a> {
+    name: &'a str,
+    event_id: UUID4,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+}
+
+/// Encodes a fired [`TimeEvent`] into canonical bytes with no sidecar indices.
+///
+/// Time events carry a callback boundary rather than a cache-state key. The event store
+/// captures them for forensic ordering and deterministic replay inputs, while cache
+/// replay leaves clock re-arming to the later clock lifecycle event workstream.
+///
+/// # Errors
+///
+/// Returns [`EncodeError::Serialize`] when MessagePack rejects the payload.
+pub fn encode_time_event(event: &TimeEvent) -> Result<EncodedPayload, EncodeError> {
+    let payload = TimeEventPayload {
+        name: event.name.as_str(),
+        event_id: event.event_id,
+        ts_event: event.ts_event,
+        ts_init: event.ts_init,
+    };
+    Ok(EncodedPayload::new(encode_serde(&payload)?, Vec::new()))
+}
+
 /// Encodes a [`DataCommand`] envelope by dispatching on its command category.
 ///
 /// `send_data_command` hands the bus tap a [`DataCommand`] wrapper, so the tap
@@ -1134,6 +1310,8 @@ pub fn encode_data_response(response: &DataResponse) -> Result<EncodedPayload, E
         DataResponse::Instrument(resp) => encode_instrument_response(resp),
         DataResponse::Instruments(resp) => encode_instruments_response(resp),
         DataResponse::Book(resp) => encode_book_response(resp),
+        DataResponse::BookDeltas(resp) => encode_book_deltas_response(resp),
+        DataResponse::BookDepth(resp) => encode_book_depth_response(resp),
         DataResponse::Quotes(resp) => encode_quotes_response(resp),
         DataResponse::Trades(resp) => encode_trades_response(resp),
         DataResponse::FundingRates(resp) => encode_funding_rates_response(resp),
@@ -1241,6 +1419,26 @@ fn encode_quotes_response(response: &QuotesResponse) -> Result<EncodedPayload, E
     ))
 }
 
+fn encode_book_deltas_response(
+    response: &BookDeltasResponse,
+) -> Result<EncodedPayload, EncodeError> {
+    let payload = encode_serde(response)?;
+    Ok(EncodedPayload::with_payload_type(
+        payload_type(PAYLOAD_TYPE_BOOK_DELTAS_RESPONSE),
+        payload,
+        Vec::new(),
+    ))
+}
+
+fn encode_book_depth_response(response: &BookDepthResponse) -> Result<EncodedPayload, EncodeError> {
+    let payload = encode_serde(response)?;
+    Ok(EncodedPayload::with_payload_type(
+        payload_type(PAYLOAD_TYPE_BOOK_DEPTH_RESPONSE),
+        payload,
+        Vec::new(),
+    ))
+}
+
 fn encode_trades_response(response: &TradesResponse) -> Result<EncodedPayload, EncodeError> {
     let payload = encode_serde(response)?;
     Ok(EncodedPayload::with_payload_type(
@@ -1296,12 +1494,15 @@ mod tests {
     #[cfg(feature = "defi")]
     use nautilus_model::defi::Blockchain;
     use nautilus_model::{
-        data::{Bar, BarType},
+        data::{Bar, BarType, stubs::stub_depth10},
         enums::{
             AccountType, BookType, LiquiditySide, OrderSide, OrderStatus, OrderType,
             PositionAdjustmentType, PositionSide, PositionSideSpecified, TimeInForce,
         },
-        events::{PositionAdjusted, PositionChanged, PositionClosed, PositionOpened},
+        events::{
+            PositionAdjusted, PositionChanged, PositionClosed, PositionOpened,
+            order::spec::{OrderFilledSpec, OrderInitializedSpec, OrderSubmittedSpec},
+        },
         identifiers::{
             AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
             TradeId, TraderId, Venue, VenueOrderId,
@@ -1313,6 +1514,7 @@ mod tests {
         types::{AccountBalance, Currency, Money, Price, Quantity},
     };
     use rstest::rstest;
+    use serde::Deserialize;
 
     use super::*;
 
@@ -1337,41 +1539,14 @@ mod tests {
     }
 
     fn make_submit_order() -> SubmitOrder {
-        let order_init = OrderInitialized::new(
-            trader_id(),
-            strategy_id(),
-            instrument_id(),
-            client_order_id(),
-            OrderSide::Buy,
-            OrderType::Market,
-            Quantity::from("1"),
-            TimeInForce::Gtc,
-            false,
-            false,
-            false,
-            false,
-            UUID4::new(),
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let order_init = OrderInitializedSpec::builder()
+            .instrument_id(instrument_id())
+            .client_order_id(client_order_id())
+            .quantity(Quantity::from("1"))
+            .time_in_force(TimeInForce::Gtc)
+            .ts_event(UnixNanos::from(1))
+            .ts_init(UnixNanos::from(2))
+            .build();
         SubmitOrder::new(
             trader_id(),
             Some(ClientId::from("BINANCE")),
@@ -1389,27 +1564,19 @@ mod tests {
     }
 
     fn make_order_filled() -> OrderFilled {
-        OrderFilled::new(
-            trader_id(),
-            strategy_id(),
-            instrument_id(),
-            client_order_id(),
-            venue_order_id(),
-            AccountId::from("BINANCE-001"),
-            TradeId::from("T-9999"),
-            OrderSide::Buy,
-            OrderType::Market,
-            Quantity::from("1"),
-            Price::from("100.00"),
-            Currency::USDT(),
-            LiquiditySide::Taker,
-            UUID4::new(),
-            UnixNanos::from(10),
-            UnixNanos::from(11),
-            false,
-            None,
-            Some(Money::new(0.10, Currency::USDT())),
-        )
+        OrderFilledSpec::builder()
+            .instrument_id(instrument_id())
+            .client_order_id(client_order_id())
+            .venue_order_id(venue_order_id())
+            .account_id(AccountId::from("BINANCE-001"))
+            .trade_id(TradeId::from("T-9999"))
+            .last_qty(Quantity::from("1"))
+            .last_px(Price::from("100.00"))
+            .currency(Currency::USDT())
+            .ts_event(UnixNanos::from(10))
+            .ts_init(UnixNanos::from(11))
+            .commission(Money::new(0.10, Currency::USDT()))
+            .build()
     }
 
     fn make_order_status_report() -> OrderStatusReport {
@@ -1476,22 +1643,76 @@ mod tests {
     }
 
     #[rstest]
-    fn default_registry_contains_bare_and_envelope_encoders() {
+    fn default_registry_covers_published_state_affecting_surface() {
         let registry = default_registry();
+        let expected = [
+            (
+                "send_any_value(SubmitOrder) / bare SubmitOrder",
+                registry.contains::<SubmitOrder>(),
+            ),
+            (
+                "publish_order_event(OrderFilled) / bare OrderFilled",
+                registry.contains::<OrderFilled>(),
+            ),
+            (
+                "reconciliation.raw.order_status / OrderStatusReport",
+                registry.contains::<OrderStatusReport>(),
+            ),
+            (
+                "reconciliation.raw.fill / FillReport",
+                registry.contains::<FillReport>(),
+            ),
+            (
+                "reconciliation.raw.position / PositionStatusReport",
+                registry.contains::<PositionStatusReport>(),
+            ),
+            (
+                "send_trading_command / TradingCommand",
+                registry.contains::<TradingCommand>(),
+            ),
+            (
+                "publish_order_event / OrderEventAny",
+                registry.contains::<OrderEventAny>(),
+            ),
+            (
+                "send_execution_report / ExecutionReport",
+                registry.contains::<ExecutionReport>(),
+            ),
+            (
+                "publish_position_event / PositionEvent",
+                registry.contains::<PositionEvent>(),
+            ),
+            (
+                "publish_account_state and send_account_state / AccountState",
+                registry.contains::<AccountState>(),
+            ),
+            (
+                "time event handler firing / TimeEvent",
+                registry.contains::<TimeEvent>(),
+            ),
+            (
+                "send_data_command / DataCommand",
+                registry.contains::<DataCommand>(),
+            ),
+            (
+                "send_data_response / DataResponse",
+                registry.contains::<DataResponse>(),
+            ),
+        ];
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter_map(|(name, registered)| (!*registered).then_some(*name))
+            .collect();
 
-        assert_eq!(registry.len(), 12);
-        assert!(registry.contains::<SubmitOrder>());
-        assert!(registry.contains::<OrderFilled>());
-        assert!(registry.contains::<OrderStatusReport>());
-        assert!(registry.contains::<FillReport>());
-        assert!(registry.contains::<PositionStatusReport>());
-        assert!(registry.contains::<TradingCommand>());
-        assert!(registry.contains::<OrderEventAny>());
-        assert!(registry.contains::<ExecutionReport>());
-        assert!(registry.contains::<PositionEvent>());
-        assert!(registry.contains::<AccountState>());
-        assert!(registry.contains::<DataCommand>());
-        assert!(registry.contains::<DataResponse>());
+        assert!(
+            missing.is_empty(),
+            "missing default event-store encoder registrations for {missing:?}",
+        );
+        assert_eq!(
+            registry.len(),
+            expected.len(),
+            "default registry must match the audited state-affecting surface",
+        );
     }
 
     #[rstest]
@@ -1549,16 +1770,13 @@ mod tests {
     }
 
     fn make_order_submitted() -> OrderSubmitted {
-        OrderSubmitted::new(
-            trader_id(),
-            strategy_id(),
-            instrument_id(),
-            client_order_id(),
-            AccountId::from("BINANCE-001"),
-            UUID4::new(),
-            UnixNanos::from(30),
-            UnixNanos::from(31),
-        )
+        OrderSubmittedSpec::builder()
+            .instrument_id(instrument_id())
+            .client_order_id(client_order_id())
+            .account_id(AccountId::from("BINANCE-001"))
+            .ts_event(UnixNanos::from(30))
+            .ts_init(UnixNanos::from(31))
+            .build()
     }
 
     fn make_modify_order(venue: Option<VenueOrderId>) -> ModifyOrder {
@@ -1574,6 +1792,20 @@ mod tests {
             None,
             UUID4::new(),
             UnixNanos::from(6),
+            None,
+            None, // correlation_id
+        )
+    }
+
+    fn make_batch_modify_orders(modifies: Vec<ModifyOrder>) -> BatchModifyOrders {
+        BatchModifyOrders::new(
+            trader_id(),
+            Some(ClientId::from("BINANCE")),
+            strategy_id(),
+            instrument_id(),
+            modifies,
+            UUID4::new(),
+            UnixNanos::from(7),
             None,
             None, // correlation_id
         )
@@ -1891,20 +2123,27 @@ mod tests {
         PAYLOAD_TYPE_MODIFY_ORDER,
         2
     )]
+    #[case::batch_modify_orders(
+        TradingCommand::ModifyOrders(make_batch_modify_orders(vec![
+            make_modify_order(Some(venue_order_id())),
+        ])),
+        PAYLOAD_TYPE_BATCH_MODIFY_ORDERS,
+        2,
+    )]
     #[case::cancel_order(
         TradingCommand::CancelOrder(make_cancel_order()),
         PAYLOAD_TYPE_CANCEL_ORDER,
         2
     )]
+    #[case::batch_cancel_orders(
+        TradingCommand::CancelOrders(make_batch_cancel_orders(vec![make_cancel_order()])),
+        PAYLOAD_TYPE_BATCH_CANCEL_ORDERS,
+        2,
+    )]
     #[case::cancel_all_orders(
         TradingCommand::CancelAllOrders(make_cancel_all_orders()),
         PAYLOAD_TYPE_CANCEL_ALL_ORDERS,
         0
-    )]
-    #[case::batch_cancel_orders(
-        TradingCommand::BatchCancelOrders(make_batch_cancel_orders(vec![make_cancel_order()])),
-        PAYLOAD_TYPE_BATCH_CANCEL_ORDERS,
-        2,
     )]
     #[case::query_order(
         TradingCommand::QueryOrder(make_query_order(Some(venue_order_id()))),
@@ -2019,6 +2258,13 @@ mod tests {
         2
     )]
     #[case::modify_order_none(TradingCommand::ModifyOrder(make_modify_order(None)), 1)]
+    #[case::batch_modify_orders(
+        TradingCommand::ModifyOrders(make_batch_modify_orders(vec![
+            make_modify_order(Some(venue_order_id())),
+            make_modify_order(None),
+        ])),
+        3,
+    )]
     #[case::query_order_some(
         TradingCommand::QueryOrder(make_query_order(Some(venue_order_id()))),
         2
@@ -2062,12 +2308,42 @@ mod tests {
         without_venue.client_order_id = ClientOrderId::from("O-NOVENUE");
         let batch = make_batch_cancel_orders(vec![with_venue.clone(), without_venue.clone()]);
 
-        let encoded =
-            encode_trading_command(&TradingCommand::BatchCancelOrders(batch)).expect("encode");
+        let encoded = encode_trading_command(&TradingCommand::CancelOrders(batch)).expect("encode");
 
         assert_eq!(
             encoded.payload_type.expect("override").as_str(),
             PAYLOAD_TYPE_BATCH_CANCEL_ORDERS,
+        );
+        assert_eq!(encoded.index_keys.len(), 3);
+        assert_eq!(encoded.index_keys[0].kind, IndexKind::ClientOrderId);
+        assert_eq!(
+            encoded.index_keys[0].key,
+            with_venue.client_order_id.to_string(),
+        );
+        assert_eq!(encoded.index_keys[1].kind, IndexKind::VenueOrderId);
+        assert_eq!(
+            encoded.index_keys[1].key,
+            with_venue.venue_order_id.expect("set").to_string(),
+        );
+        assert_eq!(encoded.index_keys[2].kind, IndexKind::ClientOrderId);
+        assert_eq!(
+            encoded.index_keys[2].key,
+            without_venue.client_order_id.to_string(),
+        );
+    }
+
+    #[rstest]
+    fn batch_modify_orders_envelope_indexes_each_child_with_optional_venue() {
+        let with_venue = make_modify_order(Some(venue_order_id()));
+        let mut without_venue = make_modify_order(None);
+        without_venue.client_order_id = ClientOrderId::from("O-NOVENUE");
+        let batch = make_batch_modify_orders(vec![with_venue.clone(), without_venue.clone()]);
+
+        let encoded = encode_trading_command(&TradingCommand::ModifyOrders(batch)).expect("encode");
+
+        assert_eq!(
+            encoded.payload_type.expect("override").as_str(),
+            PAYLOAD_TYPE_BATCH_MODIFY_ORDERS,
         );
         assert_eq!(encoded.index_keys.len(), 3);
         assert_eq!(encoded.index_keys[0].kind, IndexKind::ClientOrderId);
@@ -2724,6 +3000,56 @@ mod tests {
         assert!(encoded.index_keys.is_empty());
     }
 
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct DecodedTimeEventPayload {
+        name: String,
+        event_id: UUID4,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
+    }
+
+    #[rstest]
+    fn time_event_payload_round_trips_through_msgpack() {
+        let event = TimeEvent::new(
+            Ustr::from("heartbeat"),
+            UUID4::new(),
+            UnixNanos::from(100),
+            UnixNanos::from(99),
+        );
+        let encoded = encode_time_event(&event).expect("encode");
+
+        let decoded: DecodedTimeEventPayload =
+            rmp_serde::from_slice(&encoded.payload).expect("decode");
+        assert_eq!(
+            decoded,
+            DecodedTimeEventPayload {
+                name: event.name.to_string(),
+                event_id: event.event_id,
+                ts_event: event.ts_event,
+                ts_init: event.ts_init,
+            },
+        );
+        assert!(encoded.index_keys.is_empty());
+    }
+
+    #[rstest]
+    fn time_event_registered_under_canonical_payload_type() {
+        let registry = default_registry();
+        let event = TimeEvent::new(
+            Ustr::from("heartbeat"),
+            UUID4::new(),
+            UnixNanos::from(100),
+            UnixNanos::from(99),
+        );
+        let (tag, encoded) = registry
+            .encode(&event)
+            .expect("encode")
+            .expect("registered");
+
+        assert_eq!(tag.as_str(), PAYLOAD_TYPE_TIME_EVENT);
+        assert!(encoded.index_keys.is_empty());
+    }
+
     #[rstest]
     fn data_command_request_envelope_stamps_request_command_payload_type() {
         // DataCommand reaches the bus tap as the wrapper TypeId. The dispatcher must
@@ -3032,6 +3358,34 @@ mod tests {
         )
     }
 
+    fn make_book_deltas_response() -> BookDeltasResponse {
+        BookDeltasResponse::new(
+            correlation_id(),
+            client_id(),
+            instrument_id(),
+            Vec::new(),
+            None,
+            None,
+            UnixNanos::from(204),
+            None,
+        )
+    }
+
+    fn make_book_depth_response() -> BookDepthResponse {
+        let mut depth = stub_depth10();
+        depth.instrument_id = instrument_id();
+        BookDepthResponse::new(
+            correlation_id(),
+            client_id(),
+            instrument_id(),
+            vec![depth],
+            None,
+            None,
+            UnixNanos::from(205),
+            None,
+        )
+    }
+
     fn make_quotes_response() -> QuotesResponse {
         QuotesResponse::new(
             correlation_id(),
@@ -3040,7 +3394,7 @@ mod tests {
             Vec::new(),
             None,
             None,
-            UnixNanos::from(204),
+            UnixNanos::from(206),
             None,
         )
     }
@@ -3053,7 +3407,7 @@ mod tests {
             Vec::new(),
             None,
             None,
-            UnixNanos::from(205),
+            UnixNanos::from(207),
             None,
         )
     }
@@ -3066,7 +3420,7 @@ mod tests {
             Vec::new(),
             None,
             None,
-            UnixNanos::from(206),
+            UnixNanos::from(208),
             None,
         )
     }
@@ -3077,7 +3431,7 @@ mod tests {
             client_id(),
             venue(),
             Vec::new(),
-            UnixNanos::from(207),
+            UnixNanos::from(209),
             None,
         )
     }
@@ -3090,7 +3444,7 @@ mod tests {
             Vec::<Bar>::new(),
             None,
             None,
-            UnixNanos::from(208),
+            UnixNanos::from(210),
             None,
         )
     }
@@ -3168,6 +3522,24 @@ mod tests {
         let decoded: BookResponseOwned = rmp_serde::from_slice(&encoded.payload).expect("decode");
         assert_eq!(decoded.correlation_id, response.correlation_id);
         assert_eq!(decoded.instrument_id, response.instrument_id);
+    }
+
+    #[rstest]
+    fn data_response_book_depth_payload_round_trips() {
+        let response = make_book_depth_response();
+        let envelope = DataResponse::BookDepth(response.clone());
+        let encoded = encode_data_response(&envelope).expect("encode");
+
+        assert_eq!(
+            encoded.payload_type.expect("override").as_str(),
+            PAYLOAD_TYPE_BOOK_DEPTH_RESPONSE,
+        );
+        assert!(encoded.index_keys.is_empty());
+
+        let decoded: BookDepthResponse = rmp_serde::from_slice(&encoded.payload).expect("decode");
+        assert_eq!(decoded.correlation_id, response.correlation_id);
+        assert_eq!(decoded.instrument_id, response.instrument_id);
+        assert_eq!(decoded.data, response.data);
     }
 
     #[rstest]
@@ -3253,6 +3625,14 @@ mod tests {
         PAYLOAD_TYPE_INSTRUMENTS_RESPONSE
     )]
     #[case::book(DataResponse::Book(make_book_response()), PAYLOAD_TYPE_BOOK_RESPONSE)]
+    #[case::book_deltas(
+        DataResponse::BookDeltas(make_book_deltas_response()),
+        PAYLOAD_TYPE_BOOK_DELTAS_RESPONSE
+    )]
+    #[case::book_depth(
+        DataResponse::BookDepth(make_book_depth_response()),
+        PAYLOAD_TYPE_BOOK_DEPTH_RESPONSE
+    )]
     #[case::quotes(
         DataResponse::Quotes(make_quotes_response()),
         PAYLOAD_TYPE_QUOTES_RESPONSE
@@ -3372,6 +3752,7 @@ mod tests {
     #[case::submit_order(trading_command_submit_order)]
     #[case::submit_order_list(trading_command_submit_order_list)]
     #[case::modify_order(trading_command_modify_order)]
+    #[case::batch_modify_orders(trading_command_batch_modify_orders)]
     #[case::cancel_order(trading_command_cancel_order)]
     #[case::cancel_all_orders(trading_command_cancel_all_orders)]
     #[case::batch_cancel_orders(trading_command_batch_cancel_orders)]
@@ -3421,6 +3802,15 @@ mod tests {
         (TradingCommand::ModifyOrder(cmd), corr, caus)
     }
 
+    fn trading_command_batch_modify_orders() -> (TradingCommand, UUID4, UUID4) {
+        let corr = UUID4::new();
+        let caus = UUID4::new();
+        let mut cmd = make_batch_modify_orders(vec![make_modify_order(Some(venue_order_id()))]);
+        cmd.correlation_id = Some(corr);
+        cmd.causation_id = Some(caus);
+        (TradingCommand::ModifyOrders(cmd), corr, caus)
+    }
+
     fn trading_command_cancel_order() -> (TradingCommand, UUID4, UUID4) {
         let corr = UUID4::new();
         let caus = UUID4::new();
@@ -3430,6 +3820,15 @@ mod tests {
         (TradingCommand::CancelOrder(cmd), corr, caus)
     }
 
+    fn trading_command_batch_cancel_orders() -> (TradingCommand, UUID4, UUID4) {
+        let corr = UUID4::new();
+        let caus = UUID4::new();
+        let mut cmd = make_batch_cancel_orders(vec![make_cancel_order()]);
+        cmd.correlation_id = Some(corr);
+        cmd.causation_id = Some(caus);
+        (TradingCommand::CancelOrders(cmd), corr, caus)
+    }
+
     fn trading_command_cancel_all_orders() -> (TradingCommand, UUID4, UUID4) {
         let corr = UUID4::new();
         let caus = UUID4::new();
@@ -3437,15 +3836,6 @@ mod tests {
         cmd.correlation_id = Some(corr);
         cmd.causation_id = Some(caus);
         (TradingCommand::CancelAllOrders(cmd), corr, caus)
-    }
-
-    fn trading_command_batch_cancel_orders() -> (TradingCommand, UUID4, UUID4) {
-        let corr = UUID4::new();
-        let caus = UUID4::new();
-        let mut cmd = make_batch_cancel_orders(vec![make_cancel_order()]);
-        cmd.correlation_id = Some(corr);
-        cmd.causation_id = Some(caus);
-        (TradingCommand::BatchCancelOrders(cmd), corr, caus)
     }
 
     fn trading_command_query_order() -> (TradingCommand, UUID4, UUID4) {
@@ -3471,6 +3861,8 @@ mod tests {
     #[case::instrument(data_response_instrument())]
     #[case::instruments(data_response_instruments())]
     #[case::book(data_response_book())]
+    #[case::book_deltas(data_response_book_deltas())]
+    #[case::book_depth(data_response_book_depth())]
     #[case::quotes(data_response_quotes())]
     #[case::trades(data_response_trades())]
     #[case::funding_rates(data_response_funding_rates())]
@@ -3514,6 +3906,18 @@ mod tests {
         let resp = make_book_response();
         let expected = resp.correlation_id;
         (DataResponse::Book(resp), expected)
+    }
+
+    fn data_response_book_deltas() -> (DataResponse, UUID4) {
+        let resp = make_book_deltas_response();
+        let expected = resp.correlation_id;
+        (DataResponse::BookDeltas(resp), expected)
+    }
+
+    fn data_response_book_depth() -> (DataResponse, UUID4) {
+        let resp = make_book_depth_response();
+        let expected = resp.correlation_id;
+        (DataResponse::BookDepth(resp), expected)
     }
 
     fn data_response_quotes() -> (DataResponse, UUID4) {

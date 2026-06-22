@@ -15,6 +15,8 @@
 
 from decimal import Decimal
 
+import pytest
+
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.nautilus_pyo3 import Currency as Pyo3Currency
 from nautilus_trader.core.nautilus_pyo3 import InstrumentId
@@ -26,9 +28,21 @@ from nautilus_trader.model.objects import Currency
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.test_kit.rust.instruments_pyo3 import TestInstrumentProviderPyo3
+from tests.unit_tests.model.instruments import as_pyo3_instrument_dict
 
 
 _BTCUSDT_FUTURE = TestInstrumentProviderPyo3.btcusdt_future_binance()
+_USD_EQUIVALENT_CODES = (
+    "BUSD",
+    "FDUSD",
+    "pUSD",
+    "TUSD",
+    "USD",
+    "USDC",
+    "USDC.e",
+    "USDP",
+    "USDT",
+)
 
 # Create an inverse future fixture (BitMEX-style inverse contract)
 _XBTUSD_FUTURE_INVERSE = nautilus_pyo3.CryptoFuture(
@@ -88,6 +102,34 @@ _ETHUSD_FUTURE_QUANTO = nautilus_pyo3.CryptoFuture(
     ts_init=0,
 )
 
+_ETHUSD_FUTURE_USD_STABLE_SETTLED = nautilus_pyo3.CryptoFuture(
+    instrument_id=InstrumentId.from_str("ETHUSD_240329_STABLE.BITMEX"),
+    raw_symbol=Symbol("ETHUSD_240329_STABLE"),
+    underlying=Pyo3Currency.from_str("ETH"),
+    quote_currency=Pyo3Currency.from_str("USD"),
+    settlement_currency=Pyo3Currency.from_str("USDT"),
+    is_inverse=False,
+    activation_ns=1640390400000000000,
+    expiration_ns=1711670400000000000,
+    price_precision=1,
+    size_precision=0,
+    price_increment=Pyo3Price.from_str("0.5"),
+    size_increment=Pyo3Quantity.from_int(1),
+    maker_fee=Decimal(0),
+    taker_fee=Decimal(0),
+    margin_init=Decimal("0.01"),
+    margin_maint=Decimal("0.005"),
+    multiplier=None,
+    lot_size=None,
+    max_quantity=Pyo3Quantity.from_int(10_000_000),
+    min_quantity=Pyo3Quantity.from_int(1),
+    max_notional=None,
+    min_price=Pyo3Price.from_str("0.5"),
+    max_price=Pyo3Price.from_str("1000000.0"),
+    ts_event=0,
+    ts_init=0,
+)
+
 
 def test_equality():
     item_1 = TestInstrumentProviderPyo3.btcusdt_future_binance()
@@ -115,6 +157,7 @@ def test_to_dict():
         "price_precision": 2,
         "size_precision": 6,
         "price_increment": "0.01",
+        "tick_scheme": None,
         "size_increment": "0.000001",
         "maker_fee": "0",
         "taker_fee": "0",
@@ -139,10 +182,39 @@ def test_pyo3_cython_conversion():
     crypto_future_pyo3_dict = crypto_future_pyo3.to_dict()
     crypto_future_cython = CryptoFuture.from_pyo3(crypto_future_pyo3)
     crypto_future_cython_dict = CryptoFuture.to_dict(crypto_future_cython)
-    del crypto_future_cython_dict["tick_scheme_name"]  # TODO: Under development
     crypto_future_pyo3_back = nautilus_pyo3.CryptoFuture.from_dict(crypto_future_cython_dict)
     assert crypto_future_pyo3 == crypto_future_pyo3_back
-    assert crypto_future_pyo3_dict == crypto_future_cython_dict
+    assert crypto_future_pyo3_dict == as_pyo3_instrument_dict(crypto_future_cython_dict)
+
+
+def test_dict_round_trip_preserves_fractional_lot_size():
+    values = CryptoFuture.to_dict(CryptoFuture.from_pyo3(_BTCUSDT_FUTURE))
+    values["lot_size"] = "0.25"
+
+    restored = CryptoFuture.from_dict(values)
+
+    assert restored.lot_size == Quantity.from_str("0.25")
+    assert CryptoFuture.to_dict(restored)["lot_size"] == "0.25"
+
+
+def test_dict_round_trip_preserves_none_lot_size():
+    values = CryptoFuture.to_dict(CryptoFuture.from_pyo3(_BTCUSDT_FUTURE))
+    values["lot_size"] = None
+
+    restored = CryptoFuture.from_dict(values)
+
+    assert restored.lot_size is None
+    assert CryptoFuture.to_dict(restored)["lot_size"] is None
+
+
+def test_dict_round_trip_defaults_missing_lot_size_to_none():
+    values = CryptoFuture.to_dict(CryptoFuture.from_pyo3(_BTCUSDT_FUTURE))
+    values.pop("lot_size")
+
+    restored = CryptoFuture.from_dict(values)
+
+    assert restored.lot_size is None
+    assert CryptoFuture.to_dict(restored)["lot_size"] is None
 
 
 def test_get_base_currency_linear():
@@ -168,6 +240,33 @@ def test_get_cost_currency_inverse():
 def test_get_cost_currency_quanto():
     quanto = CryptoFuture.from_pyo3(_ETHUSD_FUTURE_QUANTO)
     assert quanto.get_cost_currency() == Currency.from_str("BTC")
+
+
+@pytest.mark.parametrize(
+    ("quote_currency_code", "settlement_currency_code"),
+    [("USD", code) for code in _USD_EQUIVALENT_CODES]
+    + [(code, "USD") for code in _USD_EQUIVALENT_CODES if code != "USD"],
+)
+def test_usd_equivalent_settlement_is_not_quanto(
+    quote_currency_code: str,
+    settlement_currency_code: str,
+):
+    instrument = CryptoFuture.from_pyo3(
+        _crypto_future_with_quote_settlement(
+            quote_currency_code,
+            settlement_currency_code,
+        ),
+    )
+    quantity = Quantity.from_int(1000)
+    price = Price.from_str("2000.0")
+
+    notional = instrument.notional_value(quantity, price)
+
+    assert instrument.is_quanto is False
+    assert instrument.get_cost_currency() == Currency.from_str(quote_currency_code)
+    assert notional.currency == Currency.from_str(quote_currency_code)
+    expected = quantity.as_decimal() * instrument.multiplier.as_decimal() * price.as_decimal()
+    assert notional.as_decimal() == expected
 
 
 def test_notional_value_linear():
@@ -213,3 +312,48 @@ def test_notional_value_quanto():
     assert notional.currency == Currency.from_str("BTC")
     expected = quantity.as_decimal() * quanto.multiplier.as_decimal() * price.as_decimal()
     assert notional.as_decimal() == expected
+
+
+def test_notional_value_usd_stable_settlement_returns_quote():
+    instrument = CryptoFuture.from_pyo3(_ETHUSD_FUTURE_USD_STABLE_SETTLED)
+    quantity = Quantity.from_int(1000)
+    price = Price.from_str("2000.0")
+
+    notional = instrument.notional_value(quantity, price)
+
+    assert notional.currency == Currency.from_str("USD")
+    expected = quantity.as_decimal() * instrument.multiplier.as_decimal() * price.as_decimal()
+    assert notional.as_decimal() == expected
+
+
+def _crypto_future_with_quote_settlement(
+    quote_currency_code: str,
+    settlement_currency_code: str,
+) -> nautilus_pyo3.CryptoFuture:
+    return nautilus_pyo3.CryptoFuture(
+        instrument_id=InstrumentId.from_str("ETHUSD_240329_STABLE.BITMEX"),
+        raw_symbol=Symbol("ETHUSD_240329_STABLE"),
+        underlying=Pyo3Currency.from_str("ETH"),
+        quote_currency=Pyo3Currency.from_str(quote_currency_code),
+        settlement_currency=Pyo3Currency.from_str(settlement_currency_code),
+        is_inverse=False,
+        activation_ns=1640390400000000000,
+        expiration_ns=1711670400000000000,
+        price_precision=1,
+        size_precision=0,
+        price_increment=Pyo3Price.from_str("0.5"),
+        size_increment=Pyo3Quantity.from_int(1),
+        maker_fee=Decimal(0),
+        taker_fee=Decimal(0),
+        margin_init=Decimal("0.01"),
+        margin_maint=Decimal("0.005"),
+        multiplier=None,
+        lot_size=None,
+        max_quantity=Pyo3Quantity.from_int(10_000_000),
+        min_quantity=Pyo3Quantity.from_int(1),
+        max_notional=None,
+        min_price=Pyo3Price.from_str("0.5"),
+        max_price=Pyo3Price.from_str("1000000.0"),
+        ts_event=0,
+        ts_init=0,
+    )

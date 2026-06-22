@@ -75,6 +75,41 @@ contracts (e.g. `BTC-27MAR26-70000-P-USDT`) but omit it for USDC-settled
 contracts (e.g. `ETH-28FEB25-2800-C`). The adapter appends `-OPTION` to
 whatever symbol the API returns.
 
+## Instrument loading
+
+Bybit data and execution clients use the common `instrument_provider` config.
+Configure it to load instruments before strategies subscribe to market data or submit
+orders. Subscriptions do not request missing instrument definitions.
+
+```python
+from nautilus_trader.adapters.bybit import BybitProductType
+from nautilus_trader.adapters.bybit.config import BybitDataClientConfig
+from nautilus_trader.config import InstrumentProviderConfig
+
+BybitDataClientConfig(
+    instrument_provider=InstrumentProviderConfig(load_all=True),
+    product_types=(BybitProductType.SPOT,),
+)
+```
+
+Use `load_ids` when you only need a known set of instruments:
+
+```python
+from nautilus_trader.adapters.bybit import BybitProductType
+from nautilus_trader.adapters.bybit.config import BybitDataClientConfig
+from nautilus_trader.config import InstrumentProviderConfig
+from nautilus_trader.model.identifiers import InstrumentId
+
+BybitDataClientConfig(
+    instrument_provider=InstrumentProviderConfig(
+        load_ids=frozenset([InstrumentId.from_str("BTCUSDT-SPOT.BYBIT")]),
+    ),
+    product_types=(BybitProductType.SPOT,),
+)
+```
+
+The configured `product_types` must include the product suffix in each instrument ID.
+
 ## Environments
 
 Bybit provides three trading environments. Configure the appropriate
@@ -124,7 +159,8 @@ Environment variables: `BYBIT_DEMO_API_KEY`, `BYBIT_DEMO_API_SECRET`
 **Demo environment limitations:**
 
 - The WebSocket Trade API is **not supported** for demo trading. NautilusTrader automatically uses the HTTP REST API for order operations in demo mode.
-- Some advanced order features available via WebSocket (trigger orders, post-only with is_quote_quantity) are not available in demo mode.
+- Native TP/SL and option params (`order_iv`, `mmp`) on new orders work in demo via the HTTP create-order endpoint.
+- The custom TP/SL trigger prices `tp_trigger_price` and `sl_trigger_price` are not supported in demo (orders setting them are denied); the create-order endpoint cannot carry them.
 - Demo private streams use `wss://stream-demo.bybit.com`, but public market data uses Bybit's mainnet public stream `wss://stream.bybit.com`.
 
 :::
@@ -357,8 +393,10 @@ Individual orders can be customized using the `params` dictionary when submittin
 | `bbo_level`        | `str` or `int`         | Linear/inverse BBO book level: `"1"` through `"5"`.                     |
 
 :::note
-Native TP/SL params are not supported in demo mode. The `is_leverage` param applies to
-Spot products only. See [Bybit's isLeverage documentation](https://bybit-exchange.github.io/docs/v5/order/create-order#request-parameters).
+On demo, native TP/SL params route through the HTTP create-order endpoint, with one exception:
+the custom trigger prices `tp_trigger_price` and `sl_trigger_price` are not supported because that
+endpoint cannot carry them, and orders that set either are denied. The `is_leverage` param applies
+to Spot products only. See [Bybit's isLeverage documentation](https://bybit-exchange.github.io/docs/v5/order/create-order#request-parameters).
 :::
 
 When `bbo_side_type` and `bbo_level` are set, Nautilus sends Bybit's
@@ -608,12 +646,13 @@ In addition to the standard order parameters, option orders accept:
 | `order_iv` | `str` or `float` | Place or amend the order by implied volatility instead of price. |
 | `mmp`      | `bool`           | Enable Market Maker Protection for the order.            |
 
-These parameters are passed through `params` on `SubmitOrder` and flow through
-the WebSocket trade channel on mainnet. They are not supported in demo mode.
+These parameters are passed through `params` on `SubmitOrder`. On mainnet they flow through the
+WebSocket trade channel; on demo they route through the HTTP create-order endpoint. Amending an
+existing order by `order_iv` is not supported in demo mode.
 
 #### Options trading limitations
 
-- IV-based option orders and WS-trade-only features are not supported in demo mode.
+- Amending an order by implied volatility (`order_iv`) and other WS-trade-only features are not supported in demo mode.
 - Leverage is not configurable. Option buyers pay premium; sellers post margin.
 - Position mode is one-way only. Hedge mode is not supported.
 - Conditional order types (`STOP_MARKET`, `STOP_LIMIT`, `MARKET_IF_TOUCHED`,
@@ -766,49 +805,53 @@ The product types for each client must be specified in the configurations.
 
 ### Data client configuration options
 
-| Option                           | Default | Description |
-|----------------------------------|---------|-------------|
-| `api_key`                        | `None`  | API key; loaded from the matching environment variable when omitted. |
-| `api_secret`                     | `None`  | API secret; loaded from the matching environment variable when omitted. |
-| `product_types`                  | `None`  | Sequence of `BybitProductType` values to enable; loads all products when `None`. |
-| `environment`                    | `None`  | Bybit environment enum. Use `BybitEnvironment.MAINNET`, `BybitEnvironment.DEMO`, or `BybitEnvironment.TESTNET`. |
-| `base_url_http`                  | `None`  | Override for the REST base URL. |
-| `proxy_url`                      | `None`  | Optional proxy URL for HTTP and WebSocket transports. |
-| `update_instruments_interval_mins` | `60`  | Interval (minutes) between instrument catalogue refreshes. |
-| `recv_window_ms`                 | `5,000` | Receive window (milliseconds) for signed REST requests. |
-| `bars_timestamp_on_close`        | `True`  | Timestamp bars on the close (`True`) or open (`False`) of the interval. |
-| `max_retries`                    | `None`  | Maximum retry attempts for REST/WebSocket recovery. |
-| `retry_delay_initial_ms`         | `None`  | Initial delay (milliseconds) between retries. |
-| `retry_delay_max_ms`             | `None`  | Maximum delay (milliseconds) between retries. |
+| Option                             | Default   | Description |
+|------------------------------------|-----------|-------------|
+| `api_key`                          | `None`    | API key; loaded from the matching environment variable when omitted. |
+| `api_secret`                       | `None`    | API secret; loaded from the matching environment variable when omitted. |
+| `product_types`                    | `None`    | Sequence of `BybitProductType` values to enable; loads all products when `None`. |
+| `instrument_provider`              | default   | Instrument loading config. Use `load_all=True` or `load_ids` before subscribing. |
+| `environment`                      | `None`    | Bybit environment enum. Use `BybitEnvironment.MAINNET`, `BybitEnvironment.DEMO`, or `BybitEnvironment.TESTNET`. |
+| `base_url_http`                    | `None`    | Override for the REST base URL. |
+| `proxy_url`                        | `None`    | Optional proxy URL for HTTP and WebSocket transports. |
+| `update_instruments_interval_mins` | `60`      | Interval (minutes) between instrument catalogue refreshes. |
+| `recv_window_ms`                   | `5,000`   | Receive window (milliseconds) for signed REST requests. |
+| `bars_timestamp_on_close`          | `True`    | Timestamp bars on the close (`True`) or open (`False`) of the interval. |
+| `max_retries`                      | `None`    | Maximum retry attempts for REST/WebSocket recovery. |
+| `retry_delay_initial_ms`           | `None`    | Initial delay (milliseconds) between retries. |
+| `retry_delay_max_ms`               | `None`    | Maximum delay (milliseconds) between retries. |
+| `transport_backend`                | `Sockudo` | WebSocket transport backend. |
 
 ### Execution client configuration options
 
-| Option                           | Default | Description |
-|----------------------------------|---------|-------------|
-| `api_key`                        | `None`  | API key; loaded from the matching environment variable when omitted. |
-| `api_secret`                     | `None`  | API secret; loaded from the matching environment variable when omitted. |
-| `product_types`                  | `None`  | Sequence of `BybitProductType` values to enable (Spot cannot be mixed with derivatives for execution). |
-| `environment`                    | `None`  | Bybit environment enum. Use `BybitEnvironment.MAINNET`, `BybitEnvironment.DEMO`, or `BybitEnvironment.TESTNET`. |
-| `base_url_http`                  | `None`  | Override for the REST base URL. |
-| `base_url_ws_private`            | `None`  | Override for the private WebSocket base URL. |
-| `base_url_ws_trade`              | `None`  | Override for the trade WebSocket base URL. |
-| `proxy_url`                      | `None`  | Optional proxy URL for HTTP and WebSocket transports. |
-| `use_gtd`                        | `False` | Remap GTD orders to GTC when `True` (Bybit lacks native GTD support). |
-| `use_ws_execution_fast`          | `False` | Subscribe to the low‑latency execution stream. |
-| `use_http_batch_api`             | `False` | Use Bybit's HTTP batch trading API (deprecated). |
-| `use_spot_position_reports`      | `False` | Report Spot wallet balances as positions when `True`. |
-| `auto_repay_spot_borrows`        | `True`  | Automatically repay Spot margin borrows after BUY orders fully fill (Spot only). |
-| `repay_queue_interval_secs`      | `1.0`   | Interval (seconds) between processing repayment queues for spot borrows. |
-| `ignore_uncached_instrument_executions`    | `False` | Ignore execution messages for instruments not yet cached. |
-| `max_retries`                    | `None`  | Maximum retry attempts for order submission/cancel/modify calls. |
-| `retry_delay_initial_ms`         | `None`  | Initial delay (milliseconds) between retries. |
-| `retry_delay_max_ms`             | `None`  | Maximum delay (milliseconds) between retries. |
-| `recv_window_ms`                 | `5,000` | Receive window (milliseconds) for signed REST requests. |
-| `ws_trade_timeout_secs`          | `5.0`   | Timeout (seconds) waiting for trade WebSocket acknowledgements. |
-| `ws_auth_timeout_secs`           | `5.0`   | Timeout (seconds) waiting for auth WebSocket acknowledgements. |
-| `futures_leverages`              | `None`  | Mapping of `BybitSymbol` to leverage settings. |
-| `position_mode`                  | `None`  | Mapping of `BybitSymbol` to position mode. See [Hedge mode](#hedge-mode-bothsides). |
-| `margin_mode`                    | `None`  | Margin mode setting for the account. |
+| Option                                  | Default   | Description |
+|-----------------------------------------|-----------|-------------|
+| `api_key`                               | `None`    | API key; loaded from the matching environment variable when omitted. |
+| `api_secret`                            | `None`    | API secret; loaded from the matching environment variable when omitted. |
+| `product_types`                         | `None`    | Sequence of `BybitProductType` values to enable (Spot cannot be mixed with derivatives for execution). |
+| `instrument_provider`                   | default   | Instrument loading config. Use `load_all=True` or `load_ids` before submitting orders. |
+| `environment`                           | `None`    | Bybit environment enum. Use `BybitEnvironment.MAINNET`, `BybitEnvironment.DEMO`, or `BybitEnvironment.TESTNET`. |
+| `base_url_http`                         | `None`    | Override for the REST base URL. |
+| `base_url_ws_private`                   | `None`    | Override for the private WebSocket base URL. |
+| `base_url_ws_trade`                     | `None`    | Override for the trade WebSocket base URL. |
+| `proxy_url`                             | `None`    | Optional proxy URL for HTTP and WebSocket transports. |
+| `use_gtd`                               | `False`   | Remap GTD orders to GTC when `True` (Bybit lacks native GTD support). |
+| `use_ws_execution_fast`                 | `False`   | Subscribe to the low‑latency execution stream. |
+| `use_http_batch_api`                    | `False`   | Use Bybit's HTTP batch trading API (deprecated). |
+| `use_spot_position_reports`             | `False`   | Report Spot wallet balances as positions when `True`. |
+| `auto_repay_spot_borrows`               | `True`    | Automatically repay Spot margin borrows after BUY orders fully fill (Spot only). |
+| `repay_queue_interval_secs`             | `1.0`     | Interval (seconds) between processing repayment queues for spot borrows. |
+| `ignore_uncached_instrument_executions` | `False`   | Ignore execution messages for instruments not yet cached. |
+| `max_retries`                           | `None`    | Maximum retry attempts for order submission/cancel/modify calls. |
+| `retry_delay_initial_ms`                | `None`    | Initial delay (milliseconds) between retries. |
+| `retry_delay_max_ms`                    | `None`    | Maximum delay (milliseconds) between retries. |
+| `recv_window_ms`                        | `5,000`   | Receive window (milliseconds) for signed REST requests. |
+| `ws_trade_timeout_secs`                 | `5.0`     | Timeout (seconds) waiting for trade WebSocket acknowledgements. |
+| `ws_auth_timeout_secs`                  | `5.0`     | Timeout (seconds) waiting for auth WebSocket acknowledgements. |
+| `futures_leverages`                     | `None`    | Mapping of `BybitSymbol` to leverage settings. |
+| `position_mode`                         | `None`    | Mapping of `BybitSymbol` to position mode. See [Hedge mode](#hedge-mode-bothsides). |
+| `margin_mode`                           | `None`    | Margin mode setting for the account. |
+| `transport_backend`                     | `Sockudo` | WebSocket transport backend. |
 
 The most common use case is to configure a live `TradingNode` to include Bybit
 data and execution clients. To achieve this, add a `BYBIT` section to your client

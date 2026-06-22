@@ -19,8 +19,8 @@ use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use arrow::{
     array::{
-        BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, StringArray, StringBuilder,
-        UInt8Array, UInt64Array,
+        Array, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, StringArray,
+        StringBuilder, UInt8Array, UInt64Array,
     },
     datatypes::{DataType, Field, Schema},
     error::ArrowError,
@@ -39,7 +39,8 @@ use serde_json::Value;
 
 use crate::arrow::{
     ArrowSchemaProvider, EncodeToRecordBatch, EncodingError, KEY_INSTRUMENT_ID,
-    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column,
+    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column, extract_column_by_name_or_index,
+    extract_optional_string_column_by_name, optional_ustr_value,
 };
 
 impl ArrowSchemaProvider for CryptoFuture {
@@ -58,6 +59,7 @@ impl ArrowSchemaProvider for CryptoFuture {
             Field::new("price_increment", DataType::Utf8, false),
             Field::new("size_increment", DataType::Utf8, false),
             Field::new("multiplier", DataType::Utf8, false),
+            Field::new("lot_size", DataType::Utf8, true),
             Field::new("max_quantity", DataType::Utf8, true), // nullable
             Field::new("min_quantity", DataType::Utf8, true), // nullable
             Field::new("max_notional", DataType::Utf8, true), // nullable
@@ -68,6 +70,7 @@ impl ArrowSchemaProvider for CryptoFuture {
             Field::new("margin_maint", DataType::Utf8, false),
             Field::new("maker_fee", DataType::Utf8, false),
             Field::new("taker_fee", DataType::Utf8, false),
+            Field::new("tick_scheme", DataType::Utf8, true),
             Field::new("info", DataType::Binary, true), // nullable
             Field::new("ts_event", DataType::UInt64, false),
             Field::new("ts_init", DataType::UInt64, false),
@@ -102,6 +105,7 @@ impl EncodeToRecordBatch for CryptoFuture {
         let mut price_increment_builder = StringBuilder::new();
         let mut size_increment_builder = StringBuilder::new();
         let mut multiplier_builder = StringBuilder::new();
+        let mut lot_size_builder = StringBuilder::new();
         let mut max_quantity_builder = StringBuilder::new();
         let mut min_quantity_builder = StringBuilder::new();
         let mut max_notional_builder = StringBuilder::new();
@@ -112,6 +116,7 @@ impl EncodeToRecordBatch for CryptoFuture {
         let mut margin_maint_builder = StringBuilder::new();
         let mut maker_fee_builder = StringBuilder::new();
         let mut taker_fee_builder = StringBuilder::new();
+        let mut tick_scheme_builder = StringBuilder::new();
         let mut info_builder = BinaryBuilder::new();
         let mut ts_event_builder = UInt64Array::builder(data.len());
         let mut ts_init_builder = UInt64Array::builder(data.len());
@@ -130,6 +135,7 @@ impl EncodeToRecordBatch for CryptoFuture {
             price_increment_builder.append_value(cf.price_increment.to_string());
             size_increment_builder.append_value(cf.size_increment.to_string());
             multiplier_builder.append_value(cf.multiplier.to_string());
+            lot_size_builder.append_value(cf.lot_size.to_string());
 
             if let Some(max_qty) = cf.max_quantity {
                 max_quantity_builder.append_value(max_qty.to_string());
@@ -172,6 +178,12 @@ impl EncodeToRecordBatch for CryptoFuture {
             maker_fee_builder.append_value(cf.maker_fee.to_string());
             taker_fee_builder.append_value(cf.taker_fee.to_string());
 
+            if let Some(tick_scheme) = cf.tick_scheme {
+                tick_scheme_builder.append_value(tick_scheme);
+            } else {
+                tick_scheme_builder.append_null();
+            }
+
             // Encode info dict as JSON bytes (matching Python's msgspec.json.encode)
             if let Some(ref info) = cf.info {
                 match serde_json::to_vec(info) {
@@ -211,6 +223,7 @@ impl EncodeToRecordBatch for CryptoFuture {
                 Arc::new(price_increment_builder.finish()),
                 Arc::new(size_increment_builder.finish()),
                 Arc::new(multiplier_builder.finish()),
+                Arc::new(lot_size_builder.finish()),
                 Arc::new(max_quantity_builder.finish()),
                 Arc::new(min_quantity_builder.finish()),
                 Arc::new(max_notional_builder.finish()),
@@ -221,6 +234,7 @@ impl EncodeToRecordBatch for CryptoFuture {
                 Arc::new(margin_maint_builder.finish()),
                 Arc::new(maker_fee_builder.finish()),
                 Arc::new(taker_fee_builder.finish()),
+                Arc::new(tick_scheme_builder.finish()),
                 Arc::new(info_builder.finish()),
                 Arc::new(ts_event_builder.finish()),
                 Arc::new(ts_init_builder.finish()),
@@ -278,35 +292,58 @@ pub fn decode_crypto_future_batch(
     let size_increment_values =
         extract_column::<StringArray>(cols, "size_increment", 11, DataType::Utf8)?;
     let multiplier_values = extract_column::<StringArray>(cols, "multiplier", 12, DataType::Utf8)?;
+    let lot_size_values = record_batch
+        .schema()
+        .index_of("lot_size")
+        .ok()
+        .map(|index| extract_column::<StringArray>(cols, "lot_size", index, DataType::Utf8))
+        .transpose()?;
+    let lot_size_offset = usize::from(lot_size_values.is_some());
     let max_quantity_values = cols
-        .get(13)
-        .ok_or_else(|| EncodingError::MissingColumn("max_quantity", 13))?;
+        .get(13 + lot_size_offset)
+        .ok_or_else(|| EncodingError::MissingColumn("max_quantity", 13 + lot_size_offset))?;
     let min_quantity_values = cols
-        .get(14)
-        .ok_or_else(|| EncodingError::MissingColumn("min_quantity", 14))?;
+        .get(14 + lot_size_offset)
+        .ok_or_else(|| EncodingError::MissingColumn("min_quantity", 14 + lot_size_offset))?;
     let max_notional_values = cols
-        .get(15)
-        .ok_or_else(|| EncodingError::MissingColumn("max_notional", 15))?;
+        .get(15 + lot_size_offset)
+        .ok_or_else(|| EncodingError::MissingColumn("max_notional", 15 + lot_size_offset))?;
     let min_notional_values = cols
-        .get(16)
-        .ok_or_else(|| EncodingError::MissingColumn("min_notional", 16))?;
+        .get(16 + lot_size_offset)
+        .ok_or_else(|| EncodingError::MissingColumn("min_notional", 16 + lot_size_offset))?;
     let max_price_values = cols
-        .get(17)
-        .ok_or_else(|| EncodingError::MissingColumn("max_price", 17))?;
+        .get(17 + lot_size_offset)
+        .ok_or_else(|| EncodingError::MissingColumn("max_price", 17 + lot_size_offset))?;
     let min_price_values = cols
-        .get(18)
-        .ok_or_else(|| EncodingError::MissingColumn("min_price", 18))?;
+        .get(18 + lot_size_offset)
+        .ok_or_else(|| EncodingError::MissingColumn("min_price", 18 + lot_size_offset))?;
     let margin_init_values =
-        extract_column::<StringArray>(cols, "margin_init", 19, DataType::Utf8)?;
+        extract_column::<StringArray>(cols, "margin_init", 19 + lot_size_offset, DataType::Utf8)?;
     let margin_maint_values =
-        extract_column::<StringArray>(cols, "margin_maint", 20, DataType::Utf8)?;
-    let maker_fee_values = extract_column::<StringArray>(cols, "maker_fee", 21, DataType::Utf8)?;
-    let taker_fee_values = extract_column::<StringArray>(cols, "taker_fee", 22, DataType::Utf8)?;
-    let info_values = cols
-        .get(23)
-        .ok_or_else(|| EncodingError::MissingColumn("info", 23))?;
-    let ts_event_values = extract_column::<UInt64Array>(cols, "ts_event", 24, DataType::UInt64)?;
-    let ts_init_values = extract_column::<UInt64Array>(cols, "ts_init", 25, DataType::UInt64)?;
+        extract_column::<StringArray>(cols, "margin_maint", 20 + lot_size_offset, DataType::Utf8)?;
+    let maker_fee_values =
+        extract_column::<StringArray>(cols, "maker_fee", 21 + lot_size_offset, DataType::Utf8)?;
+    let taker_fee_values =
+        extract_column::<StringArray>(cols, "taker_fee", 22 + lot_size_offset, DataType::Utf8)?;
+    let tick_scheme_values = extract_optional_string_column_by_name(record_batch, "tick_scheme")?;
+    let info_values = extract_column_by_name_or_index::<BinaryArray>(
+        record_batch,
+        "info",
+        23 + lot_size_offset,
+        DataType::Binary,
+    )?;
+    let ts_event_values = extract_column_by_name_or_index::<UInt64Array>(
+        record_batch,
+        "ts_event",
+        24 + lot_size_offset,
+        DataType::UInt64,
+    )?;
+    let ts_init_values = extract_column_by_name_or_index::<UInt64Array>(
+        record_batch,
+        "ts_init",
+        25 + lot_size_offset,
+        DataType::UInt64,
+    )?;
 
     let mut result = Vec::with_capacity(num_rows);
 
@@ -344,6 +381,18 @@ pub fn decode_crypto_future_batch(
             .map_err(|e| EncodingError::ParseError("size_increment", format!("row {i}: {e}")))?;
         let multiplier = Quantity::from_str(multiplier_values.value(i))
             .map_err(|e| EncodingError::ParseError("multiplier", format!("row {i}: {e}")))?;
+        let lot_size =
+            if let Some(values) = lot_size_values {
+                if values.is_null(i) {
+                    None
+                } else {
+                    Some(Quantity::from_str(values.value(i)).map_err(|e| {
+                        EncodingError::ParseError("lot_size", format!("row {i}: {e}"))
+                    })?)
+                }
+            } else {
+                None
+            };
 
         let max_quantity =
             if max_quantity_values.is_null(i) {
@@ -474,7 +523,9 @@ pub fn decode_crypto_future_batch(
         let ts_event = nautilus_core::UnixNanos::from(ts_event_values.value(i));
         let ts_init = nautilus_core::UnixNanos::from(ts_init_values.value(i));
 
-        let crypto_future = CryptoFuture::new(
+        let tick_scheme = optional_ustr_value(tick_scheme_values, i);
+
+        let crypto_future = CryptoFuture::new_checked(
             id,
             raw_symbol,
             underlying,
@@ -488,7 +539,7 @@ pub fn decode_crypto_future_batch(
             price_increment,
             size_increment,
             Some(multiplier),
-            None, // lot_size - not in Python schema, will default to 1
+            lot_size,
             max_quantity,
             min_quantity,
             max_notional,
@@ -499,10 +550,12 @@ pub fn decode_crypto_future_batch(
             Some(margin_maint),
             Some(maker_fee),
             Some(taker_fee),
+            tick_scheme,
             info,
             ts_event,
             ts_init,
-        );
+        )
+        .map_err(|e| super::instrument_validation_error::<CryptoFuture>(i, e))?;
 
         result.push(crypto_future);
     }

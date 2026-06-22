@@ -2,7 +2,7 @@
 
 use chrono::{NaiveDate, Utc};
 use serde_json::Value;
-use sqlx::{Row, types::Json};
+use sqlx::{AssertSqlSafe, Row, types::Json};
 
 use crate::{
     options_runtime::OptionsEngineConfig, performance::CandidateLedgerSummary,
@@ -63,7 +63,7 @@ pub async fn append_candidate_ledger_record(
         storage.schema()
     );
 
-    sqlx::query(&query)
+    sqlx::query(AssertSqlSafe(query))
         .bind(account_id)
         .bind(date.to_string())
         .bind(Utc::now().to_rfc3339())
@@ -87,7 +87,7 @@ pub async fn read_candidate_ledger_records(
         "SELECT payload FROM \"{}\".candidate_ledger WHERE account_id = $1 AND ($2::date IS NULL OR trade_date >= $2::date) AND ($3::date IS NULL OR trade_date <= $3::date) ORDER BY ts_utc ASC",
         storage.schema()
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(AssertSqlSafe(query))
         .bind(account_id)
         .bind(filters.since.map(|d| d.to_string()))
         .bind(filters.until.map(|d| d.to_string()))

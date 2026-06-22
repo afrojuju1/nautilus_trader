@@ -108,7 +108,7 @@ pub struct OrderRequestState {
     /// Cancellation signal that aborts pending timeout tasks on shutdown so
     /// the runtime can drop without waiting for in-flight timers.
     cancellation_token: CancellationToken,
-    /// Clock used to stamp `ts_event` on synthesized timeout-rejection events.
+    /// Clock used to stamp `ts_event` on synthesized timeout events.
     /// Sharing the caller's clock keeps test ts_event values consistent with
     /// the ts_sent_ns the same caller stamped at submit time.
     clock: &'static AtomicTime,
@@ -371,7 +371,9 @@ impl OrderRequestState {
                 self.emit_order_modify_rejected(pending, &response, ts_event_ns);
             }
             PendingOperation::Cancel => {
-                self.emit_order_cancel_rejected(pending, &response, ts_event_ns);
+                log::warn!(
+                    "Kraken WS cancel request timed out req_id={req_id}; awaiting reconciliation"
+                );
             }
             PendingOperation::BatchAdd => {
                 for cl_ord_id in &pending.client_order_ids {
@@ -1399,6 +1401,27 @@ mod tests {
     }
 
     #[rstest]
+    fn test_cancel_timeout_emits_no_order_cancel_rejected() {
+        let mut harness = make_harness(60_000);
+        let cl_ord_id = ClientOrderId::from(CLIENT_ORDER_ID);
+        register_default_identity(&harness.dispatch_state, cl_ord_id);
+
+        let pending = PendingRequest {
+            operation: PendingOperation::Cancel,
+            client_order_ids: vec![cl_ord_id],
+            venue_order_ids: vec![Some(VenueOrderId::from(VENUE_ORDER_ID))],
+            ts_sent_ns: 0,
+            new_quantity: None,
+            new_price: None,
+            new_trigger_price: None,
+        };
+
+        harness.state.emit_timeout_rejection(23, &pending, 7_000);
+
+        assert!(harness.event_rx.try_recv().is_err());
+    }
+
+    #[rstest]
     fn test_handle_response_late_after_timeout_is_noop() {
         let mut harness = make_harness(60_000);
         let cl_ord_id = ClientOrderId::from(CLIENT_ORDER_ID);
@@ -1676,6 +1699,32 @@ mod tests {
         out
     }
 
+    // The compensating cancel is the last command the timeout task emits, so
+    // awaiting it means the original request and the rejection event are
+    // already enqueued; avoids racing a fixed sleep against the global runtime.
+    async fn recv_send_payloads_until_cancel(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<SpotHandlerCommand>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+
+        loop {
+            let cmd = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("timed out awaiting compensating cancel")
+                .expect("command channel closed");
+
+            let SpotHandlerCommand::SendOrderRequest { payload, .. } = cmd else {
+                continue;
+            };
+            let is_cancel = payload.contains("\"cancel_order\"");
+            out.push(payload);
+
+            if is_cancel {
+                return out;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_submit_timeout_sends_compensating_cancel() {
         let mut harness = make_harness(50);
@@ -1705,9 +1754,7 @@ mod tests {
             .submit(params, identity, 1)
             .expect("submit ok");
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        let payloads = drain_send_payloads(&mut harness.cmd_rx);
+        let payloads = recv_send_payloads_until_cancel(&mut harness.cmd_rx).await;
         assert!(
             payloads.iter().any(|p| p.contains("\"add_order\"")),
             "original add_order missing: {payloads:?}",
@@ -1760,11 +1807,10 @@ mod tests {
             .submit(params, identity, 1)
             .expect("submit ok");
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let payloads = recv_send_payloads_until_cancel(&mut harness.cmd_rx).await;
 
         let _ = harness.event_rx.try_recv().expect("rejection event");
 
-        let payloads = drain_send_payloads(&mut harness.cmd_rx);
         let cancel = payloads
             .iter()
             .find(|p| p.contains("\"cancel_order\""))
@@ -1830,9 +1876,10 @@ mod tests {
             .submit(params, identity, 1)
             .expect("submit ok");
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        let event = harness.event_rx.try_recv().expect("rejection event");
+        let event = tokio::time::timeout(Duration::from_secs(5), harness.event_rx.recv())
+            .await
+            .expect("timed out awaiting rejection event")
+            .expect("event channel closed");
         match event {
             OrderEventAny::Rejected(e) => {
                 let ts_event_ns = e.ts_event.as_u64();
@@ -1874,16 +1921,17 @@ mod tests {
             .submit(params, identity, 1)
             .expect("submit ok");
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let event = tokio::time::timeout(Duration::from_secs(5), harness.event_rx.recv())
+            .await
+            .expect("timed out awaiting rejection event")
+            .expect("event channel closed");
+        assert!(matches!(event, OrderEventAny::Rejected(_)));
 
         let payloads = drain_send_payloads(&mut harness.cmd_rx);
         assert!(
             payloads.iter().all(|p| !p.contains("\"cancel_order\"")),
             "no compensating cancel expected without token, was {payloads:?}",
         );
-
-        let event = harness.event_rx.try_recv().expect("rejection event");
-        assert!(matches!(event, OrderEventAny::Rejected(_)));
     }
 
     #[tokio::test]
@@ -1914,9 +1962,7 @@ mod tests {
             .batch_add(params, identity, 1)
             .expect("batch ok");
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        let payloads = drain_send_payloads(&mut harness.cmd_rx);
+        let payloads = recv_send_payloads_until_cancel(&mut harness.cmd_rx).await;
         let cancel = payloads
             .iter()
             .find(|p| p.contains("\"cancel_order\""))
@@ -1954,7 +2000,17 @@ mod tests {
         assert_eq!(harness.state.pending_len(), 1);
 
         harness.cancellation_token.cancel();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Cancellation clears the pending entry from a task on the global runtime,
+        // so poll the condition rather than racing a fixed sleep.
+        nautilus_common::testing::wait_until_async(
+            || {
+                let state = Arc::clone(&harness.state);
+                async move { state.pending_len() == 0 }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
 
         assert_eq!(
             harness.state.pending_len(),

@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use nautilus_core::{UnixNanos, python::to_pytype_err};
 use nautilus_model::{
     data::{
-        Bar, Data, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate, OrderBookDelta,
-        OrderBookDepth10, QuoteTick, TradeTick, close::InstrumentClose,
+        Bar, Data, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate, OptionGreeks,
+        OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick, close::InstrumentClose,
     },
     python::instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
 };
@@ -28,19 +28,29 @@ use pyo3::{exceptions::PyIOError, prelude::*, types::PyList};
 use crate::backend::catalog::ParquetDataCatalog;
 
 /// Converts a single `Data` variant into a Python object for returning from catalog methods.
+#[allow(
+    clippy::match_wildcard_for_single_variants,
+    reason = "Data::Defi appears through nautilus-model feature unification"
+)]
 fn data_to_pyobject(py: Python<'_>, item: Data) -> PyResult<Py<PyAny>> {
     match item {
-        Data::Quote(quote) => Py::new(py, quote).map(|x| x.into_any()),
-        Data::Trade(trade) => Py::new(py, trade).map(|x| x.into_any()),
-        Data::Bar(bar) => Py::new(py, bar).map(|x| x.into_any()),
-        Data::Delta(delta) => Py::new(py, delta).map(|x| x.into_any()),
-        Data::Deltas(deltas) => Py::new(py, (*deltas).clone()).map(|x| x.into_any()),
-        Data::Depth10(depth) => Py::new(py, *depth).map(|x| x.into_any()),
-        Data::IndexPriceUpdate(price) => Py::new(py, price).map(|x| x.into_any()),
-        Data::MarkPriceUpdate(price) => Py::new(py, price).map(|x| x.into_any()),
-        Data::InstrumentStatus(status) => Py::new(py, status).map(|x| x.into_any()),
-        Data::InstrumentClose(close) => Py::new(py, close).map(|x| x.into_any()),
-        Data::Custom(custom) => Py::new(py, custom).map(|x| x.into_any()),
+        Data::Quote(quote) => Py::new(py, quote).map(pyo3::Py::into_any),
+        Data::Trade(trade) => Py::new(py, trade).map(pyo3::Py::into_any),
+        Data::Bar(bar) => Py::new(py, bar).map(pyo3::Py::into_any),
+        Data::Delta(delta) => Py::new(py, delta).map(pyo3::Py::into_any),
+        Data::Deltas(deltas) => Py::new(py, (*deltas).clone()).map(pyo3::Py::into_any),
+        Data::Depth10(depth) => Py::new(py, *depth).map(pyo3::Py::into_any),
+        Data::IndexPriceUpdate(price) => Py::new(py, price).map(pyo3::Py::into_any),
+        Data::MarkPriceUpdate(price) => Py::new(py, price).map(pyo3::Py::into_any),
+        Data::FundingRateUpdate(funding) => Py::new(py, funding).map(pyo3::Py::into_any),
+        Data::InstrumentStatus(status) => Py::new(py, status).map(pyo3::Py::into_any),
+        Data::OptionGreeks(greeks) => Py::new(py, greeks).map(pyo3::Py::into_any),
+        Data::InstrumentClose(close) => Py::new(py, close).map(pyo3::Py::into_any),
+        Data::Custom(custom) => Py::new(py, custom).map(pyo3::Py::into_any),
+        #[cfg(feature = "defi")]
+        Data::Defi(_) => Err(to_pytype_err("Unsupported Data::Defi variant")),
+        #[allow(unreachable_patterns)]
+        _ => Err(to_pytype_err("Unsupported Data variant")),
     }
 }
 
@@ -66,6 +76,10 @@ impl PyParquetDataCatalog {
     /// - `batch_size`: Optional batch size for processing (default: 5000)
     /// - `compression`: Optional compression type (0=UNCOMPRESSED, 1=SNAPPY, 2=GZIP, 3=LZO, 4=BROTLI, 5=LZ4, 6=ZSTD)
     /// - `max_row_group_size`: Optional maximum row group size (default: 5000)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying [`ParquetDataCatalog`] cannot be created.
     #[new]
     #[pyo3(signature = (base_path, storage_options=None, batch_size=None, compression=None, max_row_group_size=None))]
     #[must_use]
@@ -78,7 +92,6 @@ impl PyParquetDataCatalog {
     ) -> Self {
         let compression = compression.map(|c| match c {
             0 => parquet::basic::Compression::UNCOMPRESSED,
-            1 => parquet::basic::Compression::SNAPPY,
             // For GZIP, LZO, BROTLI, LZ4, ZSTD we need to use the default level
             // since we can't pass the level parameter through PyO3
             2 => {
@@ -135,12 +148,17 @@ impl PyParquetDataCatalog {
         end: Option<u64>,
         skip_disjoint_check: bool,
     ) -> PyResult<String> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write quote ticks: {e}")))
     }
@@ -164,12 +182,17 @@ impl PyParquetDataCatalog {
         end: Option<u64>,
         skip_disjoint_check: bool,
     ) -> PyResult<String> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write trade ticks: {e}")))
     }
@@ -193,12 +216,17 @@ impl PyParquetDataCatalog {
         end: Option<u64>,
         skip_disjoint_check: bool,
     ) -> PyResult<String> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write order book deltas: {e}")))
     }
@@ -222,12 +250,17 @@ impl PyParquetDataCatalog {
         end: Option<u64>,
         skip_disjoint_check: bool,
     ) -> PyResult<String> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write bars: {e}")))
     }
@@ -251,12 +284,17 @@ impl PyParquetDataCatalog {
         end: Option<u64>,
         skip_disjoint_check: bool,
     ) -> PyResult<String> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write order book depths: {e}")))
     }
@@ -280,12 +318,17 @@ impl PyParquetDataCatalog {
         end: Option<u64>,
         skip_disjoint_check: bool,
     ) -> PyResult<String> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write mark price updates: {e}")))
     }
@@ -309,14 +352,53 @@ impl PyParquetDataCatalog {
         end: Option<u64>,
         skip_disjoint_check: bool,
     ) -> PyResult<String> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write index price updates: {e}")))
+    }
+
+    /// Write option greeks data to Parquet files.
+    ///
+    /// # Parameters
+    ///
+    /// - `data`: Vector of option greeks to write
+    /// - `start`: Optional start timestamp override (nanoseconds since Unix epoch)
+    /// - `end`: Optional end timestamp override (nanoseconds since Unix epoch)
+    ///
+    /// # Returns
+    ///
+    /// Returns the path of the created file as a string.
+    #[pyo3(signature = (data, start=None, end=None, skip_disjoint_check=false))]
+    pub fn write_option_greeks(
+        &self,
+        data: Vec<OptionGreeks>,
+        start: Option<u64>,
+        end: Option<u64>,
+        skip_disjoint_check: bool,
+    ) -> PyResult<String> {
+        let start_nanos = start.map(UnixNanos::from);
+        let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
+
+        self.inner
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
+            .map(|path| path.to_string_lossy().to_string())
+            .map_err(|e| PyIOError::new_err(format!("Failed to write option greeks: {e}")))
     }
 
     /// Write instruments to Parquet files in the catalog.
@@ -327,7 +409,7 @@ impl PyParquetDataCatalog {
     ///
     /// # Parameters
     ///
-    /// - `data`: A Python list of instrument objects (e.g. CurrencyPair, Equity).
+    /// - `data`: A Python list of instrument objects (e.g. `CurrencyPair`, Equity).
     ///
     /// # Returns
     ///
@@ -363,7 +445,7 @@ impl PyParquetDataCatalog {
     ///
     /// # Returns
     ///
-    /// Returns a list of instrument objects (e.g. CurrencyPair, Equity).
+    /// Returns a list of instrument objects (e.g. `CurrencyPair`, Equity).
     #[pyo3(signature = (instrument_ids=None, start=None, end=None))]
     #[expect(clippy::needless_pass_by_value)]
     pub fn instruments(
@@ -405,7 +487,6 @@ impl PyParquetDataCatalog {
         start: u64,
         end: u64,
     ) -> PyResult<()> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = UnixNanos::from(start);
         let end_nanos = UnixNanos::from(end);
 
@@ -430,7 +511,6 @@ impl PyParquetDataCatalog {
         ensure_contiguous_files: Option<bool>,
         deduplicate: Option<bool>,
     ) -> PyResult<()> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -460,7 +540,6 @@ impl PyParquetDataCatalog {
         ensure_contiguous_files: Option<bool>,
         deduplicate: Option<bool>,
     ) -> PyResult<()> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -498,7 +577,6 @@ impl PyParquetDataCatalog {
         end: Option<u64>,
         ensure_contiguous_files: Option<bool>,
     ) -> PyResult<()> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -540,7 +618,6 @@ impl PyParquetDataCatalog {
         end: Option<u64>,
         ensure_contiguous_files: Option<bool>,
     ) -> PyResult<()> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -604,7 +681,6 @@ impl PyParquetDataCatalog {
     /// - Empty directories are not automatically removed after deletion
     #[pyo3(signature = (start=None, end=None))]
     pub fn delete_catalog_range(&mut self, start: Option<u64>, end: Option<u64>) -> PyResult<()> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -643,7 +719,6 @@ impl PyParquetDataCatalog {
         start: Option<u64>,
         end: Option<u64>,
     ) -> PyResult<()> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -715,8 +790,8 @@ impl PyParquetDataCatalog {
     /// # Parameters
     ///
     /// - `data_cls`: The data class name to query
-    /// - `identifiers`: Optional list of identifiers to filter by. Can be instrument_id strings
-    ///   (e.g., "EUR/USD.SIM") or bar_type strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
+    /// - `identifiers`: Optional list of identifiers to filter by. Can be `instrument_id` strings
+    ///   (e.g., "EUR/USD.SIM") or `bar_type` strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
     ///   For bars, partial matching is supported.
     /// - `start`: Optional start timestamp (nanoseconds since Unix epoch)
     /// - `end`: Optional end timestamp (nanoseconds since Unix epoch)
@@ -732,7 +807,6 @@ impl PyParquetDataCatalog {
         start: Option<u64>,
         end: Option<u64>,
     ) -> PyResult<Vec<String>> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -835,7 +909,11 @@ impl PyParquetDataCatalog {
 
     /// Query Parquet files for data matching the given criteria.
     #[pyo3(signature = (data_type, identifiers=None, start=None, end=None, where_clause=None, files=None, optimize_file_loading=true))]
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "PyO3 query binding mirrors the Python catalog API"
+    )]
     pub fn query(
         &mut self,
         py: Python<'_>,
@@ -963,6 +1041,20 @@ impl PyParquetDataCatalog {
                     .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
                 statuses.into_iter().map(Data::from).collect()
             }
+            "option_greeks" => {
+                let greeks = self
+                    .inner
+                    .query_typed_data::<OptionGreeks>(
+                        identifiers,
+                        start_nanos,
+                        end_nanos,
+                        where_clause,
+                        files,
+                        optimize_file_loading,
+                    )
+                    .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
+                greeks.into_iter().map(Data::from).collect()
+            }
             "instrument_closes" => {
                 let closes = self
                     .inner
@@ -1003,8 +1095,8 @@ impl PyParquetDataCatalog {
     ///
     /// # Parameters
     ///
-    /// - `identifiers`: Optional list of identifiers to filter by. Can be instrument_id strings
-    ///   (e.g., "EUR/USD.SIM") or bar_type strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
+    /// - `identifiers`: Optional list of identifiers to filter by. Can be `instrument_id` strings
+    ///   (e.g., "EUR/USD.SIM") or `bar_type` strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
     ///   For bars, partial matching is supported.
     /// - `start`: Optional start timestamp (nanoseconds since Unix epoch)
     /// - `end`: Optional end timestamp (nanoseconds since Unix epoch)
@@ -1040,8 +1132,8 @@ impl PyParquetDataCatalog {
     ///
     /// # Parameters
     ///
-    /// - `identifiers`: Optional list of identifiers to filter by. Can be instrument_id strings
-    ///   (e.g., "EUR/USD.SIM") or bar_type strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
+    /// - `identifiers`: Optional list of identifiers to filter by. Can be `instrument_id` strings
+    ///   (e.g., "EUR/USD.SIM") or `bar_type` strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
     ///   For bars, partial matching is supported.
     /// - `start`: Optional start timestamp (nanoseconds since Unix epoch)
     /// - `end`: Optional end timestamp (nanoseconds since Unix epoch)
@@ -1077,8 +1169,8 @@ impl PyParquetDataCatalog {
     ///
     /// # Parameters
     ///
-    /// - `identifiers`: Optional list of identifiers to filter by. Can be instrument_id strings
-    ///   (e.g., "EUR/USD.SIM") or bar_type strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
+    /// - `identifiers`: Optional list of identifiers to filter by. Can be `instrument_id` strings
+    ///   (e.g., "EUR/USD.SIM") or `bar_type` strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
     ///   For bars, partial matching is supported.
     /// - `start`: Optional start timestamp (nanoseconds since Unix epoch)
     /// - `end`: Optional end timestamp (nanoseconds since Unix epoch)
@@ -1114,8 +1206,8 @@ impl PyParquetDataCatalog {
     ///
     /// # Parameters
     ///
-    /// - `identifiers`: Optional list of identifiers to filter by. Can be instrument_id strings
-    ///   (e.g., "EUR/USD.SIM") or bar_type strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
+    /// - `identifiers`: Optional list of identifiers to filter by. Can be `instrument_id` strings
+    ///   (e.g., "EUR/USD.SIM") or `bar_type` strings (e.g., "EUR/USD.SIM-1-MINUTE-LAST-EXTERNAL").
     ///   For bars, partial matching is supported (e.g., "EUR/USD.SIM" will match all bar types for that instrument).
     /// - `start`: Optional start timestamp (nanoseconds since Unix epoch)
     /// - `end`: Optional end timestamp (nanoseconds since Unix epoch)
@@ -1248,6 +1340,30 @@ impl PyParquetDataCatalog {
                 where_clause,
                 None,
                 true, // optimize_file_loading=true for directory-based registration (default)
+            )
+            .map_err(|e| PyIOError::new_err(format!("Failed to query data: {e}")))
+    }
+
+    /// Query option greeks data from Parquet files.
+    #[pyo3(signature = (instrument_ids=None, start=None, end=None, where_clause=None))]
+    pub fn query_option_greeks(
+        &mut self,
+        instrument_ids: Option<Vec<String>>,
+        start: Option<u64>,
+        end: Option<u64>,
+        where_clause: Option<&str>,
+    ) -> PyResult<Vec<OptionGreeks>> {
+        let start_nanos = start.map(UnixNanos::from);
+        let end_nanos = end.map(UnixNanos::from);
+
+        self.inner
+            .query_typed_data::<OptionGreeks>(
+                instrument_ids,
+                start_nanos,
+                end_nanos,
+                where_clause,
+                None,
+                true,
             )
             .map_err(|e| PyIOError::new_err(format!("Failed to query data: {e}")))
     }

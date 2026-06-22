@@ -7,6 +7,7 @@ from nautilus_trader import model
 
 __all__ = [
     "SandboxExecutionClientConfig",
+    "SandboxExecutionClientFactory",
 ]
 
 @typing.final
@@ -31,6 +32,7 @@ class SandboxExecutionClientConfig:
         use_position_ids: bool = True,
         use_random_ids: bool = False,
         use_reduce_only: bool = True,
+        fee_model: typing.Any | None = None,
     ) -> None: ...
     @property
     def trader_id(self) -> model.TraderId: ...
@@ -51,6 +53,8 @@ class SandboxExecutionClientConfig:
     @property
     def book_type(self) -> model.BookType: ...
     @property
+    def fee_model(self) -> typing.Any | None: ...
+    @property
     def frozen_account(self) -> bool: ...
     @property
     def bar_execution(self) -> bool: ...
@@ -68,3 +72,8 @@ class SandboxExecutionClientConfig:
     def use_random_ids(self) -> bool: ...
     @property
     def use_reduce_only(self) -> bool: ...
+
+@typing.final
+class SandboxExecutionClientFactory:
+    def __init__(self) -> None: ...
+    def name(self) -> str: ...

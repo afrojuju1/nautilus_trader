@@ -82,10 +82,11 @@ use crate::{
         models::OKXInstrument,
         parse::{
             okx_status_to_market_action, parse_account_state, parse_instrument_any,
-            parse_millisecond_timestamp, parse_position_status_report, parse_price, parse_quantity,
+            parse_instrument_id, parse_millisecond_timestamp, parse_position_status_report,
+            parse_price, parse_quantity,
         },
     },
-    http::models::{OKXAccount, OKXPosition},
+    http::models::{OKXAccount, OKXPosition, OKXSpreadOrder},
     websocket::{
         OKXWebSocketClient,
         enums::{OKXWsChannel, OKXWsOperation},
@@ -97,7 +98,7 @@ use crate::{
         parse::{
             extract_fees_from_cached_instrument, parse_algo_order_msg, parse_book_msg_vec,
             parse_index_price_msg_vec, parse_option_summary_greeks, parse_order_msg_vec,
-            parse_ws_message_data,
+            parse_spread_order_msg, parse_ws_message_data,
         },
     },
 };
@@ -534,6 +535,17 @@ impl OKXWebSocketClient {
                                 &callback,
                             );
                         }
+                        OKXWsMessage::SpreadOrders(order_msgs) => {
+                            handle_spread_orders(
+                                &order_msgs,
+                                account_id,
+                                &instruments_by_symbol,
+                                &mut filled_qty_cache,
+                                clock,
+                                &call_soon,
+                                &callback,
+                            );
+                        }
                         OKXWsMessage::AlgoOrders(algo_msgs) => {
                             handle_algo_orders(
                                 algo_msgs,
@@ -633,7 +645,7 @@ impl OKXWebSocketClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Err(e) = client.close().await {
-                log::error!("Error on close: {e}");
+                log::warn!("Error on close: {e}");
             }
             Ok(())
         })
@@ -1155,6 +1167,30 @@ impl OKXWebSocketClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Err(e) = client.unsubscribe_orders(instrument_type).await {
                 log::error!("Failed to unsubscribe from orders '{instrument_type}': {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "subscribe_spread_orders")]
+    fn py_subscribe_spread_orders<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.subscribe_spread_orders().await {
+                log::error!("Failed to subscribe to spread orders: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_spread_orders")]
+    fn py_unsubscribe_spread_orders<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.unsubscribe_spread_orders().await {
+                log::error!("Failed to unsubscribe from spread orders: {e}");
             }
             Ok(())
         })
@@ -1876,7 +1912,7 @@ fn handle_instruments(
         let status_action = okx_status_to_market_action(okx_inst.state);
         let is_live = matches!(okx_inst.state, OKXInstrumentStatus::Live);
 
-        if let Ok(Some(inst_any)) = parse_instrument_any(
+        match parse_instrument_any(
             &okx_inst,
             margin_init,
             margin_maint,
@@ -1884,23 +1920,60 @@ fn handle_instruments(
             taker_fee,
             ts_init,
         ) {
-            let instrument_id = inst_any.id();
-            instruments_by_symbol.insert(inst_any.symbol().inner(), inst_any.clone());
-            call_python_with_data(call_soon, callback, |py| {
-                instrument_any_to_pyobject(py, inst_any)
-            });
-            let status = InstrumentStatus::new(
-                instrument_id,
-                status_action,
-                ts_init,
-                ts_init,
-                None,
-                None,
-                Some(is_live),
-                None,
-                None,
-            );
-            call_python_with_data(call_soon, callback, |py| status.into_py_any(py));
+            Ok(Some(inst_any)) => {
+                let instrument_id = inst_any.id();
+                instruments_by_symbol.insert(inst_any.symbol().inner(), inst_any.clone());
+                call_python_with_data(call_soon, callback, |py| {
+                    instrument_any_to_pyobject(py, inst_any)
+                });
+                let status = InstrumentStatus::new(
+                    instrument_id,
+                    status_action,
+                    ts_init,
+                    ts_init,
+                    None,
+                    None,
+                    Some(is_live),
+                    None,
+                    None,
+                );
+                call_python_with_data(call_soon, callback, |py| status.into_py_any(py));
+            }
+            Ok(None) => {
+                let instrument_id = instruments_by_symbol
+                    .get(&inst_key)
+                    .map_or_else(|| parse_instrument_id(inst_key), |i| i.id());
+                let status = InstrumentStatus::new(
+                    instrument_id,
+                    status_action,
+                    ts_init,
+                    ts_init,
+                    None,
+                    None,
+                    Some(is_live),
+                    None,
+                    None,
+                );
+                call_python_with_data(call_soon, callback, |py| status.into_py_any(py));
+            }
+            Err(e) => {
+                log::warn!("Failed to parse instrument {}: {e}", okx_inst.inst_id);
+                let instrument_id = instruments_by_symbol
+                    .get(&inst_key)
+                    .map_or_else(|| parse_instrument_id(inst_key), |i| i.id());
+                let status = InstrumentStatus::new(
+                    instrument_id,
+                    status_action,
+                    ts_init,
+                    ts_init,
+                    None,
+                    None,
+                    Some(is_live),
+                    None,
+                    None,
+                );
+                call_python_with_data(call_soon, callback, |py| status.into_py_any(py));
+            }
         }
     }
 }
@@ -1933,6 +2006,43 @@ fn handle_orders(
             log::error!("Failed to parse order messages: {e}");
         }
     }
+}
+
+fn handle_spread_orders(
+    order_msgs: &[OKXSpreadOrder],
+    account_id: AccountId,
+    instruments_by_symbol: &AHashMap<Ustr, InstrumentAny>,
+    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
+    clock: &AtomicTime,
+    call_soon: &Py<PyAny>,
+    callback: &Py<PyAny>,
+) {
+    let ts_init = clock.get_time_ns();
+    let mut reports = Vec::with_capacity(order_msgs.len());
+
+    for msg in order_msgs {
+        match parse_spread_order_msg(
+            msg,
+            account_id,
+            instruments_by_symbol,
+            filled_qty_cache,
+            ts_init,
+        ) {
+            Ok(report) => {
+                if let Some(instrument) = instruments_by_symbol.get(&msg.sprd_id)
+                    && !msg.acc_fill_sz.is_empty()
+                    && msg.acc_fill_sz != "0"
+                    && let Ok(qty) = parse_quantity(&msg.acc_fill_sz, instrument.size_precision())
+                {
+                    filled_qty_cache.insert(msg.ord_id, qty);
+                }
+                reports.push(report);
+            }
+            Err(e) => log::error!("Failed to parse spread order message: {e}"),
+        }
+    }
+
+    dispatch_execution_reports_to_python(reports, call_soon, callback);
 }
 
 fn handle_algo_orders(
@@ -2299,6 +2409,9 @@ fn dispatch_nautilus_ws_msg_to_python(
             if let Some(status) = status {
                 call_python_with_data(call_soon, callback, |py| status.into_py_any(py));
             }
+        }
+        NautilusWsMessage::InstrumentStatus(status) => {
+            call_python_with_data(call_soon, callback, |py| status.into_py_any(py));
         }
         NautilusWsMessage::Raw(data) => {
             dispatch_json_value_to_python(&data, call_soon, callback);

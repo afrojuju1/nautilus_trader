@@ -22,6 +22,7 @@
 
 use std::{
     any::Any,
+    cell::RefCell,
     rc::Rc,
     sync::{Arc, Mutex},
     time::Duration,
@@ -30,7 +31,10 @@ use std::{
 use bytes::Bytes;
 use indexmap::IndexMap;
 use nautilus_common::{
-    messages::execution::{SubmitOrder, TradingCommand},
+    messages::{
+        data::{DataResponse, QuotesResponse},
+        execution::{SubmitOrder, TradingCommand},
+    },
     msgbus::{
         self, BusTap, Endpoint, MStr, MessageBus, MessagingSwitchboard, ShareableMessageHandler,
     },
@@ -44,7 +48,10 @@ use nautilus_event_store::{
 };
 use nautilus_model::{
     enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSideSpecified, TimeInForce},
-    events::{OrderFilled, OrderInitialized},
+    events::{
+        OrderEventAny, OrderFilled,
+        order::spec::{OrderFilledSpec, OrderInitializedSpec},
+    },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
         TraderId, VenueOrderId,
@@ -167,41 +174,14 @@ fn drain(writer: &Arc<EventStoreWriter>, target_hwm: u64) {
 
 /// Makes a [`SubmitOrder`] command suitable for a representative-end-to-end capture.
 fn make_submit_order(client_order_id: ClientOrderId) -> SubmitOrder {
-    let order_init = OrderInitialized::new(
-        TraderId::from("TRADER-001"),
-        StrategyId::from("S-001"),
-        InstrumentId::from("ETHUSDT-PERP.BINANCE"),
-        client_order_id,
-        OrderSide::Buy,
-        OrderType::Market,
-        Quantity::from("1"),
-        TimeInForce::Gtc,
-        false,
-        false,
-        false,
-        false,
-        UUID4::new(),
-        UnixNanos::from(1),
-        UnixNanos::from(2),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
+    let order_init = OrderInitializedSpec::builder()
+        .instrument_id(InstrumentId::from("ETHUSDT-PERP.BINANCE"))
+        .client_order_id(client_order_id)
+        .quantity(Quantity::from("1"))
+        .time_in_force(TimeInForce::Gtc)
+        .ts_event(UnixNanos::from(1))
+        .ts_init(UnixNanos::from(2))
+        .build();
     SubmitOrder::new(
         TraderId::from("TRADER-001"),
         Some(ClientId::from("BINANCE")),
@@ -219,27 +199,19 @@ fn make_submit_order(client_order_id: ClientOrderId) -> SubmitOrder {
 }
 
 fn make_order_filled(client_order_id: ClientOrderId, venue_order_id: VenueOrderId) -> OrderFilled {
-    OrderFilled::new(
-        TraderId::from("TRADER-001"),
-        StrategyId::from("S-001"),
-        InstrumentId::from("ETHUSDT-PERP.BINANCE"),
-        client_order_id,
-        venue_order_id,
-        AccountId::from("BINANCE-001"),
-        TradeId::from("T-9999"),
-        OrderSide::Buy,
-        OrderType::Market,
-        Quantity::from("1"),
-        Price::from("100.00"),
-        Currency::USDT(),
-        LiquiditySide::Taker,
-        UUID4::new(),
-        UnixNanos::from(10),
-        UnixNanos::from(11),
-        false,
-        None,
-        Some(Money::new(0.10, Currency::USDT())),
-    )
+    OrderFilledSpec::builder()
+        .instrument_id(InstrumentId::from("ETHUSDT-PERP.BINANCE"))
+        .client_order_id(client_order_id)
+        .venue_order_id(venue_order_id)
+        .account_id(AccountId::from("BINANCE-001"))
+        .trade_id(TradeId::from("T-9999"))
+        .last_qty(Quantity::from("1"))
+        .last_px(Price::from("100.00"))
+        .currency(Currency::USDT())
+        .ts_event(UnixNanos::from(10))
+        .ts_init(UnixNanos::from(11))
+        .commission(Money::new(0.10, Currency::USDT()))
+        .build()
 }
 
 fn make_order_status_report(
@@ -369,6 +341,70 @@ fn end_to_end_capture_writes_command_event_and_report() {
     let manifest = backend.manifest().expect("manifest");
     assert_eq!(manifest.status, RunStatus::Ended);
     assert_eq!(manifest.high_watermark, 4);
+}
+
+#[rstest]
+fn capture_dedups_order_event_across_dispatch_hops() {
+    // The execution engine sends the same OrderEventAny to the portfolio endpoint and
+    // publishes it on the strategy topic; both boundaries reach the tap. The log must
+    // record the event once or tail replay aborts on OrderError::DuplicateFill.
+    let (writer, backend_arc) = writer_with_open_run("run-capture-dedup", noop_halt());
+    let registry = Arc::new(default_registry());
+    let adapter = BusCaptureAdapter::new(Arc::clone(&writer), registry, noop_halt());
+
+    let fill = make_order_filled(
+        ClientOrderId::from("O-20260510-000002"),
+        VenueOrderId::from("V-12346"),
+    );
+    let event = OrderEventAny::Filled(fill);
+
+    let first = adapter
+        .capture::<OrderEventAny>(
+            Topic::from("Portfolio.update_order"),
+            &event,
+            Headers::empty(),
+            UnixNanos::from(11),
+        )
+        .expect("first capture");
+    let second = adapter
+        .capture::<OrderEventAny>(
+            Topic::from("events.order.S-001"),
+            &event,
+            Headers::empty(),
+            UnixNanos::from(11),
+        )
+        .expect("second capture");
+
+    assert!(first, "first dispatch hop must capture");
+    assert!(!second, "second dispatch hop must dedup on event identity");
+
+    // A distinct event still captures.
+    let other_fill = make_order_filled(
+        ClientOrderId::from("O-20260510-000003"),
+        VenueOrderId::from("V-12347"),
+    );
+    let captured_other = adapter
+        .capture::<OrderEventAny>(
+            Topic::from("events.order.S-001"),
+            &OrderEventAny::Filled(other_fill),
+            Headers::empty(),
+            UnixNanos::from(12),
+        )
+        .expect("third capture");
+    assert!(captured_other, "distinct event identity must capture");
+
+    drain(&writer, 2);
+
+    let backend = backend_arc.lock().expect("backend");
+    assert_eq!(backend.high_watermark().expect("hwm"), 2);
+
+    let entry = backend.scan_seq(1).expect("scan").expect("present");
+    assert_eq!(entry.payload_type.as_str(), "OrderFilled");
+    assert_eq!(
+        entry.topic.as_ref(),
+        "Portfolio.update_order",
+        "first dispatch hop wins the captured topic"
+    );
 }
 
 #[rstest]
@@ -512,8 +548,8 @@ fn raw_report_topics_capture_via_publish_any() {
     // The execution engine publishes raw venue reports on the
     // `reconciliation.raw.*` topics before reconciliation mutates local state.
     // Each topic must produce a captured entry whose payload decodes back to the
-    // original report so forensic replay can re-run reconciliation against the
-    // captured raw inputs.
+    // original report. Replay treats these raw inputs as forensic records; it
+    // applies the synthesized events captured later rather than running reconciliation.
     let bus = MessageBus::new(TraderId::from("TRADER-001"), UUID4::new(), None, None);
     let _bus_rc = bus.register_message_bus();
 
@@ -669,6 +705,17 @@ impl BusTap for HeadersAwareAdapterTap {
             .adapter
             .capture_any(topic, message, headers, UnixNanos::from(0));
     }
+
+    fn on_response(&self, _correlation_id: &UUID4, message: &dyn Any) {
+        let headers = self
+            .registry
+            .headers_for_any(message)
+            .unwrap_or_else(Headers::empty);
+        let topic = MessagingSwitchboard::data_response_topic();
+        let _ = self
+            .adapter
+            .capture_any(topic, message, headers, UnixNanos::from(0));
+    }
 }
 
 #[rstest]
@@ -707,6 +754,73 @@ fn tap_path_writes_headers_from_command_fields() {
     let entry = backend.scan_seq(1).expect("scan").expect("present");
     assert_eq!(entry.headers.correlation_id, Some(correlation));
     assert_eq!(entry.headers.causation_id, Some(caused));
+
+    drop(backend);
+    msgbus::clear_bus_tap();
+    drop(adapter);
+    let writer = Arc::try_unwrap(writer).expect("sole writer reference");
+    let _ = writer.close(run_ended_draft()).expect("close writer");
+}
+
+#[rstest]
+fn tap_path_writes_headers_from_data_response_correlation_handler() {
+    // Data responses dispatch through the bus correlation-response path rather than a
+    // publish topic or endpoint. The tap still captures the DataResponse envelope and
+    // forwards its correlation_id into event-store headers.
+    let bus = MessageBus::new(TraderId::from("TRADER-001"), UUID4::new(), None, None);
+    let _bus_rc = bus.register_message_bus();
+
+    let (writer, backend_arc) = writer_with_open_run("run-tap-data-response-headers", noop_halt());
+    let registry = Arc::new(default_registry());
+    let adapter = Arc::new(BusCaptureAdapter::new(
+        Arc::clone(&writer),
+        Arc::clone(&registry),
+        noop_halt(),
+    ));
+    let tap: Rc<dyn BusTap> = Rc::new(HeadersAwareAdapterTap {
+        adapter: Arc::clone(&adapter),
+        registry: Arc::clone(&registry),
+    });
+    msgbus::set_bus_tap(tap);
+
+    let correlation = UUID4::new();
+    let handler_called = Rc::new(RefCell::new(false));
+    let handler_called_clone = Rc::clone(&handler_called);
+    msgbus::register_response_handler(
+        &correlation,
+        ShareableMessageHandler::from_typed(move |_resp: &QuotesResponse| {
+            *handler_called_clone.borrow_mut() = true;
+        }),
+    );
+
+    let response = QuotesResponse::new(
+        correlation,
+        ClientId::from("BINANCE"),
+        InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+        Vec::new(),
+        None,
+        None,
+        UnixNanos::from(30),
+        None,
+    );
+    msgbus::send_response(&correlation, &DataResponse::Quotes(response.clone()));
+
+    drain(&writer, 1);
+
+    assert!(*handler_called.borrow());
+    let backend = backend_arc.lock().expect("backend");
+    let entry = backend.scan_seq(1).expect("scan").expect("present");
+    assert_eq!(entry.headers.correlation_id, Some(correlation));
+    assert_eq!(entry.headers.causation_id, None);
+    assert_eq!(entry.payload_type.as_str(), "QuotesResponse");
+    assert_eq!(entry.topic, MessagingSwitchboard::data_response_topic());
+
+    let decoded: QuotesResponse =
+        rmp_serde::from_slice(&entry.payload).expect("decode QuotesResponse");
+    assert_eq!(decoded.correlation_id, response.correlation_id);
+    assert_eq!(decoded.client_id, response.client_id);
+    assert_eq!(decoded.instrument_id, response.instrument_id);
+    assert!(decoded.data.is_empty());
 
     drop(backend);
     msgbus::clear_bus_tap();

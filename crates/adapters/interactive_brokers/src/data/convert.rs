@@ -17,7 +17,7 @@
 
 use chrono::{DateTime, Utc};
 use ibapi::market_data::historical::{
-    BarSize as HistoricalBarSize, Duration as IBDuration, ToDuration,
+    BarSize as HistoricalBarSize, BarTimestamp, Duration as IBDuration, ToDuration,
     WhatToShow as HistoricalWhatToShow,
 };
 use nautilus_core::UnixNanos;
@@ -49,7 +49,7 @@ pub fn bar_type_to_ib_bar_size(bar_type: &BarType) -> anyhow::Result<HistoricalB
         (BarAggregation::Minute, 2) => HistoricalBarSize::Min2,
         (BarAggregation::Minute, 3) => HistoricalBarSize::Min3,
         (BarAggregation::Minute, 5) => HistoricalBarSize::Min5,
-        (BarAggregation::Minute, 10) => HistoricalBarSize::Min15, // IB doesn't have 10-min, closest is 15
+        (BarAggregation::Minute, 10) => HistoricalBarSize::Min10,
         (BarAggregation::Minute, 15) => HistoricalBarSize::Min15,
         (BarAggregation::Minute, 20) => HistoricalBarSize::Min20,
         (BarAggregation::Minute, 30) => HistoricalBarSize::Min30,
@@ -85,6 +85,32 @@ pub fn price_type_to_ib_what_to_show(price_type: PriceType) -> HistoricalWhatToS
     }
 }
 
+#[must_use]
+pub fn apply_price_magnifier(price: f64, price_magnifier: i32) -> f64 {
+    if price_magnifier > 0 {
+        price / f64::from(price_magnifier)
+    } else {
+        price
+    }
+}
+
+#[must_use]
+pub fn apply_bar_price_magnifier(
+    ib_bar: &ibapi::market_data::historical::Bar,
+    price_magnifier: i32,
+) -> ibapi::market_data::historical::Bar {
+    ibapi::market_data::historical::Bar {
+        date: ib_bar.date,
+        open: apply_price_magnifier(ib_bar.open, price_magnifier),
+        high: apply_price_magnifier(ib_bar.high, price_magnifier),
+        low: apply_price_magnifier(ib_bar.low, price_magnifier),
+        close: apply_price_magnifier(ib_bar.close, price_magnifier),
+        volume: ib_bar.volume,
+        wap: apply_price_magnifier(ib_bar.wap, price_magnifier),
+        count: ib_bar.count,
+    }
+}
+
 /// Implement bar price validation logic.
 /// Matches Python's `_validate_bar_prices` behavior.
 fn _validate_bar_prices(open: &mut f64, high: &mut f64, low: &mut f64, close: &f64) {
@@ -114,7 +140,7 @@ pub fn ib_bar_to_nautilus_bar(
     size_precision: u8,
 ) -> anyhow::Result<Bar> {
     // Convert IB timestamp to UnixNanos
-    let ts_event = ib_timestamp_to_unix_nanos(&ib_bar.date);
+    let ts_event = ib_bar_timestamp_to_unix_nanos(&ib_bar.date);
     let ts_init = ts_event; // Use same timestamp for init
 
     // Validate and correct prices
@@ -147,6 +173,15 @@ pub fn ib_bar_to_nautilus_bar(
         ts_event,
         ts_init,
     ))
+}
+
+/// Convert IB historical bar timestamp to UnixNanos.
+#[must_use]
+pub fn ib_bar_timestamp_to_unix_nanos(dt: &BarTimestamp) -> UnixNanos {
+    match dt {
+        BarTimestamp::Date(date) => ib_timestamp_to_unix_nanos(&date.midnight().assume_utc()),
+        BarTimestamp::DateTime(dt) => ib_timestamp_to_unix_nanos(dt),
+    }
 }
 
 /// Convert IB timestamp (OffsetDateTime) to UnixNanos.
@@ -370,7 +405,7 @@ mod tests {
     #[rstest]
     fn test_ib_bar_to_nautilus_bar() {
         let ib_bar = ibapi::market_data::historical::Bar {
-            date: datetime!(2024-01-01 10:00:00 UTC),
+            date: datetime!(2024-01-01 10:00:00 UTC).into(),
             open: 150.0,
             high: 151.0,
             low: 149.0,
@@ -399,7 +434,7 @@ mod tests {
     #[rstest]
     fn test_ib_bar_to_nautilus_bar_negative_volume() {
         let ib_bar = ibapi::market_data::historical::Bar {
-            date: datetime!(2024-01-01 10:00:00 UTC),
+            date: datetime!(2024-01-01 10:00:00 UTC).into(),
             open: 150.0,
             high: 151.0,
             low: 149.0,

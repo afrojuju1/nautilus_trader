@@ -69,7 +69,8 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
         When set, this address is used for balance queries, position reports,
         and WebSocket subscriptions instead of the address derived from the private key.
         Signing still uses the agent wallet's private key.
-        If ``None`` then will source the `HYPERLIQUID_ACCOUNT_ADDRESS` environment variable.
+        If ``None`` and no explicit `vault_address` is set, then will source the
+        `HYPERLIQUID_ACCOUNT_ADDRESS` environment variable.
     product_types : tuple[HyperliquidProductType, ...], optional
         The Hyperliquid product types to load for the client instrument provider.
         If ``None`` then the instrument provider defaults are used.
@@ -96,6 +97,9 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
         dynamic constraint that depends on the price magnitude and cannot be fully encoded
         in the static instrument tick size. When enabled, prices are automatically rounded
         to comply with this rule. Disable if you want full control over price formatting.
+    include_builder_attribution : bool, default True
+        If True, eligible mainnet orders include the zero-fee Nautilus builder code.
+        Set False to opt out of builder attribution.
 
     Warnings
     --------
@@ -116,3 +120,4 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
     http_timeout_secs: PositiveInt = 10
     ws_post_timeout_secs: PositiveInt = 10
     normalize_prices: bool = True
+    include_builder_attribution: bool = True

@@ -385,7 +385,7 @@ class MessageBusConfig(NautilusConfig, frozen=True):
     ----------
     database : DatabaseConfig, optional
         The configuration for the message bus backing database.
-    encoding : str, {'msgpack', 'json'}, default 'msgpack'
+    encoding : str, {'json', 'msgpack'}, default 'json'
         The encoding for database operations, controls the type of serializer used.
     timestamps_as_iso8601, default False
         If timestamps should be persisted as ISO 8601 strings.
@@ -424,7 +424,7 @@ class MessageBusConfig(NautilusConfig, frozen=True):
     """
 
     database: DatabaseConfig | None = None
-    encoding: str = "msgpack"
+    encoding: str = "json"
     timestamps_as_iso8601: bool = False
     buffer_interval_ms: PositiveInt | None = None
     autotrim_mins: int | None = None
@@ -621,6 +621,10 @@ class LoggingConfig(NautilusConfig, frozen=True):
     clear_log_file : bool, default False
         If the log file name should be cleared before being used (e.g. for testing).
         Only applies if `log_file_name` is not ``None``.
+    fileout_sync_on_flush : bool, default True
+        If file log flushes should also sync data to disk.
+    buffered_stdout : bool, default False
+        If stdout writes should be buffered until flush or buffer capacity.
 
     """
 
@@ -639,6 +643,8 @@ class LoggingConfig(NautilusConfig, frozen=True):
     use_tracing: bool = False
     use_pyo3: bool = False
     clear_log_file: bool = False
+    fileout_sync_on_flush: bool = True
+    buffered_stdout: bool = False
 
 
 class ImportableFactoryConfig(NautilusConfig, frozen=True):

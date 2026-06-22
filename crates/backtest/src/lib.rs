@@ -42,12 +42,14 @@
 //! or as part of a Rust only build.
 //!
 //! - `examples`: Enables example strategies and the EMA crossover backtest example.
+//! - `defi`: Enables DeFi replay APIs and data-engine routing.
 //! - `streaming`: Enables `persistence` dependency for streaming configuration.
 //! - `ffi`: Enables the C foreign function interface (FFI) from [cbindgen](https://github.com/mozilla/cbindgen).
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 //! - `extension-module`: Builds the crate as a Python extension module.
 
 #![warn(rustc::all)]
+#![warn(clippy::pedantic)]
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
@@ -55,11 +57,17 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(
+    clippy::too_many_lines,
+    reason = "backtest engine, node, and Python registration flows exceed the default threshold by design"
+)]
 
 pub mod accumulator;
 pub mod config;
 pub mod data_client;
 pub mod data_iterator;
+#[cfg(feature = "defi")]
+pub mod defi;
 pub mod engine;
 pub mod exchange;
 pub mod execution_client;

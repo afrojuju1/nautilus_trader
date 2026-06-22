@@ -22,21 +22,41 @@
 
 #![allow(unsafe_code)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
-use nautilus_model::{data::QuoteTick, events::PositionOpened};
+use nautilus_common::timer::TimeEvent;
+use nautilus_core::{UUID4, UnixNanos};
+use nautilus_model::{
+    data::QuoteTick,
+    enums::{OrderSide, TimeInForce},
+    events::PositionOpened,
+    identifiers::{ClientOrderId, InstrumentId, StrategyId, TraderId},
+    orders::{MarketOrder, OrderAny},
+    types::{Price, Quantity, fixed::FIXED_PRECISION},
+};
 use nautilus_plugin::{
     NAUTILUS_PLUGIN_ABI_VERSION, PLUGIN_BUILD_ID_VERSION,
     boundary::{BorrowedStr, OwnedBytes, PluginResult, Slice},
-    host::{HostContext, HostLogLevel, HostVTable},
-    manifest::PluginManifest,
+    host::{ControllerHostContext, ControllerHostVTable, HostContext, HostLogLevel, HostVTable},
+    manifest::{PluginManifest, compiled_precision_mode},
     surfaces::{
         actor::PluginActor,
+        commands::{
+            CancelAllOrdersHandle, CancelOrderCommand, CancelOrderHandle, CancelOrdersHandle,
+            CloseAllPositionsHandle, ClosePositionHandle, ModifyOrderCommand, ModifyOrderHandle,
+            QueryAccountHandle, QueryOrderHandle, SubmitOrderCommand, SubmitOrderHandle,
+            SubmitOrderListHandle,
+        },
+        controller::PluginController,
         custom_data::{CustomDataHandle, MetadataEntry, PluginCustomData, custom_data_vtable},
         strategy::PluginStrategy,
     },
 };
 use rstest::rstest;
+use ustr::Ustr;
 
 macro_rules! generated_slot {
     ($vtable:expr, $slot:ident) => {{
@@ -137,7 +157,7 @@ impl PluginCustomData for TestTick {
 static TEST_ACTOR_START_COUNT: AtomicU64 = AtomicU64::new(0);
 static TEST_ACTOR_STOP_COUNT: AtomicU64 = AtomicU64::new(0);
 static TEST_ACTOR_QUOTE_COUNT: AtomicU64 = AtomicU64::new(0);
-static TEST_ACTOR_LAST_BID_RAW: AtomicU64 = AtomicU64::new(0);
+static TEST_ACTOR_LAST_BID: Mutex<Option<Price>> = Mutex::new(None);
 
 #[derive(Default)]
 struct TestActor;
@@ -161,7 +181,9 @@ impl PluginActor for TestActor {
 
     fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
         TEST_ACTOR_QUOTE_COUNT.fetch_add(1, Ordering::SeqCst);
-        TEST_ACTOR_LAST_BID_RAW.store(quote.bid_price.raw as u64, Ordering::SeqCst);
+        *TEST_ACTOR_LAST_BID
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(quote.bid_price);
         Ok(())
     }
 }
@@ -203,12 +225,83 @@ impl PluginStrategy for TestStrategy {
         // SAFETY: the host vtable lives for the strategy's lifetime per
         // the plug-in contract.
         let host = unsafe { &*self.host };
-        let cmd = BorrowedStr::from_str(r#"{"kind":"noop"}"#);
-        // SAFETY: ctx is the value the host supplied at create time.
-        let r = unsafe { (host.submit_order)(self.ctx, cmd) };
+        let handle = SubmitOrderHandle::new(test_market_submit_order_command());
+        // SAFETY: ctx is the value the host supplied at create time;
+        // handle outlives the call.
+        let r = unsafe { (host.submit_order)(self.ctx, &raw const handle) };
         r.into_result()
             .map_err(|e| anyhow::anyhow!(e.message_string()))
     }
+}
+
+static TEST_CONTROLLER_PREPARE_COUNT: AtomicU64 = AtomicU64::new(0);
+static TEST_CONTROLLER_START_COUNT: AtomicU64 = AtomicU64::new(0);
+static TEST_CONTROLLER_TIME_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+static TEST_CONTROLLER_CONTEXT_PTR: std::sync::atomic::AtomicPtr<ControllerHostContext> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+struct TestController;
+
+// SAFETY: TestController holds no fields; the trait requires Send.
+unsafe impl Send for TestController {}
+
+impl PluginController for TestController {
+    const TYPE_NAME: &'static str = "TestController";
+
+    fn prepare(request_json: &str) -> anyhow::Result<Vec<u8>> {
+        TEST_CONTROLLER_PREPARE_COUNT.fetch_add(1, Ordering::SeqCst);
+        Ok(format!(r#"{{"prepared":true,"request":{request_json}}}"#).into_bytes())
+    }
+
+    fn new(
+        _host: *const ControllerHostVTable,
+        ctx: *const ControllerHostContext,
+        _config_json: &str,
+    ) -> Self {
+        TEST_CONTROLLER_CONTEXT_PTR.store(ctx.cast_mut(), Ordering::SeqCst);
+        Self
+    }
+
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        TEST_CONTROLLER_START_COUNT.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn on_time_event(&mut self, event: &TimeEvent) -> anyhow::Result<()> {
+        let expected = Ustr::from("ControllerAlarm");
+        anyhow::ensure!(
+            event.name == expected,
+            "controller time event name was {}, expected {expected}",
+            event.name
+        );
+        TEST_CONTROLLER_TIME_EVENT_COUNT.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+fn test_market_submit_order_command() -> SubmitOrderCommand {
+    let order = OrderAny::Market(MarketOrder::new(
+        TraderId::from("TRADER-001"),
+        StrategyId::from("S-001"),
+        InstrumentId::from("ETH-USDT.BINANCE"),
+        ClientOrderId::from("O-1"),
+        OrderSide::Buy,
+        Quantity::from("1.0"),
+        TimeInForce::Gtc,
+        UUID4::new(),
+        UnixNanos::default(),
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    SubmitOrderCommand::new(order, None, None, None)
 }
 
 // Emit the plug-in entry symbol and manifest using the macro.
@@ -219,6 +312,7 @@ nautilus_plugin::nautilus_plugin! {
     custom_data: [TestTick],
     actors: [TestActor],
     strategies: [TestStrategy],
+    controllers: [TestController],
 }
 
 unsafe extern "C" fn test_clock_now_ns() -> u64 {
@@ -405,7 +499,7 @@ const TEST_HOST_SENTINEL_VALUE: u64 = 0xC0DE_BABE_F00D_BEEFu64;
 
 unsafe extern "C" fn test_submit_order(
     ctx: *const HostContext,
-    _command_json: BorrowedStr<'_>,
+    _command: *const SubmitOrderHandle,
 ) -> PluginResult<()> {
     TEST_HOST_SUBMIT_COUNT.fetch_add(1, Ordering::SeqCst);
     TEST_HOST_LAST_SUBMIT_CTX.store(ctx.cast_mut(), Ordering::SeqCst);
@@ -415,7 +509,7 @@ unsafe extern "C" fn test_submit_order(
 
 unsafe extern "C" fn test_cancel_order(
     _ctx: *const HostContext,
-    _command_json: BorrowedStr<'_>,
+    _command: *const CancelOrderHandle,
 ) -> PluginResult<()> {
     TEST_HOST_CANCEL_COUNT.fetch_add(1, Ordering::SeqCst);
     PluginResult::Ok(())
@@ -423,10 +517,67 @@ unsafe extern "C" fn test_cancel_order(
 
 unsafe extern "C" fn test_modify_order(
     _ctx: *const HostContext,
-    _command_json: BorrowedStr<'_>,
+    _command: *const ModifyOrderHandle,
 ) -> PluginResult<()> {
     TEST_HOST_MODIFY_COUNT.fetch_add(1, Ordering::SeqCst);
     PluginResult::Ok(())
+}
+
+unsafe extern "C" fn test_submit_order_list_stub(
+    _ctx: *const HostContext,
+    _command: *const SubmitOrderListHandle,
+) -> PluginResult<()> {
+    PluginResult::Ok(())
+}
+
+unsafe extern "C" fn test_cancel_orders_stub(
+    _ctx: *const HostContext,
+    _command: *const CancelOrdersHandle,
+) -> PluginResult<()> {
+    PluginResult::Ok(())
+}
+
+unsafe extern "C" fn test_cancel_all_orders_stub(
+    _ctx: *const HostContext,
+    _command: *const CancelAllOrdersHandle,
+) -> PluginResult<()> {
+    PluginResult::Ok(())
+}
+
+unsafe extern "C" fn test_close_position_stub(
+    _ctx: *const HostContext,
+    _command: *const ClosePositionHandle,
+) -> PluginResult<()> {
+    PluginResult::Ok(())
+}
+
+unsafe extern "C" fn test_close_all_positions_stub(
+    _ctx: *const HostContext,
+    _command: *const CloseAllPositionsHandle,
+) -> PluginResult<()> {
+    PluginResult::Ok(())
+}
+
+unsafe extern "C" fn test_query_account_stub(
+    _ctx: *const HostContext,
+    _command: *const QueryAccountHandle,
+) -> PluginResult<()> {
+    PluginResult::Ok(())
+}
+
+unsafe extern "C" fn test_query_order_stub(
+    _ctx: *const HostContext,
+    _command: *const QueryOrderHandle,
+) -> PluginResult<()> {
+    PluginResult::Ok(())
+}
+
+unsafe extern "C" fn test_host_bytes_stub(_ctx: *const HostContext) -> PluginResult<OwnedBytes> {
+    PluginResult::Ok(OwnedBytes::empty())
+}
+
+unsafe extern "C" fn test_component_state_stub(_ctx: *const HostContext) -> PluginResult<u8> {
+    PluginResult::Ok(0)
 }
 
 static TEST_HOST: HostVTable = HostVTable {
@@ -456,13 +607,37 @@ static TEST_HOST: HostVTable = HostVTable {
     submit_order: test_submit_order,
     cancel_order: test_cancel_order,
     modify_order: test_modify_order,
-    submit_order_list: test_submit_order,
-    cancel_orders: test_submit_order,
-    cancel_all_orders: test_submit_order,
-    close_position: test_submit_order,
-    close_all_positions: test_submit_order,
-    query_account: test_submit_order,
-    query_order: test_submit_order,
+    submit_order_list: test_submit_order_list_stub,
+    cancel_orders: test_cancel_orders_stub,
+    cancel_all_orders: test_cancel_all_orders_stub,
+    close_position: test_close_position_stub,
+    close_all_positions: test_close_all_positions_stub,
+    query_account: test_query_account_stub,
+    query_order: test_query_order_stub,
+    trader_id: test_host_bytes_stub,
+    strategy_id: test_host_bytes_stub,
+    component_state: test_component_state_stub,
+    generate_client_order_id: test_host_bytes_stub,
+    generate_order_list_id: test_host_bytes_stub,
+};
+
+unsafe extern "C" fn test_controller_host_call(
+    _ctx: *const ControllerHostContext,
+    _request_json: BorrowedStr<'_>,
+) -> PluginResult<OwnedBytes> {
+    PluginResult::Ok(OwnedBytes::from_vec(br#"{"ok":true}"#.to_vec()))
+}
+
+static TEST_CONTROLLER_HOST: ControllerHostVTable = ControllerHostVTable {
+    abi_version: NAUTILUS_PLUGIN_ABI_VERSION,
+    create_plugin_strategy: test_controller_host_call,
+    start_strategy: test_controller_host_call,
+    stop_strategy: test_controller_host_call,
+    exit_market: test_controller_host_call,
+    remove_strategy: test_controller_host_call,
+    instrument_exists: test_controller_host_call,
+    log: test_controller_host_call,
+    clock_now_ns: test_controller_host_call,
 };
 
 unsafe extern "C" {
@@ -498,6 +673,12 @@ fn macro_emits_loadable_manifest() {
     assert!(!unsafe { manifest.build_id.target_triple.as_str() }.is_empty());
     // SAFETY: build id strings live in static storage.
     assert!(!unsafe { manifest.build_id.build_profile.as_str() }.is_empty());
+    // SAFETY: build id strings live in static storage.
+    assert_eq!(
+        unsafe { manifest.build_id.precision_mode.as_str() },
+        compiled_precision_mode()
+    );
+    assert_eq!(manifest.build_id.fixed_precision, FIXED_PRECISION);
 
     // SAFETY: slice points at static storage owned by the manifest.
     let cd = unsafe { manifest.custom_data.as_slice() };
@@ -516,6 +697,77 @@ fn macro_emits_loadable_manifest() {
     assert_eq!(strategies.len(), 1, "one strategy registration expected");
     // SAFETY: type_name in the registration points at static storage.
     assert_eq!(unsafe { strategies[0].type_name.as_str() }, "TestStrategy");
+
+    // SAFETY: slice points at static storage owned by the manifest.
+    let controllers = unsafe { manifest.controllers.as_slice() };
+    assert_eq!(controllers.len(), 1, "one controller registration expected");
+    // SAFETY: type_name in the registration points at static storage.
+    assert_eq!(
+        unsafe { controllers[0].type_name.as_str() },
+        "TestController"
+    );
+}
+
+#[rstest]
+fn controller_vtable_dispatches_prepare_and_lifecycle() {
+    TEST_CONTROLLER_PREPARE_COUNT.store(0, Ordering::SeqCst);
+    TEST_CONTROLLER_START_COUNT.store(0, Ordering::SeqCst);
+    TEST_CONTROLLER_TIME_EVENT_COUNT.store(0, Ordering::SeqCst);
+    TEST_CONTROLLER_CONTEXT_PTR.store(std::ptr::null_mut(), Ordering::SeqCst);
+
+    let manifest_ptr = unsafe { nautilus_plugin_init(&raw const TEST_HOST) };
+    let manifest = unsafe { &*manifest_ptr };
+    let entry = unsafe { &manifest.controllers.as_slice()[0] };
+    // SAFETY: vtable pointer is non-null and lives for the process lifetime.
+    let vtable = unsafe { &*entry.vtable };
+
+    let request = BorrowedStr::from_str(r#"{"scope":"test"}"#);
+    // SAFETY: request outlives the call.
+    let response = unsafe { generated_slot!(vtable, prepare)(request) }
+        .into_result()
+        .expect("prepare failed");
+    // SAFETY: response buffer is live until dropped.
+    let response_text = std::str::from_utf8(unsafe { response.as_bytes() }).unwrap();
+    assert_eq!(
+        response_text,
+        r#"{"prepared":true,"request":{"scope":"test"}}"#
+    );
+    assert_eq!(TEST_CONTROLLER_PREPARE_COUNT.load(Ordering::SeqCst), 1);
+
+    let ctx = std::ptr::NonNull::<u8>::dangling()
+        .as_ptr()
+        .cast::<ControllerHostContext>();
+    // SAFETY: host vtable, context, and config borrow are live for the call.
+    let handle = unsafe {
+        generated_slot!(vtable, create)(
+            &raw const TEST_CONTROLLER_HOST,
+            ctx,
+            BorrowedStr::from_str(r#"{"id":"controller-001"}"#),
+        )
+    };
+    assert!(!handle.is_null());
+    assert_eq!(TEST_CONTROLLER_CONTEXT_PTR.load(Ordering::SeqCst), ctx);
+
+    // SAFETY: handle is live and owned by the controller vtable.
+    unsafe { generated_slot!(vtable, on_start)(handle) }
+        .into_result()
+        .expect("on_start failed");
+    assert_eq!(TEST_CONTROLLER_START_COUNT.load(Ordering::SeqCst), 1);
+
+    let event = TimeEvent::new(
+        Ustr::from("ControllerAlarm"),
+        UUID4::new(),
+        UnixNanos::from(1u64),
+        UnixNanos::from(2u64),
+    );
+    // SAFETY: event is live for the duration of the call.
+    unsafe { generated_slot!(vtable, on_time_event)(handle, &raw const event) }
+        .into_result()
+        .expect("on_time_event failed");
+    assert_eq!(TEST_CONTROLLER_TIME_EVENT_COUNT.load(Ordering::SeqCst), 1);
+
+    // SAFETY: dropping the live controller handle.
+    unsafe { generated_slot!(vtable, drop_handle)(handle) };
 }
 
 #[rstest]
@@ -573,11 +825,15 @@ fn nautilus_plugin_init_rejects_invalid_host_ptr(#[case] host: *const HostVTable
     assert!(m.is_null(), "init should reject the host pointer");
 }
 
+// Init returns the manifest even when the host's vtable ABI differs: the
+// host's own check on `PluginManifest::abi_version` rejects the plug-in with
+// a proper `AbiMismatch` error and build diagnostics, while a null return
+// would degrade that to an opaque `NullManifest` report.
 #[rstest]
 #[case::off_by_one(NAUTILUS_PLUGIN_ABI_VERSION.wrapping_add(1))]
 #[case::zero(0)]
 #[case::max(u32::MAX)]
-fn nautilus_plugin_init_rejects_abi_mismatch(#[case] abi: u32) {
+fn nautilus_plugin_init_returns_manifest_for_host_abi_mismatch(#[case] abi: u32) {
     let bad_host = HostVTable {
         abi_version: abi,
         clock_now_ns: test_clock_now_ns,
@@ -605,16 +861,30 @@ fn nautilus_plugin_init_rejects_abi_mismatch(#[case] abi: u32) {
         submit_order: test_submit_order,
         cancel_order: test_cancel_order,
         modify_order: test_modify_order,
-        submit_order_list: test_submit_order,
-        cancel_orders: test_submit_order,
-        cancel_all_orders: test_submit_order,
-        close_position: test_submit_order,
-        close_all_positions: test_submit_order,
-        query_account: test_submit_order,
-        query_order: test_submit_order,
+        submit_order_list: test_submit_order_list_stub,
+        cancel_orders: test_cancel_orders_stub,
+        cancel_all_orders: test_cancel_all_orders_stub,
+        close_position: test_close_position_stub,
+        close_all_positions: test_close_all_positions_stub,
+        query_account: test_query_account_stub,
+        query_order: test_query_order_stub,
+        trader_id: test_host_bytes_stub,
+        strategy_id: test_host_bytes_stub,
+        component_state: test_component_state_stub,
+        generate_client_order_id: test_host_bytes_stub,
+        generate_order_list_id: test_host_bytes_stub,
     };
     let m = unsafe { nautilus_plugin_init(&raw const bad_host) };
-    assert!(m.is_null(), "init should reject ABI {abi}");
+    assert!(
+        !m.is_null(),
+        "init should return the manifest for host ABI {abi} so the host can report AbiMismatch",
+    );
+    // SAFETY: the returned manifest points at the plug-in's static storage.
+    let manifest = unsafe { &*m };
+    assert_eq!(
+        manifest.abi_version, NAUTILUS_PLUGIN_ABI_VERSION,
+        "manifest must carry the plug-in's compiled ABI for the host check",
+    );
 }
 
 #[rstest]
@@ -756,18 +1026,20 @@ fn decode_batch_round_trips_through_drop_handle_array() {
     // final `drop(decoded)` invokes `drop_handle_array` which deallocates
     // with the correct `Vec<*mut CustomDataHandle>` layout.
     // SAFETY: buffer is live and contains `count` aligned handle pointers.
-    let buf_ptr = unsafe { decoded.as_bytes() }.as_ptr();
-    let handle_ptr = buf_ptr.cast::<*mut CustomDataHandle>();
+    let buf = unsafe { decoded.as_bytes() };
+    // SAFETY: `decode_batch` returns an OwnedBytes buffer backed by a
+    // Vec<*mut CustomDataHandle>.
+    let (prefix, handles, suffix) = unsafe { buf.align_to::<*mut CustomDataHandle>() };
+    assert!(prefix.is_empty(), "decoded handle buffer prefix");
+    assert!(suffix.is_empty(), "decoded handle buffer suffix");
+    assert_eq!(handles.len(), count, "decoded handle slice length");
 
-    for i in 0..count {
-        // SAFETY: i < count and the buffer is `count * elem_size` bytes.
-        let slot = unsafe { handle_ptr.add(i) };
-        // SAFETY: slot points at a freshly-decoded handle pointer.
-        let h = unsafe { slot.read() };
+    for (i, &h) in handles.iter().enumerate() {
         // SAFETY: handle is live (decode just produced it).
         let ts_init = unsafe { generated_slot!(vtable, ts_init)(h) };
         // Decoded order matches encoded order: ts_init was 2 then 4.
-        assert_eq!(ts_init, ((i as u64) + 1) * 2);
+        let i = u64::try_from(i).expect("decoded handle index fits in u64");
+        assert_eq!(ts_init, (i + 1) * 2);
         // SAFETY: handle is live.
         unsafe {
             generated_slot!(vtable, drop_handle)(h);
@@ -832,10 +1104,7 @@ fn actor_lifecycle_callbacks_dispatch_to_trait() {
 #[rstest]
 fn actor_on_quote_dispatches_typed_pointer() {
     use nautilus_core::UnixNanos;
-    use nautilus_model::{
-        identifiers::InstrumentId,
-        types::{Price, Quantity},
-    };
+    use nautilus_model::identifiers::InstrumentId;
 
     // Verifies the on_quote thunk receives the typed `*const QuoteTick`
     // pointer and routes it into the actor's typed `on_quote` method.
@@ -848,7 +1117,9 @@ fn actor_on_quote_dispatches_typed_pointer() {
     let vtable = unsafe { &*entry.vtable };
 
     TEST_ACTOR_QUOTE_COUNT.store(0, Ordering::SeqCst);
-    TEST_ACTOR_LAST_BID_RAW.store(0, Ordering::SeqCst);
+    *TEST_ACTOR_LAST_BID
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 
     let quote = QuoteTick::new(
         InstrumentId::from("ETH-USDT.BINANCE"),
@@ -870,8 +1141,10 @@ fn actor_on_quote_dispatches_typed_pointer() {
 
     assert_eq!(TEST_ACTOR_QUOTE_COUNT.load(Ordering::SeqCst), 1);
     assert_eq!(
-        TEST_ACTOR_LAST_BID_RAW.load(Ordering::SeqCst),
-        quote.bid_price.raw as u64,
+        *TEST_ACTOR_LAST_BID
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        Some(quote.bid_price),
     );
 
     // SAFETY: handle is live.
@@ -920,7 +1193,9 @@ fn strategy_lifecycle_dispatches_to_trait() {
     assert!(!handle.is_null(), "create returned null");
 
     // The strategy must have stored the context pointer during `new`.
-    let stored = TEST_STRATEGY_CONTEXT_PTR.load(Ordering::SeqCst) as *const HostContext;
+    let stored = TEST_STRATEGY_CONTEXT_PTR
+        .load(Ordering::SeqCst)
+        .cast_const();
     assert!(
         std::ptr::eq(stored, ctx),
         "strategy did not store host context"
@@ -944,7 +1219,7 @@ fn strategy_on_position_opened_invokes_host_submit() {
         enums::{OrderSide, PositionSide},
         events::PositionOpened,
         identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TraderId},
-        types::{Currency, Price, Quantity},
+        types::{Currency, Quantity},
     };
 
     // Drives an on_position_opened callback with a typed pointer and
@@ -994,7 +1269,9 @@ fn strategy_on_position_opened_invokes_host_submit() {
         1
     );
     assert_eq!(TEST_HOST_SUBMIT_COUNT.load(Ordering::SeqCst), 1);
-    let last_ctx = TEST_HOST_LAST_SUBMIT_CTX.load(Ordering::SeqCst) as *const HostContext;
+    let last_ctx = TEST_HOST_LAST_SUBMIT_CTX
+        .load(Ordering::SeqCst)
+        .cast_const();
     assert!(
         std::ptr::eq(last_ctx, ctx),
         "submit_order received the wrong host context"
@@ -1124,24 +1401,39 @@ fn custom_data_vtable_schema_ipc_returns_registered_schema() {
 
 #[rstest]
 fn host_vtable_cancel_order_routes_to_bound_handler() {
+    use nautilus_model::identifiers::ClientOrderId;
+
     TEST_HOST_CANCEL_COUNT.store(0, Ordering::SeqCst);
     let host = &TEST_HOST;
     let ctx: *const HostContext = std::ptr::null();
-    let cmd = BorrowedStr::from_str(r#"{"kind":"cancel"}"#);
+    let cmd = CancelOrderHandle::new(CancelOrderCommand::new(
+        ClientOrderId::from("O-1"),
+        None,
+        None,
+    ));
     // SAFETY: cmd outlives the call; ctx is not dereferenced by the test stub.
-    let r = unsafe { (host.cancel_order)(ctx, cmd) };
+    let r = unsafe { (host.cancel_order)(ctx, &raw const cmd) };
     r.into_result().expect("cancel_order");
     assert_eq!(TEST_HOST_CANCEL_COUNT.load(Ordering::SeqCst), 1);
 }
 
 #[rstest]
 fn host_vtable_modify_order_routes_to_bound_handler() {
+    use nautilus_model::identifiers::ClientOrderId;
+
     TEST_HOST_MODIFY_COUNT.store(0, Ordering::SeqCst);
     let host = &TEST_HOST;
     let ctx: *const HostContext = std::ptr::null();
-    let cmd = BorrowedStr::from_str(r#"{"kind":"modify"}"#);
+    let cmd = ModifyOrderHandle::new(ModifyOrderCommand::new(
+        ClientOrderId::from("O-1"),
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
     // SAFETY: cmd outlives the call; ctx is not dereferenced by the test stub.
-    let r = unsafe { (host.modify_order)(ctx, cmd) };
+    let r = unsafe { (host.modify_order)(ctx, &raw const cmd) };
     r.into_result().expect("modify_order");
     assert_eq!(TEST_HOST_MODIFY_COUNT.load(Ordering::SeqCst), 1);
 }

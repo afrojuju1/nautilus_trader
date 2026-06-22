@@ -19,8 +19,15 @@ use std::{collections::HashMap, str::FromStr, time::Duration};
 
 use ahash::AHashMap;
 use nautilus_common::{
-    cache::CacheConfig, enums::Environment, logging::logger::LoggerConfig,
-    msgbus::database::MessageBusConfig, throttler::RateLimit,
+    cache::CacheConfig,
+    config::{
+        ConfigError, ConfigErrorCollector, ConfigResult, check_non_empty_field, check_range,
+        check_supported_field, check_valid_format,
+    },
+    enums::Environment,
+    logging::logger::LoggerConfig,
+    msgbus::backing::MessageBusConfig,
+    throttler::RateLimit,
 };
 use nautilus_core::{UUID4, datetime::NANOSECONDS_IN_SECOND};
 use nautilus_data::engine::config::DataEngineConfig;
@@ -33,12 +40,17 @@ use nautilus_model::{
 };
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
-use nautilus_system::config::{NautilusKernelConfig, StreamingConfig};
+use nautilus_system::{
+    config::{NautilusKernelConfig, StreamingConfig},
+    event_store::EventStoreConfig,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 /// The default rate limit string used for order submission and modification.
 const DEFAULT_ORDER_RATE_LIMIT: &str = "100/00:00:01";
+const RUST_RUNTIME_UNSUPPORTED: &str = "not supported by the Rust live runtime yet";
+const RATE_LIMIT_FORMAT: &str = "expected 'limit/HH:MM:SS'";
 
 /// Configuration for one Rust-native plug-in instance loaded by a live node.
 #[cfg_attr(
@@ -80,6 +92,10 @@ impl Default for PluginConfig {
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "config fields mirror the existing Python live data engine surface"
 )]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
@@ -124,9 +140,6 @@ pub struct LiveDataEngineConfig {
     /// If debug mode is active (will provide extra debug logging).
     #[builder(default)]
     pub debug: bool,
-    /// If the engine should gracefully shut down when queue processing encounters unexpected errors.
-    #[builder(default)]
-    pub graceful_shutdown_on_error: bool,
     /// The queue size for the engine's internal queue buffers.
     ///
     /// Not implemented on the current live runtime; `validate_runtime_support` rejects
@@ -200,9 +213,6 @@ pub struct LiveRiskEngineConfig {
     /// If debug mode is active (will provide extra debug logging).
     #[builder(default)]
     pub debug: bool,
-    /// If the engine should gracefully shut down when queue processing encounters unexpected errors.
-    #[builder(default)]
-    pub graceful_shutdown_on_error: bool,
     /// The queue size for the engine's internal queue buffers.
     ///
     /// Not implemented on the current live runtime; `validate_runtime_support` rejects
@@ -233,47 +243,48 @@ impl From<LiveRiskEngineConfig> for RiskEngineConfig {
 
         Self {
             bypass: config.bypass,
-            max_order_submit: parse_rate_limit(&config.max_order_submit_rate)
-                .expect("validate_runtime_support must run before RiskEngineConfig conversion"),
-            max_order_modify: parse_rate_limit(&config.max_order_modify_rate)
-                .expect("validate_runtime_support must run before RiskEngineConfig conversion"),
+            max_order_submit: parse_rate_limit(
+                "LiveRiskEngineConfig.max_order_submit_rate",
+                &config.max_order_submit_rate,
+            )
+            .expect("validate_runtime_support must run before RiskEngineConfig conversion"),
+            max_order_modify: parse_rate_limit(
+                "LiveRiskEngineConfig.max_order_modify_rate",
+                &config.max_order_modify_rate,
+            )
+            .expect("validate_runtime_support must run before RiskEngineConfig conversion"),
             max_notional_per_order,
             debug: config.debug,
         }
     }
 }
 
-fn parse_rate_limit(input: &str) -> anyhow::Result<RateLimit> {
-    let (limit, interval) = input.split_once('/').ok_or_else(|| {
-        anyhow::anyhow!("invalid rate limit '{input}': expected 'limit/HH:MM:SS'")
-    })?;
+pub(crate) fn parse_rate_limit(field: impl Into<String>, input: &str) -> ConfigResult<RateLimit> {
+    let field = field.into();
+    let (limit, interval) = input
+        .split_once('/')
+        .ok_or_else(|| ConfigError::invalid_format(field.clone(), RATE_LIMIT_FORMAT))?;
 
     let limit = limit
         .parse::<usize>()
-        .map_err(|e| anyhow::anyhow!("invalid rate limit '{input}': {e}"))?;
-
-    if limit == 0 {
-        anyhow::bail!("invalid rate limit '{input}': limit must be greater than zero");
-    }
+        .map_err(|e| ConfigError::invalid_format(field.clone(), format!("limit: {e}")))?;
 
     let mut parts = interval.split(':');
-    let mut next = |label: &str| -> anyhow::Result<u64> {
+    let mut next = |label: &str| -> ConfigResult<u64> {
         parts
             .next()
             .ok_or_else(|| {
-                anyhow::anyhow!("invalid rate limit '{input}': missing {label} component")
+                ConfigError::invalid_format(field.clone(), format!("missing {label} component"))
             })?
             .parse::<u64>()
-            .map_err(|e| anyhow::anyhow!("invalid rate limit '{input}': {label}: {e}"))
+            .map_err(|e| ConfigError::invalid_format(field.clone(), format!("{label}: {e}")))
     };
 
     let hours = next("hours")?;
     let minutes = next("minutes")?;
     let seconds = next("seconds")?;
 
-    if parts.next().is_some() {
-        anyhow::bail!("invalid rate limit '{input}': expected 'limit/HH:MM:SS'");
-    }
+    check_valid_format(field.clone(), parts.next().is_none(), RATE_LIMIT_FORMAT)?;
 
     let interval_ns = hours
         .saturating_mul(3_600)
@@ -281,11 +292,85 @@ fn parse_rate_limit(input: &str) -> anyhow::Result<RateLimit> {
         .saturating_add(seconds)
         .saturating_mul(NANOSECONDS_IN_SECOND);
 
-    if interval_ns == 0 {
-        anyhow::bail!("invalid rate limit '{input}': interval must be greater than zero");
+    RateLimit::new_checked(limit, interval_ns).map_err(|e| ConfigError::range(field, e.to_string()))
+}
+
+pub(crate) fn validate_max_notional_per_order(
+    field: &str,
+    max_notional_per_order: &HashMap<String, String>,
+) -> ConfigResult<()> {
+    let mut collector = ConfigErrorCollector::new();
+
+    for (instrument_id, notional) in max_notional_per_order {
+        let entry_path = format!("{field}[{instrument_id}]");
+        if let Err(e) = InstrumentId::from_str(instrument_id) {
+            collector.push(ConfigError::invalid_reference(
+                entry_path.clone(),
+                "instrument ID",
+                e.to_string(),
+            ));
+        }
+
+        if let Err(e) = Decimal::from_str(notional) {
+            collector.push(ConfigError::invalid_value(
+                entry_path,
+                format!("invalid notional: {e}"),
+            ));
+        }
     }
 
-    Ok(RateLimit::new(limit, interval_ns))
+    collector.into_result()
+}
+
+pub(crate) fn validate_instrument_id_strings(field: &str, values: &[String]) -> ConfigResult<()> {
+    let mut collector = ConfigErrorCollector::new();
+
+    for (index, value) in values.iter().enumerate() {
+        if let Err(e) = InstrumentId::from_str(value) {
+            collector.push(ConfigError::invalid_reference(
+                format!("{field}[{index}]"),
+                "instrument ID",
+                e.to_string(),
+            ));
+        }
+    }
+
+    collector.into_result()
+}
+
+pub(crate) fn validate_client_order_id_strings(field: &str, values: &[String]) -> ConfigResult<()> {
+    let mut collector = ConfigErrorCollector::new();
+
+    for (index, value) in values.iter().enumerate() {
+        if let Err(e) = ClientOrderId::new_checked(value) {
+            collector.push(ConfigError::invalid_reference(
+                format!("{field}[{index}]"),
+                "client order ID",
+                e.to_string(),
+            ));
+        }
+    }
+
+    collector.into_result()
+}
+
+pub(crate) fn validate_non_negative_finite_f64(field: &str, value: f64) -> ConfigResult<()> {
+    check_range(
+        field,
+        value.is_finite() && value >= 0.0,
+        format!("{value} (must be a non-negative finite number)"),
+    )
+}
+
+#[cfg(feature = "python")]
+pub(crate) fn duration_from_secs_f64(field: &str, value: f64) -> ConfigResult<Duration> {
+    check_range(
+        field,
+        value.is_finite() && (0.0..=86_400.0).contains(&value),
+        format!("{value} (must be finite, non-negative, and <= 86400)"),
+    )?;
+
+    Ok(Duration::from_secs_f64(value))
 }
 
 /// Configuration for live execution engines.
@@ -296,6 +381,10 @@ fn parse_rate_limit(input: &str) -> anyhow::Result<RateLimit> {
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "config fields mirror the existing Python live execution engine surface"
 )]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
@@ -406,9 +495,6 @@ pub struct LiveExecEngineConfig {
     pub purge_from_database: bool,
     /// The interval (seconds) between auditing own books against public order books.
     pub own_books_audit_interval_secs: Option<f64>,
-    /// If the engine should gracefully shutdown when queue processing encounters unexpected errors.
-    #[builder(default)]
-    pub graceful_shutdown_on_error: bool,
     /// The queue size for the engine's internal queue buffers.
     #[builder(default = 100_000)]
     pub qsize: u32,
@@ -439,6 +525,7 @@ impl From<LiveExecEngineConfig> for ExecutionEngineConfig {
             snapshot_positions: config.snapshot_positions,
             snapshot_positions_interval_secs: config.snapshot_positions_interval_secs,
             allow_overfills: config.allow_overfills,
+            filter_unclaimed_external_orders: config.filter_unclaimed_external_orders,
             external_clients: config.external_clients,
             purge_closed_orders_interval_mins: config.purge_closed_orders_interval_mins,
             purge_closed_orders_buffer_mins: config.purge_closed_orders_buffer_mins,
@@ -556,6 +643,10 @@ pub struct LiveExecClientConfig {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "config fields mirror the existing Python live node surface"
+)]
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 pub struct LiveNodeConfig {
@@ -571,13 +662,18 @@ pub struct LiveNodeConfig {
     /// If trading strategy state should be saved to the database on stop.
     #[builder(default)]
     pub save_state: bool,
+    /// If the system should request shutdown when an error log is emitted.
+    ///
+    /// Filtered or bypassed error logs still request shutdown.
+    #[builder(default)]
+    pub shutdown_on_error: bool,
     /// The logging configuration for the kernel.
     #[builder(default)]
     pub logging: LoggerConfig,
     /// The unique instance identifier for the kernel
     pub instance_id: Option<UUID4>,
     /// The timeout for all clients to connect and initialize.
-    #[builder(default = Duration::from_secs(120))]
+    #[builder(default = Duration::from_mins(1))]
     pub timeout_connection: Duration,
     /// The timeout for execution state to reconcile.
     #[builder(default = Duration::from_secs(30))]
@@ -604,6 +700,12 @@ pub struct LiveNodeConfig {
     pub emulator: Option<OrderEmulatorConfig>,
     /// The configuration for streaming to feather files.
     pub streaming: Option<StreamingConfig>,
+    /// The event-store configuration.
+    ///
+    /// When set, the live node boots a kernel-managed event-store run for audit and replay.
+    /// The caller supplies a factory via `LiveNodeBuilder::with_event_store` to construct
+    /// the concrete `KernelEventStore`; this field carries the configuration that factory reads.
+    pub event_store: Option<EventStoreConfig>,
     /// If the asyncio event loop should run in debug mode.
     #[builder(default)]
     pub loop_debug: bool,
@@ -641,199 +743,184 @@ impl LiveNodeConfig {
     ///
     /// Returns an error when a config field would otherwise be ignored at runtime, or when a
     /// supported field holds a value that cannot be converted to its engine-side representation.
-    pub(crate) fn validate_runtime_support(&self) -> anyhow::Result<()> {
-        if self.msgbus.is_some() {
-            anyhow::bail!("LiveNodeConfig.msgbus is not supported by the Rust live runtime yet");
+    pub(crate) fn validate_runtime_support(&self) -> ConfigResult<()> {
+        let mut collector = ConfigErrorCollector::new();
+
+        if let Some(config) = &self.msgbus {
+            collector.collect(check_supported_field(
+                "LiveNodeConfig.msgbus.external_streams",
+                config.external_streams.is_none(),
+                RUST_RUNTIME_UNSUPPORTED,
+            ));
         }
+        collector.collect(check_supported_field(
+            "LiveNodeConfig.streaming",
+            self.streaming.is_none(),
+            RUST_RUNTIME_UNSUPPORTED,
+        ));
+        collector.collect(check_supported_field(
+            "LiveNodeConfig.emulator",
+            self.emulator.is_none(),
+            RUST_RUNTIME_UNSUPPORTED,
+        ));
+        collector.collect(check_supported_field(
+            "LiveNodeConfig.loop_debug",
+            !self.loop_debug,
+            RUST_RUNTIME_UNSUPPORTED,
+        ));
+        collector.collect(self.data_engine.validate_runtime_support());
+        collector.collect(self.risk_engine.validate_runtime_support());
+        collector.collect(self.exec_engine.validate_runtime_support());
+        collector.collect(self.validate_plugin_configs());
 
-        if self.streaming.is_some() {
-            anyhow::bail!("LiveNodeConfig.streaming is not supported by the Rust live runtime yet");
-        }
-
-        if self.emulator.is_some() {
-            anyhow::bail!("LiveNodeConfig.emulator is not supported by the Rust live runtime yet");
-        }
-
-        if self.loop_debug {
-            anyhow::bail!(
-                "LiveNodeConfig.loop_debug is not supported by the Rust live runtime yet"
-            );
-        }
-
-        self.data_engine.validate_runtime_support()?;
-        self.risk_engine.validate_runtime_support()?;
-        self.exec_engine.validate_runtime_support()?;
-        self.validate_plugin_configs()?;
-
-        Ok(())
+        collector.into_result()
     }
 
-    fn validate_plugin_configs(&self) -> anyhow::Result<()> {
+    fn validate_plugin_configs(&self) -> ConfigResult<()> {
+        let mut collector = ConfigErrorCollector::new();
+
         for (index, plugin) in self.plugins.iter().enumerate() {
-            plugin.validate_runtime_support(index)?;
+            collector.collect(plugin.validate_runtime_support(index));
         }
-        Ok(())
+
+        collector.into_result()
     }
 }
 
 impl PluginConfig {
-    fn validate_runtime_support(&self, index: usize) -> anyhow::Result<()> {
-        if self.path.trim().is_empty() {
-            anyhow::bail!("LiveNodeConfig.plugins[{index}].path must not be empty");
-        }
+    pub(crate) fn validate_runtime_support(&self, index: usize) -> ConfigResult<()> {
+        let mut collector = ConfigErrorCollector::with_capacity(3);
 
-        if self.type_name.trim().is_empty() {
-            anyhow::bail!("LiveNodeConfig.plugins[{index}].type_name must not be empty");
-        }
+        collector.collect(check_non_empty_field(
+            format!("LiveNodeConfig.plugins[{index}].path"),
+            &self.path,
+        ));
+        collector.collect(check_non_empty_field(
+            format!("LiveNodeConfig.plugins[{index}].type_name"),
+            &self.type_name,
+        ));
 
         if let Some(sha256) = &self.sha256 {
             let valid = sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit());
-            if !valid {
-                anyhow::bail!(
-                    "LiveNodeConfig.plugins[{index}].sha256 must be a 64-character hex digest"
-                );
-            }
+            collector.collect(check_valid_format(
+                format!("LiveNodeConfig.plugins[{index}].sha256"),
+                valid,
+                "must be a 64-character hex digest",
+            ));
         }
 
-        Ok(())
+        collector.into_result()
     }
 }
 
 impl LiveDataEngineConfig {
-    fn validate_runtime_support(&self) -> anyhow::Result<()> {
+    fn validate_runtime_support(&self) -> ConfigResult<()> {
+        let mut collector = ConfigErrorCollector::new();
+
         for agg_str in self.time_bars_origin_offset.keys() {
-            BarAggregation::from_str(agg_str).map_err(|e| {
-                anyhow::anyhow!(
-                    "invalid LiveDataEngineConfig.time_bars_origin_offset key {agg_str:?}: {e}"
-                )
-            })?;
+            if let Err(e) = BarAggregation::from_str(agg_str) {
+                collector.push(ConfigError::invalid_reference(
+                    format!("LiveDataEngineConfig.time_bars_origin_offset[{agg_str}]"),
+                    "bar aggregation",
+                    e.to_string(),
+                ));
+            }
         }
 
         let default = Self::default();
+        collector.collect(check_supported_field(
+            "LiveDataEngineConfig.qsize",
+            self.qsize == default.qsize,
+            RUST_RUNTIME_UNSUPPORTED,
+        ));
 
-        if self.graceful_shutdown_on_error != default.graceful_shutdown_on_error {
-            anyhow::bail!(
-                "LiveDataEngineConfig.graceful_shutdown_on_error is not supported by the Rust live runtime yet"
-            );
-        }
-
-        if self.qsize != default.qsize {
-            anyhow::bail!(
-                "LiveDataEngineConfig.qsize is not supported by the Rust live runtime yet"
-            );
-        }
-
-        Ok(())
+        collector.into_result()
     }
 }
 
 impl LiveRiskEngineConfig {
-    fn validate_runtime_support(&self) -> anyhow::Result<()> {
-        parse_rate_limit(&self.max_order_submit_rate).map_err(|e| {
-            anyhow::anyhow!("invalid LiveRiskEngineConfig.max_order_submit_rate: {e}")
-        })?;
-        parse_rate_limit(&self.max_order_modify_rate).map_err(|e| {
-            anyhow::anyhow!("invalid LiveRiskEngineConfig.max_order_modify_rate: {e}")
-        })?;
+    fn validate_runtime_support(&self) -> ConfigResult<()> {
+        let mut collector = ConfigErrorCollector::new();
 
-        for (instrument_id, notional) in &self.max_notional_per_order {
-            InstrumentId::from_str(instrument_id).map_err(|e| {
-                anyhow::anyhow!(
-                    "invalid LiveRiskEngineConfig.max_notional_per_order instrument ID {instrument_id:?}: {e}"
-                )
-            })?;
-            Decimal::from_str(notional).map_err(|e| {
-                anyhow::anyhow!(
-                    "invalid LiveRiskEngineConfig.max_notional_per_order notional {notional:?}: {e}"
-                )
-            })?;
-        }
+        collector.collect(
+            parse_rate_limit(
+                "LiveRiskEngineConfig.max_order_submit_rate",
+                &self.max_order_submit_rate,
+            )
+            .map(|_| ()),
+        );
+        collector.collect(
+            parse_rate_limit(
+                "LiveRiskEngineConfig.max_order_modify_rate",
+                &self.max_order_modify_rate,
+            )
+            .map(|_| ()),
+        );
+        collector.collect(validate_max_notional_per_order(
+            "LiveRiskEngineConfig.max_notional_per_order",
+            &self.max_notional_per_order,
+        ));
 
         let default = Self::default();
+        collector.collect(check_supported_field(
+            "LiveRiskEngineConfig.qsize",
+            self.qsize == default.qsize,
+            RUST_RUNTIME_UNSUPPORTED,
+        ));
 
-        if self.graceful_shutdown_on_error != default.graceful_shutdown_on_error {
-            anyhow::bail!(
-                "LiveRiskEngineConfig.graceful_shutdown_on_error is not supported by the Rust live runtime yet"
-            );
-        }
-
-        if self.qsize != default.qsize {
-            anyhow::bail!(
-                "LiveRiskEngineConfig.qsize is not supported by the Rust live runtime yet"
-            );
-        }
-
-        Ok(())
+        collector.into_result()
     }
 }
 
 impl LiveExecEngineConfig {
-    fn validate_runtime_support(&self) -> anyhow::Result<()> {
+    fn validate_runtime_support(&self) -> ConfigResult<()> {
+        let mut collector = ConfigErrorCollector::new();
+
         // `Duration::from_secs_f64` panics on negative, NaN, or infinite input, and the
         // `run()` path feeds this value straight in when reconciliation is enabled. Match
         // the legacy Python `PositiveFloat` semantics and reject hostile values at build.
-        if !self.reconciliation_startup_delay_secs.is_finite()
-            || self.reconciliation_startup_delay_secs < 0.0
-        {
-            anyhow::bail!(
-                "invalid LiveExecEngineConfig.reconciliation_startup_delay_secs: {} (must be a non-negative finite number)",
-                self.reconciliation_startup_delay_secs
-            );
-        }
+        collector.collect(validate_non_negative_finite_f64(
+            "LiveExecEngineConfig.reconciliation_startup_delay_secs",
+            self.reconciliation_startup_delay_secs,
+        ));
 
         if let Some(instrument_ids) = &self.reconciliation_instrument_ids {
-            for instrument_id in instrument_ids {
-                InstrumentId::from_str(instrument_id).map_err(|e| {
-                    anyhow::anyhow!(
-                        "invalid LiveExecEngineConfig.reconciliation_instrument_ids entry {instrument_id:?}: {e}"
-                    )
-                })?;
-            }
+            collector.collect(validate_instrument_id_strings(
+                "LiveExecEngineConfig.reconciliation_instrument_ids",
+                instrument_ids,
+            ));
         }
 
         if let Some(client_order_ids) = &self.filtered_client_order_ids {
-            for client_order_id in client_order_ids {
-                ClientOrderId::new_checked(client_order_id).map_err(|e| {
-                    anyhow::anyhow!(
-                        "invalid LiveExecEngineConfig.filtered_client_order_ids entry {client_order_id:?}: {e}"
-                    )
-                })?;
-            }
+            collector.collect(validate_client_order_id_strings(
+                "LiveExecEngineConfig.filtered_client_order_ids",
+                client_order_ids,
+            ));
         }
 
         let default = Self::default();
+        collector.collect(check_supported_field(
+            "LiveExecEngineConfig.snapshot_orders",
+            self.snapshot_orders == default.snapshot_orders,
+            RUST_RUNTIME_UNSUPPORTED,
+        ));
+        collector.collect(check_supported_field(
+            "LiveExecEngineConfig.snapshot_positions",
+            self.snapshot_positions == default.snapshot_positions,
+            RUST_RUNTIME_UNSUPPORTED,
+        ));
+        collector.collect(check_supported_field(
+            "LiveExecEngineConfig.purge_from_database",
+            self.purge_from_database == default.purge_from_database,
+            RUST_RUNTIME_UNSUPPORTED,
+        ));
+        collector.collect(check_supported_field(
+            "LiveExecEngineConfig.qsize",
+            self.qsize == default.qsize,
+            RUST_RUNTIME_UNSUPPORTED,
+        ));
 
-        if self.snapshot_orders != default.snapshot_orders {
-            anyhow::bail!(
-                "LiveExecEngineConfig.snapshot_orders is not supported by the Rust live runtime yet"
-            );
-        }
-
-        if self.snapshot_positions != default.snapshot_positions {
-            anyhow::bail!(
-                "LiveExecEngineConfig.snapshot_positions is not supported by the Rust live runtime yet"
-            );
-        }
-
-        if self.purge_from_database != default.purge_from_database {
-            anyhow::bail!(
-                "LiveExecEngineConfig.purge_from_database is not supported by the Rust live runtime yet"
-            );
-        }
-
-        if self.graceful_shutdown_on_error != default.graceful_shutdown_on_error {
-            anyhow::bail!(
-                "LiveExecEngineConfig.graceful_shutdown_on_error is not supported by the Rust live runtime yet"
-            );
-        }
-
-        if self.qsize != default.qsize {
-            anyhow::bail!(
-                "LiveExecEngineConfig.qsize is not supported by the Rust live runtime yet"
-            );
-        }
-
-        Ok(())
+        collector.into_result()
     }
 }
 
@@ -852,6 +939,10 @@ impl NautilusKernelConfig for LiveNodeConfig {
 
     fn save_state(&self) -> bool {
         self.save_state
+    }
+
+    fn shutdown_on_error(&self) -> bool {
+        self.shutdown_on_error
     }
 
     fn logging(&self) -> LoggerConfig {
@@ -931,6 +1022,7 @@ mod tests {
         assert_eq!(config.data_engine.qsize, 100_000);
         assert_eq!(config.risk_engine.qsize, 100_000);
         assert_eq!(config.exec_engine.qsize, 100_000);
+        assert_eq!(config.timeout_connection, Duration::from_mins(1));
         assert!(config.exec_engine.reconciliation);
         assert!(!config.exec_engine.filter_unclaimed_external_orders);
         assert!(config.data_clients.is_empty());
@@ -959,16 +1051,36 @@ mod tests {
     }
 
     #[rstest]
-    fn test_validate_runtime_support_rejects_msgbus_config() {
+    fn test_validate_runtime_support_accepts_msgbus_config() {
         let config = LiveNodeConfig {
             msgbus: Some(MessageBusConfig::default()),
             ..Default::default()
         };
 
+        assert!(config.validate_runtime_support().is_ok());
+    }
+
+    #[rstest]
+    fn test_validate_runtime_support_rejects_msgbus_external_streams() {
+        let config = LiveNodeConfig {
+            msgbus: Some(MessageBusConfig {
+                external_streams: Some(vec!["stream".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
         let error = config.validate_runtime_support().unwrap_err();
         assert_eq!(
+            error,
+            ConfigError::UnsupportedField {
+                field: "LiveNodeConfig.msgbus.external_streams".to_string(),
+                reason: RUST_RUNTIME_UNSUPPORTED.to_string(),
+            },
+        );
+        assert_eq!(
             error.to_string(),
-            "LiveNodeConfig.msgbus is not supported by the Rust live runtime yet"
+            "LiveNodeConfig.msgbus.external_streams is not supported by the Rust live runtime yet"
         );
     }
 
@@ -990,6 +1102,41 @@ mod tests {
             error.to_string(),
             "LiveNodeConfig.streaming is not supported by the Rust live runtime yet"
         );
+    }
+
+    #[rstest]
+    fn test_validate_runtime_support_collects_multiple_errors() {
+        let config = LiveNodeConfig {
+            msgbus: Some(MessageBusConfig {
+                external_streams: Some(vec!["stream".to_string()]),
+                ..Default::default()
+            }),
+            loop_debug: true,
+            ..Default::default()
+        };
+
+        let error = config.validate_runtime_support().unwrap_err();
+
+        match error {
+            ConfigError::Multiple { errors } => {
+                assert_eq!(errors.len(), 2);
+                assert_eq!(
+                    errors[0],
+                    ConfigError::UnsupportedField {
+                        field: "LiveNodeConfig.msgbus.external_streams".to_string(),
+                        reason: RUST_RUNTIME_UNSUPPORTED.to_string(),
+                    },
+                );
+                assert_eq!(
+                    errors[1],
+                    ConfigError::UnsupportedField {
+                        field: "LiveNodeConfig.loop_debug".to_string(),
+                        reason: RUST_RUNTIME_UNSUPPORTED.to_string(),
+                    },
+                );
+            }
+            _ => panic!("Expected multiple config errors, received {error:?}"),
+        }
     }
 
     #[rstest]
@@ -1077,7 +1224,7 @@ mod tests {
         assert_eq!(converted.time_bars_origin_offset.len(), 1);
         assert_eq!(
             converted.time_bars_origin_offset[&BarAggregation::Minute],
-            Duration::from_nanos(5_000_000_000),
+            Duration::from_secs(5),
         );
         assert!(converted.emit_quotes_from_book);
         assert!(converted.emit_quotes_from_book_depths);
@@ -1088,6 +1235,7 @@ mod tests {
         let config = LiveExecEngineConfig {
             load_cache: false,
             snapshot_positions_interval_secs: Some(30.0),
+            filter_unclaimed_external_orders: true,
             ..Default::default()
         };
 
@@ -1095,6 +1243,7 @@ mod tests {
 
         assert!(!converted.load_cache);
         assert_eq!(converted.snapshot_positions_interval_secs, Some(30.0));
+        assert!(converted.filter_unclaimed_external_orders);
     }
 
     #[rstest]
@@ -1158,6 +1307,51 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_rate_limit_rejects_invalid_format_with_field_path() {
+        let error =
+            parse_rate_limit("LiveRiskEngineConfig.max_order_submit_rate", "bad-rate").unwrap_err();
+
+        assert_eq!(
+            error,
+            ConfigError::InvalidFormat {
+                field: "LiveRiskEngineConfig.max_order_submit_rate".to_string(),
+                expected: RATE_LIMIT_FORMAT.to_string(),
+            },
+        );
+    }
+
+    #[rstest]
+    fn test_validate_max_notional_per_order_collects_entry_errors() {
+        let error = validate_max_notional_per_order(
+            "LiveRiskEngineConfig.max_notional_per_order",
+            &HashMap::from([("INVALID".to_string(), "not-a-decimal".to_string())]),
+        )
+        .unwrap_err();
+
+        match error {
+            ConfigError::Multiple { errors } => {
+                assert_eq!(errors.len(), 2);
+                assert!(matches!(
+                    &errors[0],
+                    ConfigError::InvalidReference {
+                        field,
+                        reference,
+                        ..
+                    } if field == "LiveRiskEngineConfig.max_notional_per_order[INVALID]"
+                        && reference == "instrument ID"
+                ));
+                assert!(matches!(
+                    &errors[1],
+                    ConfigError::InvalidValue { field, reason }
+                        if field == "LiveRiskEngineConfig.max_notional_per_order[INVALID]"
+                            && reason.contains("invalid notional")
+                ));
+            }
+            _ => panic!("Expected multiple config errors, received {error:?}"),
+        }
+    }
+
+    #[rstest]
     #[case(-1.0)]
     #[case(f64::NAN)]
     #[case(f64::INFINITY)]
@@ -1173,6 +1367,32 @@ mod tests {
 
         let error = config.validate_runtime_support().unwrap_err().to_string();
         assert!(error.contains("reconciliation_startup_delay_secs"));
+    }
+
+    #[cfg(feature = "python")]
+    #[rstest]
+    fn test_duration_from_secs_f64_accepts_valid_value() {
+        let duration = duration_from_secs_f64("LiveNodeConfig.timeout_connection", 1.5).unwrap();
+
+        assert_eq!(duration, Duration::from_millis(1_500));
+    }
+
+    #[cfg(feature = "python")]
+    #[rstest]
+    #[case(-1.0)]
+    #[case(f64::NAN)]
+    #[case(f64::INFINITY)]
+    #[case(86_400.1)]
+    fn test_duration_from_secs_f64_rejects_invalid_values(#[case] value: f64) {
+        let error = duration_from_secs_f64("LiveNodeConfig.timeout_connection", value).unwrap_err();
+
+        match error {
+            ConfigError::Range { field, reason } => {
+                assert_eq!(field, "LiveNodeConfig.timeout_connection");
+                assert!(reason.contains("must be finite, non-negative, and <= 86400"));
+            }
+            _ => panic!("Expected range config error, received {error:?}"),
+        }
     }
 
     #[rstest]
@@ -1191,26 +1411,34 @@ mod tests {
 
     #[rstest]
     fn test_parse_rate_limit_happy_path() {
-        let limit = parse_rate_limit("150/00:00:02").unwrap();
+        let limit = parse_rate_limit("test.rate_limit", "150/00:00:02").unwrap();
         assert_eq!(limit, RateLimit::new(150, 2_000_000_000));
     }
 
     #[rstest]
     fn test_parse_rate_limit_rejects_trailing_component() {
-        let err = parse_rate_limit("10/00:00:01:99").unwrap_err().to_string();
+        let err = parse_rate_limit("test.rate_limit", "10/00:00:01:99")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("expected 'limit/HH:MM:SS'"));
     }
 
     #[rstest]
     fn test_parse_rate_limit_rejects_zero_limit() {
-        let err = parse_rate_limit("0/00:00:01").unwrap_err().to_string();
-        assert!(err.contains("limit must be greater than zero"));
+        let err = parse_rate_limit("test.rate_limit", "0/00:00:01")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid limit"));
+        assert!(err.contains("must be non-zero"));
     }
 
     #[rstest]
     fn test_parse_rate_limit_rejects_zero_interval() {
-        let err = parse_rate_limit("100/00:00:00").unwrap_err().to_string();
-        assert!(err.contains("interval must be greater than zero"));
+        let err = parse_rate_limit("test.rate_limit", "100/00:00:00")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid interval_ns"));
+        assert!(err.contains("must be non-zero"));
     }
 
     #[rstest]
@@ -1228,34 +1456,6 @@ mod tests {
             error.to_string(),
             "LiveExecEngineConfig.qsize is not supported by the Rust live runtime yet"
         );
-    }
-
-    #[rstest]
-    fn test_validate_runtime_support_rejects_data_engine_graceful_shutdown() {
-        let config = LiveNodeConfig {
-            data_engine: LiveDataEngineConfig {
-                graceful_shutdown_on_error: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let error = config.validate_runtime_support().unwrap_err().to_string();
-        assert!(error.contains("graceful_shutdown_on_error"));
-    }
-
-    #[rstest]
-    fn test_validate_runtime_support_rejects_risk_engine_graceful_shutdown() {
-        let config = LiveNodeConfig {
-            risk_engine: LiveRiskEngineConfig {
-                graceful_shutdown_on_error: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let error = config.validate_runtime_support().unwrap_err().to_string();
-        assert!(error.contains("graceful_shutdown_on_error"));
     }
 
     #[rstest]
@@ -1367,6 +1567,10 @@ mod tests {
     }
 
     #[rstest]
+    #[expect(
+        clippy::float_cmp,
+        reason = "asserts the exact configured default with no arithmetic involved"
+    )]
     fn test_live_exec_engine_config_defaults() {
         let config = LiveExecEngineConfig::default();
 
@@ -1397,7 +1601,6 @@ mod tests {
         assert_eq!(config.position_check_threshold_ms, 5_000);
         assert_eq!(config.position_check_retries, 3);
         assert!(!config.purge_from_database);
-        assert!(!config.graceful_shutdown_on_error);
         assert_eq!(config.qsize, 100_000);
     }
 
@@ -1417,7 +1620,6 @@ mod tests {
         assert!(!config.emit_quotes_from_book_depths);
         assert_eq!(config.external_clients, None);
         assert!(!config.debug);
-        assert!(!config.graceful_shutdown_on_error);
         assert_eq!(config.qsize, 100_000);
     }
 
@@ -1430,7 +1632,6 @@ mod tests {
         assert_eq!(config.max_order_modify_rate, DEFAULT_ORDER_RATE_LIMIT);
         assert!(config.max_notional_per_order.is_empty());
         assert!(!config.debug);
-        assert!(!config.graceful_shutdown_on_error);
         assert_eq!(config.qsize, 100_000);
     }
 
@@ -1534,5 +1735,27 @@ config = { strategy_id = "ExampleStrategy-001", threshold = 10 }
             serde_json::json!("ExampleStrategy-001")
         );
         assert_eq!(config.plugins[0].config["threshold"], serde_json::json!(10));
+    }
+
+    #[rstest]
+    fn live_node_config_serde_roundtrip_with_event_store() {
+        let config = LiveNodeConfig {
+            event_store: Some(EventStoreConfig {
+                channel_capacity: 5_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        let restored: LiveNodeConfig = serde_json::from_str(&json).expect("deserialize");
+
+        let restored_event_store = restored.event_store.expect("event_store present");
+        assert_eq!(restored_event_store.channel_capacity, 5_000);
+    }
+
+    #[rstest]
+    fn live_node_config_default_has_no_event_store() {
+        let config = LiveNodeConfig::default();
+        assert!(config.event_store.is_none());
     }
 }

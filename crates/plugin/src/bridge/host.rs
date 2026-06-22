@@ -28,11 +28,17 @@
               SAFETY comments cover both ops together"
 )]
 
-use std::{num::NonZeroUsize, str::FromStr, sync::OnceLock};
+use std::{
+    num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind},
+    str::FromStr,
+    sync::OnceLock,
+};
 
 use nautilus_common::{
-    actor::{DataActor, registry::try_get_actor_unchecked},
+    actor::{DataActor, DataActorNative, registry::try_get_actor_unchecked},
     cache::Cache,
+    component::Component,
     msgbus,
 };
 use nautilus_core::{Params, UnixNanos, time::duration_since_unix_epoch};
@@ -40,8 +46,9 @@ use nautilus_model::{
     data::BarType,
     enums::{BookType, FromU8},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId},
+    orders::{Order, OrderAny},
 };
-use nautilus_trading::strategy::Strategy;
+use nautilus_trading::strategy::{Strategy, StrategyNative};
 use serde::Serialize;
 
 use crate::{
@@ -49,16 +56,18 @@ use crate::{
     boundary::{BorrowedStr, OwnedBytes, PluginError, PluginErrorCode, PluginResult, Slice},
     bridge::{
         actor::PluginActorAdapter,
-        commands::{
-            CancelAllOrdersCommand, CancelOrderCommand, CancelOrdersCommand,
-            CloseAllPositionsCommand, ClosePositionCommand, ModifyOrderCommand,
-            QueryAccountCommand, QueryOrderCommand, SubmitOrderCommand, SubmitOrderListCommand,
-        },
-        registry::{HostContextInner, host_context_inner},
+        registry::{HostContextInner, controller_host_context_inner, host_context_inner},
         strategy::PluginStrategyAdapter,
     },
-    host::{HostContext, HostLogLevel, HostVTable},
+    host::{ControllerHostContext, ControllerHostVTable, HostContext, HostLogLevel, HostVTable},
     loader::PluginLoader,
+    normalize::BoundaryCommandHandle,
+    panic::{drop_payload, panic_message},
+    surfaces::commands::{
+        CancelAllOrdersHandle, CancelOrderHandle, CancelOrdersHandle, CloseAllPositionsHandle,
+        ClosePositionHandle, ModifyOrderHandle, QueryAccountHandle, QueryOrderHandle,
+        SubmitOrderHandle, SubmitOrderListHandle,
+    },
 };
 
 /// Returns the process-wide `HostVTable` configured for the live node.
@@ -103,6 +112,28 @@ pub fn host_vtable() -> *const HostVTable {
         close_all_positions: host_close_all_positions,
         query_account: host_query_account,
         query_order: host_query_order,
+        trader_id: host_trader_id,
+        strategy_id: host_strategy_id,
+        component_state: host_component_state,
+        generate_client_order_id: host_generate_client_order_id,
+        generate_order_list_id: host_generate_order_list_id,
+    }))
+}
+
+/// Returns the process-wide `ControllerHostVTable` for plug-in controllers.
+#[must_use]
+pub fn controller_host_vtable() -> *const ControllerHostVTable {
+    static HOST: OnceLock<ControllerHostVTable> = OnceLock::new();
+    std::ptr::from_ref(HOST.get_or_init(|| ControllerHostVTable {
+        abi_version: NAUTILUS_PLUGIN_ABI_VERSION,
+        create_plugin_strategy: controller_host_not_implemented,
+        start_strategy: controller_host_not_implemented,
+        stop_strategy: controller_host_not_implemented,
+        exit_market: controller_host_not_implemented,
+        remove_strategy: controller_host_not_implemented,
+        instrument_exists: controller_host_not_implemented,
+        log: controller_host_log,
+        clock_now_ns: controller_host_clock_now_ns,
     }))
 }
 
@@ -121,22 +152,66 @@ unsafe extern "C" fn host_clock_now_ns() -> u64 {
     u64::try_from(duration_since_unix_epoch().as_nanos()).unwrap_or(u64::MAX)
 }
 
+unsafe extern "C" fn controller_host_not_implemented(
+    ctx: *const ControllerHostContext,
+    _request_json: BorrowedStr<'_>,
+) -> PluginResult<OwnedBytes> {
+    let context = controller_context_label(ctx);
+    PluginResult::Err(PluginError::new(
+        PluginErrorCode::NotImplemented,
+        format!("{context} controller host service is not implemented"),
+    ))
+}
+
+unsafe extern "C" fn controller_host_log(
+    ctx: *const ControllerHostContext,
+    request_json: BorrowedStr<'_>,
+) -> PluginResult<OwnedBytes> {
+    guard_host_dispatch("controller log", || {
+        let context = controller_context_label(ctx);
+        let request = borrowed_utf8(request_json, "request_json")?;
+        log::info!(target: "nautilus_plugin", "[{context}] {request}");
+        Ok(OwnedBytes::empty())
+    })
+}
+
+unsafe extern "C" fn controller_host_clock_now_ns(
+    _ctx: *const ControllerHostContext,
+    _request_json: BorrowedStr<'_>,
+) -> PluginResult<OwnedBytes> {
+    json_bytes(&serde_json::json!({
+        "unix_nanos": u64::try_from(duration_since_unix_epoch().as_nanos()).unwrap_or(u64::MAX),
+    }))
+}
+
+fn controller_context_label(ctx: *const ControllerHostContext) -> String {
+    // SAFETY: plug-ins round-trip the context pointer supplied at create time.
+    let Some(inner) = (unsafe { controller_host_context_inner(ctx) }) else {
+        return "unknown-controller".to_string();
+    };
+    format!("{}:{}", inner.plugin_name, inner.type_name)
+}
+
 unsafe extern "C" fn host_log(
     level: HostLogLevel,
     target: BorrowedStr<'_>,
     message: BorrowedStr<'_>,
 ) {
-    // SAFETY: producer holds the storage live across the call.
-    let target = unsafe { target.as_str() };
-    // SAFETY: see above.
-    let message = unsafe { message.as_str() };
-    match level {
-        HostLogLevel::Error => log::error!(target: "nautilus_plugin", "[{target}] {message}"),
-        HostLogLevel::Warn => log::warn!(target: "nautilus_plugin", "[{target}] {message}"),
-        HostLogLevel::Info => log::info!(target: "nautilus_plugin", "[{target}] {message}"),
-        HostLogLevel::Debug => log::debug!(target: "nautilus_plugin", "[{target}] {message}"),
-        HostLogLevel::Trace => log::trace!(target: "nautilus_plugin", "[{target}] {message}"),
-    }
+    // No error channel here, so a panicking logger must be swallowed rather
+    // than unwind out of the `extern "C"` thunk and abort the process.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: producer holds the storage live across the call.
+        let target = unsafe { target.to_string_lossy() };
+        // SAFETY: see above.
+        let message = unsafe { message.to_string_lossy() };
+        match level {
+            HostLogLevel::Error => log::error!(target: "nautilus_plugin", "[{target}] {message}"),
+            HostLogLevel::Warn => log::warn!(target: "nautilus_plugin", "[{target}] {message}"),
+            HostLogLevel::Info => log::info!(target: "nautilus_plugin", "[{target}] {message}"),
+            HostLogLevel::Debug => log::debug!(target: "nautilus_plugin", "[{target}] {message}"),
+            HostLogLevel::Trace => log::trace!(target: "nautilus_plugin", "[{target}] {message}"),
+        }
+    }));
 }
 
 unsafe extern "C" fn host_cache_instrument(
@@ -233,6 +308,82 @@ unsafe extern "C" fn host_cache_positions_for_strategy(
             .map(|position| position.cloned())
             .collect::<Vec<_>>();
         json_bytes(&positions)
+    })
+}
+
+unsafe extern "C" fn host_trader_id(ctx: *const HostContext) -> PluginResult<OwnedBytes> {
+    guard_host_dispatch("trader_id", || {
+        let inner = resolve_context(ctx, "trader_id")?;
+        let actor_id = inner.actor_id.inner();
+        let trader_id = if inner.is_strategy {
+            let adapter_ref = try_get_actor_unchecked::<PluginStrategyAdapter>(&actor_id)
+                .ok_or_else(|| resolve_adapter_error("trader_id", inner))?;
+            adapter_ref.trader_id()
+        } else {
+            let adapter_ref = try_get_actor_unchecked::<PluginActorAdapter>(&actor_id)
+                .ok_or_else(|| resolve_adapter_error("trader_id", inner))?;
+            adapter_ref.trader_id()
+        }
+        .ok_or_else(|| {
+            PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                format!("trader_id is unavailable for unregistered actor_id={actor_id}"),
+            )
+        })?;
+
+        json_bytes(&trader_id).into_result()
+    })
+}
+
+unsafe extern "C" fn host_strategy_id(ctx: *const HostContext) -> PluginResult<OwnedBytes> {
+    dispatch_strategy_query(ctx, "strategy_id", |adapter| {
+        let strategy_id = StrategyNative::strategy_core(adapter)
+            .strategy_id()
+            .ok_or_else(|| {
+                PluginError::new(
+                    PluginErrorCode::InvalidArgument,
+                    "strategy_id is unavailable before strategy registration",
+                )
+            })?;
+        json_bytes(&strategy_id).into_result()
+    })
+}
+
+unsafe extern "C" fn host_component_state(ctx: *const HostContext) -> PluginResult<u8> {
+    guard_host_dispatch("component_state", || {
+        let inner = resolve_context(ctx, "component_state")?;
+        let actor_id = inner.actor_id.inner();
+        let state = if inner.is_strategy {
+            let adapter_ref = try_get_actor_unchecked::<PluginStrategyAdapter>(&actor_id)
+                .ok_or_else(|| resolve_adapter_error("component_state", inner))?;
+            adapter_ref.state()
+        } else {
+            let adapter_ref = try_get_actor_unchecked::<PluginActorAdapter>(&actor_id)
+                .ok_or_else(|| resolve_adapter_error("component_state", inner))?;
+            adapter_ref.state()
+        };
+
+        Ok(state as u8)
+    })
+}
+
+unsafe extern "C" fn host_generate_client_order_id(
+    ctx: *const HostContext,
+) -> PluginResult<OwnedBytes> {
+    dispatch_strategy_query(ctx, "generate_client_order_id", |adapter| {
+        require_registered_strategy(adapter, "generate_client_order_id")?;
+        let client_order_id = StrategyNative::order_factory(adapter).generate_client_order_id();
+        json_bytes(&client_order_id).into_result()
+    })
+}
+
+unsafe extern "C" fn host_generate_order_list_id(
+    ctx: *const HostContext,
+) -> PluginResult<OwnedBytes> {
+    dispatch_strategy_query(ctx, "generate_order_list_id", |adapter| {
+        require_registered_strategy(adapter, "generate_order_list_id")?;
+        let order_list_id = StrategyNative::order_factory(adapter).generate_order_list_id();
+        json_bytes(&order_list_id).into_result()
     })
 }
 
@@ -559,14 +710,11 @@ unsafe extern "C" fn host_subscribe_book_at_interval(
         };
     let actor_args = args.clone();
     let strategy_args = args;
-    let interval_ms = match NonZeroUsize::new(interval_ms) {
-        Some(value) => value,
-        None => {
-            return PluginResult::Err(PluginError::new(
-                PluginErrorCode::InvalidArgument,
-                "interval_ms must be greater than zero",
-            ));
-        }
+    let Some(interval_ms) = NonZeroUsize::new(interval_ms) else {
+        return PluginResult::Err(PluginError::new(
+            PluginErrorCode::InvalidArgument,
+            "interval_ms must be greater than zero",
+        ));
     };
 
     dispatch_actor_action(
@@ -612,14 +760,11 @@ unsafe extern "C" fn host_unsubscribe_book_at_interval(
     };
     let actor_args = args.clone();
     let strategy_args = args;
-    let interval_ms = match NonZeroUsize::new(interval_ms) {
-        Some(value) => value,
-        None => {
-            return PluginResult::Err(PluginError::new(
-                PluginErrorCode::InvalidArgument,
-                "interval_ms must be greater than zero",
-            ));
-        }
+    let Some(interval_ms) = NonZeroUsize::new(interval_ms) else {
+        return PluginResult::Err(PluginError::new(
+            PluginErrorCode::InvalidArgument,
+            "interval_ms must be greater than zero",
+        ));
     };
 
     dispatch_actor_action(
@@ -653,21 +798,16 @@ unsafe extern "C" fn host_msgbus_publish(
     topic: BorrowedStr<'_>,
     payload: Slice<'_, u8>,
 ) -> PluginResult<()> {
-    let inner = match resolve_context(ctx, "msgbus_publish") {
-        Ok(inner) => inner,
-        Err(e) => return PluginResult::Err(e),
-    };
+    guard_host_dispatch("msgbus_publish", || {
+        let inner = resolve_context(ctx, "msgbus_publish")?;
+        ensure_adapter_registered("msgbus_publish", inner)?;
 
-    if let Err(e) = ensure_adapter_registered("msgbus_publish", inner) {
-        return PluginResult::Err(e);
-    }
-
-    // SAFETY: topic and payload borrow storage live across this call.
-    let topic = unsafe { topic.as_str() };
-    // SAFETY: see above.
-    let payload = unsafe { payload.as_slice() }.to_vec();
-    msgbus::publish_any(topic.into(), &payload);
-    PluginResult::Ok(())
+        let topic = borrowed_utf8(topic, "topic")?;
+        // SAFETY: payload borrows storage live across this call.
+        let payload = unsafe { payload.as_slice() }.to_vec();
+        msgbus::publish_any(topic.into(), &payload);
+        Ok(())
+    })
 }
 
 unsafe extern "C" fn host_set_time_alert(
@@ -676,8 +816,10 @@ unsafe extern "C" fn host_set_time_alert(
     alert_time_ns: u64,
     allow_past: u8,
 ) -> PluginResult<()> {
-    // SAFETY: name borrows storage live across this call.
-    let name = unsafe { name.as_str() }.to_string();
+    let name = match borrowed_utf8(name, "name") {
+        Ok(value) => value.to_string(),
+        Err(e) => return PluginResult::Err(e),
+    };
     dispatch_actor_action(
         ctx,
         "set_time_alert",
@@ -709,8 +851,10 @@ unsafe extern "C" fn host_set_timer(
     allow_past: u8,
     fire_immediately: u8,
 ) -> PluginResult<()> {
-    // SAFETY: name borrows storage live across this call.
-    let name = unsafe { name.as_str() }.to_string();
+    let name = match borrowed_utf8(name, "name") {
+        Ok(value) => value.to_string(),
+        Err(e) => return PluginResult::Err(e),
+    };
     let start_time_ns = nonzero_unix_nanos(start_time_ns);
     let stop_time_ns = nonzero_unix_nanos(stop_time_ns);
 
@@ -746,8 +890,10 @@ unsafe extern "C" fn host_cancel_timer(
     ctx: *const HostContext,
     name: BorrowedStr<'_>,
 ) -> PluginResult<()> {
-    // SAFETY: name borrows storage live across this call.
-    let name = unsafe { name.as_str() }.to_string();
+    let name = match borrowed_utf8(name, "name") {
+        Ok(value) => value.to_string(),
+        Err(e) => return PluginResult::Err(e),
+    };
     dispatch_actor_action(
         ctx,
         "cancel_timer",
@@ -764,204 +910,322 @@ unsafe extern "C" fn host_cancel_timer(
 
 unsafe extern "C" fn host_submit_order(
     ctx: *const HostContext,
-    command_json: BorrowedStr<'_>,
+    command: *const SubmitOrderHandle,
 ) -> PluginResult<()> {
-    dispatch_command(ctx, command_json, "submit_order", |adapter, json| {
-        let cmd: SubmitOrderCommand = serde_json::from_str(json)?;
-        Strategy::submit_order(
-            adapter,
-            cmd.order,
-            cmd.position_id,
-            cmd.client_id,
-            cmd.params,
-        )
-    })
+    // SAFETY: plug-in keeps the handle alive for the duration of the call.
+    unsafe {
+        dispatch_handle_plugin_error(ctx, command, "submit_order", |adapter, cmd| {
+            validate_order_identity(adapter, &cmd.order)?;
+            Strategy::submit_order(
+                adapter,
+                cmd.order,
+                cmd.position_id,
+                cmd.client_id,
+                cmd.params,
+            )
+            .map_err(|e| generic_plugin_error(&e))
+        })
+    }
 }
 
 unsafe extern "C" fn host_cancel_order(
     ctx: *const HostContext,
-    command_json: BorrowedStr<'_>,
+    command: *const CancelOrderHandle,
 ) -> PluginResult<()> {
-    dispatch_command(ctx, command_json, "cancel_order", |adapter, json| {
-        let cmd: CancelOrderCommand = serde_json::from_str(json)?;
-        Strategy::cancel_order(adapter, cmd.client_order_id, cmd.client_id, cmd.params)
-    })
+    // SAFETY: plug-in keeps the handle alive for the duration of the call.
+    unsafe {
+        dispatch_handle(ctx, command, "cancel_order", |adapter, cmd| {
+            Strategy::cancel_order(adapter, cmd.client_order_id, cmd.client_id, cmd.params)
+        })
+    }
 }
 
 unsafe extern "C" fn host_modify_order(
     ctx: *const HostContext,
-    command_json: BorrowedStr<'_>,
+    command: *const ModifyOrderHandle,
 ) -> PluginResult<()> {
-    dispatch_command(ctx, command_json, "modify_order", |adapter, json| {
-        let cmd: ModifyOrderCommand = serde_json::from_str(json)?;
-        Strategy::modify_order(
-            adapter,
-            cmd.client_order_id,
-            cmd.quantity,
-            cmd.price,
-            cmd.trigger_price,
-            cmd.client_id,
-            cmd.params,
-        )
-    })
+    // SAFETY: plug-in keeps the handle alive for the duration of the call.
+    unsafe {
+        dispatch_handle(ctx, command, "modify_order", |adapter, cmd| {
+            Strategy::modify_order(
+                adapter,
+                cmd.client_order_id,
+                cmd.quantity,
+                cmd.price,
+                cmd.trigger_price,
+                cmd.client_id,
+                cmd.params,
+            )
+        })
+    }
 }
 
 unsafe extern "C" fn host_submit_order_list(
     ctx: *const HostContext,
-    command_json: BorrowedStr<'_>,
+    command: *const SubmitOrderListHandle,
 ) -> PluginResult<()> {
-    dispatch_command(ctx, command_json, "submit_order_list", |adapter, json| {
-        let cmd: SubmitOrderListCommand = serde_json::from_str(json)?;
-        Strategy::submit_order_list(
-            adapter,
-            cmd.orders,
-            cmd.position_id,
-            cmd.client_id,
-            cmd.params,
-        )
-    })
+    // SAFETY: plug-in keeps the handle alive for the duration of the call.
+    unsafe {
+        dispatch_handle_plugin_error(ctx, command, "submit_order_list", |adapter, cmd| {
+            for order in &cmd.orders {
+                validate_order_identity(adapter, order)?;
+            }
+            Strategy::submit_order_list(
+                adapter,
+                cmd.orders,
+                cmd.position_id,
+                cmd.client_id,
+                cmd.params,
+            )
+            .map_err(|e| generic_plugin_error(&e))
+        })
+    }
 }
 
 unsafe extern "C" fn host_cancel_orders(
     ctx: *const HostContext,
-    command_json: BorrowedStr<'_>,
+    command: *const CancelOrdersHandle,
 ) -> PluginResult<()> {
-    dispatch_command(ctx, command_json, "cancel_orders", |adapter, json| {
-        let cmd: CancelOrdersCommand = serde_json::from_str(json)?;
-        Strategy::cancel_orders(adapter, cmd.client_order_ids, cmd.client_id, cmd.params)
-    })
+    // SAFETY: plug-in keeps the handle alive for the duration of the call.
+    unsafe {
+        dispatch_handle(ctx, command, "cancel_orders", |adapter, cmd| {
+            Strategy::cancel_orders(adapter, cmd.client_order_ids, cmd.client_id, cmd.params)
+        })
+    }
 }
 
 unsafe extern "C" fn host_cancel_all_orders(
     ctx: *const HostContext,
-    command_json: BorrowedStr<'_>,
+    command: *const CancelAllOrdersHandle,
 ) -> PluginResult<()> {
-    dispatch_command(ctx, command_json, "cancel_all_orders", |adapter, json| {
-        let cmd: CancelAllOrdersCommand = serde_json::from_str(json)?;
-        Strategy::cancel_all_orders(
-            adapter,
-            cmd.instrument_id,
-            cmd.order_side,
-            cmd.client_id,
-            cmd.params,
-        )
-    })
+    // SAFETY: plug-in keeps the handle alive for the duration of the call.
+    unsafe {
+        dispatch_handle(ctx, command, "cancel_all_orders", |adapter, cmd| {
+            Strategy::cancel_all_orders(
+                adapter,
+                cmd.instrument_id,
+                cmd.order_side,
+                cmd.client_id,
+                cmd.params,
+            )
+        })
+    }
 }
 
 unsafe extern "C" fn host_close_position(
     ctx: *const HostContext,
-    command_json: BorrowedStr<'_>,
+    command: *const ClosePositionHandle,
 ) -> PluginResult<()> {
-    dispatch_command(ctx, command_json, "close_position", |adapter, json| {
-        let cmd: ClosePositionCommand = serde_json::from_str(json)?;
-        let position = {
-            let cache = adapter.cache();
-            cache.position(&cmd.position_id).map(|p| p.cloned())
-        };
-        let position = position
-            .ok_or_else(|| anyhow::anyhow!("position '{}' not found in cache", cmd.position_id))?;
-        Strategy::close_position(
-            adapter,
-            &position,
-            cmd.client_id,
-            cmd.tags,
-            cmd.time_in_force,
-            cmd.reduce_only,
-            cmd.quote_quantity,
-        )
-    })
+    // SAFETY: plug-in keeps the handle alive for the duration of the call.
+    unsafe {
+        dispatch_handle(ctx, command, "close_position", |adapter, cmd| {
+            let position = {
+                let cache = DataActorNative::cache_ref(adapter);
+                cache.position(&cmd.position_id).map(|p| p.cloned())
+            };
+            let position = position.ok_or_else(|| {
+                anyhow::anyhow!("position '{}' not found in cache", cmd.position_id)
+            })?;
+            Strategy::close_position(
+                adapter,
+                &position,
+                cmd.client_id,
+                cmd.tags,
+                cmd.time_in_force,
+                cmd.reduce_only,
+                cmd.quote_quantity,
+            )
+        })
+    }
 }
 
 unsafe extern "C" fn host_close_all_positions(
     ctx: *const HostContext,
-    command_json: BorrowedStr<'_>,
+    command: *const CloseAllPositionsHandle,
 ) -> PluginResult<()> {
-    dispatch_command(ctx, command_json, "close_all_positions", |adapter, json| {
-        let cmd: CloseAllPositionsCommand = serde_json::from_str(json)?;
-        Strategy::close_all_positions(
-            adapter,
-            cmd.instrument_id,
-            cmd.position_side,
-            cmd.client_id,
-            cmd.tags,
-            cmd.time_in_force,
-            cmd.reduce_only,
-            cmd.quote_quantity,
-        )
-    })
+    // SAFETY: plug-in keeps the handle alive for the duration of the call.
+    unsafe {
+        dispatch_handle(ctx, command, "close_all_positions", |adapter, cmd| {
+            Strategy::close_all_positions(
+                adapter,
+                cmd.instrument_id,
+                cmd.position_side,
+                cmd.client_id,
+                cmd.tags,
+                cmd.time_in_force,
+                cmd.reduce_only,
+                cmd.quote_quantity,
+            )
+        })
+    }
 }
 
 unsafe extern "C" fn host_query_account(
     ctx: *const HostContext,
-    command_json: BorrowedStr<'_>,
+    command: *const QueryAccountHandle,
 ) -> PluginResult<()> {
-    dispatch_command(ctx, command_json, "query_account", |adapter, json| {
-        let cmd: QueryAccountCommand = serde_json::from_str(json)?;
-        Strategy::query_account(adapter, cmd.account_id, cmd.client_id, cmd.params)
-    })
+    // SAFETY: plug-in keeps the handle alive for the duration of the call.
+    unsafe {
+        dispatch_handle(ctx, command, "query_account", |adapter, cmd| {
+            Strategy::query_account(adapter, cmd.account_id, cmd.client_id, cmd.params)
+        })
+    }
 }
 
 unsafe extern "C" fn host_query_order(
     ctx: *const HostContext,
-    command_json: BorrowedStr<'_>,
+    command: *const QueryOrderHandle,
 ) -> PluginResult<()> {
-    dispatch_command(ctx, command_json, "query_order", |adapter, json| {
-        let cmd: QueryOrderCommand = serde_json::from_str(json)?;
-        let order = {
-            let cache = adapter.cache();
-            cache.order(&cmd.client_order_id).map(|o| o.cloned())
-        };
-        let order = order
-            .ok_or_else(|| anyhow::anyhow!("order '{}' not found in cache", cmd.client_order_id))?;
-        Strategy::query_order(adapter, &order, cmd.client_id, cmd.params)
+    // SAFETY: plug-in keeps the handle alive for the duration of the call.
+    unsafe {
+        dispatch_handle(ctx, command, "query_order", |adapter, cmd| {
+            let order = {
+                let cache = DataActorNative::cache_ref(adapter);
+                cache.order(&cmd.client_order_id).map(|o| o.cloned())
+            };
+            let order = order.ok_or_else(|| {
+                anyhow::anyhow!("order '{}' not found in cache", cmd.client_order_id)
+            })?;
+            Strategy::query_order(adapter, &order, cmd.client_id, cmd.params)
+        })
+    }
+}
+
+// Resolves the calling strategy adapter from `ctx` and invokes `f` with a
+// borrowed reference to the plug-in-owned handle. Used by the boundary-owned
+// command slots (`cancel_order`, `modify_order`, etc.) that take
+// `*const XHandle` rather than JSON. The handle stays owned by the plug-in
+// for the duration of the call; the host only borrows it.
+//
+// SAFETY contract for callers: `command` must be a non-null pointer to a
+// live handle whose layout matches the host's view of `H`. The loader pins
+// `rustc_version` and `nautilus_plugin_version` at load time by default
+// (`LoadError::BuildMismatch`); an operator who opts out via
+// `PluginLoader::set_allow_build_mismatch` accepts that a plug-in built
+// against a mismatched toolchain derefs through this path with whatever
+// layout it happened to compile against.
+unsafe fn dispatch_handle<H>(
+    ctx: *const HostContext,
+    command: *const H,
+    method: &'static str,
+    f: impl FnOnce(&mut PluginStrategyAdapter, H::Command) -> anyhow::Result<()>,
+) -> PluginResult<()>
+where
+    H: BoundaryCommandHandle,
+{
+    // SAFETY: forwards the caller's handle contract unchanged.
+    unsafe {
+        dispatch_handle_plugin_error(ctx, command, method, |adapter, command| {
+            f(adapter, command).map_err(|e| generic_plugin_error(&e))
+        })
+    }
+}
+
+unsafe fn dispatch_handle_plugin_error<H>(
+    ctx: *const HostContext,
+    command: *const H,
+    method: &'static str,
+    f: impl FnOnce(&mut PluginStrategyAdapter, H::Command) -> Result<(), PluginError>,
+) -> PluginResult<()>
+where
+    H: BoundaryCommandHandle,
+{
+    guard_host_dispatch(method, || {
+        if command.is_null() {
+            return Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                format!("{method} called with null command handle"),
+            ));
+        }
+
+        // SAFETY: caller (the plug-in) round-trips the same ctx the host
+        // handed back from `PluginStrategyAdapter::new`.
+        let inner = unsafe { host_context_inner(ctx) }.ok_or_else(|| {
+            PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                format!("{method} called with null HostContext"),
+            )
+        })?;
+
+        if !inner.is_strategy {
+            return Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                format!(
+                    "{method} called from a non-strategy plug-in context (actor_id={})",
+                    inner.actor_id
+                ),
+            ));
+        }
+
+        let actor_id = inner.actor_id.inner();
+        let mut adapter_ref = try_get_actor_unchecked::<PluginStrategyAdapter>(&actor_id)
+            .ok_or_else(|| resolve_adapter_error(method, inner))?;
+
+        // SAFETY: command is non-null (checked above) and the plug-in commits
+        // to keeping the handle live for the duration of this call.
+        let handle = unsafe { &*command };
+        let command = handle.boundary_normalized_command();
+        f(&mut adapter_ref, command)
     })
 }
 
-fn dispatch_command(
-    ctx: *const HostContext,
-    command_json: BorrowedStr<'_>,
-    method: &'static str,
-    f: impl FnOnce(&mut PluginStrategyAdapter, &str) -> anyhow::Result<()>,
-) -> PluginResult<()> {
-    // SAFETY: command_json borrows storage that is live across the call.
-    let json = unsafe { command_json.as_str() };
-
-    // SAFETY: caller (the plug-in) round-trips the same ctx the host handed
-    // back from `PluginStrategyAdapter::new`.
-    let inner = match unsafe { host_context_inner(ctx) } {
-        Some(inner) => inner,
-        None => {
-            return PluginResult::Err(PluginError::new(
+fn validate_order_identity(
+    adapter: &PluginStrategyAdapter,
+    order: &OrderAny,
+) -> Result<(), PluginError> {
+    let expected_trader_id = adapter.trader_id().ok_or_else(|| {
+        PluginError::new(
+            PluginErrorCode::InvalidArgument,
+            "trader_id is unavailable before strategy registration",
+        )
+    })?;
+    let expected_strategy_id = StrategyNative::strategy_core(adapter)
+        .strategy_id()
+        .ok_or_else(|| {
+            PluginError::new(
                 PluginErrorCode::InvalidArgument,
-                format!("{method} called with null HostContext"),
-            ));
-        }
-    };
+                "strategy_id is unavailable before strategy registration",
+            )
+        })?;
 
-    if !inner.is_strategy {
-        return PluginResult::Err(PluginError::new(
+    if order.trader_id() != expected_trader_id {
+        return Err(PluginError::new(
             PluginErrorCode::InvalidArgument,
             format!(
-                "{method} called from a non-strategy plug-in context (actor_id={})",
-                inner.actor_id
+                "order {} trader_id mismatch: expected {}, found {}",
+                order.client_order_id(),
+                expected_trader_id,
+                order.trader_id()
             ),
         ));
     }
 
-    let actor_id = inner.actor_id.inner();
-    let Some(mut adapter_ref) = try_get_actor_unchecked::<PluginStrategyAdapter>(&actor_id) else {
-        return PluginResult::Err(PluginError::new(
-            PluginErrorCode::Generic,
+    if order.strategy_id() != expected_strategy_id {
+        return Err(PluginError::new(
+            PluginErrorCode::InvalidArgument,
             format!(
-                "{method} could not resolve strategy adapter for actor_id={}",
-                inner.actor_id
+                "order {} strategy_id mismatch: expected {}, found {}",
+                order.client_order_id(),
+                expected_strategy_id,
+                order.strategy_id()
             ),
         ));
-    };
+    }
 
-    match f(&mut adapter_ref, json) {
-        Ok(()) => PluginResult::Ok(()),
-        Err(e) => PluginResult::Err(PluginError::new(PluginErrorCode::Generic, e.to_string())),
+    Ok(())
+}
+
+fn require_registered_strategy(
+    adapter: &PluginStrategyAdapter,
+    method: &'static str,
+) -> Result<(), PluginError> {
+    if adapter.is_registered() {
+        Ok(())
+    } else {
+        Err(PluginError::new(
+            PluginErrorCode::InvalidArgument,
+            format!("{method} requires a registered strategy"),
+        ))
     }
 }
 
@@ -971,29 +1235,47 @@ fn dispatch_actor_action(
     actor_fn: impl FnOnce(&mut PluginActorAdapter) -> anyhow::Result<()>,
     strategy_fn: impl FnOnce(&mut PluginStrategyAdapter) -> anyhow::Result<()>,
 ) -> PluginResult<()> {
-    let inner = match resolve_context(ctx, method) {
-        Ok(inner) => inner,
-        Err(e) => return PluginResult::Err(e),
-    };
+    guard_host_dispatch(method, || {
+        let inner = resolve_context(ctx, method)?;
 
-    let actor_id = inner.actor_id.inner();
-    let result = if inner.is_strategy {
-        let Some(mut adapter_ref) = try_get_actor_unchecked::<PluginStrategyAdapter>(&actor_id)
-        else {
-            return PluginResult::Err(resolve_adapter_error(method, inner));
+        let actor_id = inner.actor_id.inner();
+        let result = if inner.is_strategy {
+            let mut adapter_ref = try_get_actor_unchecked::<PluginStrategyAdapter>(&actor_id)
+                .ok_or_else(|| resolve_adapter_error(method, inner))?;
+            strategy_fn(&mut adapter_ref)
+        } else {
+            let mut adapter_ref = try_get_actor_unchecked::<PluginActorAdapter>(&actor_id)
+                .ok_or_else(|| resolve_adapter_error(method, inner))?;
+            actor_fn(&mut adapter_ref)
         };
-        strategy_fn(&mut adapter_ref)
-    } else {
-        let Some(mut adapter_ref) = try_get_actor_unchecked::<PluginActorAdapter>(&actor_id) else {
-            return PluginResult::Err(resolve_adapter_error(method, inner));
-        };
-        actor_fn(&mut adapter_ref)
-    };
 
-    match result {
-        Ok(()) => PluginResult::Ok(()),
-        Err(e) => PluginResult::Err(PluginError::new(PluginErrorCode::Generic, e.to_string())),
-    }
+        result.map_err(|e| PluginError::new(PluginErrorCode::Generic, e.to_string()))
+    })
+}
+
+fn dispatch_strategy_query<T>(
+    ctx: *const HostContext,
+    method: &'static str,
+    f: impl FnOnce(&mut PluginStrategyAdapter) -> Result<T, PluginError>,
+) -> PluginResult<T> {
+    guard_host_dispatch(method, || {
+        let inner = resolve_context(ctx, method)?;
+        if !inner.is_strategy {
+            return Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                format!(
+                    "{method} called from a non-strategy plug-in context (actor_id={})",
+                    inner.actor_id
+                ),
+            ));
+        }
+
+        let actor_id = inner.actor_id.inner();
+        let mut adapter_ref = try_get_actor_unchecked::<PluginStrategyAdapter>(&actor_id)
+            .ok_or_else(|| resolve_adapter_error(method, inner))?;
+
+        f(&mut adapter_ref)
+    })
 }
 
 fn dispatch_cache_query(
@@ -1001,24 +1283,42 @@ fn dispatch_cache_query(
     method: &'static str,
     f: impl FnOnce(&Cache, &HostContextInner) -> PluginResult<OwnedBytes>,
 ) -> PluginResult<OwnedBytes> {
-    let inner = match resolve_context(ctx, method) {
-        Ok(inner) => inner,
-        Err(e) => return PluginResult::Err(e),
-    };
+    guard_host_dispatch(method, || {
+        let inner = resolve_context(ctx, method)?;
 
-    let actor_id = inner.actor_id.inner();
-    if inner.is_strategy {
-        let Some(adapter_ref) = try_get_actor_unchecked::<PluginStrategyAdapter>(&actor_id) else {
-            return PluginResult::Err(resolve_adapter_error(method, inner));
-        };
-        let cache = adapter_ref.cache();
-        f(&cache, inner)
-    } else {
-        let Some(adapter_ref) = try_get_actor_unchecked::<PluginActorAdapter>(&actor_id) else {
-            return PluginResult::Err(resolve_adapter_error(method, inner));
-        };
-        let cache = adapter_ref.cache();
-        f(&cache, inner)
+        let actor_id = inner.actor_id.inner();
+        if inner.is_strategy {
+            let adapter_ref = try_get_actor_unchecked::<PluginStrategyAdapter>(&actor_id)
+                .ok_or_else(|| resolve_adapter_error(method, inner))?;
+            let cache = DataActorNative::cache_ref(&*adapter_ref);
+            f(&cache, inner).into_result()
+        } else {
+            let adapter_ref = try_get_actor_unchecked::<PluginActorAdapter>(&actor_id)
+                .ok_or_else(|| resolve_adapter_error(method, inner))?;
+            let cache = DataActorNative::cache_ref(&*adapter_ref);
+            f(&cache, inner).into_result()
+        }
+    })
+}
+
+// Wraps host-side dispatch in `catch_unwind` so a panic inside engine code
+// (command normalization, cache access, msgbus subscribers, order paths)
+// surfaces to the calling plug-in as a `Panic` error instead of unwinding
+// out of the `extern "C"` thunk, which would abort the process.
+fn guard_host_dispatch<T>(
+    method: &'static str,
+    f: impl FnOnce() -> Result<T, PluginError>,
+) -> PluginResult<T> {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(r) => PluginResult::from_result(r),
+        Err(payload) => {
+            let msg = panic_message(payload.as_ref());
+            drop_payload(payload);
+            PluginResult::Err(PluginError::new(
+                PluginErrorCode::Panic,
+                format!("{method} panicked in host dispatch: {msg}"),
+            ))
+        }
     }
 }
 
@@ -1048,6 +1348,10 @@ fn resolve_adapter_error(method: &str, inner: &HostContextInner) -> PluginError 
             inner.actor_id
         ),
     )
+}
+
+fn generic_plugin_error(error: &anyhow::Error) -> PluginError {
+    PluginError::new(PluginErrorCode::Generic, error.to_string())
 }
 
 fn ensure_adapter_registered(method: &str, inner: &HostContextInner) -> Result<(), PluginError> {
@@ -1128,8 +1432,7 @@ fn parse_bar_subscription(
     client_id: BorrowedStr<'_>,
     params_json: BorrowedStr<'_>,
 ) -> Result<BarSubscriptionArgs, PluginError> {
-    // SAFETY: bar_type borrows storage live across this call.
-    let raw = unsafe { bar_type.as_str() };
+    let raw = borrowed_utf8(bar_type, "bar_type")?;
     let bar_type = BarType::from_str(raw).map_err(|e| {
         PluginError::new(
             PluginErrorCode::InvalidArgument,
@@ -1169,8 +1472,7 @@ fn parse_instrument_id(
     value: BorrowedStr<'_>,
     label: &'static str,
 ) -> Result<InstrumentId, PluginError> {
-    // SAFETY: value borrows storage live across this call.
-    let raw = unsafe { value.as_str() };
+    let raw = borrowed_utf8(value, label)?;
     InstrumentId::from_str(raw).map_err(|e| {
         PluginError::new(
             PluginErrorCode::InvalidArgument,
@@ -1180,8 +1482,7 @@ fn parse_instrument_id(
 }
 
 fn parse_account_id(value: BorrowedStr<'_>, label: &'static str) -> Result<AccountId, PluginError> {
-    // SAFETY: value borrows storage live across this call.
-    let raw = unsafe { value.as_str() };
+    let raw = borrowed_utf8(value, label)?;
     AccountId::new_checked(raw).map_err(|e| {
         PluginError::new(
             PluginErrorCode::InvalidArgument,
@@ -1194,8 +1495,7 @@ fn parse_client_order_id(
     value: BorrowedStr<'_>,
     label: &'static str,
 ) -> Result<ClientOrderId, PluginError> {
-    // SAFETY: value borrows storage live across this call.
-    let raw = unsafe { value.as_str() };
+    let raw = borrowed_utf8(value, label)?;
     ClientOrderId::new_checked(raw).map_err(|e| {
         PluginError::new(
             PluginErrorCode::InvalidArgument,
@@ -1208,8 +1508,7 @@ fn parse_position_id(
     value: BorrowedStr<'_>,
     label: &'static str,
 ) -> Result<PositionId, PluginError> {
-    // SAFETY: value borrows storage live across this call.
-    let raw = unsafe { value.as_str() };
+    let raw = borrowed_utf8(value, label)?;
     PositionId::new_checked(raw).map_err(|e| {
         PluginError::new(
             PluginErrorCode::InvalidArgument,
@@ -1222,8 +1521,7 @@ fn parse_strategy_id_for_context(
     value: BorrowedStr<'_>,
     inner: &HostContextInner,
 ) -> Result<StrategyId, PluginError> {
-    // SAFETY: value borrows storage live across this call.
-    let raw = unsafe { value.as_str() };
+    let raw = borrowed_utf8(value, "strategy_id")?;
     if !raw.is_empty() {
         return StrategyId::new_checked(raw).map_err(|e| {
             PluginError::new(
@@ -1249,8 +1547,7 @@ fn parse_strategy_id_for_context(
 }
 
 fn parse_optional_client_id(value: BorrowedStr<'_>) -> Result<Option<ClientId>, PluginError> {
-    // SAFETY: value borrows storage live across this call.
-    let raw = unsafe { value.as_str() };
+    let raw = borrowed_utf8(value, "client_id")?;
     if raw.is_empty() {
         return Ok(None);
     }
@@ -1260,8 +1557,7 @@ fn parse_optional_client_id(value: BorrowedStr<'_>) -> Result<Option<ClientId>, 
 }
 
 fn parse_optional_params(value: BorrowedStr<'_>) -> Result<Option<Params>, PluginError> {
-    // SAFETY: value borrows storage live across this call.
-    let raw = unsafe { value.as_str() };
+    let raw = borrowed_utf8(value, "params_json")?;
     if raw.trim().is_empty() {
         return Ok(None);
     }
@@ -1273,15 +1569,64 @@ fn parse_optional_params(value: BorrowedStr<'_>) -> Result<Option<Params>, Plugi
     })
 }
 
+// Validates UTF-8 on plug-in-supplied strings. The plug-in side commits to
+// UTF-8, but the host verifies at the trust boundary instead of assuming;
+// `BorrowedStr::as_str` would be library UB on a violating producer.
+fn borrowed_utf8<'a>(value: BorrowedStr<'a>, label: &'static str) -> Result<&'a str, PluginError> {
+    // SAFETY: value borrows storage live across this call.
+    unsafe { value.try_as_str() }.map_err(|e| {
+        PluginError::new(
+            PluginErrorCode::InvalidArgument,
+            format!("invalid {label}: not valid UTF-8: {e}"),
+        )
+    })
+}
+
 fn nonzero_unix_nanos(value: u64) -> Option<UnixNanos> {
     (value != 0).then_some(UnixNanos::from(value))
 }
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::{UUID4, UnixNanos};
+    use nautilus_model::{
+        enums::{OrderSide, TimeInForce},
+        identifiers::{
+            ClientOrderId as TestClientOrderId, InstrumentId as TestInstrumentId, StrategyId,
+            TraderId,
+        },
+        orders::{MarketOrder, OrderAny},
+        types::Quantity,
+    };
     use rstest::rstest;
 
     use super::*;
+    use crate::surfaces::commands::{CancelOrderCommand, ModifyOrderCommand, SubmitOrderCommand};
+
+    fn make_market_submit_command() -> SubmitOrderCommand {
+        let order = OrderAny::Market(MarketOrder::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("S-001"),
+            TestInstrumentId::from("ETH-USDT.BINANCE"),
+            TestClientOrderId::from("O-1"),
+            OrderSide::Buy,
+            Quantity::from("1.0"),
+            TimeInForce::Gtc,
+            UUID4::new(),
+            UnixNanos::default(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        SubmitOrderCommand::new(order, None, None, None)
+    }
 
     #[rstest]
     fn host_vtable_carries_compiled_abi() {
@@ -1328,6 +1673,26 @@ mod tests {
             host_modify_order as *const () as usize,
         );
         assert_eq!(
+            v.trader_id as *const () as usize,
+            host_trader_id as *const () as usize,
+        );
+        assert_eq!(
+            v.strategy_id as *const () as usize,
+            host_strategy_id as *const () as usize,
+        );
+        assert_eq!(
+            v.component_state as *const () as usize,
+            host_component_state as *const () as usize,
+        );
+        assert_eq!(
+            v.generate_client_order_id as *const () as usize,
+            host_generate_client_order_id as *const () as usize,
+        );
+        assert_eq!(
+            v.generate_order_list_id as *const () as usize,
+            host_generate_order_list_id as *const () as usize,
+        );
+        assert_eq!(
             v.clock_now_ns as *const () as usize,
             host_clock_now_ns as *const () as usize,
         );
@@ -1346,13 +1711,49 @@ mod tests {
     }
 
     #[rstest]
+    fn guard_host_dispatch_maps_panic_to_error() {
+        let r: PluginResult<()> =
+            guard_host_dispatch("test_method", || panic!("engine panic message"));
+        let err = r.into_result().unwrap_err();
+        assert_eq!(err.code, PluginErrorCode::Panic);
+        let message = err.message_string();
+        assert!(
+            message.contains("test_method") && message.contains("engine panic message"),
+            "expected method and panic payload in message, was: {message}",
+        );
+    }
+
+    #[rstest]
+    fn guard_host_dispatch_passes_through_ok_and_err() {
+        let r = guard_host_dispatch("test_method", || Ok(7u32));
+        assert_eq!(r.into_result().unwrap(), 7);
+
+        let r: PluginResult<u32> = guard_host_dispatch("test_method", || {
+            Err(PluginError::new(PluginErrorCode::InvalidArgument, "bad"))
+        });
+        let err = r.into_result().unwrap_err();
+        assert_eq!(err.code, PluginErrorCode::InvalidArgument);
+    }
+
+    #[rstest]
+    fn borrowed_utf8_rejects_invalid_bytes() {
+        static INVALID: [u8; 2] = [0xff, 0xfe];
+        let mut value = BorrowedStr::empty();
+        value.ptr = INVALID.as_ptr();
+        value.len = INVALID.len();
+        let err = borrowed_utf8(value, "topic").unwrap_err();
+        assert_eq!(err.code, PluginErrorCode::InvalidArgument);
+        assert!(err.message_string().contains("topic"));
+    }
+
+    #[rstest]
     fn host_submit_order_rejects_null_ctx() {
         let p = host_vtable();
         // SAFETY: pointer is to a static OnceLock-backed HostVTable.
         let v = unsafe { &*p };
-        let payload = BorrowedStr::from_str("{}");
-        // SAFETY: passes null ctx; the thunk handles it.
-        let r = unsafe { (v.submit_order)(std::ptr::null(), payload) };
+        let handle = SubmitOrderHandle::new(make_market_submit_command());
+        // SAFETY: passes null ctx; handle is live.
+        let r = unsafe { (v.submit_order)(std::ptr::null(), &raw const handle) };
         let err = r.into_result().unwrap_err();
         assert_eq!(err.code, PluginErrorCode::InvalidArgument);
         assert!(err.message_string().contains("null HostContext"));
@@ -1360,26 +1761,65 @@ mod tests {
 
     #[rstest]
     fn host_cancel_order_rejects_null_ctx() {
+        use nautilus_model::identifiers::ClientOrderId;
+
         let p = host_vtable();
         // SAFETY: see above.
         let v = unsafe { &*p };
-        let payload = BorrowedStr::from_str("{}");
-        // SAFETY: passes null ctx.
-        let r = unsafe { (v.cancel_order)(std::ptr::null(), payload) };
+        let handle = CancelOrderHandle::new(CancelOrderCommand::new(
+            ClientOrderId::from("O-1"),
+            None,
+            None,
+        ));
+        // SAFETY: passes null ctx; handle is live.
+        let r = unsafe { (v.cancel_order)(std::ptr::null(), &raw const handle) };
         let err = r.into_result().unwrap_err();
         assert_eq!(err.code, PluginErrorCode::InvalidArgument);
     }
 
     #[rstest]
     fn host_modify_order_rejects_null_ctx() {
+        use nautilus_model::identifiers::ClientOrderId;
+
         let p = host_vtable();
         // SAFETY: see above.
         let v = unsafe { &*p };
-        let payload = BorrowedStr::from_str("{}");
-        // SAFETY: passes null ctx.
-        let r = unsafe { (v.modify_order)(std::ptr::null(), payload) };
+        let handle = ModifyOrderHandle::new(ModifyOrderCommand::new(
+            ClientOrderId::from("O-1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        // SAFETY: passes null ctx; handle is live.
+        let r = unsafe { (v.modify_order)(std::ptr::null(), &raw const handle) };
         let err = r.into_result().unwrap_err();
         assert_eq!(err.code, PluginErrorCode::InvalidArgument);
+    }
+
+    #[rstest]
+    fn host_cancel_order_rejects_null_command() {
+        let p = host_vtable();
+        // SAFETY: see above.
+        let v = unsafe { &*p };
+        // SAFETY: passes null command handle; ctx irrelevant.
+        let r = unsafe { (v.cancel_order)(std::ptr::null(), std::ptr::null()) };
+        let err = r.into_result().unwrap_err();
+        assert_eq!(err.code, PluginErrorCode::InvalidArgument);
+        assert!(err.message_string().contains("null command handle"));
+    }
+
+    #[rstest]
+    fn host_modify_order_rejects_null_command() {
+        let p = host_vtable();
+        // SAFETY: see above.
+        let v = unsafe { &*p };
+        // SAFETY: passes null command handle; ctx irrelevant.
+        let r = unsafe { (v.modify_order)(std::ptr::null(), std::ptr::null()) };
+        let err = r.into_result().unwrap_err();
+        assert_eq!(err.code, PluginErrorCode::InvalidArgument);
+        assert!(err.message_string().contains("null command handle"));
     }
 
     #[rstest]
@@ -1401,9 +1841,9 @@ mod tests {
         let p = host_vtable();
         // SAFETY: pointer is to a static OnceLock-backed HostVTable.
         let v = unsafe { &*p };
-        let payload = BorrowedStr::from_str("{}");
-        // SAFETY: ctx was leaked above and is live.
-        let r = unsafe { (v.submit_order)(ctx, payload) };
+        let handle = SubmitOrderHandle::new(make_market_submit_command());
+        // SAFETY: ctx was leaked above and is live; handle outlives the call.
+        let r = unsafe { (v.submit_order)(ctx, &raw const handle) };
         let err = r.into_result().unwrap_err();
         assert_eq!(err.code, PluginErrorCode::InvalidArgument);
         assert!(
@@ -1434,9 +1874,9 @@ mod tests {
         let p = host_vtable();
         // SAFETY: pointer is to a static OnceLock-backed HostVTable.
         let v = unsafe { &*p };
-        let payload = BorrowedStr::from_str("{}");
-        // SAFETY: ctx was leaked above and is live.
-        let r = unsafe { (v.submit_order)(ctx, payload) };
+        let handle = SubmitOrderHandle::new(make_market_submit_command());
+        // SAFETY: ctx was leaked above and is live; handle outlives the call.
+        let r = unsafe { (v.submit_order)(ctx, &raw const handle) };
         let err = r.into_result().unwrap_err();
         assert_eq!(err.code, PluginErrorCode::Generic);
         assert!(

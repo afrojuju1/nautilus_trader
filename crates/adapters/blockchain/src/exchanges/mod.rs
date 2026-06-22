@@ -82,6 +82,7 @@ pub fn find_dex_type_case_insensitive(dex_name: &str, chain: &Chain) -> Option<D
 mod tests {
     use alloy::primitives::keccak256;
     use nautilus_core::hex;
+    use nautilus_model::defi::pool_analysis::PoolEventKind;
     use rstest::rstest;
 
     use super::*;
@@ -95,12 +96,7 @@ mod tests {
     /// Pre-existing (chain, dex, event) parser gaps that predate the structured-error
     /// patch. New gaps must not be added without also wiring the parser; legacy gaps
     /// belong to a separate cleanup.
-    const KNOWN_PARSER_GAPS: &[(Blockchain, DexType, &str)] = &[
-        (Blockchain::Base, DexType::UniswapV3, "Swap"),
-        (Blockchain::Base, DexType::UniswapV3, "Mint"),
-        (Blockchain::Base, DexType::UniswapV3, "Burn"),
-        (Blockchain::Base, DexType::UniswapV3, "Collect"),
-    ];
+    const KNOWN_PARSER_GAPS: &[(Blockchain, DexType, &str)] = &[];
 
     fn is_known_gap(blockchain: Blockchain, dex_type: DexType, event: &str) -> bool {
         KNOWN_PARSER_GAPS
@@ -204,5 +200,39 @@ mod tests {
             .expect("BSC dispatch should return the registered DEX");
         assert_eq!(dex_extended.dex.chain.name, blockchain);
         assert_eq!(dex_extended.dex.name, dex_type);
+    }
+
+    #[rstest]
+    #[case(Blockchain::Bsc)]
+    #[case(Blockchain::Base)]
+    #[case(Blockchain::Arbitrum)]
+    #[case(Blockchain::Ethereum)]
+    fn test_pancakeswap_v3_supports_pool_analysis(#[case] blockchain: Blockchain) {
+        let dex_extended = get_dex_extended(blockchain, &DexType::PancakeSwapV3)
+            .expect("PancakeSwapV3 should be registered");
+        assert!(dex_extended.supports_pool_discovery());
+        assert!(
+            dex_extended.missing_pool_analysis_parsers().is_empty(),
+            "PancakeSwapV3 on {blockchain:?} is missing analysis parsers: {:?}",
+            dex_extended.missing_pool_analysis_parsers()
+        );
+    }
+
+    #[rstest]
+    fn test_dex_without_parsers_reports_unsupported() {
+        // SushiSwapV3 on Arbitrum is registered for the pool set but has no event parsers.
+        let dex_extended = get_dex_extended(Blockchain::Arbitrum, &DexType::SushiSwapV3)
+            .expect("SushiSwapV3 should be registered on Arbitrum");
+        assert!(!dex_extended.supports_pool_discovery());
+        assert_eq!(
+            dex_extended.missing_pool_analysis_parsers(),
+            vec![
+                PoolEventKind::Initialize,
+                PoolEventKind::Swap,
+                PoolEventKind::Mint,
+                PoolEventKind::Burn,
+                PoolEventKind::Collect,
+            ]
+        );
     }
 }

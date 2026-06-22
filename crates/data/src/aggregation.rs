@@ -1273,7 +1273,7 @@ impl BarAggregator for ValueImbalanceBarAggregator {
         while size_remaining > 0.0 {
             let value_remaining = price_f64 * size_remaining;
 
-            #[allow(clippy::float_cmp, reason = "exact-zero check on accumulator")]
+            #[expect(clippy::float_cmp, reason = "exact-zero check on accumulator")]
             if self.imbalance_value == 0.0 || self.imbalance_value.signum() == side_sign {
                 let needed = self.step_value - self.imbalance_value.abs();
                 if value_remaining <= needed {
@@ -2498,7 +2498,7 @@ impl SpreadQuoteAggregator {
             self.ask_sizes[idx] = tick.ask_size.as_f64();
 
             if !self.is_futures_spread {
-                self.mid_prices[idx] = (ask_price + bid_price) * 0.5;
+                self.mid_prices[idx] = f64::midpoint(ask_price, bid_price);
                 self.bid_ask_spreads[idx] = ask_price - bid_price;
 
                 if let Some(ref vp) = self.vega_provider

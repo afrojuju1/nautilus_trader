@@ -33,14 +33,16 @@
 //! tests.
 
 use std::{
+    collections::VecDeque,
     fmt::Debug,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
-use nautilus_core::UnixNanos;
+use ahash::AHashSet;
+use nautilus_core::{UUID4, UnixNanos};
 
 use crate::{
     capture::{encoder::EncodeError, registry::EncoderRegistry},
@@ -48,6 +50,10 @@ use crate::{
     headers::Headers,
     writer::{EntryDraft, EventStoreWriter, HaltCallback, HaltReason, SubmitError},
 };
+
+// Duplicate dispatches of the same message land within one engine cycle (endpoint send
+// followed by topic publish), so a small dedup window suffices and keeps memory flat.
+const RECENT_IDENTITY_CAPACITY: usize = 128;
 
 /// Errors returned by [`BusCaptureAdapter::capture`].
 ///
@@ -85,6 +91,33 @@ pub struct BusCaptureAdapter {
     registry: Arc<EncoderRegistry>,
     halt: HaltCallback,
     halted: AtomicBool,
+    submit_counter: Option<Arc<AtomicU64>>,
+    recent_identities: Mutex<RecentIdentities>,
+}
+
+// Insertion-ordered set of recently captured message identities with FIFO eviction.
+#[derive(Debug, Default)]
+struct RecentIdentities {
+    order: VecDeque<UUID4>,
+    seen: AHashSet<UUID4>,
+}
+
+impl RecentIdentities {
+    // Returns false when `identity` was already noted; records it otherwise.
+    fn note_fresh(&mut self, identity: UUID4) -> bool {
+        if self.seen.contains(&identity) {
+            return false;
+        }
+
+        if self.order.len() == RECENT_IDENTITY_CAPACITY
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.seen.remove(&evicted);
+        }
+        self.order.push_back(identity);
+        self.seen.insert(identity);
+        true
+    }
 }
 
 impl Debug for BusCaptureAdapter {
@@ -114,7 +147,16 @@ impl BusCaptureAdapter {
             registry,
             halt,
             halted: AtomicBool::new(false),
+            submit_counter: None,
+            recent_identities: Mutex::new(RecentIdentities::default()),
         }
+    }
+
+    /// Shares an entry-submit counter with the data-marker capture path.
+    #[must_use]
+    pub fn with_submit_counter(mut self, submit_counter: Arc<AtomicU64>) -> Self {
+        self.submit_counter = Some(submit_counter);
+        self
     }
 
     /// Returns whether the adapter has fail-stopped.
@@ -140,7 +182,10 @@ impl BusCaptureAdapter {
     /// Looks up the encoder for `T`, builds an [`EntryDraft`], and forwards it to the
     /// writer. Returns `Ok(false)` when the type has no registered encoder so the adapter
     /// can be wired into bus dispatch paths that carry a mix of state-affecting and
-    /// non-state-affecting messages without surfacing per-message errors.
+    /// non-state-affecting messages without surfacing per-message errors, and when the
+    /// message's registered identity was already captured on another dispatch hop (the
+    /// same order event reaches the tap via the portfolio endpoint send and the strategy
+    /// topic publish; the log records it once).
     ///
     /// `topic` is the bus topic the message was dispatched on, `headers` are the
     /// dispatch-time correlation headers (defaulting to [`Headers::empty`] until header
@@ -187,6 +232,12 @@ impl BusCaptureAdapter {
             return Err(CaptureError::Halted);
         }
 
+        if let Some(identity) = self.registry.identity_for_any(message)
+            && !self.note_fresh_identity(identity)
+        {
+            return Ok(false);
+        }
+
         let Some((payload_type, encoded)) = self.registry.encode_any(message)? else {
             return Ok(false);
         };
@@ -201,12 +252,26 @@ impl BusCaptureAdapter {
         };
 
         match self.writer.submit(draft) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                if let Some(submit_counter) = self.submit_counter.as_ref() {
+                    submit_counter.fetch_add(1, Ordering::AcqRel);
+                }
+                Ok(true)
+            }
             Err(e) => {
                 self.fail_stop(&e);
                 Err(CaptureError::Submit(e))
             }
         }
+    }
+
+    fn note_fresh_identity(&self, identity: UUID4) -> bool {
+        // The dedup window is a cache: on the (panic-only) poisoned path the prior state
+        // is still internally consistent, so recover the guard rather than propagate.
+        self.recent_identities
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .note_fresh(identity)
     }
 
     fn fail_stop(&self, err: &SubmitError) {
@@ -243,7 +308,10 @@ fn halt_reason_from_submit(err: &SubmitError) -> HaltReason {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
         time::Duration,
     };
 
@@ -488,6 +556,49 @@ mod tests {
         assert!(!captured_flag);
         assert_eq!(writer.high_watermark(), 0);
         assert!(!adapter.is_halted());
+    }
+
+    #[rstest]
+    fn submit_counter_increments_on_each_captured_entry(
+        captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
+    ) {
+        let (halt, _captured) = captured_halt;
+        let (writer, _backend) = writer_with_open_run("run-submit-counter", Arc::clone(&halt));
+        let submit_counter = Arc::new(AtomicU64::new(1));
+        let adapter = BusCaptureAdapter::new(Arc::clone(&writer), stub_registry(), halt)
+            .with_submit_counter(Arc::clone(&submit_counter));
+
+        adapter
+            .capture::<StubCommand>(
+                Topic::from("exec.command.SubmitOrder"),
+                &StubCommand {
+                    client_order_id: "O-counter-1".to_string(),
+                },
+                Headers::empty(),
+                UnixNanos::from(100),
+            )
+            .expect("first capture");
+        adapter
+            .capture::<UnknownMessage>(
+                Topic::from("data.market.unknown"),
+                &UnknownMessage,
+                Headers::empty(),
+                UnixNanos::from(101),
+            )
+            .expect("unknown type");
+        adapter
+            .capture::<StubEvent>(
+                Topic::from("exec.event.OrderFilled"),
+                &StubEvent {
+                    client_order_id: "O-counter-1".to_string(),
+                    venue_order_id: "V-counter-1".to_string(),
+                },
+                Headers::empty(),
+                UnixNanos::from(102),
+            )
+            .expect("second capture");
+
+        assert_eq!(submit_counter.load(Ordering::Acquire), 3);
     }
 
     #[rstest]

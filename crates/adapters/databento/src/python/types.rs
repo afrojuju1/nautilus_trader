@@ -18,7 +18,10 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use nautilus_core::python::{IntoPyObjectNautilusExt, serialization::from_dict_pyo3};
+use nautilus_core::python::{
+    IntoPyObjectNautilusExt,
+    serialization::{from_dict_pyo3, to_dict_pyo3},
+};
 use nautilus_model::{
     enums::OrderSide,
     identifiers::InstrumentId,
@@ -142,15 +145,10 @@ impl DatabentoImbalance {
         from_dict_pyo3(py, values)
     }
 
-    // TODO
-    /// # Errors
-    ///
-    /// Returns a `PyErr` if generating the Python dictionary fails.
+    /// Return a dictionary representation of the object.
     #[pyo3(name = "to_dict")]
-    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let dict = PyDict::new(py);
-        dict.set_item("type", stringify!(DatabentoImbalance))?;
-        Ok(dict.into())
+    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        to_dict_pyo3(py, self)
     }
 }
 
@@ -281,15 +279,10 @@ impl DatabentoStatistics {
         from_dict_pyo3(py, values)
     }
 
-    // TODO
-    /// # Errors
-    ///
-    /// Returns a `PyErr` if generating the Python dictionary fails.
+    /// Return a dictionary representation of the object.
     #[pyo3(name = "to_dict")]
-    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let dict = PyDict::new(py);
-        dict.set_item("type", stringify!(DatabentoStatistics))?;
-        Ok(dict.into())
+    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        to_dict_pyo3(py, self)
     }
 }
 
@@ -303,7 +296,7 @@ impl DatabentoStatistics {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.databento")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.databento")
 )]
 #[derive(Debug, Clone)]
 pub struct DatabentoSubscriptionAck {

@@ -69,8 +69,8 @@ pub struct OKXCandlestick(
 use crate::common::{
     enums::{
         OKXAlgoOrderStatus, OKXAlgoOrderType, OKXExecType, OKXInstrumentType, OKXMarginMode,
-        OKXOrderCategory, OKXOrderStatus, OKXOrderType, OKXPositionSide, OKXSide,
-        OKXTargetCurrency, OKXTradeMode, OKXTriggerType, OKXVipLevel,
+        OKXOrderCategory, OKXOrderStatus, OKXOrderType, OKXPositionSide, OKXSide, OKXSpreadState,
+        OKXSpreadType, OKXTargetCurrency, OKXTradeMode, OKXTriggerType, OKXVipLevel,
     },
     parse::deserialize_string_to_u64,
 };
@@ -109,6 +109,199 @@ pub struct OKXOptionSummary {
     /// Forward price.
     pub fwd_px: String,
     /// Data timestamp in milliseconds.
+    #[serde(deserialize_with = "deserialize_string_to_u64")]
+    pub ts: u64,
+}
+
+/// Represents a spread from the GET /api/v5/sprd/spreads endpoint.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXSpread {
+    /// Spread ID.
+    pub sprd_id: Ustr,
+    /// Spread type.
+    pub sprd_type: OKXSpreadType,
+    /// Spread status.
+    pub state: OKXSpreadState,
+    /// Base currency.
+    pub base_ccy: Ustr,
+    /// Size currency.
+    pub sz_ccy: Ustr,
+    /// Quote currency.
+    pub quote_ccy: Ustr,
+    /// Tick size in quote currency.
+    pub tick_sz: String,
+    /// Minimum order size in size currency.
+    pub min_sz: String,
+    /// Order size increment in size currency.
+    pub lot_sz: String,
+    /// Listing time in milliseconds.
+    #[serde(default, deserialize_with = "deserialize_optional_string_to_u64")]
+    pub list_time: Option<u64>,
+    /// Expiry time in milliseconds.
+    #[serde(default, deserialize_with = "deserialize_optional_string_to_u64")]
+    pub exp_time: Option<u64>,
+    /// Last update time in milliseconds.
+    #[serde(default, deserialize_with = "deserialize_optional_string_to_u64")]
+    pub u_time: Option<u64>,
+    /// Spread legs.
+    pub legs: Vec<OKXSpreadLeg>,
+}
+
+/// Represents a leg in an OKX spread.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXSpreadLeg {
+    /// Instrument ID.
+    pub inst_id: Ustr,
+    /// Leg side.
+    pub side: OKXSide,
+}
+
+/// Represents the request body for `POST /api/v5/sprd/order`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXPlaceSpreadOrderRequest {
+    /// Spread ID.
+    pub sprd_id: String,
+    /// Client-supplied order ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cl_ord_id: Option<String>,
+    /// Order tag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// Order side.
+    pub side: OKXSide,
+    /// Order type.
+    pub ord_type: OKXOrderType,
+    /// Order size.
+    pub sz: String,
+    /// Limit price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub px: Option<String>,
+}
+
+/// Represents the request body for `POST /api/v5/sprd/cancel-order`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXCancelSpreadOrderRequest {
+    /// Order ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ord_id: Option<String>,
+    /// Client-supplied order ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cl_ord_id: Option<String>,
+}
+
+/// Represents the request body for `POST /api/v5/sprd/mass-cancel`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXCancelAllSpreadOrdersRequest {
+    /// Spread ID.
+    pub sprd_id: String,
+}
+
+/// Represents a spread order from `GET /api/v5/sprd/order` and history endpoints.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXSpreadOrder {
+    /// Spread ID.
+    pub sprd_id: Ustr,
+    /// Order ID.
+    pub ord_id: Ustr,
+    /// Client order ID.
+    #[serde(default)]
+    pub cl_ord_id: Ustr,
+    /// Order tag.
+    #[serde(default)]
+    pub tag: String,
+    /// Order side.
+    pub side: OKXSide,
+    /// Order type.
+    pub ord_type: OKXOrderType,
+    /// Order size.
+    pub sz: String,
+    /// Order price.
+    #[serde(default)]
+    pub px: String,
+    /// Average fill price.
+    #[serde(default)]
+    pub avg_px: String,
+    /// Order state.
+    pub state: OKXOrderStatus,
+    /// Accumulated filled size.
+    #[serde(default)]
+    pub acc_fill_sz: String,
+    /// Pending fill size.
+    #[serde(default)]
+    pub pending_fill_sz: String,
+    /// Pending settlement size.
+    #[serde(default)]
+    pub pending_settle_sz: String,
+    /// Canceled size.
+    #[serde(default)]
+    pub canceled_sz: String,
+    /// Last fill size.
+    #[serde(default)]
+    pub fill_sz: String,
+    /// Last fill price.
+    #[serde(default)]
+    pub fill_px: String,
+    /// Trade ID for the last fill, if provided.
+    #[serde(default)]
+    pub trade_id: Ustr,
+    /// Cancel source.
+    #[serde(default)]
+    pub cancel_source: String,
+    /// Request ID for amend responses.
+    #[serde(default)]
+    pub req_id: String,
+    /// Amend result.
+    #[serde(default)]
+    pub amend_result: String,
+    /// Response code.
+    #[serde(default)]
+    pub code: String,
+    /// Response message.
+    #[serde(default)]
+    pub msg: String,
+    /// Creation time in milliseconds.
+    #[serde(default, deserialize_with = "deserialize_optional_string_to_u64")]
+    pub c_time: Option<u64>,
+    /// Last update time in milliseconds.
+    #[serde(default, deserialize_with = "deserialize_optional_string_to_u64")]
+    pub u_time: Option<u64>,
+}
+
+/// Represents a spread trade from `GET /api/v5/sprd/trades`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXSpreadTrade {
+    /// Spread ID.
+    pub sprd_id: Ustr,
+    /// Trade ID.
+    pub trade_id: Ustr,
+    /// Order ID.
+    pub ord_id: Ustr,
+    /// Client order ID.
+    #[serde(default)]
+    pub cl_ord_id: Ustr,
+    /// Last filled price.
+    pub fill_px: String,
+    /// Last filled quantity.
+    pub fill_sz: String,
+    /// Trade side.
+    pub side: OKXSide,
+    /// Execution type.
+    #[serde(default)]
+    pub exec_type: OKXExecType,
+    /// Fee currency.
+    #[serde(default)]
+    pub fee_ccy: String,
+    /// Fee amount.
+    #[serde(default, deserialize_with = "deserialize_empty_string_as_none")]
+    pub fee: Option<String>,
+    /// Timestamp in milliseconds.
     #[serde(deserialize_with = "deserialize_string_to_u64")]
     pub ts: u64,
 }
@@ -325,7 +518,7 @@ pub struct OKXAccount {
 #[cfg_attr(feature = "python", pyo3::pyclass(from_py_object))]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.okx")
 )]
 pub struct OKXBalanceDetail {
     /// Available balance.
@@ -709,6 +902,43 @@ pub struct OKXPlaceOrderRequest {
     /// the venue's accepted range. See the OKX v5 docs for the current matrix.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slippage_pct: Option<String>,
+}
+
+/// Represents the request body for `POST /api/v5/trade/cancel-batch-orders`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXCancelOrderRequest {
+    /// Instrument ID.
+    pub inst_id: String,
+    /// Instrument ID code (numeric). May be required per OKX deprecation notice.
+    #[serde(rename = "instIdCode", skip_serializing_if = "Option::is_none")]
+    pub inst_id_code: Option<u64>,
+    /// Order ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ord_id: Option<String>,
+    /// Client-supplied order ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cl_ord_id: Option<String>,
+}
+
+/// Represents a single response item from `POST /api/v5/trade/cancel-batch-orders`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXCancelOrderResponse {
+    /// Order ID.
+    pub ord_id: String,
+    /// Client-supplied order ID.
+    #[serde(default)]
+    pub cl_ord_id: Option<String>,
+    /// The result of the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s_code: Option<String>,
+    /// Error message if the request failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s_msg: Option<String>,
+    /// Response timestamp.
+    #[serde(default)]
+    pub ts: Option<String>,
 }
 
 pub use crate::common::models::OKXAttachedAlgoOrd;
@@ -1165,9 +1395,29 @@ pub struct OKXAmendAlgoOrderRequest {
     /// New order size.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_sz: Option<String>,
-    /// New trigger price (for trigger/conditional orders).
+    /// New trigger price (for `trigger` algo orders).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_trigger_px: Option<String>,
+    /// New take-profit trigger price (for attached/OCO TP legs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_tp_trigger_px: Option<String>,
+    /// New take-profit order price (`-1` for market).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_tp_ord_px: Option<String>,
+    /// New take-profit trigger price type (last, mark, index).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_tp_trigger_px_type: Option<String>,
+    /// New stop-loss trigger price (for `conditional` SL algo orders, incl.
+    /// `closeFraction` close-position stops, which OKX amends via `newSlTriggerPx`
+    /// rather than `newTriggerPx`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_sl_trigger_px: Option<String>,
+    /// New stop-loss order price (`-1` for market).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_sl_ord_px: Option<String>,
+    /// New stop-loss trigger price type (last, mark, index).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_sl_trigger_px_type: Option<String>,
     /// New order price (for limit orders after trigger).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_order_px: Option<String>,
@@ -1298,6 +1548,71 @@ mod tests {
         assert!(!json.contains("posSide"));
         assert!(!json.contains("closePosition"));
         assert!(!json.contains("closeFraction"));
+    }
+
+    #[rstest]
+    fn test_amend_algo_order_request_serializes_sl_trigger_px() {
+        // A conditional stop-loss algo order (incl. closeFraction stops) is amended
+        // via `newSlTriggerPx`, not `newTriggerPx`. Verify the camelCase field name
+        // and that an unset `new_trigger_px` is omitted.
+        let request = OKXAmendAlgoOrderRequest {
+            inst_id: "ETH-USDT-SWAP".to_string(),
+            algo_id: "123".to_string(),
+            algo_cl_ord_id: None,
+            new_sz: None,
+            new_trigger_px: None,
+            new_tp_trigger_px: None,
+            new_tp_ord_px: None,
+            new_tp_trigger_px_type: None,
+            new_sl_trigger_px: Some("850".to_string()),
+            new_sl_ord_px: None,
+            new_sl_trigger_px_type: None,
+            new_order_px: None,
+            new_callback_ratio: None,
+            new_callback_spread: None,
+            new_active_px: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert!(json.contains("\"algoId\":\"123\""));
+        assert!(json.contains("\"newSlTriggerPx\":\"850\""));
+        // Unset optional fields must be omitted (OKX rejects an empty newTriggerPx).
+        assert!(!json.contains("newTriggerPx"));
+        assert!(!json.contains("newSz"));
+        assert!(!json.contains("algoClOrdId"));
+    }
+
+    #[rstest]
+    fn test_amend_algo_order_request_serializes_oco_tp_sl_fields() {
+        let request = OKXAmendAlgoOrderRequest {
+            inst_id: "DOGE-USDT-SWAP".to_string(),
+            algo_id: "algo-oco-1".to_string(),
+            algo_cl_ord_id: None,
+            new_sz: None,
+            new_trigger_px: None,
+            new_tp_trigger_px: Some("0.10495".to_string()),
+            new_tp_ord_px: Some("-1".to_string()),
+            new_tp_trigger_px_type: Some("last".to_string()),
+            new_sl_trigger_px: Some("0.06297".to_string()),
+            new_sl_ord_px: Some("-1".to_string()),
+            new_sl_trigger_px_type: Some("last".to_string()),
+            new_order_px: None,
+            new_callback_ratio: None,
+            new_callback_spread: None,
+            new_active_px: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert!(json.contains("\"algoId\":\"algo-oco-1\""));
+        assert!(json.contains("\"newTpTriggerPx\":\"0.10495\""));
+        assert!(json.contains("\"newTpOrdPx\":\"-1\""));
+        assert!(json.contains("\"newTpTriggerPxType\":\"last\""));
+        assert!(json.contains("\"newSlTriggerPx\":\"0.06297\""));
+        assert!(json.contains("\"newSlOrdPx\":\"-1\""));
+        assert!(json.contains("\"newSlTriggerPxType\":\"last\""));
+        assert!(!json.contains("newTriggerPx"));
     }
 
     #[rstest]
@@ -1434,6 +1749,12 @@ mod tests {
             algo_cl_ord_id: None,
             new_sz: None,
             new_trigger_px: Some("3500".to_string()),
+            new_tp_trigger_px: None,
+            new_tp_ord_px: None,
+            new_tp_trigger_px_type: None,
+            new_sl_trigger_px: None,
+            new_sl_ord_px: None,
+            new_sl_trigger_px_type: None,
             new_order_px: Some("3490".to_string()),
             new_callback_ratio: None,
             new_callback_spread: None,
@@ -1459,6 +1780,12 @@ mod tests {
             algo_cl_ord_id: Some("client456".to_string()),
             new_sz: Some("0.1".to_string()),
             new_trigger_px: None,
+            new_tp_trigger_px: None,
+            new_tp_ord_px: None,
+            new_tp_trigger_px_type: None,
+            new_sl_trigger_px: None,
+            new_sl_ord_px: None,
+            new_sl_trigger_px_type: None,
             new_order_px: None,
             new_callback_ratio: Some("0.02".to_string()),
             new_callback_spread: None,
@@ -1597,6 +1924,12 @@ mod tests {
             algo_cl_ord_id: None,
             new_sz: None,
             new_trigger_px: None,
+            new_tp_trigger_px: None,
+            new_tp_ord_px: None,
+            new_tp_trigger_px_type: None,
+            new_sl_trigger_px: None,
+            new_sl_ord_px: None,
+            new_sl_trigger_px_type: None,
             new_order_px: None,
             new_callback_ratio: None,
             new_callback_spread: Some("25.0".to_string()),
@@ -1620,6 +1953,12 @@ mod tests {
             algo_cl_ord_id: None,
             new_sz: Some("0.5".to_string()),
             new_trigger_px: None,
+            new_tp_trigger_px: None,
+            new_tp_ord_px: None,
+            new_tp_trigger_px_type: None,
+            new_sl_trigger_px: None,
+            new_sl_ord_px: None,
+            new_sl_trigger_px_type: None,
             new_order_px: None,
             new_callback_ratio: None,
             new_callback_spread: None,
@@ -1644,6 +1983,12 @@ mod tests {
             algo_cl_ord_id: Some("client789".to_string()),
             new_sz: Some("1.0".to_string()),
             new_trigger_px: Some("60000".to_string()),
+            new_tp_trigger_px: None,
+            new_tp_ord_px: None,
+            new_tp_trigger_px_type: None,
+            new_sl_trigger_px: None,
+            new_sl_ord_px: None,
+            new_sl_trigger_px_type: None,
             new_order_px: Some("59900".to_string()),
             new_callback_ratio: Some("0.015".to_string()),
             new_callback_spread: Some("100".to_string()),

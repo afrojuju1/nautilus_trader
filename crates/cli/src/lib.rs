@@ -40,6 +40,7 @@
 //! - `defi`: Enables DeFi functionality including blockchain data access and pool analysis.
 
 #![warn(rustc::all)]
+#![warn(clippy::pedantic)]
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
@@ -69,7 +70,9 @@ pub async fn run(opt: NautilusCli) -> anyhow::Result<()> {
     match opt.command {
         Commands::Database(database_opt) => run_database_command(database_opt).await?,
         #[cfg(feature = "defi")]
-        Commands::Blockchain(blockchain_opt) => run_blockchain_command(blockchain_opt).await?,
+        Commands::Blockchain(blockchain_opt) => {
+            Box::pin(run_blockchain_command(blockchain_opt)).await?;
+        }
     }
     Ok(())
 }

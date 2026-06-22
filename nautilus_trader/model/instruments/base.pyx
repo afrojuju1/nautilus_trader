@@ -33,13 +33,18 @@ from nautilus_trader.model.functions cimport instrument_class_to_str
 from nautilus_trader.model.identifiers cimport InstrumentId
 from nautilus_trader.model.instruments.betting cimport BettingInstrument
 from nautilus_trader.model.instruments.binary_option cimport BinaryOption
+from nautilus_trader.model.instruments.cfd cimport Cfd
+from nautilus_trader.model.instruments.commodity cimport Commodity
 from nautilus_trader.model.instruments.crypto_future cimport CryptoFuture
+from nautilus_trader.model.instruments.crypto_futures_spread cimport CryptoFuturesSpread
 from nautilus_trader.model.instruments.crypto_option cimport CryptoOption
+from nautilus_trader.model.instruments.crypto_option_spread cimport CryptoOptionSpread
 from nautilus_trader.model.instruments.crypto_perpetual cimport CryptoPerpetual
 from nautilus_trader.model.instruments.currency_pair cimport CurrencyPair
 from nautilus_trader.model.instruments.equity cimport Equity
 from nautilus_trader.model.instruments.futures_contract cimport FuturesContract
 from nautilus_trader.model.instruments.futures_spread cimport FuturesSpread
+from nautilus_trader.model.instruments.index cimport IndexInstrument
 from nautilus_trader.model.instruments.option_contract cimport OptionContract
 from nautilus_trader.model.instruments.option_spread cimport OptionSpread
 from nautilus_trader.model.instruments.perpetual_contract cimport PerpetualContract
@@ -71,6 +76,18 @@ NEGATIVE_PRICE_INSTRUMENT_CLASSES = (
     InstrumentClass.FUTURES_SPREAD,
     InstrumentClass.OPTION_SPREAD,
 )
+
+USD_EQUIVALENT_CURRENCY_CODES = frozenset({
+    "BUSD",
+    "FDUSD",
+    "pUSD",
+    "TUSD",
+    "USD",
+    "USDC",
+    "USDC.e",
+    "USDP",
+    "USDT",
+})
 
 
 cdef class Instrument(Data):
@@ -169,8 +186,6 @@ cdef class Instrument(Data):
         If `min_notional` is negative (< 0).
     ValueError
         If `max_price` is not positive (> 0).
-    ValueError
-        If `min_price` is negative (< 0).
 
     """
 
@@ -238,9 +253,6 @@ cdef class Instrument(Data):
 
         if max_price is not None:
             Condition.positive(max_price, "max_price")
-
-        if min_price is not None:
-            Condition.not_negative(min_price, "min_price")
 
         Condition.type(margin_init, Decimal, "margin_init")
         Condition.not_negative(margin_init, "margin_init")
@@ -447,7 +459,21 @@ cdef class Instrument(Data):
         bool
 
         """
-        return len(self.legs()) > 1
+        return self.instrument_class in (
+            InstrumentClass.FUTURES_SPREAD,
+            InstrumentClass.OPTION_SPREAD,
+        )
+
+    cpdef bint allows_negative_price(self):
+        """
+        Return whether the instrument allows negative prices.
+
+        Returns
+        -------
+        bool
+
+        """
+        return self.instrument_class in NEGATIVE_PRICE_INSTRUMENT_CLASSES
 
     cpdef list legs(self):
         """
@@ -855,12 +881,20 @@ cpdef list[Instrument] instruments_from_pyo3(list pyo3_instruments):
             instruments.append(BettingInstrument.from_pyo3_c(pyo3_instrument))
         elif isinstance(pyo3_instrument, nautilus_pyo3.BinaryOption):
             instruments.append(BinaryOption.from_pyo3_c(pyo3_instrument))
+        elif isinstance(pyo3_instrument, nautilus_pyo3.Cfd):
+            instruments.append(Cfd.from_pyo3_c(pyo3_instrument))
+        elif isinstance(pyo3_instrument, nautilus_pyo3.Commodity):
+            instruments.append(Commodity.from_pyo3_c(pyo3_instrument))
         elif isinstance(pyo3_instrument, nautilus_pyo3.CryptoPerpetual):
             instruments.append(CryptoPerpetual.from_pyo3_c(pyo3_instrument))
         elif isinstance(pyo3_instrument, nautilus_pyo3.CryptoFuture):
             instruments.append(CryptoFuture.from_pyo3_c(pyo3_instrument))
+        elif isinstance(pyo3_instrument, nautilus_pyo3.CryptoFuturesSpread):
+            instruments.append(CryptoFuturesSpread.from_pyo3_c(pyo3_instrument))
         elif isinstance(pyo3_instrument, nautilus_pyo3.CryptoOption):
             instruments.append(CryptoOption.from_pyo3_c(pyo3_instrument))
+        elif isinstance(pyo3_instrument, nautilus_pyo3.CryptoOptionSpread):
+            instruments.append(CryptoOptionSpread.from_pyo3_c(pyo3_instrument))
         elif isinstance(pyo3_instrument, nautilus_pyo3.CurrencyPair):
             instruments.append(CurrencyPair.from_pyo3_c(pyo3_instrument))
         elif isinstance(pyo3_instrument, nautilus_pyo3.Equity):
@@ -869,6 +903,8 @@ cpdef list[Instrument] instruments_from_pyo3(list pyo3_instruments):
             instruments.append(FuturesContract.from_pyo3_c(pyo3_instrument))
         elif isinstance(pyo3_instrument, nautilus_pyo3.FuturesSpread):
             instruments.append(FuturesSpread.from_pyo3_c(pyo3_instrument))
+        elif isinstance(pyo3_instrument, nautilus_pyo3.IndexInstrument):
+            instruments.append(IndexInstrument.from_pyo3_c(pyo3_instrument))
         elif isinstance(pyo3_instrument, nautilus_pyo3.OptionContract):
             instruments.append(OptionContract.from_pyo3_c(pyo3_instrument))
         elif isinstance(pyo3_instrument, nautilus_pyo3.OptionSpread):
@@ -881,3 +917,20 @@ cpdef list[Instrument] instruments_from_pyo3(list pyo3_instruments):
             raise RuntimeError(f"Instrument {pyo3_instrument} not supported")
 
     return instruments
+
+
+cdef bint settlement_currency_differs_for_quanto(
+    Currency settlement_currency,
+    Currency quote_currency,
+    Currency base_currency,
+):
+    if settlement_currency == base_currency:
+        return False
+
+    if (
+        settlement_currency.code in USD_EQUIVALENT_CURRENCY_CODES
+        and quote_currency.code in USD_EQUIVALENT_CURRENCY_CODES
+    ):
+        return False
+
+    return settlement_currency != quote_currency

@@ -18,7 +18,9 @@
 use std::time::Duration;
 
 use nautilus_common::live::get_runtime;
-use nautilus_core::python::{call_python_threadsafe, to_pyruntime_err, to_pyvalue_err};
+use nautilus_core::python::{
+    IntoPyObjectNautilusExt, call_python_threadsafe, to_pyruntime_err, to_pyvalue_err,
+};
 use nautilus_model::{
     data::{BarType, Data, OrderBookDeltas_API},
     enums::{OrderSide, OrderType, TimeInForce},
@@ -31,7 +33,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use nautilus_network::websocket::TransportBackend;
-use pyo3::{conversion::IntoPyObjectExt, prelude::*};
+use pyo3::{conversion::IntoPyObjectExt, prelude::*, types::PyList};
 
 use crate::{
     common::enums::HyperliquidEnvironment,
@@ -45,6 +47,7 @@ use crate::{
 fn ws_data_to_pyobject(py: Python<'_>, data: Data) -> PyResult<Py<PyAny>> {
     match data {
         Data::Custom(custom) => Py::new(py, custom).map(|obj| obj.into_any()),
+        Data::OptionGreeks(greeks) => Py::new(py, greeks).map(|obj| obj.into_any()),
         other => Ok(data_to_pycapsule(py, other)),
     }
 }
@@ -103,6 +106,12 @@ impl HyperliquidWebSocketClient {
     ///
     /// The HTTP client supplies signing credentials, builder attribution, and
     /// cached instrument metadata. The action itself is sent over WebSocket.
+    ///
+    /// Returns an `OrderStatusReport` describing the venue's immediate
+    /// response (`Filled` for an atomic IOC fill, `Accepted` for a resting
+    /// order), or `None` when the venue deferred the order without an oid (for
+    /// example a `waitingForFill` trigger child): the order stays `SUBMITTED`
+    /// until the user-events stream delivers the first `OrderAccepted`.
     #[pyo3(name = "submit_order", signature = (
         signer,
         instrument_id,
@@ -136,7 +145,7 @@ impl HyperliquidWebSocketClient {
         let signer = signer.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client
+            let report = client
                 .submit_order(
                     &signer,
                     instrument_id,
@@ -152,11 +161,20 @@ impl HyperliquidWebSocketClient {
                 )
                 .await
                 .map_err(to_pyvalue_err)?;
-            Ok(())
+
+            Python::attach(|py| match report {
+                Some(r) => Ok(r.into_py_any_unwrap(py)),
+                None => Ok(py.None()),
+            })
         })
     }
 
     /// Submit multiple orders through the Hyperliquid WebSocket post API.
+    ///
+    /// Returns one `OrderStatusReport` per accepted order in submission
+    /// order. Deferred trigger children of a `normalTpsl` bracket are absent
+    /// from the result; they stay `SUBMITTED` until the user-events stream
+    /// delivers an `OrderAccepted` with the real oid.
     #[pyo3(name = "submit_orders")]
     fn py_submit_orders<'py>(
         &self,
@@ -177,11 +195,16 @@ impl HyperliquidWebSocketClient {
             })?;
             let order_refs: Vec<&OrderAny> = order_anys.iter().collect();
 
-            client
+            let reports = client
                 .submit_orders(&signer, &order_refs)
                 .await
                 .map_err(to_pyvalue_err)?;
-            Ok(())
+
+            Python::attach(|py| {
+                let pylist =
+                    PyList::new(py, reports.into_iter().map(|r| r.into_py_any_unwrap(py)))?;
+                Ok(pylist.into_py_any_unwrap(py))
+            })
         })
     }
 
@@ -287,6 +310,19 @@ impl HyperliquidWebSocketClient {
             .map(|(k, v)| (ustr::Ustr::from(&k), ustr::Ustr::from(&v)))
             .collect();
         self.cache_spot_fill_coins(ahash_mapping);
+    }
+
+    /// Cache the ordered instrument IDs required to normalize `allDexsAssetCtxs`.
+    #[pyo3(name = "cache_all_dex_asset_ctxs_instrument_ids")]
+    fn py_cache_all_dex_asset_ctxs_instrument_ids(
+        &self,
+        mapping: std::collections::HashMap<String, Vec<Option<InstrumentId>>>,
+    ) {
+        let ahash_mapping: ahash::AHashMap<ustr::Ustr, Vec<Option<InstrumentId>>> = mapping
+            .into_iter()
+            .map(|(dex, instrument_ids)| (ustr::Ustr::from(&dex), instrument_ids))
+            .collect();
+        self.cache_all_dex_asset_ctxs_instrument_ids(ahash_mapping);
     }
 
     /// Caches a venue CLOID to client_order_id mapping for order/fill resolution.
@@ -527,7 +563,7 @@ impl HyperliquidWebSocketClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Err(e) = client.disconnect().await {
-                log::error!("Error on close: {e}");
+                log::warn!("Error on close: {e}");
             }
             Ok(())
         })
@@ -577,6 +613,23 @@ impl HyperliquidWebSocketClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client
                 .subscribe_all_mids()
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Subscribe to aggregate asset contexts across all perp dexes.
+    #[pyo3(name = "subscribe_all_dexs_asset_ctxs")]
+    fn py_subscribe_all_dexs_asset_ctxs<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .subscribe_all_dexs_asset_ctxs()
                 .await
                 .map_err(to_pyruntime_err)?;
             Ok(())
@@ -772,6 +825,23 @@ impl HyperliquidWebSocketClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client
                 .unsubscribe_all_mids()
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Unsubscribe from aggregate asset contexts across all perp dexes.
+    #[pyo3(name = "unsubscribe_all_dexs_asset_ctxs")]
+    fn py_unsubscribe_all_dexs_asset_ctxs<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_all_dexs_asset_ctxs()
                 .await
                 .map_err(to_pyruntime_err)?;
             Ok(())

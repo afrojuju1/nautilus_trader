@@ -594,14 +594,17 @@ async fn backtest_underlying_day(
 ) -> anyhow::Result<BacktestDay> {
     let entry_timestamp = timestamp_for(config, trade_date, entry_time)?;
     let exit_timestamp = timestamp_for(config, trade_date, exit_time)?;
-    let entry_start = timestamp_plus_minutes(config, trade_date, entry_time, -entry_mark_window_mins)?;
-    let entry_end = timestamp_plus_minutes(config, trade_date, entry_time, entry_mark_window_mins + 1)?;
+    let entry_start =
+        timestamp_plus_minutes(config, trade_date, entry_time, -entry_mark_window_mins)?;
+    let entry_end =
+        timestamp_plus_minutes(config, trade_date, entry_time, entry_mark_window_mins + 1)?;
     let exit_end = timestamp_plus_minutes(config, trade_date, exit_time, 1)?;
     let (min_dte, max_dte) = scanner_dte_window(config);
 
-    let mut contracts =
-        load_contracts(client, storage, account_id, underlying, trade_date, min_dte, max_dte)
-            .await?;
+    let mut contracts = load_contracts(
+        client, storage, account_id, underlying, trade_date, min_dte, max_dte,
+    )
+    .await?;
     normalize_historical_open_interest(&mut contracts, missing_open_interest);
     let symbols = contracts
         .iter()
@@ -770,7 +773,9 @@ fn select_historical_entry(
             rejections: result.rejection_counts.clone(),
         });
         if let Some(best) = result.candidates.first()
-            && selected.as_ref().is_none_or(|current| best.score > current.score())
+            && selected
+                .as_ref()
+                .is_none_or(|current| best.score > current.score())
         {
             selected = Some(SelectedOptionsEntry::Credit(SelectedEntry {
                 underlying: underlying.to_string(),
@@ -799,7 +804,9 @@ fn select_historical_entry(
             rejections: result.rejection_counts.clone(),
         });
         if let Some(best) = result.candidates.first()
-            && selected.as_ref().is_none_or(|current| best.score > current.score())
+            && selected
+                .as_ref()
+                .is_none_or(|current| best.score > current.score())
         {
             selected = Some(SelectedOptionsEntry::IronCondor(SelectedIronCondorEntry {
                 underlying: underlying.to_string(),
@@ -830,7 +837,9 @@ fn select_historical_entry(
             rejections: result.rejection_counts.clone(),
         });
         if let Some(best) = result.candidates.first()
-            && selected.as_ref().is_none_or(|current| best.score > current.score())
+            && selected
+                .as_ref()
+                .is_none_or(|current| best.score > current.score())
         {
             selected = Some(SelectedOptionsEntry::Debit(SelectedDebitEntry {
                 underlying: underlying.to_string(),
@@ -842,7 +851,11 @@ fn select_historical_entry(
 
     if let Some(price) = underlying_price {
         for kind in &config.naked_kinds {
-            let strategy_contracts = if kind.is_put() { &put_contracts } else { &call_contracts };
+            let strategy_contracts = if kind.is_put() {
+                &put_contracts
+            } else {
+                &call_contracts
+            };
             let capital = NakedOptionCapitalContext {
                 options_buying_power: None,
                 quantity: config.quantity,
@@ -866,13 +879,17 @@ fn select_historical_entry(
                 rejections: result.rejection_counts.clone(),
             });
             if let Some(best) = result.candidates.first()
-                && selected.as_ref().is_none_or(|current| best.score > current.score())
+                && selected
+                    .as_ref()
+                    .is_none_or(|current| best.score > current.score())
             {
-                selected = Some(SelectedOptionsEntry::NakedOption(SelectedNakedOptionEntry {
-                    underlying: underlying.to_string(),
-                    kind: *kind,
-                    candidate: best.clone(),
-                }));
+                selected = Some(SelectedOptionsEntry::NakedOption(
+                    SelectedNakedOptionEntry {
+                        underlying: underlying.to_string(),
+                        kind: *kind,
+                        candidate: best.clone(),
+                    },
+                ));
             }
         }
     }
@@ -906,7 +923,10 @@ async fn simulate_selected_entry(
         }
     }
 
-    let symbols = legs.iter().map(|leg| leg.symbol.clone()).collect::<Vec<_>>();
+    let symbols = legs
+        .iter()
+        .map(|leg| leg.symbol.clone())
+        .collect::<Vec<_>>();
     let path_bars = load_option_bars(
         client,
         storage,
@@ -952,7 +972,8 @@ async fn simulate_selected_entry(
     let mut exit_net_cashflow = 0.0;
     let mut missing_exit = false;
     let mut resolved_exit_timestamp = exit_timestamp.to_string();
-    let exit_bar_counts = exit_bar_counts_by_leg(&legs, &path_bars, entry_timestamp, exit_timestamp);
+    let exit_bar_counts =
+        exit_bar_counts_by_leg(&legs, &path_bars, entry_timestamp, exit_timestamp);
     let mut exit_missing_leg_symbols = exit_bar_counts
         .iter()
         .filter_map(|(symbol, count)| (*count == 0).then_some(symbol.clone()))
@@ -1001,8 +1022,8 @@ async fn simulate_selected_entry(
     }
 
     let pnl_per_contract = entry_net_cashflow + exit_net_cashflow;
-    let pnl =
-        (!missing_exit).then_some(pnl_per_contract * OPTION_CONTRACT_MULTIPLIER * config.quantity as f64);
+    let pnl = (!missing_exit)
+        .then_some(pnl_per_contract * OPTION_CONTRACT_MULTIPLIER * config.quantity as f64);
     let closed = !missing_exit;
     let conservative_pnl = if closed {
         pnl
@@ -1213,7 +1234,8 @@ fn nearest_exit_fallback_plan(
 ) -> Option<ExitPlan> {
     let mut marks = BTreeMap::new();
     for leg in legs {
-        let mark = historical_mark_near(&leg.symbol, path_bars, path_trades, fallback_exit_timestamp)?;
+        let mark =
+            historical_mark_near(&leg.symbol, path_bars, path_trades, fallback_exit_timestamp)?;
         let timestamp = mark.timestamp.as_deref()?;
         let distance = timestamp_distance_secs(timestamp, fallback_exit_timestamp)?;
         if distance > EXIT_FALLBACK_MAX_DISTANCE_SECS {
@@ -1281,12 +1303,9 @@ fn exit_bar_counts_by_leg(
             .map(|bars| {
                 bars.iter()
                     .filter(|bar| {
-                        bar.timestamp
-                            .as_deref()
-                            .is_some_and(|timestamp| {
-                                timestamp >= entry_timestamp && timestamp <= fallback_exit_timestamp
-                            })
-                            && bar.close.is_some_and(|value| value > 0.0)
+                        bar.timestamp.as_deref().is_some_and(|timestamp| {
+                            timestamp >= entry_timestamp && timestamp <= fallback_exit_timestamp
+                        }) && bar.close.is_some_and(|value| value > 0.0)
                     })
                     .count()
             })
@@ -1380,9 +1399,7 @@ async fn load_contracts(
     max_dte: i64,
 ) -> anyhow::Result<Vec<AlpacaOptionContract>> {
     let cache_key = format!("{underlying}|{scan_date}|{min_dte}|{max_dte}");
-    if let Some(cached) =
-        read_cache(storage, account_id, "option_contracts", &cache_key).await?
-    {
+    if let Some(cached) = read_cache(storage, account_id, "option_contracts", &cache_key).await? {
         return Ok(cached);
     }
 
@@ -1395,13 +1412,8 @@ async fn load_contracts(
         request.status = status.to_string();
         request.expiration_date_gte = Some(min_expiration.clone());
         request.expiration_date_lte = Some(max_expiration.clone());
-        let mut response = list_option_contracts_with_retry(
-            client,
-            &request,
-            underlying,
-            status,
-        )
-        .await?;
+        let mut response =
+            list_option_contracts_with_retry(client, &request, underlying, status).await?;
         contracts.append(&mut response.option_contracts);
     }
 
@@ -1524,7 +1536,8 @@ async fn load_option_bars(
     if let Some(cached) = read_cache(storage, account_id, "option_bars", &cache_key).await? {
         return Ok(cached);
     }
-    let mut request = OptionBarsRequest::for_symbols(symbols, timeframe.to_string(), start.to_string());
+    let mut request =
+        OptionBarsRequest::for_symbols(symbols, timeframe.to_string(), start.to_string());
     request.end = Some(end.to_string());
     let bars = client.option_bars(&request).await?.bars;
     write_cache(storage, account_id, "option_bars", &cache_key, &bars).await?;
@@ -1566,20 +1579,23 @@ async fn load_underlying_price_at(
 ) -> anyhow::Result<Option<f64>> {
     let symbols = [symbol.to_string()];
     let cache_key = market_data_cache_key(&symbols, &[timeframe, feed, start, end]);
-    if let Some(cached) =
-        read_cache::<BTreeMap<String, Vec<AlpacaStockBar>>>(
-            storage,
-            account_id,
-            "stock_bars",
-            &cache_key,
-        )
-        .await?
+    if let Some(cached) = read_cache::<BTreeMap<String, Vec<AlpacaStockBar>>>(
+        storage,
+        account_id,
+        "stock_bars",
+        &cache_key,
+    )
+    .await?
     {
         return Ok(cached
             .get(symbol)
             .and_then(|bars| stock_bar_close_near(bars, target_timestamp)));
     }
-    let mut request = StockBarsRequest::for_symbols([symbol.to_string()], timeframe.to_string(), start.to_string());
+    let mut request = StockBarsRequest::for_symbols(
+        [symbol.to_string()],
+        timeframe.to_string(),
+        start.to_string(),
+    );
     request.end = Some(end.to_string());
     request.feed = Some(feed.to_string());
     let response = client.stock_bars(&request).await?;
@@ -1650,9 +1666,12 @@ fn build_snapshot_map(
 ) -> BTreeMap<String, AlpacaOptionSnapshot> {
     let mut snapshots = BTreeMap::new();
     for contract in contracts {
-        let Some(mark) =
-            historical_mark_near(&contract.symbol, bars_by_symbol, trades_by_symbol, target_timestamp)
-        else {
+        let Some(mark) = historical_mark_near(
+            &contract.symbol,
+            bars_by_symbol,
+            trades_by_symbol,
+            target_timestamp,
+        ) else {
             continue;
         };
         let (bid, ask, quote_size) = synthetic_quote(
@@ -1666,9 +1685,8 @@ fn build_snapshot_map(
         let implied_volatility = underlying_price
             .and_then(|price| implied_volatility_from_mark(contract, scan_date, price, mark.price))
             .unwrap_or(assumed_iv);
-        let greeks = underlying_price.and_then(|price| {
-            calculated_greeks(contract, scan_date, price, implied_volatility)
-        });
+        let greeks = underlying_price
+            .and_then(|price| calculated_greeks(contract, scan_date, price, implied_volatility));
         snapshots.insert(
             contract.symbol.clone(),
             AlpacaOptionSnapshot {
@@ -1900,7 +1918,10 @@ fn calculated_greeks(
 
 fn years_to_expiration(contract: &AlpacaOptionContract, scan_date: NaiveDate) -> Option<f64> {
     let expiration = NaiveDate::parse_from_str(&contract.expiration_date, "%Y-%m-%d").ok()?;
-    let dte = expiration.signed_duration_since(scan_date).num_days().max(1) as f64;
+    let dte = expiration
+        .signed_duration_since(scan_date)
+        .num_days()
+        .max(1) as f64;
     Some(dte / DAYS_PER_YEAR)
 }
 
@@ -2014,7 +2035,10 @@ fn selected_legs(entry: &SelectedOptionsEntry) -> Vec<BacktestLeg> {
     }
 }
 
-fn contracts_for_type(contracts: &[AlpacaOptionContract], option_type: &str) -> Vec<AlpacaOptionContract> {
+fn contracts_for_type(
+    contracts: &[AlpacaOptionContract],
+    option_type: &str,
+) -> Vec<AlpacaOptionContract> {
     contracts
         .iter()
         .filter(|contract| contract.option_type.eq_ignore_ascii_case(option_type))
@@ -2034,7 +2058,10 @@ fn nearest_option_bar<'a>(
 ) -> Option<&'a AlpacaOptionBar> {
     bars.iter()
         .filter(|bar| bar.close.is_some_and(|value| value > 0.0))
-        .filter_map(|bar| timestamp_distance_secs(bar.timestamp.as_deref()?, target_timestamp).map(|distance| (distance, bar)))
+        .filter_map(|bar| {
+            timestamp_distance_secs(bar.timestamp.as_deref()?, target_timestamp)
+                .map(|distance| (distance, bar))
+        })
         .min_by_key(|(distance, _)| *distance)
         .map(|(_, bar)| bar)
 }
@@ -2046,7 +2073,10 @@ fn nearest_option_trade<'a>(
     trades
         .iter()
         .filter(|trade| trade.price.is_some_and(|value| value > 0.0))
-        .filter_map(|trade| timestamp_distance_secs(trade.timestamp.as_deref()?, target_timestamp).map(|distance| (distance, trade)))
+        .filter_map(|trade| {
+            timestamp_distance_secs(trade.timestamp.as_deref()?, target_timestamp)
+                .map(|distance| (distance, trade))
+        })
         .min_by_key(|(distance, _)| *distance)
         .map(|(_, trade)| trade)
 }
@@ -2094,7 +2124,11 @@ fn scanner_dte_window(config: &OptionsEngineConfig) -> (i64, i64) {
     )
 }
 
-fn timestamp_for(config: &OptionsEngineConfig, date: NaiveDate, time: NaiveTime) -> anyhow::Result<String> {
+fn timestamp_for(
+    config: &OptionsEngineConfig,
+    date: NaiveDate,
+    time: NaiveTime,
+) -> anyhow::Result<String> {
     let local = date.and_time(time);
     let timestamp = config
         .entry_timezone
@@ -2187,7 +2221,10 @@ fn summarize(
             .by_exit_status
             .entry(trade.exit_status.clone())
             .or_insert(0) += 1;
-        let strategy = summary.by_strategy.entry(trade.strategy.clone()).or_default();
+        let strategy = summary
+            .by_strategy
+            .entry(trade.strategy.clone())
+            .or_default();
         strategy.selected_trades += 1;
         update_risk_metrics(&mut strategy.accounted, accounted_pnl);
         *strategy
@@ -2291,14 +2328,23 @@ fn build_candidate_card(
         && summary.accounted.max_drawdown <= 100.0
         && negative_periods <= positive_periods
     {
-        ("candidate", "passes sample, PnL, drawdown, profit-factor, and data-closure checks")
+        (
+            "candidate",
+            "passes sample, PnL, drawdown, profit-factor, and data-closure checks",
+        )
     } else if summary.selected_trades >= 10
         && summary.unclosed_trades == 0
         && summary.accounted.total_pnl > 0.0
     {
-        ("watchlist", "positive but misses one or more candidate thresholds")
+        (
+            "watchlist",
+            "positive but misses one or more candidate thresholds",
+        )
     } else {
-        ("reject", "insufficient sample, negative expectancy, unresolved exits, or weak risk metrics")
+        (
+            "reject",
+            "insufficient sample, negative expectancy, unresolved exits, or weak risk metrics",
+        )
     };
 
     CandidateCard {
@@ -2351,7 +2397,9 @@ fn update_risk_metrics(metrics: &mut RiskMetrics, pnl: f64) {
     metrics.worst_trade = Some(metrics.worst_trade.map_or(pnl, |value| value.min(pnl)));
     metrics.equity += pnl;
     metrics.peak_equity = metrics.peak_equity.max(metrics.equity);
-    metrics.max_drawdown = metrics.max_drawdown.max(metrics.peak_equity - metrics.equity);
+    metrics.max_drawdown = metrics
+        .max_drawdown
+        .max(metrics.peak_equity - metrics.equity);
 }
 
 fn finalize_risk_metrics(metrics: &mut RiskMetrics) {
@@ -2398,12 +2446,20 @@ fn sweep_variants(args: &Args) -> Vec<SweepVariant> {
     let short_delta_mins = if args.sweep_short_delta_min.is_empty() {
         vec![None]
     } else {
-        args.sweep_short_delta_min.iter().copied().map(Some).collect()
+        args.sweep_short_delta_min
+            .iter()
+            .copied()
+            .map(Some)
+            .collect()
     };
     let short_delta_maxes = if args.sweep_short_delta_max.is_empty() {
         vec![None]
     } else {
-        args.sweep_short_delta_max.iter().copied().map(Some).collect()
+        args.sweep_short_delta_max
+            .iter()
+            .copied()
+            .map(Some)
+            .collect()
     };
     let min_return_on_risks = if args.sweep_min_return_on_risk.is_empty() {
         vec![None]
@@ -2621,12 +2677,27 @@ fn apply_backtest_overrides(config: &mut OptionsEngineConfig, args: &Args) -> an
 
 fn enabled_strategy_names(config: &OptionsEngineConfig) -> Vec<String> {
     let mut names = Vec::new();
-    names.extend(config.spread_kinds.iter().map(|kind| credit_strategy_name(*kind).to_string()));
+    names.extend(
+        config
+            .spread_kinds
+            .iter()
+            .map(|kind| credit_strategy_name(*kind).to_string()),
+    );
     if config.iron_condor_enabled {
         names.push("iron_condor".to_string());
     }
-    names.extend(config.debit_kinds.iter().map(|kind| debit_strategy_name(*kind).to_string()));
-    names.extend(config.naked_kinds.iter().map(|kind| naked_strategy_name(*kind).to_string()));
+    names.extend(
+        config
+            .debit_kinds
+            .iter()
+            .map(|kind| debit_strategy_name(*kind).to_string()),
+    );
+    names.extend(
+        config
+            .naked_kinds
+            .iter()
+            .map(|kind| naked_strategy_name(*kind).to_string()),
+    );
     names
 }
 
@@ -2767,7 +2838,11 @@ fn profile_patch_args(profile: BacktestProfilePatch) -> Vec<String> {
     push_opt_arg(&mut args, "--timeframe", profile.timeframe);
     push_opt_arg(&mut args, "--option-feed", profile.option_feed);
     push_opt_arg(&mut args, "--stock-feed", profile.stock_feed);
-    push_opt_arg(&mut args, "--assumed-iv", profile.assumed_iv.map(|value| value.to_string()));
+    push_opt_arg(
+        &mut args,
+        "--assumed-iv",
+        profile.assumed_iv.map(|value| value.to_string()),
+    );
     push_opt_arg(
         &mut args,
         "--synthetic-spread-pct",
@@ -2776,12 +2851,16 @@ fn profile_patch_args(profile: BacktestProfilePatch) -> Vec<String> {
     push_opt_arg(
         &mut args,
         "--entry-mark-window-mins",
-        profile.entry_mark_window_mins.map(|value| value.to_string()),
+        profile
+            .entry_mark_window_mins
+            .map(|value| value.to_string()),
     );
     push_opt_arg(
         &mut args,
         "--historical-min-open-interest",
-        profile.historical_min_open_interest.map(|value| value.to_string()),
+        profile
+            .historical_min_open_interest
+            .map(|value| value.to_string()),
     );
     push_opt_arg(
         &mut args,
@@ -2791,15 +2870,25 @@ fn profile_patch_args(profile: BacktestProfilePatch) -> Vec<String> {
     push_opt_arg(
         &mut args,
         "--historical-max-leg-spread-pct",
-        profile.historical_max_leg_spread_pct.map(|value| value.to_string()),
+        profile
+            .historical_max_leg_spread_pct
+            .map(|value| value.to_string()),
     );
     push_opt_float_csv(
         &mut args,
         "--sweep-synthetic-spread-pct",
         profile.sweep_synthetic_spread_pct,
     );
-    push_opt_float_csv(&mut args, "--sweep-short-delta-min", profile.sweep_short_delta_min);
-    push_opt_float_csv(&mut args, "--sweep-short-delta-max", profile.sweep_short_delta_max);
+    push_opt_float_csv(
+        &mut args,
+        "--sweep-short-delta-min",
+        profile.sweep_short_delta_min,
+    );
+    push_opt_float_csv(
+        &mut args,
+        "--sweep-short-delta-max",
+        profile.sweep_short_delta_max,
+    );
     push_opt_float_csv(
         &mut args,
         "--sweep-min-return-on-risk",
@@ -2808,12 +2897,16 @@ fn profile_patch_args(profile: BacktestProfilePatch) -> Vec<String> {
     push_opt_arg(
         &mut args,
         "--profit-target-close-fraction",
-        profile.profit_target_close_fraction.map(|value| value.to_string()),
+        profile
+            .profit_target_close_fraction
+            .map(|value| value.to_string()),
     );
     push_opt_arg(
         &mut args,
         "--stop-loss-close-multiple",
-        profile.stop_loss_close_multiple.map(|value| value.to_string()),
+        profile
+            .stop_loss_close_multiple
+            .map(|value| value.to_string()),
     );
     push_opt_arg(
         &mut args,
@@ -2835,15 +2928,27 @@ fn profile_patch_args(profile: BacktestProfilePatch) -> Vec<String> {
         "--sweep-stop-loss-close-multiple",
         profile.sweep_stop_loss_close_multiple,
     );
-    push_opt_u64_csv(&mut args, "--sweep-max-hold-mins", profile.sweep_max_hold_mins);
+    push_opt_u64_csv(
+        &mut args,
+        "--sweep-max-hold-mins",
+        profile.sweep_max_hold_mins,
+    );
     push_opt_arg(&mut args, "--breakdown-period", profile.breakdown_period);
-    push_opt_arg(&mut args, "--unclosed-valuation", profile.unclosed_valuation);
+    push_opt_arg(
+        &mut args,
+        "--unclosed-valuation",
+        profile.unclosed_valuation,
+    );
     push_opt_arg(
         &mut args,
         "--min-exit-leg-bars",
         profile.min_exit_leg_bars.map(|value| value.to_string()),
     );
-    push_opt_arg(&mut args, "--quantity", profile.quantity.map(|value| value.to_string()));
+    push_opt_arg(
+        &mut args,
+        "--quantity",
+        profile.quantity.map(|value| value.to_string()),
+    );
     if profile.require_exit_common_timestamp.unwrap_or(false) {
         args.push("--require-exit-common-timestamp".to_string());
     }
@@ -2929,9 +3034,13 @@ fn parse_args() -> anyhow::Result<Args> {
         match arg.as_str() {
             "--start" => start = Some(parse_date(&next_value(&mut iter, "--start")?)?),
             "--end" => end = Some(parse_date(&next_value(&mut iter, "--end")?)?),
-            "--entry-time" => entry_time = Some(parse_time(&next_value(&mut iter, "--entry-time")?)?),
+            "--entry-time" => {
+                entry_time = Some(parse_time(&next_value(&mut iter, "--entry-time")?)?)
+            }
             "--exit-time" => exit_time = Some(parse_time(&next_value(&mut iter, "--exit-time")?)?),
-            "--underlyings" => underlyings = Some(split_csv(next_value(&mut iter, "--underlyings")?)),
+            "--underlyings" => {
+                underlyings = Some(split_csv(next_value(&mut iter, "--underlyings")?))
+            }
             "--strategies" => strategies = Some(split_csv(next_value(&mut iter, "--strategies")?)),
             "--timeframe" => timeframe = next_value(&mut iter, "--timeframe")?,
             "--option-feed" => option_feed = Some(next_value(&mut iter, "--option-feed")?),
@@ -3272,7 +3381,10 @@ fn write_trade_csv_export(path: &str, reports: &[BacktestReport]) -> anyhow::Res
                 .exit_net_cashflow
                 .map(|value| format!("{value:.4}"))
                 .unwrap_or_default(),
-            record.pnl.map(|value| format!("{value:.2}")).unwrap_or_default(),
+            record
+                .pnl
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_default(),
             record
                 .conservative_pnl
                 .map(|value| format!("{value:.2}"))
@@ -3433,7 +3545,10 @@ fn print_report(report: &BacktestReport) {
                 trade.score,
                 trade.premium_kind,
                 trade.entry_premium,
-                trade.pnl.map(|pnl| format!("{pnl:.2}")).unwrap_or_else(|| "-".to_string()),
+                trade
+                    .pnl
+                    .map(|pnl| format!("{pnl:.2}"))
+                    .unwrap_or_else(|| "-".to_string()),
                 trade.exit_status,
                 trade.exit_diagnostic,
             );
@@ -3513,13 +3628,11 @@ fn print_sweep_report(reports: &[BacktestReport]) {
             card.accounted_pnl,
             card.average_pnl,
             card.win_rate * 100.0,
-            card
-                .profit_factor
+            card.profit_factor
                 .map(|value| format!("{value:.2}"))
                 .unwrap_or_else(|| "inf".to_string()),
             card.max_drawdown,
-            card
-                .worst_trade
+            card.worst_trade
                 .map(|value| format!("{value:.2}"))
                 .unwrap_or_else(|| "-".to_string()),
             card.active_periods,

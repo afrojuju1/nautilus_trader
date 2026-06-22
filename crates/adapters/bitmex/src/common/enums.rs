@@ -51,7 +51,7 @@ use strum::{AsRefStr, Display, EnumIter, EnumString};
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.bitmex")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.bitmex")
 )]
 pub enum BitmexSymbolStatus {
     /// Symbol is open for trading.
@@ -128,7 +128,7 @@ impl From<BitmexSide> for OrderSide {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.bitmex")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.bitmex")
 )]
 pub enum BitmexPositionSide {
     /// Long position.
@@ -366,6 +366,12 @@ impl BitmexTimeInForce {
     ///
     /// Returns an error if the time in force is not supported by BitMEX.
     pub fn try_from_time_in_force(value: TimeInForce) -> anyhow::Result<Self> {
+        if value == TimeInForce::Gtd {
+            anyhow::bail!(
+                "GTD time in force is not supported for BitMEX order submit; use GTC, Day, IOC, or FOK"
+            );
+        }
+
         Self::try_from(value)
     }
 }
@@ -625,15 +631,19 @@ pub enum BitmexInstrumentType {
     #[serde(rename = "FMXXS")]
     FuturesSpreads,
 
+    /// Active crypto futures spreads.
+    #[serde(rename = "FFMCSX")]
+    FuturesSpread,
+
     /// Prediction Markets (non-standardized financial future on index, cash settled).
     /// CFI code FFICSX - traders predict outcomes of events.
     #[serde(rename = "FFICSX")]
     PredictionMarket,
 
-    /// Stock-based Perpetual Contracts (e.g., SPY, equity derivatives).
-    /// CFI code FFSCSX - financial future on stocks, cash settled.
+    /// TradFi Perpetual Contracts (equities, FX, and commodities).
+    /// CFI code FFSCSX - financial future on non-crypto underlyings, cash settled.
     #[serde(rename = "FFSCSX")]
-    StockPerpetual,
+    TradFiPerpetual,
 
     /// Perpetual Contracts (crypto).
     #[serde(rename = "FFWCSX")]
@@ -694,6 +704,10 @@ pub enum BitmexInstrumentType {
     /// BitMEX Yield/Dividend Index.
     #[serde(rename = "MRVDXX")]
     YieldIndex,
+
+    /// Unknown instrument type.
+    #[serde(other)]
+    Other,
 }
 
 /// Represents the different types of instrument subscriptions available on BitMEX.
@@ -814,6 +828,9 @@ pub enum BitmexInstrumentState {
     Settled,
     /// Instrument is delisted.
     Delisted,
+    /// Unrecognized instrument state received from the venue.
+    #[serde(other)]
+    Unknown,
 }
 
 impl From<&BitmexInstrumentState> for MarketStatusAction {
@@ -824,6 +841,7 @@ impl From<&BitmexInstrumentState> for MarketStatusAction {
             BitmexInstrumentState::Settled => Self::Close,
             BitmexInstrumentState::Unlisted => Self::NotAvailableForTrading,
             BitmexInstrumentState::Delisted => Self::NotAvailableForTrading,
+            BitmexInstrumentState::Unknown => Self::NotAvailableForTrading,
         }
     }
 }
@@ -888,7 +906,7 @@ pub enum BitmexMarkMethod {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.bitmex")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.bitmex")
 )]
 pub enum BitmexEnvironment {
     /// Live trading environment.
@@ -977,7 +995,7 @@ mod tests {
             r#""FFWCSF""#
         );
         assert_eq!(
-            serde_json::to_string(&BitmexInstrumentType::StockPerpetual).unwrap(),
+            serde_json::to_string(&BitmexInstrumentType::TradFiPerpetual).unwrap(),
             r#""FFSCSX""#
         );
         assert_eq!(
@@ -1017,6 +1035,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&BitmexInstrumentType::FuturesSpreads).unwrap(),
             r#""FMXXS""#
+        );
+        assert_eq!(
+            serde_json::to_string(&BitmexInstrumentType::FuturesSpread).unwrap(),
+            r#""FFMCSX""#
         );
         assert_eq!(
             serde_json::to_string(&BitmexInstrumentType::ReferenceBasket).unwrap(),
@@ -1067,7 +1089,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<BitmexInstrumentType>(r#""FFSCSX""#).unwrap(),
-            BitmexInstrumentType::StockPerpetual
+            BitmexInstrumentType::TradFiPerpetual
         );
         assert_eq!(
             serde_json::from_str::<BitmexInstrumentType>(r#""IFXXXP""#).unwrap(),
@@ -1108,6 +1130,10 @@ mod tests {
             BitmexInstrumentType::FuturesSpreads
         );
         assert_eq!(
+            serde_json::from_str::<BitmexInstrumentType>(r#""FFMCSX""#).unwrap(),
+            BitmexInstrumentType::FuturesSpread
+        );
+        assert_eq!(
             serde_json::from_str::<BitmexInstrumentType>(r#""RCSXXX""#).unwrap(),
             BitmexInstrumentType::ReferenceBasket
         );
@@ -1142,8 +1168,10 @@ mod tests {
             BitmexInstrumentType::YieldIndex
         );
 
-        // Error case
-        assert!(serde_json::from_str::<BitmexInstrumentType>(r#""INVALID""#).is_err());
+        assert_eq!(
+            serde_json::from_str::<BitmexInstrumentType>(r#""INVALID""#).unwrap(),
+            BitmexInstrumentType::Other
+        );
     }
 
     #[rstest]
@@ -1276,6 +1304,15 @@ mod tests {
         let result = BitmexTimeInForce::try_from_time_in_force(TimeInForce::Ioc);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), BitmexTimeInForce::ImmediateOrCancel);
+
+        let result = BitmexTimeInForce::try_from_time_in_force(TimeInForce::Gtd);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("GTD time in force is not supported")
+        );
     }
 
     #[rstest]
@@ -1290,10 +1327,20 @@ mod tests {
         BitmexInstrumentState::Delisted,
         MarketStatusAction::NotAvailableForTrading
     )]
+    #[case(
+        BitmexInstrumentState::Unknown,
+        MarketStatusAction::NotAvailableForTrading
+    )]
     fn test_bitmex_instrument_state_to_market_status_action(
         #[case] state: BitmexInstrumentState,
         #[case] expected: MarketStatusAction,
     ) {
         assert_eq!(MarketStatusAction::from(&state), expected);
+    }
+
+    #[rstest]
+    fn test_bitmex_instrument_state_unknown_deserializes_from_unrecognized_string() {
+        let state: BitmexInstrumentState = serde_json::from_str(r#""SomeFutureState""#).unwrap();
+        assert_eq!(state, BitmexInstrumentState::Unknown);
     }
 }

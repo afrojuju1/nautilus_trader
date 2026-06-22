@@ -13,118 +13,30 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::HashMap, str::FromStr, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use nautilus_common::{
     cache::CacheConfig, enums::Environment, logging::logger::LoggerConfig,
-    msgbus::database::MessageBusConfig,
+    msgbus::backing::MessageBusConfig, python::config_error_to_pyvalue_err,
 };
 use nautilus_core::{UUID4, python::to_pyvalue_err};
 use nautilus_model::{
     enums::BarIntervalType,
-    identifiers::{ClientId, ClientOrderId, InstrumentId, TraderId},
+    identifiers::{ClientId, TraderId},
 };
 use nautilus_portfolio::config::PortfolioConfig;
 use pyo3::{
     IntoPyObject, Py, PyAny, PyResult, Python, pymethods,
     types::{PyAnyMethods, PyDict, PyDictMethods},
 };
-use rust_decimal::Decimal;
 
 use crate::config::{
     InstrumentProviderConfig, LiveDataClientConfig, LiveDataEngineConfig, LiveExecClientConfig,
     LiveExecEngineConfig, LiveNodeConfig, LiveRiskEngineConfig, PluginConfig, RoutingConfig,
+    duration_from_secs_f64, parse_rate_limit, validate_client_order_id_strings,
+    validate_instrument_id_strings, validate_max_notional_per_order,
+    validate_non_negative_finite_f64,
 };
-
-fn validate_rate_limit(value: &str, name: &str) -> PyResult<()> {
-    let (limit, interval) = value
-        .split_once('/')
-        .ok_or_else(|| to_pyvalue_err(format!("invalid `{name}`: expected 'limit/HH:MM:SS'")))?;
-
-    let limit = limit
-        .parse::<usize>()
-        .map_err(|e| to_pyvalue_err(format!("invalid `{name}` limit: {e}")))?;
-
-    if limit == 0 {
-        return Err(to_pyvalue_err(format!(
-            "invalid `{name}`: limit must be greater than zero"
-        )));
-    }
-
-    let mut total_secs: u64 = 0;
-    let mut parts = interval.split(':');
-    for label in ["hours", "minutes", "seconds"] {
-        let value = parts
-            .next()
-            .ok_or_else(|| {
-                to_pyvalue_err(format!(
-                    "invalid `{name}`: expected 'limit/HH:MM:SS' interval"
-                ))
-            })?
-            .parse::<u64>()
-            .map_err(|e| to_pyvalue_err(format!("invalid `{name}` {label}: {e}")))?;
-
-        let multiplier: u64 = match label {
-            "hours" => 3_600,
-            "minutes" => 60,
-            "seconds" => 1,
-            _ => unreachable!(),
-        };
-        total_secs = total_secs.saturating_add(value.saturating_mul(multiplier));
-    }
-
-    if parts.next().is_some() {
-        return Err(to_pyvalue_err(format!(
-            "invalid `{name}`: expected 'limit/HH:MM:SS'"
-        )));
-    }
-
-    if total_secs == 0 {
-        return Err(to_pyvalue_err(format!(
-            "invalid `{name}`: interval must be greater than zero"
-        )));
-    }
-
-    Ok(())
-}
-
-fn validate_max_notional_per_order(
-    max_notional_per_order: &HashMap<String, String>,
-) -> PyResult<()> {
-    for (instrument_id, notional) in max_notional_per_order {
-        InstrumentId::from_str(instrument_id).map_err(|e| {
-            to_pyvalue_err(format!(
-                "invalid `max_notional_per_order` instrument ID {instrument_id:?}: {e}"
-            ))
-        })?;
-
-        Decimal::from_str(notional).map_err(|e| {
-            to_pyvalue_err(format!(
-                "invalid `max_notional_per_order` notional {notional:?}: {e}"
-            ))
-        })?;
-    }
-
-    Ok(())
-}
-
-fn validate_instrument_id_strings(values: &[String], name: &str) -> PyResult<()> {
-    for value in values {
-        InstrumentId::from_str(value).map_err(|e| {
-            to_pyvalue_err(format!("invalid `{name}` instrument ID {value:?}: {e}"))
-        })?;
-    }
-    Ok(())
-}
-
-fn validate_client_order_id_strings(values: &[String], name: &str) -> PyResult<()> {
-    for value in values {
-        ClientOrderId::new_checked(value).map_err(|e| {
-            to_pyvalue_err(format!("invalid `{name}` client order ID {value:?}: {e}"))
-        })?;
-    }
-    Ok(())
-}
 
 // Coerces a PyO3 input into `BarIntervalType`, accepting both the enum (modern Rust
 // surface) and the legacy Python v1 string form (`"left-open"` / `"right-open"`).
@@ -149,9 +61,6 @@ fn coerce_bar_interval_type(value: &Py<PyAny>) -> PyResult<BarIntervalType> {
     })
 }
 
-// Normalizes a Python `max_notional_per_order` dict (values can be `int`, `float`,
-// `str`, or `Decimal`, matching the legacy Python v1 config contract) into the
-// string-keyed map stored on `LiveRiskEngineConfig`.
 /// Converts a Python value into a [`serde_json::Value`].
 fn py_to_json_value(bound: &pyo3::Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     // Check bool before int since Python `bool` is a subclass of `int`
@@ -217,8 +126,8 @@ fn json_value_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<Py
     }
 }
 
-/// Converts Python filter values into JSON values.
-fn coerce_filters_to_json(
+/// Converts Python mapping values into JSON values.
+pub(crate) fn coerce_json_config(
     raw: HashMap<String, Py<PyAny>>,
 ) -> PyResult<HashMap<String, serde_json::Value>> {
     Python::attach(|py| -> PyResult<HashMap<String, serde_json::Value>> {
@@ -231,6 +140,9 @@ fn coerce_filters_to_json(
     })
 }
 
+// Normalizes a Python `max_notional_per_order` dict (values can be `int`, `float`,
+// `str`, or `Decimal`, matching the legacy Python v1 config contract) into the
+// string-keyed map stored on `LiveRiskEngineConfig`.
 fn coerce_max_notional_per_order(
     raw: HashMap<String, Py<PyAny>>,
 ) -> PyResult<HashMap<String, String>> {
@@ -254,7 +166,7 @@ impl LiveDataEngineConfig {
         clippy::needless_pass_by_value,
         reason = "PyO3 #[new] requires owned params"
     )]
-    #[pyo3(signature = (time_bars_build_with_no_updates=None, time_bars_timestamp_on_close=None, time_bars_skip_first_non_full_bar=None, time_bars_interval_type=None, time_bars_build_delay=None, time_bars_origin_offset=None, validate_data_sequence=None, buffer_deltas=None, emit_quotes_from_book=None, emit_quotes_from_book_depths=None, external_clients=None, debug=None, graceful_shutdown_on_error=None))]
+    #[pyo3(signature = (time_bars_build_with_no_updates=None, time_bars_timestamp_on_close=None, time_bars_skip_first_non_full_bar=None, time_bars_interval_type=None, time_bars_build_delay=None, time_bars_origin_offset=None, validate_data_sequence=None, buffer_deltas=None, emit_quotes_from_book=None, emit_quotes_from_book_depths=None, external_clients=None, debug=None))]
     fn py_new(
         time_bars_build_with_no_updates: Option<bool>,
         time_bars_timestamp_on_close: Option<bool>,
@@ -268,7 +180,6 @@ impl LiveDataEngineConfig {
         emit_quotes_from_book_depths: Option<bool>,
         external_clients: Option<Vec<ClientId>>,
         debug: Option<bool>,
-        graceful_shutdown_on_error: Option<bool>,
     ) -> PyResult<Self> {
         let default = Self::default();
         let time_bars_interval_type = match time_bars_interval_type {
@@ -293,8 +204,6 @@ impl LiveDataEngineConfig {
                 .unwrap_or(default.emit_quotes_from_book_depths),
             external_clients,
             debug: debug.unwrap_or(default.debug),
-            graceful_shutdown_on_error: graceful_shutdown_on_error
-                .unwrap_or(default.graceful_shutdown_on_error),
             qsize: default.qsize,
         })
     }
@@ -313,14 +222,13 @@ impl LiveDataEngineConfig {
 impl LiveRiskEngineConfig {
     /// Configuration for live risk engines.
     #[new]
-    #[pyo3(signature = (bypass=None, max_order_submit_rate=None, max_order_modify_rate=None, max_notional_per_order=None, debug=None, graceful_shutdown_on_error=None))]
+    #[pyo3(signature = (bypass=None, max_order_submit_rate=None, max_order_modify_rate=None, max_notional_per_order=None, debug=None))]
     fn py_new(
         bypass: Option<bool>,
         max_order_submit_rate: Option<String>,
         max_order_modify_rate: Option<String>,
         max_notional_per_order: Option<HashMap<String, Py<PyAny>>>,
         debug: Option<bool>,
-        graceful_shutdown_on_error: Option<bool>,
     ) -> PyResult<Self> {
         let default = Self::default();
         let max_order_submit_rate =
@@ -332,9 +240,21 @@ impl LiveRiskEngineConfig {
             None => HashMap::new(),
         };
 
-        validate_rate_limit(&max_order_submit_rate, "max_order_submit_rate")?;
-        validate_rate_limit(&max_order_modify_rate, "max_order_modify_rate")?;
-        validate_max_notional_per_order(&max_notional_per_order)?;
+        parse_rate_limit(
+            "LiveRiskEngineConfig.max_order_submit_rate",
+            &max_order_submit_rate,
+        )
+        .map_err(config_error_to_pyvalue_err)?;
+        parse_rate_limit(
+            "LiveRiskEngineConfig.max_order_modify_rate",
+            &max_order_modify_rate,
+        )
+        .map_err(config_error_to_pyvalue_err)?;
+        validate_max_notional_per_order(
+            "LiveRiskEngineConfig.max_notional_per_order",
+            &max_notional_per_order,
+        )
+        .map_err(config_error_to_pyvalue_err)?;
 
         Ok(Self {
             bypass: bypass.unwrap_or(default.bypass),
@@ -342,8 +262,6 @@ impl LiveRiskEngineConfig {
             max_order_modify_rate,
             max_notional_per_order,
             debug: debug.unwrap_or(default.debug),
-            graceful_shutdown_on_error: graceful_shutdown_on_error
-                .unwrap_or(default.graceful_shutdown_on_error),
             qsize: default.qsize,
         })
     }
@@ -403,20 +321,25 @@ impl LiveExecEngineConfig {
     ) -> PyResult<Self> {
         let default = Self::default();
 
-        if let Some(delay) = reconciliation_startup_delay_secs
-            && (!delay.is_finite() || delay < 0.0)
-        {
-            return Err(to_pyvalue_err(format!(
-                "invalid `reconciliation_startup_delay_secs`: {delay} (must be a non-negative finite number)"
-            )));
+        if let Some(delay) = reconciliation_startup_delay_secs {
+            validate_non_negative_finite_f64(
+                "LiveExecEngineConfig.reconciliation_startup_delay_secs",
+                delay,
+            )
+            .map_err(config_error_to_pyvalue_err)?;
         }
 
         if let Some(ids) = reconciliation_instrument_ids.as_ref() {
-            validate_instrument_id_strings(ids, "reconciliation_instrument_ids")?;
+            validate_instrument_id_strings(
+                "LiveExecEngineConfig.reconciliation_instrument_ids",
+                ids,
+            )
+            .map_err(config_error_to_pyvalue_err)?;
         }
 
         if let Some(ids) = filtered_client_order_ids.as_ref() {
-            validate_client_order_id_strings(ids, "filtered_client_order_ids")?;
+            validate_client_order_id_strings("LiveExecEngineConfig.filtered_client_order_ids", ids)
+                .map_err(config_error_to_pyvalue_err)?;
         }
 
         Ok(Self {
@@ -473,7 +396,6 @@ impl LiveExecEngineConfig {
             purge_from_database: default.purge_from_database,
             debug: debug.unwrap_or(default.debug),
             own_books_audit_interval_secs,
-            graceful_shutdown_on_error: default.graceful_shutdown_on_error,
             qsize: default.qsize,
         })
     }
@@ -538,7 +460,7 @@ impl InstrumentProviderConfig {
     ) -> PyResult<Self> {
         let default = Self::default();
         let filters = match filters {
-            Some(raw) => coerce_filters_to_json(raw)?,
+            Some(raw) => coerce_json_config(raw)?,
             None => HashMap::new(),
         };
         Ok(Self {
@@ -679,7 +601,7 @@ impl PluginConfig {
         sha256: Option<String>,
     ) -> PyResult<Self> {
         let config = match config {
-            Some(config) => coerce_filters_to_json(config)?,
+            Some(config) => coerce_json_config(config)?,
             None => HashMap::new(),
         };
 
@@ -722,12 +644,13 @@ impl LiveNodeConfig {
     /// Configuration for live Nautilus system nodes.
     #[new]
     #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (environment=None, trader_id=None, load_state=None, save_state=None, logging=None, instance_id=None, timeout_connection_secs=None, timeout_reconciliation_secs=None, timeout_portfolio_secs=None, timeout_disconnection_secs=None, delay_post_stop_secs=None, timeout_shutdown_secs=None, cache=None, msgbus=None, portfolio=None, loop_debug=None, data_engine=None, risk_engine=None, exec_engine=None, plugins=None))]
+    #[pyo3(signature = (environment=None, trader_id=None, load_state=None, save_state=None, shutdown_on_error=None, logging=None, instance_id=None, timeout_connection_secs=None, timeout_reconciliation_secs=None, timeout_portfolio_secs=None, timeout_disconnection_secs=None, delay_post_stop_secs=None, timeout_shutdown_secs=None, cache=None, msgbus=None, portfolio=None, loop_debug=None, data_engine=None, risk_engine=None, exec_engine=None, plugins=None))]
     fn py_new(
         environment: Option<Environment>,
         trader_id: Option<TraderId>,
         load_state: Option<bool>,
         save_state: Option<bool>,
+        shutdown_on_error: Option<bool>,
         logging: Option<LoggerConfig>,
         instance_id: Option<UUID4>,
         timeout_connection_secs: Option<f64>,
@@ -748,12 +671,7 @@ impl LiveNodeConfig {
         let default = Self::default();
 
         let to_duration = |value: f64, name: &str| -> PyResult<Duration> {
-            if !value.is_finite() || !(0.0..=86_400.0).contains(&value) {
-                return Err(to_pyvalue_err(format!(
-                    "invalid {name}: {value} (must be finite, non-negative, and <= 86400)"
-                )));
-            }
-            Ok(Duration::from_secs_f64(value))
+            duration_from_secs_f64(name, value).map_err(config_error_to_pyvalue_err)
         };
 
         Ok(Self {
@@ -761,6 +679,7 @@ impl LiveNodeConfig {
             trader_id: trader_id.unwrap_or(default.trader_id),
             load_state: load_state.unwrap_or(default.load_state),
             save_state: save_state.unwrap_or(default.save_state),
+            shutdown_on_error: shutdown_on_error.unwrap_or(default.shutdown_on_error),
             logging: logging.unwrap_or(default.logging),
             instance_id,
             timeout_connection: to_duration(
@@ -792,6 +711,7 @@ impl LiveNodeConfig {
             portfolio,
             emulator: None,
             streaming: None,
+            event_store: None,
             loop_debug: loop_debug.unwrap_or(false),
             data_engine: data_engine.unwrap_or_default(),
             risk_engine: risk_engine.unwrap_or_default(),
@@ -828,6 +748,11 @@ impl LiveNodeConfig {
     #[getter]
     fn save_state(&self) -> bool {
         self.save_state
+    }
+
+    #[getter]
+    fn shutdown_on_error(&self) -> bool {
+        self.shutdown_on_error
     }
 
     #[getter]

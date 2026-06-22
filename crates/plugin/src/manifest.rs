@@ -16,10 +16,12 @@
 //! Static manifest a plug-in returns from `nautilus_plugin_init`.
 //!
 //! The manifest enumerates every plug-point contribution the cdylib provides
-//! and points at the per-type vtables. The current unreleased v1 surface ships
+//! and points at the per-type vtables. The current unreleased surface ships
 //! custom-data, actor, and strategy plug-point families. Future released
-//! revisions should add new `Slice` fields to [`PluginManifest`] without
-//! removing existing ones.
+//! revisions must add new `Slice` fields to [`PluginManifest`] without
+//! removing or reordering existing ones: the loader reads the header prefix
+//! (name, vendor, version, build identifier) for diagnostics even when the
+//! ABI version differs, so the prefix layout is a cross-revision contract.
 
 use std::{
     collections::BTreeMap,
@@ -27,11 +29,16 @@ use std::{
     slice,
 };
 
+use nautilus_model::types::fixed::FIXED_PRECISION;
+
 use crate::{
     NAUTILUS_PLUGIN_ABI_VERSION, PLUGIN_BUILD_ID_VERSION,
     boundary::{BorrowedStr, Slice},
     host::HostVTable,
-    surfaces::{actor::ActorVTable, custom_data::CustomDataVTable, strategy::StrategyVTable},
+    surfaces::{
+        actor::ActorVTable, controller::ControllerVTable, custom_data::CustomDataVTable,
+        strategy::StrategyVTable,
+    },
 };
 
 /// Signature of the single `extern "C"` entry symbol every plug-in exports
@@ -39,15 +46,16 @@ use crate::{
 ///
 /// The host calls this once at load time with a pointer to its `HostVTable`.
 /// The plug-in returns a pointer to its `'static` [`PluginManifest`], or null
-/// to signal load failure. v1 reports null as `LoadError::NullManifest` with
-/// the plug-in path.
+/// to signal load failure. The host reports null as `LoadError::NullManifest`
+/// with the plug-in path.
 pub type PluginInitFn = unsafe extern "C" fn(host: *const HostVTable) -> *const PluginManifest;
 
 /// Versioned build identifier carried by [`PluginManifest`].
 ///
 /// The fields identify the Nautilus plug-in crate and build environment that
-/// produced the manifest. They are diagnostic only: ABI compatibility is still
-/// enforced by [`PluginManifest::abi_version`].
+/// produced the manifest. The host validates the precision mode because it
+/// changes model type layout across the plug-in boundary. Other build fields
+/// remain diagnostic.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PluginBuildId {
@@ -67,6 +75,12 @@ pub struct PluginBuildId {
 
     /// Cargo build profile, or empty when Cargo did not expose one.
     pub build_profile: BorrowedStr<'static>,
+
+    /// Model fixed-point precision mode used to build the plug-in.
+    pub precision_mode: BorrowedStr<'static>,
+
+    /// Maximum fixed-point decimal precision used to build the plug-in.
+    pub fixed_precision: u8,
 }
 
 impl PluginBuildId {
@@ -79,7 +93,19 @@ impl PluginBuildId {
             rustc_version: BorrowedStr::from_str(env!("NAUTILUS_PLUGIN_BUILD_RUSTC_VERSION")),
             target_triple: BorrowedStr::from_str(env!("NAUTILUS_PLUGIN_BUILD_TARGET")),
             build_profile: BorrowedStr::from_str(env!("NAUTILUS_PLUGIN_BUILD_PROFILE")),
+            precision_mode: BorrowedStr::from_str(compiled_precision_mode()),
+            fixed_precision: FIXED_PRECISION,
         }
+    }
+}
+
+/// Returns the model precision mode compiled into this crate.
+#[must_use]
+pub const fn compiled_precision_mode() -> &'static str {
+    if FIXED_PRECISION > 9 {
+        "high-precision"
+    } else {
+        "standard"
     }
 }
 
@@ -152,7 +178,10 @@ pub struct PluginManifest {
 
     /// Strategy registrations contributed by this plug-in.
     pub strategies: Slice<'static, StrategyRegistration>,
-    // Future plug-point slices land here in additive ABI bumps:
+
+    /// Controller registrations contributed by this plug-in.
+    pub controllers: Slice<'static, ControllerRegistration>,
+    // Future plug-point slices land here and require rebuilding plug-ins:
     //   pub indicators: Slice<'static, IndicatorRegistration>,
     //   pub fill_models: Slice<'static, FillModelRegistration>,
     //   ...
@@ -167,9 +196,10 @@ impl PluginManifest {
 
     /// Validates manifest invariants the host relies on before registration.
     ///
-    /// This does not decide plug-in compatibility beyond the explicit ABI and
-    /// build-id schema versions. Build-id content stays diagnostic; empty
-    /// compiler, target, and profile strings do not make a manifest invalid.
+    /// This does not decide plug-in compatibility beyond the explicit ABI,
+    /// build-id schema, and fixed-point precision mode. The remaining build-id
+    /// content stays diagnostic; empty compiler, target, and profile strings do
+    /// not make a manifest invalid.
     ///
     /// # Errors
     ///
@@ -197,6 +227,7 @@ fn validate_build_id(build_id: &PluginBuildId, errors: &mut PluginManifestValida
             "build_id.schema_version {} does not match supported schema {}",
             build_id.schema_version, PLUGIN_BUILD_ID_VERSION
         ));
+        return;
     }
 
     validate_optional_str(
@@ -207,6 +238,23 @@ fn validate_build_id(build_id: &PluginBuildId, errors: &mut PluginManifestValida
     validate_optional_str("build_id.rustc_version", build_id.rustc_version, errors);
     validate_optional_str("build_id.target_triple", build_id.target_triple, errors);
     validate_optional_str("build_id.build_profile", build_id.build_profile, errors);
+    if let Some(precision_mode) =
+        validate_required_str("build_id.precision_mode", build_id.precision_mode, errors)
+    {
+        let expected = compiled_precision_mode();
+        if precision_mode != expected {
+            errors.push(format!(
+                "build_id.precision_mode '{precision_mode}' does not match host precision mode '{expected}'"
+            ));
+        }
+    }
+
+    if build_id.fixed_precision != FIXED_PRECISION {
+        errors.push(format!(
+            "build_id.fixed_precision {} does not match host fixed precision {}",
+            build_id.fixed_precision, FIXED_PRECISION
+        ));
+    }
 }
 
 macro_rules! validate_vtable_slots {
@@ -261,6 +309,19 @@ fn validate_registrations(manifest: &PluginManifest, errors: &mut PluginManifest
                 errors.push(format!("{location}.vtable must not be null"));
             } else {
                 validate_strategy_vtable(&location, type_name, entry.vtable, errors);
+            }
+        }
+    }
+
+    if let Some(entries) = validate_slice("controllers", &manifest.controllers, errors) {
+        for (index, entry) in entries.iter().enumerate() {
+            let location = format!("controllers[{index}]");
+            let type_name = validate_type_name(&location, entry.type_name, errors);
+            validate_unique_type_name(&mut seen_type_names, &location, type_name, errors);
+            if entry.vtable.is_null() {
+                errors.push(format!("{location}.vtable must not be null"));
+            } else {
+                validate_controller_vtable(&location, type_name, entry.vtable, errors);
             }
         }
     }
@@ -322,27 +383,31 @@ fn validate_actor_vtable(
             on_degrade,
             on_fault,
             on_time_event,
+            on_data,
+            on_instrument,
+            on_book_deltas,
+            on_book,
             on_quote,
             on_trade,
             on_bar,
-            on_book_deltas,
-            on_instrument,
-            on_option_chain,
             on_mark_price,
             on_index_price,
             on_funding_rate,
             on_option_greeks,
+            on_option_chain,
             on_instrument_status,
             on_instrument_close,
             on_order_filled,
             on_order_canceled,
             on_signal,
+            on_historical_book_deltas,
+            on_historical_book_depth,
             on_historical_quotes,
             on_historical_trades,
             on_historical_bars,
-            on_historical_funding_rates,
             on_historical_mark_prices,
             on_historical_index_prices,
+            on_historical_funding_rates,
         ]
     );
 }
@@ -373,16 +438,18 @@ fn validate_strategy_vtable(
             on_degrade,
             on_fault,
             on_time_event,
+            on_data,
+            on_instrument,
+            on_book_deltas,
+            on_book,
             on_quote,
             on_trade,
             on_bar,
-            on_book_deltas,
-            on_instrument,
-            on_option_chain,
             on_mark_price,
             on_index_price,
             on_funding_rate,
             on_option_greeks,
+            on_option_chain,
             on_instrument_status,
             on_instrument_close,
             on_signal,
@@ -406,12 +473,45 @@ fn validate_strategy_vtable(
             on_position_changed,
             on_position_closed,
             on_market_exit,
+            on_historical_book_deltas,
+            on_historical_book_depth,
             on_historical_quotes,
             on_historical_trades,
             on_historical_bars,
-            on_historical_funding_rates,
             on_historical_mark_prices,
             on_historical_index_prices,
+            on_historical_funding_rates,
+        ]
+    );
+}
+
+fn validate_controller_vtable(
+    location: &str,
+    type_name: Option<&str>,
+    vtable: *const ControllerVTable,
+    errors: &mut PluginManifestValidationErrors,
+) {
+    // SAFETY: caller checked the vtable pointer is non-null. Validation only
+    // reads nullable function-pointer slots and never invokes plug-in code.
+    let vtable = unsafe { &*vtable };
+    validate_vtable_slots!(
+        location,
+        type_name,
+        vtable,
+        errors,
+        [
+            prepare,
+            create,
+            drop_handle,
+            type_name,
+            on_start,
+            on_stop,
+            on_resume,
+            on_reset,
+            on_dispose,
+            on_degrade,
+            on_fault,
+            on_time_event,
         ]
     );
 }
@@ -572,6 +672,20 @@ unsafe impl Send for StrategyRegistration {}
 /// SAFETY: see above.
 unsafe impl Sync for StrategyRegistration {}
 
+/// Registration entry for one plug-in controller type.
+#[repr(C)]
+pub struct ControllerRegistration {
+    /// Canonical type name; must match the `type_name` returned by the vtable.
+    pub type_name: BorrowedStr<'static>,
+    /// Pointer to the static vtable for this controller type.
+    pub vtable: *const ControllerVTable,
+}
+
+/// SAFETY: the pointer is `'static` and immutable for the process lifetime.
+unsafe impl Send for ControllerRegistration {}
+/// SAFETY: see above.
+unsafe impl Sync for ControllerRegistration {}
+
 /// Host-side view of a manifest that passed structural validation.
 ///
 /// This wrapper is not part of the ABI. Hosts use it after loader validation
@@ -642,6 +756,15 @@ impl<'a> ValidatedPluginManifest<'a> {
         unsafe { self.manifest.strategies.as_slice() }
             .iter()
             .map(ValidatedStrategyRegistration::from_validated_registration)
+    }
+
+    /// Returns validated controller registrations in manifest order.
+    #[must_use]
+    pub fn controllers(self) -> impl ExactSizeIterator<Item = ValidatedControllerRegistration> {
+        // SAFETY: validation checked the slice descriptor.
+        unsafe { self.manifest.controllers.as_slice() }
+            .iter()
+            .map(ValidatedControllerRegistration::from_validated_registration)
     }
 }
 
@@ -737,6 +860,38 @@ impl ValidatedStrategyRegistration {
     /// Returns the validated vtable wrapper.
     #[must_use]
     pub fn vtable(self) -> ValidatedStrategyVTable {
+        self.vtable
+    }
+}
+
+/// Host-side controller registration with a validated type name and vtable.
+#[cfg(feature = "host")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatedControllerRegistration {
+    type_name: &'static str,
+    vtable: ValidatedControllerVTable,
+}
+
+#[cfg(feature = "host")]
+impl ValidatedControllerRegistration {
+    fn from_validated_registration(registration: &ControllerRegistration) -> Self {
+        Self {
+            // SAFETY: validation checked the descriptor and manifest strings
+            // live in static plug-in storage.
+            type_name: unsafe { registration.type_name.as_str() },
+            vtable: ValidatedControllerVTable::from_validated_ptr(registration.vtable),
+        }
+    }
+
+    /// Returns the canonical controller type name.
+    #[must_use]
+    pub fn type_name(self) -> &'static str {
+        self.type_name
+    }
+
+    /// Returns the validated vtable wrapper.
+    #[must_use]
+    pub fn vtable(self) -> ValidatedControllerVTable {
         self.vtable
     }
 }
@@ -864,6 +1019,47 @@ unsafe impl Send for ValidatedStrategyVTable {}
 #[cfg(feature = "host")]
 unsafe impl Sync for ValidatedStrategyVTable {}
 
+/// Host-side pointer to a validated [`ControllerVTable`].
+#[cfg(feature = "host")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatedControllerVTable {
+    ptr: std::ptr::NonNull<ControllerVTable>,
+}
+
+#[cfg(feature = "host")]
+impl ValidatedControllerVTable {
+    fn from_validated_ptr(ptr: *const ControllerVTable) -> Self {
+        Self {
+            ptr: std::ptr::NonNull::new(ptr.cast_mut())
+                .expect("validated manifest stores non-null ControllerVTable"),
+        }
+    }
+
+    /// Wraps a controller vtable pointer that the caller already validated.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be non-null, point at immutable process-lifetime storage,
+    /// and contain every required [`ControllerVTable`] function slot.
+    #[must_use]
+    pub unsafe fn from_raw_unchecked(ptr: *const ControllerVTable) -> Self {
+        Self::from_validated_ptr(ptr)
+    }
+
+    /// Returns the raw vtable pointer for ABI calls.
+    #[must_use]
+    pub fn as_ptr(self) -> *const ControllerVTable {
+        self.ptr.as_ptr()
+    }
+}
+
+/// SAFETY: validated vtables point at immutable process-lifetime storage.
+#[cfg(feature = "host")]
+unsafe impl Send for ValidatedControllerVTable {}
+/// SAFETY: see `Send`.
+#[cfg(feature = "host")]
+unsafe impl Sync for ValidatedControllerVTable {}
+
 #[cfg(test)]
 mod tests {
     use std::sync::LazyLock;
@@ -938,6 +1134,20 @@ mod tests {
         }
     }
 
+    struct ManifestTestController;
+
+    impl crate::surfaces::controller::PluginController for ManifestTestController {
+        const TYPE_NAME: &'static str = "ManifestTestController";
+
+        fn new(
+            _host: *const crate::host::ControllerHostVTable,
+            _ctx: *const crate::host::ControllerHostContext,
+            _config_json: &str,
+        ) -> Self {
+            Self
+        }
+    }
+
     static VALID_CUSTOM_DATA: LazyLock<[CustomDataRegistration; 1]> = LazyLock::new(|| {
         [CustomDataRegistration {
             type_name: BorrowedStr::from_str("TestTick"),
@@ -954,6 +1164,12 @@ mod tests {
         [StrategyRegistration {
             type_name: BorrowedStr::from_str("TestStrategy"),
             vtable: crate::surfaces::strategy::strategy_vtable::<ManifestTestStrategy>(),
+        }]
+    });
+    static VALID_CONTROLLERS: LazyLock<[ControllerRegistration; 1]> = LazyLock::new(|| {
+        [ControllerRegistration {
+            type_name: BorrowedStr::from_str("TestController"),
+            vtable: crate::surfaces::controller::controller_vtable::<ManifestTestController>(),
         }]
     });
     static DUPLICATE_CUSTOM_DATA: LazyLock<[CustomDataRegistration; 1]> = LazyLock::new(|| {
@@ -1025,6 +1241,17 @@ mod tests {
         Slice::from_slice(entries)
     }
 
+    fn controller_registration(
+        type_name: &'static str,
+        vtable: *const ControllerVTable,
+    ) -> Slice<'static, ControllerRegistration> {
+        let entries = Box::leak(Box::new([ControllerRegistration {
+            type_name: BorrowedStr::from_str(type_name),
+            vtable,
+        }]));
+        Slice::from_slice(entries)
+    }
+
     fn custom_data_vtable_missing_schema_ipc() -> *const CustomDataVTable {
         let valid = crate::surfaces::custom_data::custom_data_vtable::<ManifestTestTick>();
         // SAFETY: generated test vtable lives for the process lifetime.
@@ -1065,7 +1292,7 @@ mod tests {
         std::ptr::from_ref(&*vtable)
     }
 
-    fn actor_vtable_missing_on_quote() -> *const ActorVTable {
+    fn actor_vtable_missing_on_quote_and_on_book() -> *const ActorVTable {
         let valid = crate::surfaces::actor::actor_vtable::<ManifestTestActor>();
         // SAFETY: generated test vtable lives for the process lifetime.
         let valid = unsafe { &*valid };
@@ -1081,27 +1308,31 @@ mod tests {
             on_degrade: valid.on_degrade,
             on_fault: valid.on_fault,
             on_time_event: valid.on_time_event,
+            on_data: valid.on_data,
+            on_instrument: valid.on_instrument,
+            on_book_deltas: valid.on_book_deltas,
+            on_book: None,
             on_quote: None,
             on_trade: valid.on_trade,
             on_bar: valid.on_bar,
-            on_book_deltas: valid.on_book_deltas,
-            on_instrument: valid.on_instrument,
-            on_option_chain: valid.on_option_chain,
             on_mark_price: valid.on_mark_price,
             on_index_price: valid.on_index_price,
             on_funding_rate: valid.on_funding_rate,
             on_option_greeks: valid.on_option_greeks,
+            on_option_chain: valid.on_option_chain,
             on_instrument_status: valid.on_instrument_status,
             on_instrument_close: valid.on_instrument_close,
             on_order_filled: valid.on_order_filled,
             on_order_canceled: valid.on_order_canceled,
             on_signal: valid.on_signal,
+            on_historical_book_deltas: valid.on_historical_book_deltas,
+            on_historical_book_depth: valid.on_historical_book_depth,
             on_historical_quotes: valid.on_historical_quotes,
             on_historical_trades: valid.on_historical_trades,
             on_historical_bars: valid.on_historical_bars,
-            on_historical_funding_rates: valid.on_historical_funding_rates,
             on_historical_mark_prices: valid.on_historical_mark_prices,
             on_historical_index_prices: valid.on_historical_index_prices,
+            on_historical_funding_rates: valid.on_historical_funding_rates,
         }));
         std::ptr::from_ref(&*vtable)
     }
@@ -1122,32 +1353,36 @@ mod tests {
             on_degrade: valid.on_degrade,
             on_fault: valid.on_fault,
             on_time_event: valid.on_time_event,
+            on_data: valid.on_data,
+            on_instrument: valid.on_instrument,
+            on_book_deltas: valid.on_book_deltas,
+            on_book: valid.on_book,
             on_quote: valid.on_quote,
             on_trade: valid.on_trade,
             on_bar: valid.on_bar,
-            on_book_deltas: valid.on_book_deltas,
-            on_instrument: valid.on_instrument,
-            on_option_chain: valid.on_option_chain,
             on_mark_price: valid.on_mark_price,
             on_index_price: valid.on_index_price,
             on_funding_rate: valid.on_funding_rate,
             on_option_greeks: valid.on_option_greeks,
+            on_option_chain: valid.on_option_chain,
             on_instrument_status: valid.on_instrument_status,
             on_instrument_close: valid.on_instrument_close,
             on_order_filled: valid.on_order_filled,
             on_order_canceled: valid.on_order_canceled,
             on_signal: valid.on_signal,
+            on_historical_book_deltas: valid.on_historical_book_deltas,
+            on_historical_book_depth: valid.on_historical_book_depth,
             on_historical_quotes: valid.on_historical_quotes,
             on_historical_trades: valid.on_historical_trades,
             on_historical_bars: valid.on_historical_bars,
-            on_historical_funding_rates: valid.on_historical_funding_rates,
             on_historical_mark_prices: valid.on_historical_mark_prices,
             on_historical_index_prices: valid.on_historical_index_prices,
+            on_historical_funding_rates: valid.on_historical_funding_rates,
         }));
         std::ptr::from_ref(&*vtable)
     }
 
-    fn strategy_vtable_missing_on_position_closed() -> *const StrategyVTable {
+    fn strategy_vtable_missing_on_book_and_on_position_closed() -> *const StrategyVTable {
         let valid = crate::surfaces::strategy::strategy_vtable::<ManifestTestStrategy>();
         // SAFETY: generated test vtable lives for the process lifetime.
         let valid = unsafe { &*valid };
@@ -1163,16 +1398,18 @@ mod tests {
             on_degrade: valid.on_degrade,
             on_fault: valid.on_fault,
             on_time_event: valid.on_time_event,
+            on_data: valid.on_data,
+            on_instrument: valid.on_instrument,
+            on_book_deltas: valid.on_book_deltas,
+            on_book: None,
             on_quote: valid.on_quote,
             on_trade: valid.on_trade,
             on_bar: valid.on_bar,
-            on_book_deltas: valid.on_book_deltas,
-            on_instrument: valid.on_instrument,
-            on_option_chain: valid.on_option_chain,
             on_mark_price: valid.on_mark_price,
             on_index_price: valid.on_index_price,
             on_funding_rate: valid.on_funding_rate,
             on_option_greeks: valid.on_option_greeks,
+            on_option_chain: valid.on_option_chain,
             on_instrument_status: valid.on_instrument_status,
             on_instrument_close: valid.on_instrument_close,
             on_signal: valid.on_signal,
@@ -1196,12 +1433,14 @@ mod tests {
             on_position_changed: valid.on_position_changed,
             on_position_closed: None,
             on_market_exit: valid.on_market_exit,
+            on_historical_book_deltas: valid.on_historical_book_deltas,
+            on_historical_book_depth: valid.on_historical_book_depth,
             on_historical_quotes: valid.on_historical_quotes,
             on_historical_trades: valid.on_historical_trades,
             on_historical_bars: valid.on_historical_bars,
-            on_historical_funding_rates: valid.on_historical_funding_rates,
             on_historical_mark_prices: valid.on_historical_mark_prices,
             on_historical_index_prices: valid.on_historical_index_prices,
+            on_historical_funding_rates: valid.on_historical_funding_rates,
         }));
         std::ptr::from_ref(&*vtable)
     }
@@ -1222,16 +1461,18 @@ mod tests {
             on_degrade: valid.on_degrade,
             on_fault: valid.on_fault,
             on_time_event: valid.on_time_event,
+            on_data: valid.on_data,
+            on_instrument: valid.on_instrument,
+            on_book_deltas: valid.on_book_deltas,
+            on_book: valid.on_book,
             on_quote: valid.on_quote,
             on_trade: valid.on_trade,
             on_bar: valid.on_bar,
-            on_book_deltas: valid.on_book_deltas,
-            on_instrument: valid.on_instrument,
-            on_option_chain: valid.on_option_chain,
             on_mark_price: valid.on_mark_price,
             on_index_price: valid.on_index_price,
             on_funding_rate: valid.on_funding_rate,
             on_option_greeks: valid.on_option_greeks,
+            on_option_chain: valid.on_option_chain,
             on_instrument_status: valid.on_instrument_status,
             on_instrument_close: valid.on_instrument_close,
             on_signal: valid.on_signal,
@@ -1255,12 +1496,35 @@ mod tests {
             on_position_changed: valid.on_position_changed,
             on_position_closed: valid.on_position_closed,
             on_market_exit: valid.on_market_exit,
+            on_historical_book_deltas: valid.on_historical_book_deltas,
+            on_historical_book_depth: valid.on_historical_book_depth,
             on_historical_quotes: valid.on_historical_quotes,
             on_historical_trades: valid.on_historical_trades,
             on_historical_bars: valid.on_historical_bars,
-            on_historical_funding_rates: valid.on_historical_funding_rates,
             on_historical_mark_prices: valid.on_historical_mark_prices,
             on_historical_index_prices: valid.on_historical_index_prices,
+            on_historical_funding_rates: valid.on_historical_funding_rates,
+        }));
+        std::ptr::from_ref(&*vtable)
+    }
+
+    fn controller_vtable_missing_prepare() -> *const ControllerVTable {
+        let valid = crate::surfaces::controller::controller_vtable::<ManifestTestController>();
+        // SAFETY: generated test vtable lives for the process lifetime.
+        let valid = unsafe { &*valid };
+        let vtable = Box::leak(Box::new(ControllerVTable {
+            prepare: None,
+            create: valid.create,
+            drop_handle: valid.drop_handle,
+            type_name: valid.type_name,
+            on_start: valid.on_start,
+            on_stop: valid.on_stop,
+            on_resume: valid.on_resume,
+            on_reset: valid.on_reset,
+            on_dispose: valid.on_dispose,
+            on_degrade: valid.on_degrade,
+            on_fault: valid.on_fault,
+            on_time_event: valid.on_time_event,
         }));
         std::ptr::from_ref(&*vtable)
     }
@@ -1275,6 +1539,7 @@ mod tests {
             custom_data: Slice::empty(),
             actors: Slice::empty(),
             strategies: Slice::empty(),
+            controllers: Slice::empty(),
         }
     }
 
@@ -1292,6 +1557,12 @@ mod tests {
         assert!(!unsafe { id.target_triple.as_str() }.is_empty());
         // SAFETY: see above.
         assert!(!unsafe { id.build_profile.as_str() }.is_empty());
+        // SAFETY: see above.
+        assert_eq!(
+            unsafe { id.precision_mode.as_str() },
+            compiled_precision_mode()
+        );
+        assert_eq!(id.fixed_precision, FIXED_PRECISION);
     }
 
     #[rstest]
@@ -1303,6 +1574,7 @@ mod tests {
 
     #[rstest]
     #[case::off_by_one(NAUTILUS_PLUGIN_ABI_VERSION.wrapping_add(1))]
+    #[case::previous_v3(3)]
     #[case::zero(0)]
     #[case::max(u32::MAX)]
     fn mismatched_manifest_rejects(#[case] abi: u32) {
@@ -1319,6 +1591,7 @@ mod tests {
             custom_data: Slice::from_slice(&*VALID_CUSTOM_DATA),
             actors: Slice::from_slice(&*VALID_ACTORS),
             strategies: Slice::from_slice(&*VALID_STRATEGIES),
+            controllers: Slice::from_slice(&*VALID_CONTROLLERS),
             ..valid_manifest()
         };
 
@@ -1333,6 +1606,7 @@ mod tests {
             custom_data: Slice::from_slice(&*VALID_CUSTOM_DATA),
             actors: Slice::from_slice(&*VALID_ACTORS),
             strategies: Slice::from_slice(&*VALID_STRATEGIES),
+            controllers: Slice::from_slice(&*VALID_CONTROLLERS),
             ..valid_manifest()
         };
 
@@ -1341,14 +1615,17 @@ mod tests {
         let custom_data = manifest.custom_data().next().expect("custom data entry");
         let actor = manifest.actors().next().expect("actor entry");
         let strategy = manifest.strategies().next().expect("strategy entry");
+        let controller = manifest.controllers().next().expect("controller entry");
 
         assert_eq!(manifest.plugin_name(), "test");
         assert_eq!(custom_data.type_name(), "TestTick");
         assert_eq!(actor.type_name(), "TestActor");
         assert_eq!(strategy.type_name(), "TestStrategy");
+        assert_eq!(controller.type_name(), "TestController");
         assert_eq!(custom_data.vtable().as_ptr(), VALID_CUSTOM_DATA[0].vtable);
         assert_eq!(actor.vtable().as_ptr(), VALID_ACTORS[0].vtable);
         assert_eq!(strategy.vtable().as_ptr(), VALID_STRATEGIES[0].vtable);
+        assert_eq!(controller.vtable().as_ptr(), VALID_CONTROLLERS[0].vtable);
     }
 
     #[rstest]
@@ -1395,6 +1672,37 @@ mod tests {
             PLUGIN_BUILD_ID_VERSION
         );
         assert!(errors.to_string().contains(&expected));
+    }
+
+    #[rstest]
+    fn validate_rejects_mismatched_precision_mode() {
+        let precision_mode = if compiled_precision_mode() == "high-precision" {
+            "standard"
+        } else {
+            "high-precision"
+        };
+        let fixed_precision = if FIXED_PRECISION > 9 { 9 } else { 16 };
+        let m = PluginManifest {
+            build_id: PluginBuildId {
+                precision_mode: BorrowedStr::from_str(precision_mode),
+                fixed_precision,
+                ..PluginBuildId::current()
+            },
+            ..valid_manifest()
+        };
+
+        let errors = m
+            .validate()
+            .expect_err("mismatched precision mode is invalid");
+
+        let rendered = errors.to_string();
+        assert!(rendered.contains(&format!(
+            "build_id.precision_mode '{precision_mode}' does not match host precision mode '{}'",
+            compiled_precision_mode()
+        )));
+        assert!(rendered.contains(&format!(
+            "build_id.fixed_precision {fixed_precision} does not match host fixed precision {FIXED_PRECISION}"
+        )));
     }
 
     #[rstest]
@@ -1445,10 +1753,14 @@ mod tests {
                 "BadTick",
                 custom_data_vtable_missing_schema_ipc(),
             ),
-            actors: actor_registration("BadActor", actor_vtable_missing_on_quote()),
+            actors: actor_registration("BadActor", actor_vtable_missing_on_quote_and_on_book()),
             strategies: strategy_registration(
                 "BadStrategy",
-                strategy_vtable_missing_on_position_closed(),
+                strategy_vtable_missing_on_book_and_on_position_closed(),
+            ),
+            controllers: controller_registration(
+                "BadController",
+                controller_vtable_missing_prepare(),
             ),
             ..valid_manifest()
         };
@@ -1461,10 +1773,18 @@ mod tests {
         assert!(
             rendered.contains("custom_data[0] type 'BadTick' vtable.schema_ipc must not be null")
         );
+        assert!(rendered.contains("actors[0] type 'BadActor' vtable.on_book must not be null"));
         assert!(rendered.contains("actors[0] type 'BadActor' vtable.on_quote must not be null"));
+        assert!(
+            rendered.contains("strategies[0] type 'BadStrategy' vtable.on_book must not be null")
+        );
         assert!(rendered.contains(
             "strategies[0] type 'BadStrategy' vtable.on_position_closed must not be null"
         ));
+        assert!(
+            rendered
+                .contains("controllers[0] type 'BadController' vtable.prepare must not be null")
+        );
     }
 
     #[rstest]

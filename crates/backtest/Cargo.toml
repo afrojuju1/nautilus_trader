@@ -24,6 +24,7 @@ crate-type = ["rlib", "staticlib"]
 default = []
 examples = ["nautilus-trading/examples"]
 high-precision = ["nautilus-model/high-precision"]
+defi = ["nautilus-common/defi", "nautilus-data/defi", "nautilus-model/defi"]
 plugin = ["dep:nautilus-plugin"]
 streaming = ["nautilus-persistence", "nautilus-system/streaming"]
 extension-module = [
@@ -91,6 +92,7 @@ chrono-tz = { workspace = true }
 indexmap = { workspace = true }
 log = { workspace = true }
 rust_decimal = { workspace = true }
+serde = { workspace = true }
 ustr = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
@@ -120,5 +122,12 @@ doc = false
 [[example]]
 name = "node-ema-cross"
 path = "examples/node_ema_cross.rs"
+required-features = ["examples", "streaming"]
+doc = false
+
+# Run with `NAUTILUS_TARDIS_OPTION_CATALOG=/path/to/catalog cargo run -p nautilus-backtest --features examples,streaming --example tardis-option-chain`
+[[example]]
+name = "tardis-option-chain"
+path = "examples/tardis_option_chain.rs"
 required-features = ["examples", "streaming"]
 doc = false

@@ -310,7 +310,7 @@ impl BitmexWebSocketClient {
                 subscriptions.clone(),
             );
 
-            // Helper closure to resubscribe all tracked subscriptions after reconnection
+            // Resubscribe all tracked subscriptions after reconnection.
             let resubscribe_all = || {
                 // Use SubscriptionState as source of truth for what to restore
                 let topics = subscriptions.all_topics();
@@ -347,6 +347,8 @@ impl BitmexWebSocketClient {
                     log::error!("Failed to send resubscribe command: {e}");
                 }
             };
+
+            let mut waiting_for_reconnect_auth = false;
 
             // Run message processing with reconnection handling
             loop {
@@ -395,6 +397,7 @@ impl BitmexWebSocketClient {
 
                         if let Some(cred) = &credential {
                             log::debug!("Re-authenticating after reconnection");
+                            waiting_for_reconnect_auth = true;
 
                             let expires =
                                 (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp();
@@ -424,17 +427,28 @@ impl BitmexWebSocketClient {
                         }
 
                         if handler.send(BitmexWsMessage::Reconnected).is_err() {
-                            log::error!("Failed to forward reconnect event (receiver dropped)");
+                            if handler.is_stopped() {
+                                log::debug!("Failed to forward reconnect event (receiver dropped)");
+                            } else {
+                                log::error!("Failed to forward reconnect event (receiver dropped)");
+                            }
                             break;
                         }
                     }
                     Some(BitmexWsMessage::Authenticated) => {
-                        log::debug!("Authenticated after reconnection, resubscribing");
-                        resubscribe_all();
+                        if waiting_for_reconnect_auth {
+                            log::debug!("Authenticated after reconnection, resubscribing");
+                            resubscribe_all();
+                            waiting_for_reconnect_auth = false;
+                        }
                     }
                     Some(msg) => {
                         if handler.send(msg).is_err() {
-                            log::error!("Failed to send message (receiver dropped)");
+                            if handler.is_stopped() {
+                                log::debug!("Failed to send message (receiver dropped)");
+                            } else {
+                                log::error!("Failed to send message (receiver dropped)");
+                            }
                             break;
                         }
                     }

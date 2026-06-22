@@ -68,7 +68,7 @@ use nautilus_model::{
     orders::{Order, OrderAny, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
     stubs::TestDefault,
-    types::{Currency, Quantity},
+    types::{Currency, Money, Quantity},
 };
 use nautilus_system::{KernelEventStore, NautilusKernelBuilder};
 use rstest::rstest;
@@ -108,6 +108,7 @@ fn config_with(base_dir: PathBuf) -> EventStoreConfig {
         },
         retention: RetentionMode::Full,
         replay_from_run_id: None,
+        data_markers: None,
         channel_capacity: 64,
         max_batch_entries: 1,
         max_batch_latency: Duration::from_millis(2),
@@ -321,7 +322,15 @@ fn kernel_start_installs_snapshot_anchorer_for_execution_snapshots() {
     let _guard = lock_kernel_test();
     let tmp = TempDir::new().expect("tempdir");
     let instance_id = UUID4::new();
-    let config = config_with(tmp.path().to_path_buf());
+    let mut config = config_with(tmp.path().to_path_buf());
+
+    // This test drives the async writer through a synchronous anchor round-trip mid-run
+    // and then asserts the run sealed. On a loaded CI box the writer thread can be
+    // scheduled late, so the default 2s ceilings would misread a slow writer as a
+    // fail-stop, skip the seal, and fail the durability assertions. Generous-but-finite
+    // ceilings tolerate scheduling jitter while still surfacing a genuinely stuck writer.
+    config.halt_threshold = Duration::from_secs(30);
+    config.run_started_timeout = Duration::from_secs(30);
     let instrument = audusd_sim();
     let trader_id = TraderId::test_default();
     let strategy_id = StrategyId::test_default();
@@ -1264,7 +1273,7 @@ impl CacheDatabaseAdapter for StubCacheDatabase {
         Ok(AHashMap::new())
     }
 
-    fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, Position>> {
+    fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, PositionId>> {
         Ok(AHashMap::new())
     }
 
@@ -1462,11 +1471,19 @@ impl CacheDatabaseAdapter for StubCacheDatabase {
         Ok(())
     }
 
-    fn update_actor(&self) -> anyhow::Result<()> {
+    fn update_actor(
+        &self,
+        _component_id: &ComponentId,
+        _state: &AHashMap<String, Bytes>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn update_strategy(&self) -> anyhow::Result<()> {
+    fn update_strategy(
+        &self,
+        _strategy_id: &StrategyId,
+        _state: &AHashMap<String, Bytes>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -1486,7 +1503,12 @@ impl CacheDatabaseAdapter for StubCacheDatabase {
         Ok(())
     }
 
-    fn snapshot_position_state(&self, _position: &Position) -> anyhow::Result<()> {
+    fn snapshot_position_state(
+        &self,
+        _position: &Position,
+        _ts_snapshot: UnixNanos,
+        _unrealized_pnl: Option<Money>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 

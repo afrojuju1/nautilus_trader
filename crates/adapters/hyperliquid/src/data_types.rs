@@ -24,19 +24,20 @@ use nautilus_core::UnixNanos;
 use nautilus_model::{identifiers::InstrumentId, types::Price};
 use nautilus_persistence_macros::custom_data;
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 /// Hyperliquid all mid prices snapshot from the `allMids` WebSocket channel.
 #[cfg_attr(
     feature = "arrow",
-    custom_data(pyo3, stub_module = "nautilus_trader.hyperliquid")
+    custom_data(pyo3, stub_module = "nautilus_trader.adapters.hyperliquid")
 )]
 #[cfg_attr(
     not(feature = "arrow"),
-    custom_data(pyo3, no_arrow, stub_module = "nautilus_trader.hyperliquid")
+    custom_data(pyo3, no_arrow, stub_module = "nautilus_trader.adapters.hyperliquid")
 )]
 pub struct HyperliquidAllMids {
     /// Mapping of instrument ID to mid price for all tradable coins.
-    #[custom_data_field(json)]
+    #[custom_data_field(serde)]
     pub mids: HashMap<InstrumentId, Price>,
     /// UNIX timestamp (nanoseconds) when the data event occurred.
     pub ts_event: UnixNanos,
@@ -50,18 +51,70 @@ pub struct HyperliquidAllMids {
 /// `ts_event` mirrors `ts_init` like the peer asset-context update types.
 #[cfg_attr(
     feature = "arrow",
-    custom_data(pyo3, stub_module = "nautilus_trader.hyperliquid")
+    custom_data(pyo3, stub_module = "nautilus_trader.adapters.hyperliquid")
 )]
 #[cfg_attr(
     not(feature = "arrow"),
-    custom_data(pyo3, no_arrow, stub_module = "nautilus_trader.hyperliquid")
+    custom_data(pyo3, no_arrow, stub_module = "nautilus_trader.adapters.hyperliquid")
 )]
 pub struct HyperliquidOpenInterest {
     /// The instrument ID for this open interest update.
     pub instrument_id: InstrumentId,
     /// The current open interest for the perpetual instrument.
-    #[custom_data_field(json)]
+    #[custom_data_field(serde)]
     pub open_interest: Decimal,
+    /// UNIX timestamp (nanoseconds) when the data event occurred.
+    pub ts_event: UnixNanos,
+    /// UNIX timestamp (nanoseconds) when the instance was initialized.
+    pub ts_init: UnixNanos,
+}
+
+/// Impact prices reported by Hyperliquid for venue-side execution estimates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HyperliquidImpactPrices {
+    /// Impact bid price.
+    pub bid: Price,
+    /// Impact ask price.
+    pub ask: Price,
+}
+
+/// Normalized per-instrument entry within `allDexsAssetCtxs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HyperliquidDexAssetCtx {
+    /// Hyperliquid dex identifier. The default perp dex uses the empty string.
+    pub dex: String,
+    /// Canonical Nautilus instrument ID.
+    pub instrument_id: InstrumentId,
+    /// Mark price.
+    pub mark_price: Price,
+    /// Oracle/index price.
+    pub oracle_price: Price,
+    /// Previous day price.
+    pub prev_day_price: Price,
+    /// Optional mid price.
+    pub mid_price: Option<Price>,
+    /// Optional impact prices.
+    pub impact_prices: Option<HyperliquidImpactPrices>,
+    /// Current funding rate.
+    pub funding_rate: Decimal,
+    /// Current open interest.
+    pub open_interest: Decimal,
+    /// Optional premium.
+    pub premium: Option<Decimal>,
+    /// 24h notional volume.
+    pub day_ntl_volume: Decimal,
+    /// 24h base volume.
+    pub day_base_volume: Decimal,
+}
+
+/// Hyperliquid normalized aggregate snapshot from the `allDexsAssetCtxs` WebSocket channel.
+///
+/// This feed is live-only and intentionally JSON-backed; it is not coupled to Arrow persistence.
+#[custom_data(pyo3, no_arrow, stub_module = "nautilus_trader.adapters.hyperliquid")]
+pub struct HyperliquidAllDexsAssetCtxs {
+    /// Normalized per-instrument entries across all perp dexes.
+    #[custom_data_field(serde)]
+    pub entries: Vec<HyperliquidDexAssetCtx>,
     /// UNIX timestamp (nanoseconds) when the data event occurred.
     pub ts_event: UnixNanos,
     /// UNIX timestamp (nanoseconds) when the instance was initialized.
@@ -84,6 +137,9 @@ pub fn register_hyperliquid_custom_data() {
         let _ =
             nautilus_model::data::ensure_custom_data_json_registered::<HyperliquidOpenInterest>();
     }
+
+    let _ =
+        nautilus_model::data::ensure_custom_data_json_registered::<HyperliquidAllDexsAssetCtxs>();
 }
 
 #[cfg(test)]
@@ -155,7 +211,9 @@ mod tests {
             UnixNanos::from(2),
         );
         let metadata = EncodeToRecordBatch::metadata(&original);
-        let batch = HyperliquidOpenInterest::encode_batch(&metadata, &[original.clone()]).unwrap();
+        let batch =
+            HyperliquidOpenInterest::encode_batch(&metadata, std::slice::from_ref(&original))
+                .unwrap();
         let decoded = HyperliquidOpenInterest::decode_data_batch(&metadata, batch).unwrap();
 
         assert_eq!(decoded.len(), 1);

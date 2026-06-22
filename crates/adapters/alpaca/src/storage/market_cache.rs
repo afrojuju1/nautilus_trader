@@ -2,6 +2,7 @@
 
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use sqlx::AssertSqlSafe;
 
 use crate::storage::StorageRepository;
 
@@ -24,13 +25,16 @@ where
          WHERE account_id = $1 AND cache_kind = $2 AND cache_key = $3",
         storage.schema(),
     );
-    let payload = sqlx::query_scalar::<_, Value>(&sql)
+    let payload = sqlx::query_scalar::<_, Value>(AssertSqlSafe(sql))
         .bind(account_id)
         .bind(cache_kind)
         .bind(cache_key)
         .fetch_optional(storage.pool())
         .await?;
-    payload.map(serde_json::from_value).transpose().map_err(Into::into)
+    payload
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(Into::into)
 }
 
 /// Writes one cached backtest market-data payload.
@@ -57,7 +61,7 @@ where
          SET payload = EXCLUDED.payload, updated_at = NOW()",
         storage.schema(),
     );
-    sqlx::query(&sql)
+    sqlx::query(AssertSqlSafe(sql))
         .bind(account_id)
         .bind(cache_kind)
         .bind(cache_key)

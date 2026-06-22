@@ -15,7 +15,10 @@
 
 from decimal import Decimal
 
+import pytest
+
 from nautilus_trader.execution import BestPriceFillModel
+from nautilus_trader.execution import CappedOptionFeeModel
 from nautilus_trader.execution import CompetitionAwareFillModel
 from nautilus_trader.execution import DefaultFillModel
 from nautilus_trader.execution import FixedFeeModel
@@ -25,9 +28,11 @@ from nautilus_trader.execution import MarketHoursFillModel
 from nautilus_trader.execution import OneTickSlippageFillModel
 from nautilus_trader.execution import PerContractFeeModel
 from nautilus_trader.execution import ProbabilisticFillModel
+from nautilus_trader.execution import ProbabilityPriceFeeModel
 from nautilus_trader.execution import SizeAwareFillModel
 from nautilus_trader.execution import StaticLatencyModel
 from nautilus_trader.execution import ThreeTierFillModel
+from nautilus_trader.execution import TieredNotionalOptionFeeModel
 from nautilus_trader.execution import TwoTierFillModel
 from nautilus_trader.execution import VolumeSensitiveFillModel
 from nautilus_trader.execution import calculate_reconciliation_price
@@ -129,10 +134,26 @@ def test_fixed_fee_model():
     assert model is not None
 
 
-def test_fixed_fee_model_with_charge_once():
-    model = FixedFeeModel(commission=Money.from_str("5.00 USD"), change_commission_once=True)
+@pytest.mark.parametrize(
+    "keyword",
+    [
+        "charge_commission_once",
+        "change_commission_once",
+    ],
+)
+def test_fixed_fee_model_charge_once_keyword_routes_false(keyword):
+    model = FixedFeeModel(commission=Money.from_str("5.00 USD"), **{keyword: False})
 
-    assert model is not None
+    assert "charge_commission_once: false" in repr(model)
+
+
+def test_fixed_fee_model_rejects_both_charge_once_keywords():
+    with pytest.raises(TypeError, match="Provide only one"):
+        FixedFeeModel(
+            commission=Money.from_str("5.00 USD"),
+            charge_commission_once=True,
+            change_commission_once=True,
+        )
 
 
 def test_maker_taker_fee_model():
@@ -145,6 +166,37 @@ def test_per_contract_fee_model():
     model = PerContractFeeModel(commission=Money.from_str("1.25 USD"))
 
     assert model is not None
+
+
+def test_probability_price_fee_model():
+    model = ProbabilityPriceFeeModel()
+
+    assert model is not None
+
+
+def test_capped_option_fee_model():
+    model = CappedOptionFeeModel(
+        maker_rate=Decimal("0.0003"),
+        taker_rate=Decimal("0.0003"),
+    )
+
+    assert model is not None
+    expected = (
+        "CappedOptionFeeModel { maker_rate: Some(0.0003), "
+        "taker_rate: Some(0.0003), cap_rate: 0.125 }"
+    )
+    assert repr(model) == expected
+
+
+def test_tiered_notional_option_fee_model():
+    model = TieredNotionalOptionFeeModel(
+        maker_rate=Decimal("0.0002"),
+        taker_rate=Decimal("0.0005"),
+    )
+
+    assert model is not None
+    expected = "TieredNotionalOptionFeeModel { maker_rate: Some(0.0002), taker_rate: Some(0.0005) }"
+    assert repr(model) == expected
 
 
 def test_static_latency_model_defaults():

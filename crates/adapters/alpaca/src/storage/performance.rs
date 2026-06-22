@@ -2,7 +2,7 @@
 
 use chrono::NaiveDate;
 use serde_json::Value;
-use sqlx::{Row as _, types::Json};
+use sqlx::{AssertSqlSafe, Row as _, types::Json};
 
 use crate::{
     options_runtime::OptionsEngineConfig,
@@ -71,7 +71,7 @@ pub async fn append_performance_ledger_record(
         storage.schema()
     );
 
-    let result = sqlx::query(&query)
+    let result = sqlx::query(AssertSqlSafe(query))
         .bind(account_id)
         .bind(date.to_string())
         .bind(Utc::now().to_rfc3339())
@@ -101,7 +101,7 @@ pub async fn summarize_performance_ledger(
         "SELECT payload FROM \"{}\".performance_ledger WHERE account_id = $1 AND ($2::date IS NULL OR ledger_date >= $2::date) AND ($3::date IS NULL OR ledger_date <= $3::date) AND (payload->>'type') = 'realized_trade' ORDER BY ts_utc ASC",
         storage.schema()
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(AssertSqlSafe(query))
         .bind(account_id)
         .bind(filters.since.map(|d| d.to_string()))
         .bind(filters.until.map(|d| d.to_string()))
@@ -226,7 +226,7 @@ pub async fn append_candidate_outcome(
         storage.schema(),
         conflict_clause,
     );
-    let result = sqlx::query(&query)
+    let result = sqlx::query(AssertSqlSafe(query))
         .bind(account_id)
         .bind(date.to_string())
         .bind(Utc::now().to_rfc3339())
@@ -247,7 +247,7 @@ pub async fn summarize_candidate_outcomes(
         "SELECT payload FROM \"{}\".candidate_outcome WHERE account_id = $1 AND ($2::date IS NULL OR trade_date >= $2::date) AND ($3::date IS NULL OR trade_date <= $3::date) ORDER BY ts_utc ASC",
         storage.schema()
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(AssertSqlSafe(query))
         .bind(account_id)
         .bind(filters.since.map(|d| d.to_string()))
         .bind(filters.until.map(|d| d.to_string()))

@@ -34,6 +34,7 @@ mod commands;
 pub mod config;
 mod handlers;
 mod requests;
+mod time_range;
 
 #[cfg(feature = "defi")]
 pub mod pool;
@@ -71,14 +72,14 @@ use nautilus_common::{
     clock::Clock,
     logging::{RECV, RES},
     messages::data::{
-        BarsResponse, DataCommand, DataResponse, ForwardPricesResponse, FundingRatesResponse,
-        QuotesResponse, RequestBars, RequestCommand, RequestForwardPrices, RequestJoin,
-        RequestQuotes, RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10,
-        SubscribeBookSnapshots, SubscribeCommand, SubscribeOptionChain, SubscribeQuotes,
-        SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
-        UnsubscribeBookDepth10, UnsubscribeBookSnapshots, UnsubscribeCommand,
-        UnsubscribeInstrumentStatus, UnsubscribeOptionChain, UnsubscribeOptionGreeks,
-        UnsubscribeQuotes, UnsubscribeTrades, is_parent_subscription,
+        BarsResponse, BookDeltasResponse, BookDepthResponse, CustomDataResponse, DataCommand,
+        DataResponse, ForwardPricesResponse, FundingRatesResponse, QuotesResponse, RequestBars,
+        RequestCommand, RequestForwardPrices, RequestJoin, RequestQuotes, RequestTrades,
+        SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10, SubscribeBookSnapshots,
+        SubscribeCommand, SubscribeOptionChain, SubscribeQuotes, SubscribeTrades, TradesResponse,
+        UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeBookSnapshots,
+        UnsubscribeCommand, UnsubscribeInstrumentStatus, UnsubscribeOptionChain,
+        UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades, is_parent_subscription,
     },
     msgbus::{
         self, ShareableMessageHandler, TypedHandler, TypedIntoHandler,
@@ -92,13 +93,13 @@ use nautilus_core::{
     correctness::{
         FAILED, check_key_in_map, check_key_not_in_map, check_predicate_false, check_predicate_true,
     },
-    datetime::millis_to_nanos_unchecked,
+    datetime::{NANOSECONDS_IN_DAY, millis_to_nanos_unchecked},
 };
 #[cfg(feature = "defi")]
 use nautilus_model::defi::DefiData;
 use nautilus_model::{
     data::{
-        Bar, BarType, CustomData, Data, DataType, FundingRateUpdate, IndexPriceUpdate,
+        Bar, BarType, CustomData, Data, DataType, FundingRateUpdate, HasTsInit, IndexPriceUpdate,
         InstrumentClose, InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas,
         OrderBookDepth10, QuoteTick, TradeTick,
         option_chain::{OptionGreeks, StrikeRange},
@@ -121,6 +122,9 @@ use requests::{
 };
 #[cfg(feature = "streaming")]
 use streaming::CatalogMap;
+use time_range::{
+    TimeRangePipelineState, has_time_range_pipeline_params, is_time_range_pipeline_variant,
+};
 use ustr::Ustr;
 
 #[cfg(feature = "defi")]
@@ -150,7 +154,7 @@ pub struct DataEngine {
     routing_map: IndexMap<Venue, ClientId>,
     book_intervals: AHashMap<NonZeroUsize, BookSnapshotInfos>,
     book_snapshot_counts: IndexMap<BookSnapshotKey, usize>,
-    book_deltas_subs: AHashSet<InstrumentId>,
+    book_deltas_counts: IndexMap<BookDeltasKey, usize>,
     book_depth10_subs: AHashSet<InstrumentId>,
     book_updaters: AHashMap<InstrumentId, Rc<BookUpdater>>,
     book_deltas_parent_expansions: AHashMap<InstrumentId, Vec<InstrumentId>>,
@@ -163,6 +167,8 @@ pub struct DataEngine {
     request_pipeline_n_components: AHashMap<UUID4, usize>,
     request_pipeline_parent_request_id: AHashMap<UUID4, UUID4>,
     request_pipeline_responses: AHashMap<UUID4, Vec<DataResponse>>,
+    time_range_pipeline_requests: AHashMap<UUID4, TimeRangePipelineState>,
+    time_range_pipeline_parent_request_id: AHashMap<UUID4, UUID4>,
     parent_join_request_id: AHashMap<UUID4, UUID4>,
     pending_join_requests: AHashMap<UUID4, RequestJoin>,
     continuous_future_requests: AHashMap<UUID4, ContinuousFutureRequestState>,
@@ -197,6 +203,14 @@ pub struct DataEngine {
     pub(crate) pool_event_buffers: AHashMap<InstrumentId, Vec<DefiData>>,
 }
 
+enum BookDeltasUnsubscribeResult {
+    NotSubscribed,
+    Decremented,
+    Removed,
+}
+
+type BookDeltasKey = (InstrumentId, Option<ClientId>, Option<Venue>);
+
 impl DataEngine {
     /// Creates a new [`DataEngine`] instance.
     #[must_use]
@@ -223,7 +237,7 @@ impl DataEngine {
             routing_map: IndexMap::new(),
             book_intervals: AHashMap::new(),
             book_snapshot_counts: IndexMap::new(),
-            book_deltas_subs: AHashSet::new(),
+            book_deltas_counts: IndexMap::new(),
             book_depth10_subs: AHashSet::new(),
             book_updaters: AHashMap::new(),
             book_deltas_parent_expansions: AHashMap::new(),
@@ -236,6 +250,8 @@ impl DataEngine {
             request_pipeline_n_components: AHashMap::new(),
             request_pipeline_parent_request_id: AHashMap::new(),
             request_pipeline_responses: AHashMap::new(),
+            time_range_pipeline_requests: AHashMap::new(),
+            time_range_pipeline_parent_request_id: AHashMap::new(),
             parent_join_request_id: AHashMap::new(),
             pending_join_requests: AHashMap::new(),
             continuous_future_requests: AHashMap::new(),
@@ -386,6 +402,12 @@ impl DataEngine {
     #[must_use]
     pub fn request_pipeline_count(&self) -> usize {
         self.request_pipeline_parent_request.len()
+    }
+
+    /// Returns the number of time-range pipelines awaiting child responses.
+    #[must_use]
+    pub fn time_range_pipeline_count(&self) -> usize {
+        self.time_range_pipeline_requests.len()
     }
 
     /// Returns the number of `RequestJoin` originals awaiting finalization.
@@ -541,6 +563,8 @@ impl DataEngine {
         self.request_pipeline_n_components.clear();
         self.request_pipeline_parent_request_id.clear();
         self.request_pipeline_responses.clear();
+        self.time_range_pipeline_requests.clear();
+        self.time_range_pipeline_parent_request_id.clear();
         self.parent_join_request_id.clear();
         self.pending_join_requests.clear();
         self.continuous_future_requests.clear();
@@ -584,7 +608,7 @@ impl DataEngine {
         self.book_deltas_parent_expansions.clear();
         self.book_depth10_parent_expansions.clear();
 
-        self.book_deltas_subs.clear();
+        self.book_deltas_counts.clear();
         self.book_depth10_subs.clear();
         self.book_intervals.clear();
         self.book_snapshot_counts.clear();
@@ -887,6 +911,11 @@ impl DataEngine {
 
     /// Executes a `DataCommand` by delegating to subscribe, unsubscribe, or request handlers.
     ///
+    /// This is the final synchronous dispatch point for data commands. Runtime command producers
+    /// should send to `DataEngine.queue_execute`, which lets the runner sequence command execution
+    /// before this method runs. The engine also calls this method for child commands generated while
+    /// processing a parent command, where immediate in-engine ordering matters.
+    ///
     /// Errors during execution are logged.
     pub fn execute(&mut self, cmd: DataCommand) {
         match &cmd {
@@ -927,9 +956,20 @@ impl DataEngine {
     /// Returns an error if the subscription is invalid (e.g., synthetic instrument for book data),
     /// or if the underlying client operation fails.
     pub fn execute_subscribe(&mut self, cmd: SubscribeCommand) -> anyhow::Result<()> {
+        if let Some(client_id) = cmd.client_id()
+            && self.external_clients.contains(client_id)
+        {
+            if self.config.debug {
+                log::debug!("Skipping subscribe command for external client {client_id}: {cmd:?}");
+            }
+            return Ok(());
+        }
+
         // Update internal engine state
         match &cmd {
-            SubscribeCommand::BookDeltas(cmd) => self.subscribe_book_deltas(cmd)?,
+            SubscribeCommand::BookDeltas(cmd) if !self.subscribe_book_deltas(cmd)? => {
+                return Ok(());
+            }
             SubscribeCommand::BookDepth10(cmd) => self.subscribe_book_depth10(cmd)?,
             SubscribeCommand::BookSnapshots(cmd) => {
                 // Handles client forwarding internally (forwards as BookDeltas)
@@ -938,7 +978,12 @@ impl DataEngine {
             SubscribeCommand::Bars(cmd) if has_continuous_future_params(cmd.params.as_ref()) => {
                 return self.subscribe_continuous_future_bars(cmd);
             }
-            SubscribeCommand::Bars(cmd) => self.subscribe_bars(cmd)?,
+            SubscribeCommand::Bars(cmd) => {
+                self.subscribe_bars(cmd)?;
+                if cmd.bar_type.is_internally_aggregated() {
+                    return Ok(());
+                }
+            }
             SubscribeCommand::OptionChain(cmd) => {
                 self.subscribe_option_chain(cmd);
                 return Ok(());
@@ -972,15 +1017,6 @@ impl DataEngine {
             _ => {} // Do nothing else
         }
 
-        if let Some(client_id) = cmd.client_id()
-            && self.external_clients.contains(client_id)
-        {
-            if self.config.debug {
-                log::debug!("Skipping subscribe command for external client {client_id}: {cmd:?}");
-            }
-            return Ok(());
-        }
-
         #[cfg(feature = "streaming")]
         let cmd = self.subscribe_command_with_prefilled_start_ns(cmd)?;
 
@@ -1003,6 +1039,17 @@ impl DataEngine {
     ///
     /// Returns an error if the underlying client operation fails.
     pub fn execute_unsubscribe(&mut self, cmd: &UnsubscribeCommand) -> anyhow::Result<()> {
+        if let Some(client_id) = cmd.client_id()
+            && self.external_clients.contains(client_id)
+        {
+            if self.config.debug {
+                log::debug!(
+                    "Skipping unsubscribe command for external client {client_id}: {cmd:?}",
+                );
+            }
+            return Ok(());
+        }
+
         match &cmd {
             UnsubscribeCommand::BookDeltas(cmd) if !self.unsubscribe_book_deltas(cmd) => {
                 return Ok(());
@@ -1023,7 +1070,12 @@ impl DataEngine {
                 self.unsubscribe_continuous_future_bars(cmd);
                 return Ok(());
             }
-            UnsubscribeCommand::Bars(cmd) => self.unsubscribe_bars(cmd),
+            UnsubscribeCommand::Bars(cmd) => {
+                self.unsubscribe_bars(cmd);
+                if cmd.bar_type.is_internally_aggregated() {
+                    return Ok(());
+                }
+            }
             UnsubscribeCommand::OptionChain(cmd) => {
                 self.unsubscribe_option_chain(cmd);
                 return Ok(());
@@ -1059,17 +1111,6 @@ impl DataEngine {
                 anyhow::bail!("Cannot unsubscribe from synthetic instrument `OptionGreeks` data");
             }
             _ => {}
-        }
-
-        if let Some(client_id) = cmd.client_id()
-            && self.external_clients.contains(client_id)
-        {
-            if self.config.debug {
-                log::debug!(
-                    "Skipping unsubscribe command for external client {client_id}: {cmd:?}",
-                );
-            }
-            return Ok(());
         }
 
         // Keep client subscribed while exact-topic subscribers remain
@@ -1141,8 +1182,7 @@ impl DataEngine {
         }
 
         if let RequestCommand::Join(join) = req {
-            self.handle_request_join(join);
-            return Ok(());
+            return self.handle_request_join(join);
         }
 
         if has_continuous_future_params(request_params(&req)) {
@@ -1151,6 +1191,25 @@ impl DataEngine {
 
         let request_id = *req.request_id();
         self.prepare_request_bar_aggregators(&req)?;
+
+        if has_time_range_pipeline_params(request_params(&req))
+            && is_time_range_pipeline_variant(&req)
+        {
+            let result = self.execute_time_range_pipeline_request(req);
+            if result.is_err() {
+                self.cleanup_request_bar_aggregators(&request_id);
+            }
+            return result;
+        }
+
+        #[cfg(feature = "streaming")]
+        if self.catalogs_registered() && streaming::is_date_range_variant(&req) {
+            let result = self.dispatch_date_range_request(req);
+            if result.is_err() {
+                self.cleanup_request_bar_aggregators(&request_id);
+            }
+            return result;
+        }
 
         let result = self.dispatch_request_to_client(req);
 
@@ -1161,7 +1220,10 @@ impl DataEngine {
         result.map(|_| ())
     }
 
-    fn dispatch_request_to_client(&mut self, req: RequestCommand) -> anyhow::Result<ClientId> {
+    pub(super) fn dispatch_request_to_client(
+        &mut self,
+        req: RequestCommand,
+    ) -> anyhow::Result<ClientId> {
         let client_id = req.client_id().copied();
         let venue = req.venue().copied();
         let Some(client) = self.get_client(client_id.as_ref(), venue.as_ref()) else {
@@ -1174,6 +1236,7 @@ impl DataEngine {
             RequestCommand::Instrument(req) => client.request_instrument(req),
             RequestCommand::Instruments(req) => client.request_instruments(req),
             RequestCommand::BookSnapshot(req) => client.request_book_snapshot(req),
+            RequestCommand::BookDeltas(req) => client.request_book_deltas(req),
             RequestCommand::BookDepth(req) => client.request_book_depth(req),
             RequestCommand::Quotes(req) => client.request_quotes(req),
             RequestCommand::Trades(req) => client.request_trades(req),
@@ -1579,7 +1642,9 @@ impl DataEngine {
     /// custom data; unrecognized types are logged as errors.
     pub fn process(&mut self, data: &dyn Any) {
         self.data_count += 1;
-        // TODO: Eventually these can be added to the `Data` enum (C/Cython blocking), process here for now
+        // Dynamically-typed entry point: `FundingRateUpdate`, `InstrumentStatus`, `OptionGreeks`,
+        // and custom data are also `Data` enum variants handled in `process_data`, but can arrive
+        // here as typed data, whereas `InstrumentAny` is not a `Data` variant.
         if let Some(instrument) = data.downcast_ref::<InstrumentAny>() {
             self.handle_instrument(instrument);
         } else if let Some(funding_rate) = data.downcast_ref::<FundingRateUpdate>() {
@@ -1588,6 +1653,7 @@ impl DataEngine {
             self.handle_instrument_status(*status);
         } else if let Some(option_greeks) = data.downcast_ref::<OptionGreeks>() {
             self.cache.borrow_mut().add_option_greeks(*option_greeks);
+            self.feed_option_greeks_to_pre_bootstrap_chain(option_greeks);
             let topic = switchboard::get_option_greeks_topic(option_greeks.instrument_id);
             msgbus::publish_option_greeks(topic, option_greeks);
             self.drain_deferred_commands();
@@ -1600,6 +1666,15 @@ impl DataEngine {
 
     /// Processes a `Data` enum instance, dispatching to live handlers.
     pub fn process_data(&mut self, data: Data) {
+        #[cfg(feature = "defi")]
+        let data = match data {
+            Data::Defi(defi) => {
+                self.process_defi_data(*defi);
+                return;
+            }
+            data => data,
+        };
+
         self.data_count += 1;
 
         match data {
@@ -1620,12 +1695,43 @@ impl DataEngine {
                 self.handle_index_price(index_price);
                 self.drain_deferred_commands();
             }
+            Data::FundingRateUpdate(funding_rate) => {
+                self.handle_funding_rate(funding_rate);
+                self.drain_deferred_commands();
+            }
             Data::InstrumentStatus(status) => {
                 self.handle_instrument_status(status);
                 self.drain_deferred_commands();
             }
+            Data::OptionGreeks(greeks) => {
+                self.cache.borrow_mut().add_option_greeks(greeks);
+                self.feed_option_greeks_to_pre_bootstrap_chain(&greeks);
+                let topic = switchboard::get_option_greeks_topic(greeks.instrument_id);
+                msgbus::publish_option_greeks(topic, &greeks);
+                self.drain_deferred_commands();
+            }
             Data::InstrumentClose(close) => self.handle_instrument_close(close),
             Data::Custom(custom) => self.handle_custom_data(&custom),
+            #[cfg(feature = "defi")]
+            Data::Defi(_) => unreachable!("handled before market data dispatch"),
+        }
+    }
+
+    fn feed_option_greeks_to_pre_bootstrap_chain(&self, greeks: &OptionGreeks) {
+        let Some(series_id) = self
+            .option_chain_instrument_index
+            .get(&greeks.instrument_id)
+            .copied()
+        else {
+            return;
+        };
+
+        let Some(manager_rc) = self.option_chain_managers.get(&series_id).cloned() else {
+            return;
+        };
+
+        if !manager_rc.borrow().is_bootstrapped() {
+            manager_rc.borrow_mut().handle_greeks(greeks);
         }
     }
 
@@ -1636,6 +1742,15 @@ impl DataEngine {
     /// republish, option-chain expiry, depth-derived quotes, deferred-command drains) run in this
     /// path.
     pub fn process_pipeline(&mut self, data: Data) {
+        #[cfg(feature = "defi")]
+        let data = match data {
+            Data::Defi(defi) => {
+                self.process_defi_data(*defi);
+                return;
+            }
+            data => data,
+        };
+
         self.data_count += 1;
 
         match data {
@@ -1647,9 +1762,15 @@ impl DataEngine {
             Data::Bar(bar) => self.handle_bar_pipeline(bar),
             Data::MarkPriceUpdate(mark_price) => self.handle_mark_price_pipeline(mark_price),
             Data::IndexPriceUpdate(index_price) => self.handle_index_price_pipeline(index_price),
+            Data::FundingRateUpdate(funding_rate) => {
+                self.handle_funding_rate_pipeline(funding_rate);
+            }
             Data::InstrumentStatus(status) => self.handle_instrument_status_pipeline(status),
+            Data::OptionGreeks(greeks) => self.handle_option_greeks_pipeline(greeks),
             Data::InstrumentClose(close) => self.handle_instrument_close_pipeline(close),
             Data::Custom(custom) => self.handle_custom_data_pipeline(&custom),
+            #[cfg(feature = "defi")]
+            Data::Defi(_) => unreachable!("handled before market data dispatch"),
         }
     }
 
@@ -1682,6 +1803,14 @@ impl DataEngine {
         let Some(resp) = self.handle_request_pipeline_response(resp) else {
             return;
         };
+
+        if let Some(parent_id) = self
+            .time_range_pipeline_parent_request_id
+            .remove(resp.correlation_id())
+        {
+            self.handle_time_range_pipeline_child_response(parent_id, &resp);
+            return;
+        }
 
         if self
             .parent_join_request_id
@@ -1721,6 +1850,16 @@ impl DataEngine {
                 }
             }
             DataResponse::Book(r) => self.handle_book_response(&r.data),
+            DataResponse::BookDeltas(r) => {
+                if !log_if_empty_response(&r.data, &r.instrument_id, &correlation_id) {
+                    self.handle_book_deltas_response(r);
+                }
+            }
+            DataResponse::BookDepth(r) => {
+                if !log_if_empty_response(&r.data, &r.instrument_id, &correlation_id) {
+                    self.handle_book_depth_response(r);
+                }
+            }
             DataResponse::ForwardPrices(r) => {
                 self.process_request_bar_aggregation_response(&resp);
                 return self.handle_forward_prices_response(&correlation_id, r);
@@ -1785,6 +1924,7 @@ impl DataEngine {
             leg.trim_to_bounds();
         }
 
+        let (parent_start, parent_end) = parent_request_window(parent.as_ref());
         let rebuilt = rebuild_pipeline_response(parent_id, parent.as_ref(), legs);
 
         // If the rebuild failed (mixed-variant or unsupported-variant legs), drop the
@@ -1801,10 +1941,120 @@ impl DataEngine {
             );
         }
 
-        rebuilt
+        let mut rebuilt = rebuilt?;
+
+        // Replay must run before `trim_to_bounds`, which would otherwise discard the pre-start
+        // deltas the replay folds into the snapshot.
+        if let DataResponse::BookDeltas(r) = &mut rebuilt {
+            self.book_deltas_snapshot_replay(r);
+        }
+
+        // Trim against the parent window only when the parent supplied one. With no
+        // parent window the rebuilt response inherits the first leg's bounds; legs are
+        // already trimmed against their own bounds at the top of `response()`, so a
+        // second pass would discard data from later legs whose bounds the parent never
+        // constrained.
+        if parent_start.is_some() || parent_end.is_some() {
+            rebuilt.trim_to_bounds();
+        }
+
+        Some(rebuilt)
     }
 
-    fn handle_request_join(&mut self, req: RequestJoin) {
+    // Replays a day-start snapshot forward to the request's original start: when the first delta
+    // is an F_SNAPSHOT on a UTC day boundary, rebuilds the book from the pre-start deltas and
+    // replaces them with one snapshot keyed at the original start, then forwards the rest.
+    // Mirrors the Cython `_handle_order_book_deltas_snapshot_replay`.
+    fn book_deltas_snapshot_replay(&self, resp: &mut BookDeltasResponse) {
+        let Some(original_start_ns) = resp.start else {
+            return;
+        };
+
+        let Some(first) = resp.data.first().copied() else {
+            return;
+        };
+
+        if !RecordFlag::F_SNAPSHOT.matches(first.flags) {
+            return;
+        }
+
+        if first.ts_init.as_u64() % NANOSECONDS_IN_DAY != 0 {
+            return;
+        }
+
+        // Nothing to fast-forward when the request starts at or before the day-start snapshot
+        if original_start_ns <= first.ts_init {
+            return;
+        }
+
+        if self
+            .cache
+            .borrow()
+            .instrument(&resp.instrument_id)
+            .is_none()
+        {
+            log::warn!(
+                "Instrument {} not found in cache, skipping snapshot replay",
+                resp.instrument_id,
+            );
+            return;
+        }
+
+        let book_type = resp
+            .params
+            .as_ref()
+            .and_then(|p| p.get_str("book_type"))
+            .and_then(|s| BookType::from_str(s).ok())
+            .unwrap_or(BookType::L2_MBP);
+
+        let mut book = OrderBook::new(resp.instrument_id, book_type);
+        let mut before: Vec<OrderBookDelta> = Vec::new();
+        let mut after: Vec<OrderBookDelta> = Vec::new();
+        let mut last_applied_ts: Option<UnixNanos> = None;
+        let mut crossed = false;
+
+        for delta in &resp.data {
+            if crossed {
+                after.push(*delta);
+            } else {
+                before.push(*delta);
+                if delta.ts_init >= original_start_ns {
+                    crossed = true;
+                    last_applied_ts = Some(delta.ts_init);
+                }
+            }
+        }
+
+        if !before.is_empty() {
+            if last_applied_ts.is_none() {
+                last_applied_ts = before.last().map(|d| d.ts_init);
+            }
+
+            let batch = OrderBookDeltas::new(resp.instrument_id, before);
+            if let Err(e) = book.apply_deltas(&batch) {
+                log::error!(
+                    "Failed to rebuild book for snapshot replay on {}: {e}",
+                    resp.instrument_id,
+                );
+                return;
+            }
+        }
+
+        let Some(last_ts) = last_applied_ts else {
+            return;
+        };
+
+        let snapshot_ts = last_ts.max(original_start_ns);
+        let mut new_data = book.to_deltas(snapshot_ts, snapshot_ts).deltas;
+        new_data.extend(after);
+        resp.data = new_data;
+    }
+
+    fn handle_request_join(&mut self, req: RequestJoin) -> anyhow::Result<()> {
+        if has_time_range_pipeline_params(req.params.as_ref()) {
+            return self.execute_time_range_pipeline_request(RequestCommand::Join(req));
+        }
+
         let now_ns = self.clock.borrow().timestamp_ns();
         let now_dt = now_ns.to_datetime_utc();
         let zero = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(0);
@@ -1823,6 +2073,8 @@ impl DataEngine {
         for leg_id in leg_ids {
             self.register_request_pipeline_leg(leg_id, dated_id);
         }
+
+        Ok(())
     }
 
     fn finalize_request_join(&mut self, resp: DataResponse) {
@@ -2548,6 +2800,21 @@ impl DataEngine {
         msgbus::publish_index_price(topic, &index_price);
     }
 
+    fn handle_funding_rate_pipeline(&self, funding_rate: FundingRateUpdate) {
+        if self.pipeline_cache_writes_allowed()
+            && let Err(e) = self
+                .cache
+                .as_ref()
+                .borrow_mut()
+                .add_funding_rate(funding_rate)
+        {
+            log_error_on_cache_insert(&e);
+        }
+
+        let topic = switchboard::get_pipeline_funding_rate_topic(funding_rate.instrument_id);
+        msgbus::publish_funding_rate(topic, &funding_rate);
+    }
+
     fn handle_instrument_status_pipeline(&self, status: InstrumentStatus) {
         if self.pipeline_cache_writes_allowed()
             && let Err(e) = self
@@ -2561,6 +2828,15 @@ impl DataEngine {
 
         let topic = switchboard::get_pipeline_instrument_status_topic(status.instrument_id);
         msgbus::publish_any(topic, &status);
+    }
+
+    fn handle_option_greeks_pipeline(&self, greeks: OptionGreeks) {
+        if self.pipeline_cache_writes_allowed() {
+            self.cache.borrow_mut().add_option_greeks(greeks);
+        }
+
+        let topic = switchboard::get_pipeline_option_greeks_topic(greeks.instrument_id);
+        msgbus::publish_option_greeks(topic, &greeks);
     }
 
     fn handle_instrument_close_pipeline(&self, close: InstrumentClose) {
@@ -2640,7 +2916,7 @@ impl DataEngine {
         log::info!("Proactively torn down expired option chain {series_id}");
     }
 
-    fn subscribe_book_deltas(&mut self, cmd: &SubscribeBookDeltas) -> anyhow::Result<()> {
+    fn subscribe_book_deltas(&mut self, cmd: &SubscribeBookDeltas) -> anyhow::Result<bool> {
         if cmd.instrument_id.is_synthetic() {
             anyhow::bail!("Cannot subscribe for synthetic instrument `OrderBookDelta` data");
         }
@@ -2649,12 +2925,15 @@ impl DataEngine {
         // failure leaves the engine bookkeeping unchanged.
         let parent = resolve_parent_components(&cmd.instrument_id, cmd.params.as_ref())?;
 
-        self.book_deltas_subs.insert(cmd.instrument_id);
+        let had_deltas =
+            self.has_book_delta_subscription_key(cmd.instrument_id, cmd.client_id, cmd.venue);
+        self.increment_book_delta_subscription(cmd.instrument_id, cmd.client_id, cmd.venue);
+
         if cmd.managed {
             self.setup_book_updater(&cmd.instrument_id, cmd.book_type, true, parent)?;
         }
 
-        Ok(())
+        Ok(!had_deltas)
     }
 
     fn subscribe_book_depth10(&mut self, cmd: &SubscribeBookDepth10) -> anyhow::Result<()> {
@@ -2690,7 +2969,7 @@ impl DataEngine {
             self.setup_book_updater(&cmd.instrument_id, cmd.book_type, false, parent)?;
         }
 
-        if had_snapshots || self.book_deltas_subs.contains(&cmd.instrument_id) {
+        if had_snapshots || self.has_book_delta_subscriptions(&cmd.instrument_id) {
             return Ok(());
         }
 
@@ -2741,18 +3020,7 @@ impl DataEngine {
 
     fn subscribe_bars(&mut self, cmd: &SubscribeBars) -> anyhow::Result<()> {
         match cmd.bar_type.aggregation_source() {
-            AggregationSource::Internal => {
-                let key = bar_aggregator_key(cmd.bar_type, None);
-
-                if self
-                    .bar_aggregators
-                    .get(&key)
-                    .is_none_or(|aggregator| !aggregator.borrow().is_running())
-                    || !self.bar_aggregator_handlers.contains_key(&key)
-                {
-                    self.start_bar_aggregator(cmd.bar_type, None)?;
-                }
-            }
+            AggregationSource::Internal => self.start_live_bar_aggregator(cmd)?,
             AggregationSource::External => {
                 if cmd.bar_type.instrument_id().is_synthetic() {
                     anyhow::bail!(
@@ -2766,11 +3034,12 @@ impl DataEngine {
     }
 
     fn subscribe_synthetic_quotes(&mut self, instrument_id: InstrumentId) {
-        let Some(synthetic) = self.cache.borrow().synthetic(&instrument_id).cloned() else {
-            log::error!(
-                "Cannot subscribe to `QuoteTick` data for synthetic instrument {instrument_id}, not found",
-            );
-            return;
+        let synthetic = match self.cache.borrow().try_synthetic(&instrument_id).cloned() {
+            Ok(synthetic) => synthetic,
+            Err(e) => {
+                log::error!("Cannot subscribe to `QuoteTick` data for synthetic instrument: {e}");
+                return;
+            }
         };
 
         if !self.subscribed_synthetic_quotes.insert(instrument_id) {
@@ -2789,11 +3058,12 @@ impl DataEngine {
     }
 
     fn subscribe_synthetic_trades(&mut self, instrument_id: InstrumentId) {
-        let Some(synthetic) = self.cache.borrow().synthetic(&instrument_id).cloned() else {
-            log::error!(
-                "Cannot subscribe to `TradeTick` data for synthetic instrument {instrument_id}, not found",
-            );
-            return;
+        let synthetic = match self.cache.borrow().try_synthetic(&instrument_id).cloned() {
+            Ok(synthetic) => synthetic,
+            Err(e) => {
+                log::error!("Cannot subscribe to `TradeTick` data for synthetic instrument: {e}");
+                return;
+            }
         };
 
         if !self.subscribed_synthetic_trades.insert(instrument_id) {
@@ -2866,6 +3136,15 @@ impl DataEngine {
 
         let cache = self.cache.clone();
         let handler = Box::new(move |quote: QuoteTick| {
+            let exchange_endpoint = format!(
+                "SimulatedExchange.process_new_quote.{}",
+                quote.instrument_id.venue
+            );
+            let exchange_endpoint = exchange_endpoint.into();
+            if msgbus::has_quote_endpoint(exchange_endpoint) {
+                msgbus::send_quote(exchange_endpoint, &quote);
+            }
+
             if let Err(e) = cache.borrow_mut().add_quote(quote) {
                 log_error_on_cache_insert(&e);
             }
@@ -2875,7 +3154,10 @@ impl DataEngine {
         let aggregator = Rc::new(RefCell::new(SpreadQuoteAggregator::new(
             cmd.instrument_id,
             &legs,
-            matches!(instrument, InstrumentAny::FuturesSpread(_)),
+            matches!(
+                instrument,
+                InstrumentAny::FuturesSpread(_) | InstrumentAny::CryptoFuturesSpread(_)
+            ),
             instrument.price_precision(),
             instrument.size_precision(),
             handler,
@@ -2975,17 +3257,21 @@ impl DataEngine {
     }
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> bool {
-        if !self.book_deltas_subs.contains(&cmd.instrument_id) {
-            log::warn!("Cannot unsubscribe from `OrderBookDeltas` data: not subscribed");
-            return false;
+        match self.decrement_book_delta_subscription(cmd.instrument_id, cmd.client_id, cmd.venue) {
+            BookDeltasUnsubscribeResult::NotSubscribed => {
+                log::warn!("Cannot unsubscribe from `OrderBookDeltas` data: not subscribed");
+                return false;
+            }
+            BookDeltasUnsubscribeResult::Decremented => return false,
+            BookDeltasUnsubscribeResult::Removed => {}
         }
 
-        self.book_deltas_subs.remove(&cmd.instrument_id);
         self.maintain_book_updater(&cmd.instrument_id);
 
         // Snapshot subscriptions reuse the deltas feed.
         // Keep the client subscribed until the last snapshot consumer is gone.
-        !self.has_book_snapshot_subscriptions(&cmd.instrument_id)
+        !self.has_book_delta_subscriptions(&cmd.instrument_id)
+            && !self.has_book_snapshot_subscriptions(&cmd.instrument_id)
     }
 
     fn unsubscribe_book_depth10(&mut self, cmd: &UnsubscribeBookDepth10) -> bool {
@@ -3016,7 +3302,7 @@ impl DataEngine {
 
         self.maintain_book_updater(&cmd.instrument_id);
 
-        if self.book_deltas_subs.contains(&cmd.instrument_id) {
+        if self.has_book_delta_subscriptions(&cmd.instrument_id) {
             return;
         }
 
@@ -3052,9 +3338,11 @@ impl DataEngine {
         if self
             .bar_aggregators
             .contains_key(&bar_aggregator_key(bar_type, None))
-            && let Err(e) = self.stop_bar_aggregator(bar_type, None)
         {
-            log::error!("Error stopping bar aggregator for {bar_type}: {e}");
+            match self.stop_bar_aggregator(bar_type, None) {
+                Ok(()) => self.unsubscribe_bar_aggregator(cmd),
+                Err(e) => log::error!("Error stopping bar aggregator for {bar_type}: {e}"),
+            }
         }
 
         // After stopping a composite, check if the source aggregator is now orphaned
@@ -3316,7 +3604,7 @@ impl DataEngine {
             // memo via setup_book_updater. Keep each memo alive while any
             // sibling subscription that drives the same handler kind remains
             // active for this parent id.
-            let parent_still_needs_deltas = self.book_deltas_subs.contains(instrument_id)
+            let parent_still_needs_deltas = self.has_book_delta_subscriptions(instrument_id)
                 || self.book_depth10_subs.contains(instrument_id)
                 || self.has_book_snapshot_subscriptions(instrument_id);
             let parent_still_needs_depth10 = self.book_depth10_subs.contains(instrument_id)
@@ -3363,6 +3651,58 @@ impl DataEngine {
         self.book_snapshot_counts
             .keys()
             .any(|(id, _)| id == instrument_id)
+    }
+
+    fn has_book_delta_subscriptions(&self, instrument_id: &InstrumentId) -> bool {
+        self.book_deltas_counts
+            .keys()
+            .any(|(id, _, _)| id == instrument_id)
+    }
+
+    fn has_book_delta_subscription_key(
+        &self,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        venue: Option<Venue>,
+    ) -> bool {
+        self.book_deltas_counts
+            .contains_key(&(instrument_id, client_id, venue))
+    }
+
+    fn increment_book_delta_subscription(
+        &mut self,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        venue: Option<Venue>,
+    ) {
+        let key = (instrument_id, client_id, venue);
+
+        if let Some(count) = self.book_deltas_counts.get_mut(&key) {
+            *count += 1;
+        } else {
+            self.book_deltas_counts.insert(key, 1);
+        }
+    }
+
+    fn decrement_book_delta_subscription(
+        &mut self,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        venue: Option<Venue>,
+    ) -> BookDeltasUnsubscribeResult {
+        let key = (instrument_id, client_id, venue);
+
+        let Some(count) = self.book_deltas_counts.get_mut(&key) else {
+            return BookDeltasUnsubscribeResult::NotSubscribed;
+        };
+
+        if *count > 1 {
+            *count -= 1;
+            return BookDeltasUnsubscribeResult::Decremented;
+        }
+
+        self.book_deltas_counts.shift_remove(&key);
+        BookDeltasUnsubscribeResult::Removed
     }
 
     fn increment_book_snapshot_subscription(
@@ -3529,7 +3869,21 @@ impl DataEngine {
         }
     }
 
+    // Skip cache writes that would regress a book a `BookUpdater` is maintaining.
+    // Unmanaged subscriptions don't install a `BookUpdater`, so they don't gate writes.
+    fn cache_is_owned_by_live_subscription(&self, instrument_id: &InstrumentId) -> bool {
+        self.book_updaters.contains_key(instrument_id)
+    }
+
     fn handle_book_response(&self, book: &OrderBook) {
+        if self.cache_is_owned_by_live_subscription(&book.instrument_id) {
+            log::debug!(
+                "Skipping cache write for order book {}: live subscription owns the book",
+                book.instrument_id,
+            );
+            return;
+        }
+
         log::debug!("Adding order book {} to cache", book.instrument_id);
 
         if let Err(e) = self
@@ -3539,6 +3893,57 @@ impl DataEngine {
             .add_order_book(book.clone())
         {
             log_error_on_cache_insert(&e);
+        }
+    }
+
+    fn handle_book_deltas_response(&self, resp: &BookDeltasResponse) {
+        if !self.cache_is_owned_by_live_subscription(&resp.instrument_id) {
+            let mut cache = self.cache.as_ref().borrow_mut();
+            if let Some(book) = cache.order_book_mut(&resp.instrument_id) {
+                for delta in &resp.data {
+                    if let Err(e) = book.apply_delta(delta) {
+                        log::error!("Failed to apply historical delta to cache: {e}");
+                    }
+                }
+            } else {
+                log::debug!(
+                    "Skipping cache write for {} historical deltas on {}: no cache book yet",
+                    resp.data.len(),
+                    resp.instrument_id,
+                );
+            }
+        }
+
+        // Group deltas by `F_LAST` so each published batch preserves the original event
+        // boundary and metadata (timestamps and sequence from the closing delta), matching
+        // the live `handle_delta` buffering semantic. Collapsing the whole response into
+        // one batch would surface a synthetic event with the trailing delta's flags only.
+        if resp.data.is_empty() {
+            return;
+        }
+
+        let topic = switchboard::get_pipeline_book_deltas_topic(resp.instrument_id);
+        let mut frame: Vec<OrderBookDelta> = Vec::new();
+
+        for delta in &resp.data {
+            frame.push(*delta);
+            if RecordFlag::F_LAST.matches(delta.flags) {
+                let batch = OrderBookDeltas::new(resp.instrument_id, std::mem::take(&mut frame));
+                msgbus::publish_deltas(topic, &batch);
+            }
+        }
+
+        if !frame.is_empty() {
+            let batch = OrderBookDeltas::new(resp.instrument_id, frame);
+            msgbus::publish_deltas(topic, &batch);
+        }
+    }
+
+    fn handle_book_depth_response(&self, resp: &BookDepthResponse) {
+        let topic = switchboard::get_pipeline_book_depth10_topic(resp.instrument_id);
+
+        for depth in &resp.data {
+            msgbus::publish_depth10(topic, depth);
         }
     }
 
@@ -3676,7 +4081,7 @@ impl DataEngine {
         // Any of {deltas, depth10, snapshots} subs causes setup_book_updater to
         // subscribe the deltas handler (depth10/snapshots use only_deltas=false),
         // so all three keep the per-underlying deltas handler alive.
-        if self.book_deltas_subs.contains(target_id)
+        if self.has_book_delta_subscriptions(target_id)
             || self.book_depth10_subs.contains(target_id)
             || self.has_book_snapshot_subscriptions(target_id)
         {
@@ -3836,6 +4241,28 @@ impl DataEngine {
         Ok(())
     }
 
+    fn start_live_bar_aggregator(&mut self, cmd: &SubscribeBars) -> anyhow::Result<()> {
+        let key = bar_aggregator_key(cmd.bar_type, None);
+
+        if self
+            .bar_aggregators
+            .get(&key)
+            .is_some_and(|aggregator| aggregator.borrow().is_running())
+            && self.bar_aggregator_handlers.contains_key(&key)
+        {
+            log::warn!(
+                "Aggregator for {} is currently in use, subscription can't be started",
+                cmd.bar_type,
+            );
+            return Ok(());
+        }
+
+        self.start_bar_aggregator(cmd.bar_type, None)?;
+        self.subscribe_bar_aggregator(cmd);
+
+        Ok(())
+    }
+
     fn start_bar_aggregator(
         &mut self,
         bar_type: BarType,
@@ -3915,6 +4342,55 @@ impl DataEngine {
         Ok(())
     }
 
+    fn subscribe_bar_aggregator(&mut self, cmd: &SubscribeBars) {
+        let key = bar_aggregator_key(cmd.bar_type, None);
+        if !self.bar_aggregators.contains_key(&key) {
+            log::error!(
+                "Cannot subscribe bar aggregator: no aggregator found for {}",
+                cmd.bar_type,
+            );
+            return;
+        }
+
+        if cmd.bar_type.is_composite() {
+            let composite_bar_type = cmd.bar_type.composite();
+            if composite_bar_type.is_externally_aggregated() {
+                let subscribe = SubscribeBars::new(
+                    composite_bar_type,
+                    cmd.client_id,
+                    cmd.venue,
+                    UUID4::new(),
+                    cmd.ts_init,
+                    Some(cmd.command_id),
+                    cmd.params.clone(),
+                );
+                self.execute(DataCommand::Subscribe(SubscribeCommand::Bars(subscribe)));
+            }
+        } else if cmd.bar_type.spec().price_type == PriceType::Last {
+            let subscribe = SubscribeTrades::new(
+                cmd.bar_type.instrument_id(),
+                cmd.client_id,
+                cmd.venue,
+                UUID4::new(),
+                cmd.ts_init,
+                Some(cmd.command_id),
+                cmd.params.clone(),
+            );
+            self.execute(DataCommand::Subscribe(SubscribeCommand::Trades(subscribe)));
+        } else {
+            let subscribe = SubscribeQuotes::new(
+                cmd.bar_type.instrument_id(),
+                cmd.client_id,
+                cmd.venue,
+                UUID4::new(),
+                cmd.ts_init,
+                Some(cmd.command_id),
+                cmd.params.clone(),
+            );
+            self.execute(DataCommand::Subscribe(SubscribeCommand::Quotes(subscribe)));
+        }
+    }
+
     /// Sets up a bar aggregator, matching Cython `_setup_bar_aggregator` logic.
     ///
     /// This method handles historical mode, message bus subscriptions, and time bar aggregator setup.
@@ -3962,6 +4438,52 @@ impl DataEngine {
         }
 
         Ok(())
+    }
+
+    fn unsubscribe_bar_aggregator(&mut self, cmd: &UnsubscribeBars) {
+        if cmd.bar_type.is_composite() {
+            let composite_bar_type = cmd.bar_type.composite();
+            if composite_bar_type.is_externally_aggregated() {
+                let unsubscribe = UnsubscribeBars::new(
+                    composite_bar_type,
+                    cmd.client_id,
+                    cmd.venue,
+                    UUID4::new(),
+                    cmd.ts_init,
+                    Some(cmd.command_id),
+                    cmd.params.clone(),
+                );
+                self.execute(DataCommand::Unsubscribe(UnsubscribeCommand::Bars(
+                    unsubscribe,
+                )));
+            }
+        } else if cmd.bar_type.spec().price_type == PriceType::Last {
+            let unsubscribe = UnsubscribeTrades::new(
+                cmd.bar_type.instrument_id(),
+                cmd.client_id,
+                cmd.venue,
+                UUID4::new(),
+                cmd.ts_init,
+                Some(cmd.command_id),
+                cmd.params.clone(),
+            );
+            self.execute(DataCommand::Unsubscribe(UnsubscribeCommand::Trades(
+                unsubscribe,
+            )));
+        } else {
+            let unsubscribe = UnsubscribeQuotes::new(
+                cmd.bar_type.instrument_id(),
+                cmd.client_id,
+                cmd.venue,
+                UUID4::new(),
+                cmd.ts_init,
+                Some(cmd.command_id),
+                cmd.params.clone(),
+            );
+            self.execute(DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(
+                unsubscribe,
+            )));
+        }
     }
 
     fn stop_bar_aggregator(
@@ -4594,13 +5116,13 @@ fn build_continuous_future_subscribe_inner(
     source: ContinuousFutureSource,
     segment_instrument_id: InstrumentId,
     client_id: Option<ClientId>,
-    venue: Option<Venue>,
+    _venue: Option<Venue>,
     child_params: Params,
     correlation_id: UUID4,
     ts_init: UnixNanos,
 ) -> DataCommand {
     let command_id = UUID4::new();
-    let child_venue = venue.or(Some(segment_instrument_id.venue));
+    let child_venue = Some(segment_instrument_id.venue);
 
     match source {
         ContinuousFutureSource::Bars(source_bar_type) => {
@@ -4643,7 +5165,7 @@ fn build_continuous_future_unsubscribe_command(
     source: ContinuousFutureSource,
     segment_instrument_id: InstrumentId,
     client_id: Option<ClientId>,
-    venue: Option<Venue>,
+    _venue: Option<Venue>,
     parent_params: Option<&Params>,
     correlation_id: UUID4,
     ts_init: UnixNanos,
@@ -4655,7 +5177,7 @@ fn build_continuous_future_unsubscribe_command(
     child_params.shift_remove("first_pre_instrument_id");
     child_params.shift_remove("bar_types");
     let command_id = UUID4::new();
-    let child_venue = venue.or(Some(segment_instrument_id.venue));
+    let child_venue = Some(segment_instrument_id.venue);
 
     match source {
         ContinuousFutureSource::Bars(source_bar_type) => {
@@ -4806,12 +5328,35 @@ fn rebuild_pipeline_response(
         return None;
     }
 
-    let (parent_start, parent_end) = parent_join_window(parent);
+    let (parent_start, parent_end) = parent_request_window(parent);
 
     let mut iter = legs.into_iter();
     let first = iter.next()?;
 
     match first {
+        DataResponse::Data(mut acc) => {
+            let mut data = custom_response_data(&acc, parent_id)?;
+
+            for leg in iter {
+                let DataResponse::Data(other) = leg else {
+                    log::error!("Mixed-variant legs in pipeline {parent_id}");
+                    return None;
+                };
+                data.extend(custom_response_data(&other, parent_id)?);
+            }
+
+            data.sort_by_key(CustomData::ts_init);
+            acc.data = std::sync::Arc::new(data);
+            acc.correlation_id = parent_id;
+            if parent_start.is_some() {
+                acc.start = parent_start;
+            }
+
+            if parent_end.is_some() {
+                acc.end = parent_end;
+            }
+            Some(DataResponse::Data(acc))
+        }
         DataResponse::Quotes(mut acc) => {
             for leg in iter {
                 let DataResponse::Quotes(other) = leg else {
@@ -4899,10 +5444,48 @@ fn rebuild_pipeline_response(
             acc.correlation_id = parent_id;
             Some(DataResponse::Instruments(acc))
         }
+        DataResponse::BookDeltas(mut acc) => {
+            for leg in iter {
+                let DataResponse::BookDeltas(other) = leg else {
+                    log::error!("Mixed-variant legs in pipeline {parent_id}");
+                    return None;
+                };
+                acc.data.extend(other.data);
+            }
+            acc.data.sort_by_key(|d| d.ts_init);
+            acc.correlation_id = parent_id;
+            if parent_start.is_some() {
+                acc.start = parent_start;
+            }
+
+            if parent_end.is_some() {
+                acc.end = parent_end;
+            }
+            Some(DataResponse::BookDeltas(acc))
+        }
+        DataResponse::BookDepth(mut acc) => {
+            for leg in iter {
+                let DataResponse::BookDepth(other) = leg else {
+                    log::error!("Mixed-variant legs in pipeline {parent_id}");
+                    return None;
+                };
+                acc.data.extend(other.data);
+            }
+            acc.data.sort_by_key(|d| d.ts_init);
+            acc.correlation_id = parent_id;
+            if parent_start.is_some() {
+                acc.start = parent_start;
+            }
+
+            if parent_end.is_some() {
+                acc.end = parent_end;
+            }
+            Some(DataResponse::BookDepth(acc))
+        }
         other => {
             // Pipelines today rebuild same-variant time-series legs. Variants
             // without a per-item ts_init payload (singular Book/Instrument,
-            // ForwardPrices, custom Data) cannot be concatenated and would
+            // ForwardPrices) cannot be concatenated and would
             // otherwise leak a leg-keyed response. Drop rather than forward.
             log::error!(
                 "Pipeline rebuild not supported for variant {} (parent {parent_id})",
@@ -4913,14 +5496,59 @@ fn rebuild_pipeline_response(
     }
 }
 
-fn parent_join_window(parent: Option<&RequestCommand>) -> (Option<UnixNanos>, Option<UnixNanos>) {
-    match parent {
-        Some(RequestCommand::Join(join)) => (
-            join.start.map(datetime_to_unix_nanos_or_zero),
-            join.end.map(datetime_to_unix_nanos_or_zero),
-        ),
-        _ => (None, None),
+fn custom_response_data(resp: &CustomDataResponse, parent_id: UUID4) -> Option<Vec<CustomData>> {
+    if let Some(data) = resp.data.as_ref().downcast_ref::<Vec<CustomData>>() {
+        return Some(data.clone());
     }
+
+    if let Some(data) = resp.data.as_ref().downcast_ref::<CustomData>() {
+        return Some(vec![data.clone()]);
+    }
+
+    if let Some(data) = resp.data.as_ref().downcast_ref::<Vec<Data>>() {
+        let mut custom = Vec::with_capacity(data.len());
+        for item in data {
+            let Data::Custom(value) = item else {
+                log::error!("Custom data pipeline {parent_id} received non-custom data {item:?}");
+                return None;
+            };
+            custom.push(value.clone());
+        }
+        return Some(custom);
+    }
+
+    log::error!(
+        "Custom data pipeline {parent_id} received unsupported payload for {}",
+        resp.data_type,
+    );
+    None
+}
+
+fn parent_request_window(
+    parent: Option<&RequestCommand>,
+) -> (Option<UnixNanos>, Option<UnixNanos>) {
+    let Some(parent) = parent else {
+        return (None, None);
+    };
+
+    let (start, end) = match parent {
+        RequestCommand::Data(cmd) => (cmd.start, cmd.end),
+        RequestCommand::Instrument(cmd) => (cmd.start, cmd.end),
+        RequestCommand::Instruments(cmd) => (cmd.start, cmd.end),
+        RequestCommand::BookDeltas(cmd) => (cmd.start, cmd.end),
+        RequestCommand::BookDepth(cmd) => (cmd.start, cmd.end),
+        RequestCommand::Quotes(cmd) => (cmd.start, cmd.end),
+        RequestCommand::Trades(cmd) => (cmd.start, cmd.end),
+        RequestCommand::FundingRates(cmd) => (cmd.start, cmd.end),
+        RequestCommand::Bars(cmd) => (cmd.start, cmd.end),
+        RequestCommand::Join(cmd) => (cmd.start, cmd.end),
+        RequestCommand::BookSnapshot(_) | RequestCommand::ForwardPrices(_) => return (None, None),
+    };
+
+    (
+        start.map(datetime_to_unix_nanos_or_zero),
+        end.map(datetime_to_unix_nanos_or_zero),
+    )
 }
 
 fn datetime_to_unix_nanos_or_zero(dt: chrono::DateTime<chrono::Utc>) -> UnixNanos {
@@ -4973,6 +5601,26 @@ fn empty_response_like(
             ts_init,
             r.params.clone(),
         )),
+        DataResponse::BookDeltas(r) => DataResponse::BookDeltas(BookDeltasResponse::new(
+            correlation_id,
+            r.client_id,
+            r.instrument_id,
+            Vec::new(),
+            r.start,
+            r.end,
+            ts_init,
+            r.params.clone(),
+        )),
+        DataResponse::BookDepth(r) => DataResponse::BookDepth(BookDepthResponse::new(
+            correlation_id,
+            r.client_id,
+            r.instrument_id,
+            Vec::new(),
+            r.start,
+            r.end,
+            ts_init,
+            r.params.clone(),
+        )),
         other => {
             log::error!(
                 "Cannot fabricate empty leg response for variant {}",
@@ -4989,6 +5637,8 @@ fn rebind_response_correlation(mut resp: DataResponse, new_id: UUID4) -> DataRes
         DataResponse::Instrument(r) => r.correlation_id = new_id,
         DataResponse::Instruments(r) => r.correlation_id = new_id,
         DataResponse::Book(r) => r.correlation_id = new_id,
+        DataResponse::BookDeltas(r) => r.correlation_id = new_id,
+        DataResponse::BookDepth(r) => r.correlation_id = new_id,
         DataResponse::Quotes(r) => r.correlation_id = new_id,
         DataResponse::Trades(r) => r.correlation_id = new_id,
         DataResponse::FundingRates(r) => r.correlation_id = new_id,

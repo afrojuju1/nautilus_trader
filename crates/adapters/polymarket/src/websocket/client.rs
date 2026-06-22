@@ -284,7 +284,11 @@ impl PolymarketWebSocketClient {
                     }
                     Some(msg) => {
                         if handler.send(msg).is_err() {
-                            log::error!("Output channel closed, stopping handler");
+                            if handler.is_stopped() {
+                                log::debug!("Output channel closed, stopping handler");
+                            } else {
+                                log::error!("Output channel closed, stopping handler");
+                            }
                             break;
                         }
                     }
@@ -365,6 +369,16 @@ impl PolymarketWebSocketClient {
     #[must_use]
     pub fn subscription_count(&self) -> usize {
         self.subscriptions.all_topics().len()
+    }
+
+    /// Clears retained subscription/auth replay state.
+    ///
+    /// Useful for hard resets where the caller wants reconnect to start from a
+    /// clean slate rather than replaying a previous generation's topics.
+    pub(crate) fn clear_reconnect_state(&self) {
+        self.subscriptions.clear();
+        self.user_subscribed.store(false, Ordering::Relaxed);
+        self.auth_tracker.invalidate();
     }
 
     /// Returns `true` if the user channel has been authenticated.

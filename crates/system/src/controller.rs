@@ -17,14 +17,15 @@ use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use nautilus_common::{
     actor::{
-        DataActor, DataActorCore, data_actor::DataActorConfig, registry::try_get_actor_unchecked,
+        DataActor, DataActorCore, DataActorNative, data_actor::DataActorConfig,
+        registry::try_get_actor_unchecked,
     },
     component::Component,
     msgbus::{Endpoint, MStr, TypedHandler, get_message_bus},
     nautilus_actor,
 };
 use nautilus_model::identifiers::{ActorId, StrategyId};
-use nautilus_trading::Strategy;
+use nautilus_trading::{Strategy, StrategyNative};
 
 use crate::{messages::ControllerCommand, trader::Trader};
 
@@ -50,7 +51,7 @@ impl Controller {
     /// # Errors
     ///
     /// Returns an error if the controller execute endpoint is not registered.
-    pub fn send(command: ControllerCommand) -> anyhow::Result<()> {
+    pub fn send(command: &ControllerCommand) -> anyhow::Result<()> {
         let endpoint = Self::execute_endpoint();
         let handler = {
             let msgbus = get_message_bus();
@@ -68,7 +69,7 @@ impl Controller {
             );
         };
 
-        handler.handle(&command);
+        handler.handle(command);
         Ok(())
     }
 
@@ -79,13 +80,21 @@ impl Controller {
     /// Returns an error if the requested lifecycle operation fails.
     pub fn execute(&mut self, command: ControllerCommand) -> anyhow::Result<()> {
         match command {
-            ControllerCommand::StartActor(actor_id) => self.start_actor(&actor_id),
-            ControllerCommand::StopActor(actor_id) => self.stop_actor(&actor_id),
-            ControllerCommand::RemoveActor(actor_id) => self.remove_actor(&actor_id),
-            ControllerCommand::StartStrategy(strategy_id) => self.start_strategy(&strategy_id),
-            ControllerCommand::StopStrategy(strategy_id) => self.stop_strategy(&strategy_id),
+            ControllerCommand::CreateActor(command) => {
+                Self::unsupported_create_actor_command(&command)
+            }
+            ControllerCommand::StartActor(command) => self.start_actor(&command.actor_id),
+            ControllerCommand::StopActor(command) => self.stop_actor(&command.actor_id),
+            ControllerCommand::RemoveActor(command) => self.remove_actor(&command.actor_id),
+            ControllerCommand::CreateStrategy(command) => {
+                Self::unsupported_create_strategy_command(&command)
+            }
+            ControllerCommand::StartStrategy(command) => self.start_strategy(&command.strategy_id),
+            ControllerCommand::StopStrategy(command) => self.stop_strategy(&command.strategy_id),
             ControllerCommand::ExitMarket(strategy_id) => self.exit_market(&strategy_id),
-            ControllerCommand::RemoveStrategy(strategy_id) => self.remove_strategy(&strategy_id),
+            ControllerCommand::RemoveStrategy(command) => {
+                self.remove_strategy(&command.strategy_id)
+            }
         }
     }
 
@@ -96,12 +105,12 @@ impl Controller {
     /// Returns an error if actor registration or startup fails.
     pub fn create_actor<T>(&self, actor: T, start: bool) -> anyhow::Result<ActorId>
     where
-        T: DataActor + Component + Debug + 'static,
+        T: DataActor + DataActorNative + Component + Debug + 'static,
     {
         let actor_id = actor.actor_id();
         self.trader.borrow_mut().add_actor(actor)?;
 
-        self.start_created_actor(&actor_id, start)?;
+        self.start_created_actor(actor_id, start)?;
 
         Ok(actor_id)
     }
@@ -118,7 +127,7 @@ impl Controller {
     ) -> anyhow::Result<ActorId>
     where
         F: FnOnce() -> anyhow::Result<T>,
-        T: DataActor + Component + Debug + 'static,
+        T: DataActor + DataActorNative + Component + Debug + 'static,
     {
         let actor = factory()?;
         self.create_actor(actor, start)
@@ -131,7 +140,7 @@ impl Controller {
     /// Returns an error if strategy registration or startup fails.
     pub fn create_strategy<T>(&self, mut strategy: T, start: bool) -> anyhow::Result<StrategyId>
     where
-        T: Strategy + Component + Debug + 'static,
+        T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
     {
         let strategy_id = self
             .trader
@@ -139,7 +148,7 @@ impl Controller {
             .prepare_strategy_for_registration(&mut strategy)?;
         self.trader.borrow_mut().add_strategy(strategy)?;
 
-        self.start_created_strategy(&strategy_id, start)?;
+        self.start_created_strategy(strategy_id, start)?;
 
         Ok(strategy_id)
     }
@@ -156,7 +165,7 @@ impl Controller {
     ) -> anyhow::Result<StrategyId>
     where
         F: FnOnce() -> anyhow::Result<T>,
-        T: Strategy + Component + Debug + 'static,
+        T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
     {
         let strategy = factory()?;
         self.create_strategy(strategy, start)
@@ -186,7 +195,7 @@ impl Controller {
     ///
     /// Returns an error if the actor cannot be removed.
     pub fn remove_actor(&self, actor_id: &ActorId) -> anyhow::Result<()> {
-        if actor_id.inner() == self.actor_id().inner() {
+        if actor_id.inner() == self.core.actor_id().inner() {
             return Ok(());
         }
 
@@ -229,24 +238,24 @@ impl Controller {
         self.trader.borrow_mut().remove_strategy(strategy_id)
     }
 
-    fn start_created_actor(&self, actor_id: &ActorId, start: bool) -> anyhow::Result<()> {
+    fn start_created_actor(&self, actor_id: ActorId, start: bool) -> anyhow::Result<()> {
         if !start {
             return Ok(());
         }
 
-        if let Err(start_err) = self.start_actor(actor_id) {
+        if let Err(start_err) = self.start_actor(&actor_id) {
             return Err(self.rollback_actor_start_failure(actor_id, start_err));
         }
 
         Ok(())
     }
 
-    fn start_created_strategy(&self, strategy_id: &StrategyId, start: bool) -> anyhow::Result<()> {
+    fn start_created_strategy(&self, strategy_id: StrategyId, start: bool) -> anyhow::Result<()> {
         if !start {
             return Ok(());
         }
 
-        if let Err(start_err) = self.start_strategy(strategy_id) {
+        if let Err(start_err) = self.start_strategy(&strategy_id) {
             return Err(self.rollback_strategy_start_failure(strategy_id, start_err));
         }
 
@@ -255,10 +264,10 @@ impl Controller {
 
     fn rollback_actor_start_failure(
         &self,
-        actor_id: &ActorId,
+        actor_id: ActorId,
         start_err: anyhow::Error,
     ) -> anyhow::Error {
-        match self.remove_actor(actor_id) {
+        match self.remove_actor(&actor_id) {
             Ok(()) => start_err,
             Err(rollback_err) => anyhow::anyhow!(
                 "Failed to start actor {actor_id}: {start_err}; rollback failed: {rollback_err}"
@@ -268,10 +277,10 @@ impl Controller {
 
     fn rollback_strategy_start_failure(
         &self,
-        strategy_id: &StrategyId,
+        strategy_id: StrategyId,
         start_err: anyhow::Error,
     ) -> anyhow::Error {
-        match self.remove_strategy(strategy_id) {
+        match self.remove_strategy(&strategy_id) {
             Ok(()) => start_err,
             Err(rollback_err) => anyhow::anyhow!(
                 "Failed to start strategy {strategy_id}: {start_err}; rollback failed: {rollback_err}"
@@ -280,10 +289,10 @@ impl Controller {
     }
 
     fn register_execute_endpoint(&self) {
-        let controller_id = self.actor_id().inner();
+        let controller_id = self.core.actor_id().inner();
         let handler = TypedHandler::from(move |command: &ControllerCommand| {
             if let Some(mut controller) = try_get_actor_unchecked::<Self>(&controller_id) {
-                if let Err(e) = controller.execute(*command) {
+                if let Err(e) = controller.execute(command.clone()) {
                     log::error!("Controller command failed for {controller_id}: {e}");
                 }
             } else {
@@ -297,7 +306,7 @@ impl Controller {
             .register(Self::execute_endpoint(), handler);
     }
 
-    fn deregister_execute_endpoint(&self) {
+    fn deregister_execute_endpoint() {
         get_message_bus()
             .borrow_mut()
             .endpoint_map::<ControllerCommand>()
@@ -306,6 +315,24 @@ impl Controller {
 
     fn execute_endpoint() -> MStr<Endpoint> {
         Self::EXECUTE_ENDPOINT.into()
+    }
+
+    fn unsupported_create_actor_command(
+        command: &crate::messages::CreateActor,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "CreateActor command for importable actor '{}' is not supported by the Rust controller",
+            command.actor_config.actor_path
+        );
+    }
+
+    fn unsupported_create_strategy_command(
+        command: &crate::messages::CreateStrategy,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "CreateStrategy command for importable strategy '{}' is not supported by the Rust controller",
+            command.strategy_config.strategy_path
+        );
     }
 }
 
@@ -316,7 +343,7 @@ impl DataActor for Controller {
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
-        self.deregister_execute_endpoint();
+        Self::deregister_execute_endpoint();
         Ok(())
     }
 
@@ -326,7 +353,7 @@ impl DataActor for Controller {
     }
 
     fn on_dispose(&mut self) -> anyhow::Result<()> {
-        self.deregister_execute_endpoint();
+        Self::deregister_execute_endpoint();
         Ok(())
     }
 }
@@ -335,22 +362,53 @@ nautilus_actor!(Controller);
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use nautilus_common::{
+        actor::data_actor::ImportableActorConfig,
         cache::Cache,
         clock::{Clock, TestClock},
         enums::{ComponentState, Environment},
         msgbus::{MessageBus, set_message_bus},
     };
-    use nautilus_core::UUID4;
+    use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{identifiers::TraderId, stubs::TestDefault};
     use nautilus_portfolio::portfolio::Portfolio;
     use nautilus_trading::{
-        nautilus_strategy,
+        ImportableStrategyConfig, nautilus_strategy,
         strategy::{StrategyConfig, StrategyCore},
     };
     use rstest::rstest;
 
     use super::*;
+    use crate::messages::{
+        CreateActor, CreateStrategy, RemoveActor, RemoveStrategy, StartActor, StartStrategy,
+        StopActor, StopStrategy,
+    };
+
+    fn start_actor_command(actor_id: ActorId) -> ControllerCommand {
+        StartActor::new(actor_id, UUID4::new(), UnixNanos::default()).into()
+    }
+
+    fn stop_actor_command(actor_id: ActorId) -> ControllerCommand {
+        StopActor::new(actor_id, UUID4::new(), UnixNanos::default()).into()
+    }
+
+    fn remove_actor_command(actor_id: ActorId) -> ControllerCommand {
+        RemoveActor::new(actor_id, UUID4::new(), UnixNanos::default()).into()
+    }
+
+    fn start_strategy_command(strategy_id: StrategyId) -> ControllerCommand {
+        StartStrategy::new(strategy_id, UUID4::new(), UnixNanos::default()).into()
+    }
+
+    fn stop_strategy_command(strategy_id: StrategyId) -> ControllerCommand {
+        StopStrategy::new(strategy_id, UUID4::new(), UnixNanos::default()).into()
+    }
+
+    fn remove_strategy_command(strategy_id: StrategyId) -> ControllerCommand {
+        RemoveStrategy::new(strategy_id, UUID4::new(), UnixNanos::default()).into()
+    }
 
     #[derive(Debug)]
     struct TestDataActor {
@@ -447,7 +505,7 @@ mod tests {
 
     nautilus_strategy!(ReentrantExitStrategy, {
         fn on_market_exit(&mut self) {
-            Controller::send(ControllerCommand::StopActor(self.actor_to_stop)).unwrap();
+            Controller::send(&stop_actor_command(self.actor_to_stop)).unwrap();
         }
     });
 
@@ -489,12 +547,50 @@ mod tests {
                 ..Default::default()
             }),
         );
-        let controller_id = controller.actor_id();
+        let controller_id = controller.core.actor_id();
 
         trader.borrow_mut().add_actor(controller).unwrap();
         trader.borrow_mut().start().unwrap();
 
         (trader, controller_id)
+    }
+
+    #[rstest]
+    fn test_controller_rejects_importable_create_commands() {
+        let (trader, controller_id) = create_running_controller();
+        let controller_actor_id = controller_id.inner();
+
+        let mut controller = try_get_actor_unchecked::<Controller>(&controller_actor_id).unwrap();
+        let actor_config = ImportableActorConfig {
+            actor_path: "tests.actors:Actor".to_string(),
+            config_path: "tests.actors:ActorConfig".to_string(),
+            config: HashMap::new(),
+        };
+        let strategy_config = ImportableStrategyConfig {
+            strategy_path: "tests.strategies:Strategy".to_string(),
+            config_path: "tests.strategies:StrategyConfig".to_string(),
+            config: HashMap::new(),
+        };
+
+        let actor_result = controller.execute(
+            CreateActor::new(actor_config, true, UUID4::new(), UnixNanos::default()).into(),
+        );
+        let strategy_result = controller.execute(
+            CreateStrategy::new(strategy_config, true, UUID4::new(), UnixNanos::default()).into(),
+        );
+
+        assert_eq!(
+            actor_result.unwrap_err().to_string(),
+            "CreateActor command for importable actor 'tests.actors:Actor' is not supported by the Rust controller"
+        );
+        assert_eq!(
+            strategy_result.unwrap_err().to_string(),
+            "CreateStrategy command for importable strategy 'tests.strategies:Strategy' is not supported by the Rust controller"
+        );
+
+        drop(controller);
+        trader.borrow_mut().stop().unwrap();
+        trader.borrow_mut().dispose_components().unwrap();
     }
 
     #[rstest]
@@ -517,7 +613,7 @@ mod tests {
 
         assert!(trader.borrow().actor_ids().contains(&actor_id));
 
-        Controller::send(ControllerCommand::StartActor(actor_id)).unwrap();
+        Controller::send(&start_actor_command(actor_id)).unwrap();
         let actor_registry_id = actor_id.inner();
         assert_eq!(
             try_get_actor_unchecked::<TestDataActor>(&actor_registry_id)
@@ -526,7 +622,7 @@ mod tests {
             ComponentState::Running
         );
 
-        Controller::send(ControllerCommand::StopActor(actor_id)).unwrap();
+        Controller::send(&stop_actor_command(actor_id)).unwrap();
         assert_eq!(
             try_get_actor_unchecked::<TestDataActor>(&actor_registry_id)
                 .unwrap()
@@ -534,7 +630,7 @@ mod tests {
             ComponentState::Stopped
         );
 
-        Controller::send(ControllerCommand::RemoveActor(actor_id)).unwrap();
+        Controller::send(&remove_actor_command(actor_id)).unwrap();
         assert!(!trader.borrow().actor_ids().contains(&actor_id));
 
         trader.borrow_mut().stop().unwrap();
@@ -562,7 +658,7 @@ mod tests {
 
         assert!(trader.borrow().strategy_ids().contains(&strategy_id));
 
-        Controller::send(ControllerCommand::StartStrategy(strategy_id)).unwrap();
+        Controller::send(&start_strategy_command(strategy_id)).unwrap();
         let strategy_registry_id = strategy_id.inner();
         assert_eq!(
             try_get_actor_unchecked::<TestStrategy>(&strategy_registry_id)
@@ -571,20 +667,20 @@ mod tests {
             ComponentState::Running
         );
 
-        Controller::send(ControllerCommand::ExitMarket(strategy_id)).unwrap();
+        Controller::send(&ControllerCommand::ExitMarket(strategy_id)).unwrap();
         assert!(
             try_get_actor_unchecked::<TestStrategy>(&strategy_registry_id)
                 .unwrap()
                 .is_exiting()
         );
 
-        Controller::send(ControllerCommand::StopStrategy(strategy_id)).unwrap();
+        Controller::send(&stop_strategy_command(strategy_id)).unwrap();
         let strategy = try_get_actor_unchecked::<TestStrategy>(&strategy_registry_id).unwrap();
         assert_eq!(strategy.state(), ComponentState::Stopped);
         assert!(!strategy.is_exiting());
         drop(strategy);
 
-        Controller::send(ControllerCommand::RemoveStrategy(strategy_id)).unwrap();
+        Controller::send(&remove_strategy_command(strategy_id)).unwrap();
         assert!(!trader.borrow().strategy_ids().contains(&strategy_id));
 
         trader.borrow_mut().stop().unwrap();
@@ -696,8 +792,8 @@ mod tests {
                 .unwrap()
         };
 
-        Controller::send(ControllerCommand::StartStrategy(strategy_id)).unwrap();
-        Controller::send(ControllerCommand::ExitMarket(strategy_id)).unwrap();
+        Controller::send(&start_strategy_command(strategy_id)).unwrap();
+        Controller::send(&ControllerCommand::ExitMarket(strategy_id)).unwrap();
 
         let helper_actor =
             try_get_actor_unchecked::<TestDataActor>(&helper_actor_id.inner()).unwrap();
@@ -709,9 +805,9 @@ mod tests {
                 .is_exiting()
         );
 
-        Controller::send(ControllerCommand::StopStrategy(strategy_id)).unwrap();
-        Controller::send(ControllerCommand::RemoveStrategy(strategy_id)).unwrap();
-        Controller::send(ControllerCommand::RemoveActor(helper_actor_id)).unwrap();
+        Controller::send(&stop_strategy_command(strategy_id)).unwrap();
+        Controller::send(&remove_strategy_command(strategy_id)).unwrap();
+        Controller::send(&remove_actor_command(helper_actor_id)).unwrap();
         trader.borrow_mut().stop().unwrap();
         trader.borrow_mut().dispose_components().unwrap();
     }
@@ -722,7 +818,7 @@ mod tests {
 
         trader.borrow_mut().stop().unwrap();
 
-        let result = Controller::send(ControllerCommand::StopActor(ActorId::from("AnyActor-001")));
+        let result = Controller::send(&stop_actor_command(ActorId::from("AnyActor-001")));
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),

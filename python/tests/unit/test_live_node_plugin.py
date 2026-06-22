@@ -26,6 +26,7 @@ from nautilus_trader.live import LiveExecEngineConfig
 from nautilus_trader.live import LiveNode
 from nautilus_trader.live import LiveNodeConfig
 from nautilus_trader.live import PluginConfig
+from nautilus_trader.model import HIGH_PRECISION
 from nautilus_trader.model import TraderId
 
 
@@ -48,18 +49,18 @@ def _build_plugin_example(name: str) -> Path:
     if shutil.which(cargo) is None:
         pytest.skip("cargo is required for the Rust-native plug-in smoke test")
 
-    subprocess.run(
-        [
-            cargo,
-            "build",
-            "-p",
-            "nautilus-plugin",
-            "--example",
-            name,
-        ],
-        cwd=root,
-        check=True,
-    )
+    args = [
+        "build",
+        "-p",
+        "nautilus-plugin",
+        "--example",
+        name,
+    ]
+
+    if HIGH_PRECISION:
+        args.extend(["--features", "nautilus-model/high-precision"])
+
+    subprocess.run([cargo, *args], cwd=root, check=True)
     artifact = _cargo_target_dir(root) / "debug" / "examples" / _cdylib_filename(name)
     assert artifact.exists()
     return artifact
@@ -98,6 +99,35 @@ def test_live_node_loads_rust_native_plugin_actor_from_python(tmp_path):
     node.start()
     try:
         assert marker.read_text() == "python:on_start\n"
+    finally:
+        if node.is_running:
+            node.stop()
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="cdylib smoke test is Unix-only today")
+def test_live_node_add_plugin_loads_rust_native_plugin_actor_from_python(tmp_path):
+    artifact = _build_plugin_example("runtime_smoke_plugin")
+    marker = tmp_path / "plugin-added.txt"
+    config = LiveNodeConfig(
+        environment=Environment.SANDBOX,
+        trader_id=TraderId("PLUGIN-002"),
+        delay_post_stop_secs=0.0,
+        exec_engine=LiveExecEngineConfig(reconciliation=False),
+    )
+    node = LiveNode.build("PluginPythonAddSmoke", config)
+    node.add_plugin(
+        path=str(artifact),
+        type_name="RuntimeSmokeActor",
+        config={
+            "actor_id": "RuntimeSmokeActor-002",
+            "callback_path": str(marker),
+            "label": "python-add",
+        },
+    )
+
+    node.start()
+    try:
+        assert marker.read_text() == "python-add:on_start\n"
     finally:
         if node.is_running:
             node.stop()

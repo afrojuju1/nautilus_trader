@@ -28,6 +28,8 @@ use nautilus_model::{
     instruments::Instrument,
     types::{Currency, Money},
 };
+use rust_decimal::prelude::ToPrimitive;
+use serde::Serialize;
 
 use super::{ExchangeContext, SimulationModule};
 
@@ -48,7 +50,7 @@ const LOCATION_CURRENCY_MAP: &[(&str, &str)] = &[
 ];
 
 /// A single interest rate data entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.backtest", from_py_object)
@@ -78,6 +80,7 @@ pub struct RolloverInterestCalculator {
 
 impl RolloverInterestCalculator {
     /// Creates a new calculator from interest rate records.
+    #[must_use]
     pub fn new(records: Vec<InterestRateRecord>) -> Self {
         let location_to_currency: AHashMap<&str, &str> =
             LOCATION_CURRENCY_MAP.iter().copied().collect();
@@ -181,6 +184,7 @@ pub struct FXRolloverInterestModule {
 
 impl FXRolloverInterestModule {
     /// Creates a new FX rollover interest module.
+    #[must_use]
     pub fn new(records: Vec<InterestRateRecord>) -> Self {
         Self {
             calculator: RolloverInterestCalculator::new(records),
@@ -206,9 +210,8 @@ impl FXRolloverInterestModule {
                 continue;
             }
 
-            let matching_engine = match ctx.matching_engines.get(instrument_id) {
-                Some(engine) => engine,
-                None => continue,
+            let Some(matching_engine) = ctx.matching_engines.get(instrument_id) else {
+                continue;
             };
 
             let book = matching_engine.get_book();
@@ -252,9 +255,11 @@ impl FXRolloverInterestModule {
 
             let instrument = &ctx.instruments[instrument_id];
             let currency = if let Some(base) = ctx.base_currency {
+                // Rollover math is still f64; convert the Decimal rate at the boundary
                 let xrate = ctx
                     .cache
                     .get_xrate(ctx.venue, instrument.quote_currency(), base, PriceType::Mid)
+                    .and_then(|rate| rate.to_f64())
                     .unwrap_or(0.0);
                 rollover *= xrate;
                 base
@@ -295,7 +300,11 @@ impl SimulationModule for FXRolloverInterestModule {
                 .single()
                 .unwrap()
                 .naive_utc();
-            let rollover_ns = rollover_utc.and_utc().timestamp_nanos_opt().unwrap() as u64;
+            let rollover_ns = rollover_utc
+                .and_utc()
+                .timestamp_nanos_opt()
+                .unwrap()
+                .cast_unsigned();
             self.rollover_time_ns.set(rollover_ns);
         }
 
@@ -329,8 +338,9 @@ impl SimulationModule for FXRolloverInterestModule {
 }
 
 fn nanos_to_utc_datetime(ts: UnixNanos) -> NaiveDateTime {
-    let secs = (ts.as_u64() / 1_000_000_000) as i64;
-    let nanos = (ts.as_u64() % 1_000_000_000) as u32;
+    let secs = i64::try_from(ts.as_u64() / 1_000_000_000).expect("timestamp seconds fit in i64");
+    let nanos =
+        u32::try_from(ts.as_u64() % 1_000_000_000).expect("sub-second nanoseconds fit in u32");
     DateTime::from_timestamp(secs, nanos)
         .expect("valid timestamp")
         .naive_utc()
@@ -340,6 +350,7 @@ fn nanos_to_utc_datetime(ts: UnixNanos) -> NaiveDateTime {
 mod tests {
     use nautilus_model::identifiers::InstrumentId;
     use rstest::rstest;
+    use serde_json::json;
 
     use super::*;
 
@@ -366,6 +377,26 @@ mod tests {
                 value: 1.55,
             },
         ]
+    }
+
+    #[rstest]
+    fn test_interest_rate_record_serializes_to_json() {
+        let record = InterestRateRecord {
+            location: "AUS".into(),
+            time: "2020-Q1".into(),
+            value: 0.75,
+        };
+
+        let value = serde_json::to_value(&record).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "location": "AUS",
+                "time": "2020-Q1",
+                "value": 0.75,
+            })
+        );
     }
 
     #[rstest]

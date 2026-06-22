@@ -77,7 +77,6 @@ dotenvy = { workspace = true }
 dydx-proto = { workspace = true }
 futures-util = { workspace = true }
 log = { workspace = true }
-prost = { workspace = true }
 rust_decimal = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
@@ -153,3 +152,8 @@ name = "dydx-grid-mm"
 path = "examples/node_grid_mm.rs"
 required-features = ["examples"]
 doc = false
+
+[[test]]
+name = "python"
+path = "tests/python.rs"
+required-features = ["python"]

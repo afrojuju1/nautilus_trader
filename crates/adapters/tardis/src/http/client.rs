@@ -22,7 +22,7 @@ use nautilus_core::{
     string::{parsing::precision_from_str, secret::REDACTED, urlencoding},
 };
 use nautilus_model::instruments::InstrumentAny;
-use nautilus_network::http::HttpClient;
+use nautilus_network::http::{HttpClient, USER_AGENT};
 use ustr::Ustr;
 
 use super::{
@@ -53,7 +53,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.tardis")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.tardis")
 )]
 #[derive(Clone)]
 pub struct TardisHttpClient {
@@ -99,7 +99,7 @@ impl TardisHttpClient {
             base_url.map_or_else(|| TARDIS_HTTP_BASE_URL.to_string(), ToString::to_string);
 
         let mut headers = HashMap::new();
-        headers.insert("User-Agent".to_string(), NAUTILUS_USER_AGENT.to_string());
+        headers.insert(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string());
 
         if let Some(ref cred) = credential {
             headers.insert(
@@ -145,7 +145,7 @@ impl TardisHttpClient {
         symbol: Option<&str>,
         filter: Option<&InstrumentFilter>,
     ) -> Result<Vec<TardisInstrumentInfo>> {
-        let mut url = format!("{}/instruments/{exchange}", &self.base_url);
+        let mut url = format!("{}/instruments/{exchange}", self.base_url);
 
         if let Some(symbol) = symbol {
             url.push_str(&format!("/{symbol}"));

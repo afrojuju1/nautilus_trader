@@ -1,7 +1,7 @@
 //! Strategy state persistence in Postgres.
 
 use serde_json::Value;
-use sqlx::types::Json;
+use sqlx::{AssertSqlSafe, types::Json};
 
 use crate::{runtime::StrategyState, storage::StorageRepository};
 
@@ -23,7 +23,7 @@ pub async fn load_strategy_state_record(
         storage.schema()
     );
 
-    let row = sqlx::query_scalar::<_, Json<Value>>(&query)
+    let row = sqlx::query_scalar::<_, Json<Value>>(AssertSqlSafe(query))
         .bind(account_id)
         .fetch_optional(storage.pool())
         .await?;
@@ -46,7 +46,7 @@ pub async fn save_strategy_state(
         storage.schema()
     );
 
-    sqlx::query(&query)
+    sqlx::query(AssertSqlSafe(query))
         .bind(account_id)
         .bind(Json(payload))
         .execute(storage.pool())

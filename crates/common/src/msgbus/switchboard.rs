@@ -13,6 +13,20 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+//! Built-in message bus endpoint, topic, and pattern names.
+//!
+//! The `DataEngine`, `ExecEngine`, and `RiskEngine` command endpoints use a queued entry point
+//! plus a direct dispatch endpoint:
+//!
+//! - `*.queue_execute` is the normal entry point for runtime command producers. It routes through
+//!   the current runner queue or channel before the engine sees the command.
+//! - `*.execute` is the lower-level dispatch point used by runner drains and internal paths that
+//!   intentionally bypass the queue.
+//!
+//! Prefer queued endpoints for runtime command producers unless the caller owns the ordering and
+//! re-entrancy implications of direct dispatch. The risk and execution queued endpoints can fall
+//! back to direct dispatch when no trading command sender is installed.
+
 use std::{num::NonZeroUsize, sync::OnceLock};
 
 use ahash::AHashMap;
@@ -25,6 +39,7 @@ use super::mstr::{Endpoint, MStr, Pattern, Topic};
 use crate::msgbus::get_message_bus;
 
 pub const CLOSE_TOPIC: &str = "CLOSE";
+pub const TIME_EVENT_TOPIC: &str = "clock.time_event";
 
 static DATA_QUEUE_COMMAND_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static DATA_EXECUTE_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
@@ -32,6 +47,7 @@ static DATA_PROCESS_ANY_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static DATA_PROCESS_DATA_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static DATA_RESPONSE_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static DATA_RESPONSE_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
+static TIME_EVENT_TOPIC_MSTR: OnceLock<MStr<Topic>> = OnceLock::new();
 static EXEC_QUEUE_COMMAND_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static EXEC_EXECUTE_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static EXEC_PROCESS_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
@@ -96,12 +112,15 @@ macro_rules! define_switchboard {
 
         impl MessagingSwitchboard {
             // Static endpoints
+
+            /// Queued entry point for `DataEngine` commands.
             #[inline]
             #[must_use]
             pub fn data_engine_queue_execute() -> MStr<Endpoint> {
                 *DATA_QUEUE_COMMAND_ENDPOINT.get_or_init(|| "DataEngine.queue_execute".into())
             }
 
+            /// Direct dispatch endpoint for `DataEngine` commands.
             #[inline]
             #[must_use]
             pub fn data_engine_execute() -> MStr<Endpoint> {
@@ -140,12 +159,21 @@ macro_rules! define_switchboard {
                 *DATA_RESPONSE_TOPIC.get_or_init(|| "data.response".into())
             }
 
+            /// Pub/sub topic used by the event-store tap for fired clock events.
+            #[inline]
+            #[must_use]
+            pub fn time_event_topic() -> MStr<Topic> {
+                *TIME_EVENT_TOPIC_MSTR.get_or_init(|| TIME_EVENT_TOPIC.into())
+            }
+
+            /// Direct dispatch endpoint for `ExecEngine` commands.
             #[inline]
             #[must_use]
             pub fn exec_engine_execute() -> MStr<Endpoint> {
                 *EXEC_EXECUTE_ENDPOINT.get_or_init(|| "ExecEngine.execute".into())
             }
 
+            /// Queued entry point for `ExecEngine` commands.
             #[inline]
             #[must_use]
             pub fn exec_engine_queue_execute() -> MStr<Endpoint> {
@@ -164,15 +192,14 @@ macro_rules! define_switchboard {
                 *EXEC_RECONCILE_REPORT_ENDPOINT.get_or_init(|| "ExecEngine.reconcile_execution_report".into())
             }
 
+            /// Direct dispatch endpoint for `RiskEngine` commands.
             #[inline]
             #[must_use]
             pub fn risk_engine_execute() -> MStr<Endpoint> {
                 *RISK_EXECUTE_ENDPOINT.get_or_init(|| "RiskEngine.execute".into())
             }
 
-            /// Queued endpoint for deferred command execution (re-entrancy safe).
-            /// Falls back to direct endpoint when no `TradingCommandSender` is
-            /// available (backtest / test environments).
+            /// Queued entry point for `RiskEngine` commands.
             #[inline]
             #[must_use]
             pub fn risk_engine_queue_execute() -> MStr<Endpoint> {
@@ -366,6 +393,10 @@ define_switchboard! {
     get_funding_rate_topic(instrument_id: InstrumentId) -> instrument_id,
     "data.funding_rates.{}.{}", instrument_id.venue, instrument_id.symbol;
 
+    funding_settlement_topics: InstrumentId,
+    get_funding_settlement_topic(instrument_id: InstrumentId) -> instrument_id,
+    "events.funding_settlements.{}.{}", instrument_id.venue, instrument_id.symbol;
+
     instrument_status_topics: InstrumentId,
     get_instrument_status_topic(instrument_id: InstrumentId) -> instrument_id,
     "data.status.{}.{}", instrument_id.venue, instrument_id.symbol;
@@ -483,6 +514,12 @@ impl MessagingSwitchboard {
     }
 
     #[must_use]
+    pub fn get_pipeline_option_greeks_topic(&mut self, instrument_id: InstrumentId) -> MStr<Topic> {
+        let live = self.get_option_greeks_topic(instrument_id);
+        self.pipeline_topic(live)
+    }
+
+    #[must_use]
     pub fn get_pipeline_instrument_close_topic(
         &mut self,
         instrument_id: InstrumentId,
@@ -572,6 +609,7 @@ define_wrappers! {
     get_mark_price_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_index_price_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_funding_rate_topic(instrument_id: InstrumentId) -> MStr<Topic>,
+    get_funding_settlement_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_instrument_status_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_instrument_close_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_option_greeks_topic(instrument_id: InstrumentId) -> MStr<Topic>,
@@ -586,6 +624,7 @@ define_wrappers! {
     get_pipeline_index_price_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_pipeline_funding_rate_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_pipeline_instrument_status_topic(instrument_id: InstrumentId) -> MStr<Topic>,
+    get_pipeline_option_greeks_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_pipeline_instrument_close_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_fills_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_cancels_topic(instrument_id: InstrumentId) -> MStr<Topic>,
@@ -683,6 +722,13 @@ mod tests {
     fn test_data_response_topic() {
         let expected_topic = "data.response".into();
         let result = MessagingSwitchboard::data_response_topic();
+        assert_eq!(result, expected_topic);
+    }
+
+    #[rstest]
+    fn test_time_event_topic() {
+        let expected_topic = "clock.time_event".into();
+        let result = MessagingSwitchboard::time_event_topic();
         assert_eq!(result, expected_topic);
     }
 

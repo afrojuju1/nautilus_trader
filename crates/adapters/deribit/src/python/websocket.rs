@@ -76,6 +76,7 @@ where
 fn ws_data_to_pyobject(py: Python<'_>, data: Data) -> PyResult<Py<PyAny>> {
     match data {
         Data::Custom(custom) => Py::new(py, custom).map(|obj| obj.into_any()),
+        Data::OptionGreeks(greeks) => Py::new(py, greeks).map(|obj| obj.into_any()),
         other => Ok(data_to_pycapsule(py, other)),
     }
 }
@@ -296,7 +297,7 @@ impl DeribitWebSocketClient {
                             call_python_threadsafe(py, &call_soon, &callback, py_obj);
                         }),
                         NautilusWsMessage::Error(err) => {
-                            log::error!("WebSocket error: {err}");
+                            log::warn!("WebSocket error: {err}");
                         }
                         NautilusWsMessage::Reconnected => {
                             log::info!("WebSocket reconnected");
@@ -425,7 +426,7 @@ impl DeribitWebSocketClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Err(e) = client.close().await {
-                log::error!("Error on close: {e}");
+                log::warn!("Error on close: {e}");
             }
             Ok(())
         })

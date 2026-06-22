@@ -24,15 +24,15 @@ use nautilus_common::{
     clients::ExecutionClient,
     clock::{Clock, TestClock},
     messages::execution::{
-        BatchCancelOrders, CancelAllOrders, CancelOrder, ModifyOrder, QueryAccount, QueryOrder,
-        SubmitOrder, SubmitOrderList,
+        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
+        QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
     },
 };
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     accounts::AccountAny,
     enums::OmsType,
-    identifiers::{AccountId, ClientId, Venue},
+    identifiers::{AccountId, ClientId, ClientOrderId, Venue},
     instruments::InstrumentAny,
     types::{AccountBalance, MarginBalance},
 };
@@ -56,6 +56,12 @@ pub struct StubExecutionClient {
     stop_count: Rc<Cell<usize>>,
     reset_count: Rc<Cell<usize>>,
     dispose_count: Rc<Cell<usize>>,
+    submitted_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,
+    modified_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,
+    queried_account_ids: Rc<RefCell<Vec<AccountId>>>,
+    handles_all_order_venues: bool,
+    submit_order_error: Option<String>,
+    submit_order_list_error: Option<String>,
 }
 
 impl StubExecutionClient {
@@ -81,13 +87,58 @@ impl StubExecutionClient {
             stop_count: Rc::new(Cell::new(0)),
             reset_count: Rc::new(Cell::new(0)),
             dispose_count: Rc::new(Cell::new(0)),
+            submitted_order_ids: Rc::new(RefCell::new(Vec::new())),
+            modified_order_ids: Rc::new(RefCell::new(Vec::new())),
+            queried_account_ids: Rc::new(RefCell::new(Vec::new())),
+            handles_all_order_venues: false,
+            submit_order_error: None,
+            submit_order_list_error: None,
         }
+    }
+
+    /// Configures this stub to accept orders for any instrument venue.
+    #[must_use]
+    pub fn with_handles_all_order_venues(mut self) -> Self {
+        self.handles_all_order_venues = true;
+        self
+    }
+
+    /// Configures this stub to fail single-order submissions.
+    #[must_use]
+    pub fn with_submit_order_error(mut self, error: impl Into<String>) -> Self {
+        self.submit_order_error = Some(error.into());
+        self
+    }
+
+    /// Configures this stub to fail order-list submissions.
+    #[must_use]
+    pub fn with_submit_order_list_error(mut self, error: impl Into<String>) -> Self {
+        self.submit_order_list_error = Some(error.into());
+        self
     }
 
     /// Returns a shared handle to the instruments delivered via [`ExecutionClient::on_instrument`].
     #[must_use]
     pub fn received_instruments(&self) -> Rc<RefCell<Vec<InstrumentAny>>> {
         self.received_instruments.clone()
+    }
+
+    /// Returns a shared handle to the submitted order IDs.
+    #[must_use]
+    pub fn submitted_order_ids(&self) -> Rc<RefCell<Vec<ClientOrderId>>> {
+        self.submitted_order_ids.clone()
+    }
+
+    /// Returns a shared handle to the modified order IDs.
+    #[must_use]
+    pub fn modified_order_ids(&self) -> Rc<RefCell<Vec<ClientOrderId>>> {
+        self.modified_order_ids.clone()
+    }
+
+    /// Returns a shared handle to the queried account IDs.
+    #[must_use]
+    pub fn queried_account_ids(&self) -> Rc<RefCell<Vec<AccountId>>> {
+        self.queried_account_ids.clone()
     }
 
     /// Returns the number of times [`ExecutionClient::start`] was invoked.
@@ -133,6 +184,10 @@ impl ExecutionClient for StubExecutionClient {
         self.venue
     }
 
+    fn handles_order_venue(&self, venue: Venue) -> bool {
+        self.handles_all_order_venues || self.venue == venue
+    }
+
     fn oms_type(&self) -> OmsType {
         self.oms_type
     }
@@ -173,15 +228,45 @@ impl ExecutionClient for StubExecutionClient {
         Ok(())
     }
 
-    fn submit_order(&self, _cmd: SubmitOrder) -> anyhow::Result<()> {
+    fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        if let Some(error) = &self.submit_order_error {
+            anyhow::bail!("{error}");
+        }
+
+        self.submitted_order_ids
+            .borrow_mut()
+            .push(cmd.client_order_id);
+
         Ok(()) // Stub implementation always succeeds
     }
 
-    fn submit_order_list(&self, _cmd: SubmitOrderList) -> anyhow::Result<()> {
+    fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
+        if let Some(error) = &self.submit_order_list_error {
+            anyhow::bail!("{error}");
+        }
+
+        self.submitted_order_ids
+            .borrow_mut()
+            .extend(cmd.order_list.client_order_ids);
+
         Ok(()) // Stub implementation always succeeds
     }
 
-    fn modify_order(&self, _cmd: ModifyOrder) -> anyhow::Result<()> {
+    fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+        self.modified_order_ids
+            .borrow_mut()
+            .push(cmd.client_order_id);
+
+        Ok(()) // Stub implementation always succeeds
+    }
+
+    fn batch_modify_orders(&self, cmd: BatchModifyOrders) -> anyhow::Result<()> {
+        self.modified_order_ids.borrow_mut().extend(
+            cmd.modifies
+                .into_iter()
+                .map(|modify| modify.client_order_id),
+        );
+
         Ok(()) // Stub implementation always succeeds
     }
 
@@ -197,7 +282,9 @@ impl ExecutionClient for StubExecutionClient {
         Ok(()) // Stub implementation always succeeds
     }
 
-    fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
+    fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
+        self.queried_account_ids.borrow_mut().push(cmd.account_id);
+
         Ok(()) // Stub implementation always succeeds
     }
 

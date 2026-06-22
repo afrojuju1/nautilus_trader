@@ -45,9 +45,16 @@ point means adding one module and one `Slice` field.
 | Pricing / greeks    | Not yet | `surfaces::pricing`        |
 
 Out of scope: async client adapters (data and execution), catalog and cache
-backends, pre-trade risk gating, event store backends, and hot reload of any
-plug-in while the live node is running. Plug-ins load at process startup and
-live for the process lifetime.
+backends, pre-trade risk gating, event store backends, mutable host order book
+state, native or Python custom-data callbacks that are not backed by a plug-in
+vtable, and hot reload of any plug-in while the live node is running. Plug-ins
+load at process startup and live for the process lifetime.
+
+`OrderBook` crosses the boundary via `OrderBookHandle`, a `#[repr(C)]`
+wrapper owned by the host that boxes a cloned book snapshot for the duration
+of the callback. The plug-in's thunk dereferences the handle once and hands a
+borrowed `&OrderBook` to the trait method; the plug-in never receives mutable
+host book state.
 
 `OrderBookDeltas` cross the boundary via `OrderBookDeltasHandle`, a
 `#[repr(C)]` wrapper owned by the host that boxes the deltas for the
@@ -68,6 +75,41 @@ for the same reason: the snapshot owns
 `BTreeMap<Price, OptionStrikeData>` call and put maps and cannot be
 `#[repr(C)]`. The host boxes the slice in the handle for the duration
 of the callback.
+
+Custom data registered through `PluginCustomData` can flow into actor
+and strategy `on_data` callbacks. The host wraps each decoded value in a
+plug-in-owned handle plus vtable, then passes a borrowed
+`PluginCustomDataRef` to the cdylib. Plug-in code can inspect the type
+name and downcast to its concrete type locally. The host rejects custom
+data that did not come from a plug-in registration, because those values
+do not carry the vtable and handle needed for that downcast.
+
+Historical plug-in custom-data responses use the same boundary only when the
+value came from a `PluginCustomData` registration. The host inspects `&dyn Any`
+only inside the adapter, extracts registered plug-in `CustomData`, and calls
+the existing `on_data` slot with `PluginCustomDataRef`. No `&dyn Any` value
+crosses the cdylib boundary.
+
+## Identifier interning
+
+Nautilus identifier types such as `ClientOrderId`, `InstrumentId`,
+`ClientId`, `AccountId`, `PositionId`, `StrategyId`, and `TraderId`
+wrap `Ustr`. A Rust cdylib has its own `ustr` global string cache, so
+equal text can have different `Ustr` pointers on the host and plug-in
+sides. The plug-in boundary treats `Ustr` values as receiver-local:
+
+- Host command dispatch re-interns every identifier in boundary-owned
+  command handles before calling `Strategy::*`.
+- Plug-in event thunks re-intern identifiers in inbound event payloads
+  before calling `PluginActor` or `PluginStrategy` trait methods.
+- Plug-in authors can compare and store identifiers received through
+  trait callbacks normally. Code that bypasses the macro-generated
+  thunks must re-intern copied identifiers with `Ustr::from(value.as_str())`.
+
+The policy also covers nested identifiers such as `Symbol`, `Venue`,
+`OrderListId`, `ExecAlgorithmId`, `VenueOrderId`, `OptionSeriesId`,
+raw `Ustr` tags and names, and currency codes carried inside command
+or event payloads.
 
 ## NautilusTrader
 
@@ -99,17 +141,19 @@ Plug-in cdylibs use the platform-native shared-library format:
 Rust's ABI is unstable across compilations on every platform, so the plug-in build must be
 pinned to the host's Rust toolchain version and Nautilus version. Each manifest carries a
 versioned `PluginBuildId` with the `nautilus-plugin` crate version, Rust compiler version when
-the build script can read it, target triple, and build profile. The loader includes that build
-identifier in ABI mismatch diagnostics so operators can spot stale or cross-built cdylibs.
+the build script can read it, target triple, build profile, and fixed-point precision mode. The
+loader includes that build identifier in ABI mismatch diagnostics so operators can spot stale or
+cross-built cdylibs.
 
-The build identifier remains diagnostic; the loader validates only the build-id schema version,
-not the specific crate version, compiler version, target triple, or build profile values.
+The loader validates the build-id schema version and fixed-point precision mode because precision
+changes model layout at the plug-in boundary. The specific crate version, compiler version, target
+triple, and build profile values remain diagnostic.
 
-`NAUTILUS_PLUGIN_ABI_VERSION` stays pinned at `1` while this early-alpha surface is unreleased
-and unstable. During this phase, the value does not promise compatibility between Nautilus
-versions. Once the surface is released, every breaking change to any `#[repr(C)]` struct or
-vtable in this crate must bump it. The host refuses to load a plug-in whose
-`PluginManifest::abi_version` does not match.
+`NAUTILUS_PLUGIN_ABI_VERSION` and `PLUGIN_BUILD_ID_VERSION` remain `1` while this early-alpha
+surface is unreleased and unstable. During this phase, those values do not promise compatibility
+between Nautilus versions. Rebuild plug-in cdylibs to match the exact host version. The host
+refuses to load a plug-in whose `PluginManifest::abi_version` does not match, and manifest
+validation rejects fixed-point precision mode mismatches.
 
 ## Documentation
 

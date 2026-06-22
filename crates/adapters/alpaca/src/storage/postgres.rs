@@ -1,6 +1,6 @@
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{AssertSqlSafe, PgPool, postgres::PgPoolOptions};
 
 use crate::storage::STORAGE_SCHEMA_DEFAULT;
 
@@ -131,7 +131,9 @@ CREATE INDEX IF NOT EXISTS "ix_backtest_market_cache_account_kind"
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            sqlx::query(statement).execute(&self.pool).await?;
+            sqlx::query(AssertSqlSafe(statement))
+                .execute(&self.pool)
+                .await?;
         }
         Ok(())
     }

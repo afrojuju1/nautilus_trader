@@ -51,11 +51,22 @@ Margin account features (borrow, repay, isolated margin management) are not impl
 The Python adapter will not add margin support. Full margin trading support is planned for v2.
 :::
 
+:::info
+Each Binance client instance handles one product type. The Rust configs use a
+singular `product_type` field, and the live factories create one data or
+execution client from one config. To run Spot and Futures in the same node,
+configure separate clients with distinct IDs such as `BINANCE_SPOT` and
+`BINANCE_FUTURES`, then pass the matching `client_id` when a strategy subscribes
+or submits orders. The Python adapter uses different config field names, but
+`examples/live/binance/binance_spot_and_futures_market_maker.py` shows the same
+multi-client ID routing pattern.
+:::
+
 ## Data types
 
 The integration includes several custom data types:
 
-- `BinanceTicker`: 24-hour ticker data including price and statistical information.
+- `BinanceFuturesTicker`: Futures 24-hour ticker data including price and statistics.
 - `BinanceBar`: Bar data with additional volume metrics for historical and real-time use.
 - `BinanceFuturesMarkPriceUpdate`: Mark price updates for Binance Futures.
 - `BinanceFuturesLiquidation`: Futures liquidation events from the `forceOrder` stream.
@@ -120,7 +131,8 @@ Only *limit* order types support `post_only`.
 | Feature            | Spot | Margin | USDT Futures | Coin Futures | Notes                                        |
 |--------------------|------|--------|--------------|--------------|----------------------------------------------|
 | Order Modification | ✓    | -      | ✓            | ✓            | Price and quantity for `LIMIT` orders only.  |
-| Bracket/OCO Orders | -    | -      | -            | -            | *Planned*. Currently denied at submission.   |
+| OCO Orders         | ✓    | -      | -            | -            | Spot OCO submitted via `orderList/oco`.      |
+| Bracket Orders     | -    | -      | -            | -            | *Planned*. Currently denied at submission.   |
 | Iceberg Orders     | ✓    | -      | ✓            | ✓            | Large orders split into visible portions.    |
 
 ### Batch operations
@@ -237,8 +249,8 @@ the bundled fills is closed with an inferred fill from the status report's
 
 | Feature             | Spot | Margin | USDT Futures | Coin Futures | Notes                                        |
 |---------------------|------|--------|--------------|--------------|----------------------------------------------|
-| Order lists         | -    | -      | -            | -            | *Not supported*.                             |
-| OCO orders          | -    | -      | -            | -            | *Planned*. Currently denied at submission.   |
+| Order lists         | ✓    | -      | ✓            | ✓            | Spot OCO lists; Futures independent batches. |
+| OCO orders          | ✓    | -      | -            | -            | Spot only, via `orderList/oco`.              |
 | Bracket orders      | -    | -      | -            | -            | *Planned*. Currently denied at submission.   |
 | Conditional orders  | ✓    | ✓      | ✓            | ✓            | Stop and market‑if‑touched orders.           |
 
@@ -325,21 +337,14 @@ auto-cancels the order when the position is closed by other means.
 Pass `close_position` via the `params` dictionary on `StopMarket` or `MarketIfTouched` orders.
 Cannot be combined with `reduce_only`.
 
-<Tabs items={['Python', 'Rust']}>
-<Tab value="Python">
-
-```python
-strategy.submit_order(order, params={"close_position": True})
-```
-
-</Tab>
-<Tab value="Rust">
-```rust
+```rust tab="Rust"
 let params = Params::from([("close_position", true.into())]);
 let cmd = SubmitOrder::new(order).with_params(params);
 ```
-</Tab>
-</Tabs>
+
+```python tab="Python"
+strategy.submit_order(order, params={"close_position": True})
+```
 
 :::info
 Nautilus omits `quantity` and `reduceOnly` from the API request when `close_position` is set.
@@ -427,7 +432,8 @@ Order books can be maintained at full or partial depths. WebSocket stream
 update rates differ between Spot and Futures, with Nautilus using the highest
 available rate:
 
-- **Spot**: 100ms
+- **Spot SBE diff depth**: 25ms
+- **Spot JSON diff depth**: 100ms
 - **Futures**: 0ms (unthrottled)
 
 Only one order book per instrument per trader instance is supported. When
@@ -449,6 +455,12 @@ The sequence of events is as follows:
 - Deltas will stop buffering.
 - Remaining deltas are sent to the `DataEngine`.
 
+:::note
+This snapshot-and-buffer sequence applies to Futures and Spot `BookDeltas`
+subscriptions without an explicit depth. Spot partial-depth subscriptions deliver
+self-contained top-N snapshots. See [Spot market data mode](#spot-market-data-mode).
+:::
+
 ## Binance data differences
 
 The `ts_event` field on `QuoteTick` differs between Spot and Futures. Spot
@@ -464,6 +476,34 @@ Bars, mark prices, index prices, and funding rates can be subscribed to in the
 normal way via the Rust adapter. The custom data subscriptions below are for
 the Python adapter.
 :::
+
+Binance USD-M mark-price payloads may include an `ap` moving-average field. The Rust
+adapter parses this raw venue field but does not emit it as domain data or
+Binance custom data; Nautilus mark-price subscriptions emit mark, index, and
+funding-rate updates from the same stream.
+
+### `BinanceFuturesTicker`
+
+Subscribe to 24-hour ticker statistics for a specific Futures instrument:
+
+```python
+from nautilus_trader.core import nautilus_pyo3 as pyo3
+
+client_id = pyo3.ClientId.from_str("BINANCE")
+
+self.subscribe_data(
+    data_type=pyo3.DataType(
+        "BinanceFuturesTicker",
+        {"instrument_id": "BTCUSDT-PERP.BINANCE"},
+    ),
+    client_id=client_id,
+)
+```
+
+The adapter subscribes to the instrument `@ticker` stream and emits
+`BinanceFuturesTicker` custom data with `metadata={"instrument_id": "<instrument_id>"}`.
+Ticker custom data requires `instrument_id`; all-market ticker subscriptions are not
+supported.
 
 ### `BinanceFuturesMarkPriceUpdate`
 
@@ -540,13 +580,21 @@ time alongside mark and index prices. All three subscriptions
 (`subscribe_mark_prices`, `subscribe_index_prices`, `subscribe_funding_rates`)
 share a single `@markPrice@1s` stream with ref-counted subscription management.
 
+Historical funding rates are available through `request_funding_rates`, which
+queries the
+[Get Funding Rate History](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Get-Funding-Rate-History)
+REST endpoint (`GET /fapi/v1/fundingRate` for USD-M, `GET /dapi/v1/fundingRate`
+for COIN-M). Each history row maps to a `FundingRateUpdate` with `ts_event` set
+to the funding time. The `next_funding_ns` field is `None` for historical rows
+because the endpoint does not provide it.
+
 The Python adapter exposes funding rate data through
 `BinanceFuturesMarkPriceUpdate` custom data subscriptions (see
 [Binance specific data](#binance-specific-data) below).
 
 The `interval` field on `FundingRateUpdate` is `None` for Binance because the
-Mark Price Stream does not include a funding interval field. Binance exposes
-`fundingIntervalHours` through the
+Mark Price Stream and the funding rate history endpoint do not include a
+funding interval field. Binance exposes `fundingIntervalHours` through the
 [Get Funding Rate Info](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Get-Funding-Rate-Info)
 REST endpoint, but the adapter does not consume it.
 
@@ -710,37 +758,41 @@ definitive list of Rust config options.
 | `environment`                      | `None`    | Binance environment: `LIVE`, `TESTNET`, or `DEMO`. Defaults to `LIVE` when `None`. |
 | `update_instruments_interval_mins` | `60`      | Interval (minutes) between instrument catalogue refreshes. |
 | `use_agg_trade_ticks`              | `False`   | When `True`, subscribe to aggregated trade ticks instead of raw trades. Futures WebSocket subscriptions always use `@aggTrade` regardless of this flag. |
+| `spot_market_data_mode`            | `Sbe`     | *Rust only.* Spot market data transport (`Sbe` or `Json`). See [Spot market data mode](#spot-market-data-mode). |
 | `instrument_status_poll_secs`      | `3600`    | *Rust only.* Interval (seconds) between exchange info polls to detect instrument status changes. Set to `0` to disable. |
+| `transport_backend`                | `Sockudo` | *Rust only.* WebSocket transport backend. |
 
 ### Execution client configuration options
 
-| Option                               | Default   | Description |
-|--------------------------------------|-----------|-------------|
-| `venue`                              | `BINANCE` | Venue identifier used when registering the client. |
-| `api_key`                            | `None`    | Binance API key; loaded from environment variables when omitted. |
-| `api_secret`                         | `None`    | Binance API secret; loaded from environment variables when omitted. |
-| `key_type`                           | `HMAC`    | **Deprecated**: key type is now auto‑detected from the API secret format. Only needed to force `RSA` (data clients only, RSA is not supported for execution). |
-| `account_type`                       | `SPOT`    | Account type for order placement (spot, margin, USDT futures, coin futures). |
-| `base_url_http`                      | `None`    | Override for the HTTP REST base URL. |
-| `base_url_ws`                        | `None`    | Override for the WebSocket API base URL. |
-| `base_url_ws_stream`                 | `None`    | Override for the WebSocket stream URL (futures user data event delivery). |
-| `proxy_url`                          | `None`    | Optional proxy URL for HTTP and WebSocket transports. |
-| `us`                                 | `False`   | Route requests to Binance US endpoints when `True`. |
-| `environment`                        | `None`    | Binance environment: `LIVE`, `TESTNET`, or `DEMO`. Defaults to `LIVE` when `None`. |
-| `use_gtd`                            | `True`    | When `False`, remaps GTD orders to GTC for local expiry management. |
-| `use_reduce_only`                    | `True`    | When `True`, passes through `reduce_only` instructions to Binance. |
-| `use_position_ids`                   | `True`    | Enable Binance hedging position IDs; set `False` for virtual hedging. |
-| `use_trade_lite`                     | `False`   | Use TRADE_LITE execution events that include derived fees. |
-| `treat_expired_as_canceled`          | `False`   | Treat `EXPIRED` execution types as `CANCELED` when `True`. |
-| `recv_window_ms`                     | `5,000`   | Receive window (milliseconds) for signed REST requests. |
-| `max_retries`                        | `None`    | Maximum retry attempts for order submission/cancel/modify calls. |
-| `retry_delay_initial_ms`             | `None`    | Initial delay (milliseconds) between retry attempts. |
-| `retry_delay_max_ms`                 | `None`    | Maximum delay (milliseconds) between retry attempts. |
-| `futures_leverages`                  | `None`    | Mapping of `BinanceSymbol` to initial leverage for futures accounts. |
-| `futures_margin_types`               | `None`    | Mapping of `BinanceSymbol` to futures margin type (isolated/cross). |
-| `use_ws_trading`                         | `True`  | Use the WebSocket trading API for order operations (Spot and USD-M Futures). When `False`, HTTP is used. |
-| `default_taker_fee`                      | `0.0004` | Default taker fee rate for commission estimation on exchange‑generated fills (liquidation, ADL, settlement). |
-| `log_rejected_due_post_only_as_warning` | `True` | Log post‑only rejections as warnings when `True`; otherwise as errors. |
+| Option                                  | Default   | Description |
+|-----------------------------------------|-----------|-------------|
+| `venue`                                 | `BINANCE` | Venue identifier used when registering the client. |
+| `api_key`                               | `None`    | Binance API key; loaded from environment variables when omitted. |
+| `api_secret`                            | `None`    | Binance API secret; loaded from environment variables when omitted. |
+| `key_type`                              | `HMAC`    | **Deprecated**: key type is now auto‑detected from the API secret format. Only needed to force `RSA` (data clients only, RSA is not supported for execution). |
+| `account_type`                          | `SPOT`    | Account type for order placement (spot, margin, USDT futures, coin futures). |
+| `base_url_http`                         | `None`    | Override for the HTTP REST base URL. |
+| `base_url_ws`                           | `None`    | Override for the WebSocket API base URL. |
+| `base_url_ws_stream`                    | `None`    | Override for the WebSocket stream URL (futures user data event delivery). |
+| `proxy_url`                             | `None`    | Optional proxy URL for HTTP and WebSocket transports. |
+| `us`                                    | `False`   | Route requests to Binance US endpoints when `True`. |
+| `environment`                           | `None`    | Binance environment: `LIVE`, `TESTNET`, or `DEMO`. Defaults to `LIVE` when `None`. |
+| `use_gtd`                               | `True`    | When `False`, remaps GTD orders to GTC for local expiry management. |
+| `use_reduce_only`                       | `True`    | When `True`, passes through `reduce_only` instructions to Binance. |
+| `use_position_ids`                      | `True`    | Enable Binance hedging position IDs; set `False` for virtual hedging. |
+| `use_trade_lite`                        | `False`   | Use TRADE_LITE execution events that include derived fees. |
+| `treat_expired_as_canceled`             | `False`   | Treat `EXPIRED` execution types as `CANCELED` when `True`. |
+| `recv_window_ms`                        | `5,000`   | Receive window (milliseconds) for signed REST requests. |
+| `max_retries`                           | `None`    | Maximum retry attempts for order submission/cancel/modify calls. |
+| `retry_delay_initial_ms`                | `None`    | Initial delay (milliseconds) between retry attempts. |
+| `retry_delay_max_ms`                    | `None`    | Maximum delay (milliseconds) between retry attempts. |
+| `futures_leverages`                     | `None`    | Mapping of `BinanceSymbol` to initial leverage for futures accounts. |
+| `futures_margin_types`                  | `None`    | Mapping of `BinanceSymbol` to futures margin type (isolated/cross). |
+| `use_ws_trading`                        | `True`    | Use the WebSocket trading API for order operations (Spot and USD-M Futures). When `False`, HTTP is used. |
+| `default_taker_fee`                     | `0.0004`  | Default taker fee rate for commission estimation on exchange‑generated fills (liquidation, ADL, settlement). |
+| `bnfcr_currency`                        | `USDT`    | USD-M Futures Credits Trading Mode: currency that `BNFCR` balances and fees resolve to. See [Futures Credits Trading Mode (BNFCR)](#futures-credits-trading-mode-bnfcr). |
+| `log_rejected_due_post_only_as_warning` | `True`    | Log post‑only rejections as warnings when `True`; otherwise as errors. |
+| `transport_backend`                     | `Sockudo` | *Rust only.* WebSocket transport backend. |
 
 The most common use case is to configure a live `TradingNode` with Binance
 data and execution clients. Add a `BINANCE` section to your client
@@ -793,6 +845,39 @@ node.add_exec_client_factory(BINANCE, BinanceLiveExecClientFactory)
 # Finally build the node
 node.build()
 ```
+
+### Futures Credits Trading Mode (BNFCR)
+
+Binance Futures Credits Trading Mode is an EU regulatory mode in which the USD-M
+futures wallet, margin, PnL, and fees are denominated in `BNFCR`: an internal credit
+unit pegged 1:1 to USD that replaces stablecoin balances. Because `BNFCR` is not a
+tradable asset, the adapter maps it to the `bnfcr_currency` execution config option
+(default `USDT`) so account balances and commissions reconcile against the stablecoin
+the traded contracts settle in. Set `bnfcr_currency` to `USDC` when trading
+USDC-margined perpetuals. Any other unrecognized futures asset is registered as a
+generic crypto currency rather than failing.
+
+### Spot market data mode
+
+`spot_market_data_mode` (Rust `BinanceDataClientConfig`) selects the Spot data
+transport. It affects Spot only; Futures is unchanged.
+
+| Mode   | Credentials        | Quotes       |
+|--------|--------------------|--------------|
+| `Sbe`  | Ed25519 (required) | `bestBidAsk` |
+| `Json` | None (public)      | `bookTicker` |
+
+`Sbe` (default) uses Binance Simple Binary Encoding streams and requires Ed25519
+keys (see [Key types](#key-types)); the client refuses to connect without them.
+`Json` uses public streams with no credentials. Full Spot `BookDeltas`
+subscriptions use SBE diff-depth streams at 25ms in `Sbe` mode, or public JSON
+diff-depth streams at 100ms in `Json` mode, with REST snapshot synchronization.
+Explicit depth subscriptions use partial-book snapshots (see [Order books](#order-books)).
+
+:::note
+Exposed to Python as `BinanceSpotMarketDataMode` on
+`nautilus_trader.core.nautilus_pyo3.binance`; not on the legacy Python adapter config.
+:::
 
 ### Key types
 

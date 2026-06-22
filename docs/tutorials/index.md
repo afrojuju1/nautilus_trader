@@ -3,9 +3,10 @@
 Step-by-step walkthroughs demonstrating specific features and workflows.
 
 :::info
-Each tutorial is a Jupytext percent-format Python file in the docs
+Most Python tutorials are Jupytext percent-format files in the docs
 [tutorials directory](https://github.com/nautechsystems/nautilus_trader/tree/develop/docs/tutorials).
-You can run them directly as scripts or open them as notebooks with Jupytext.
+You can run those directly as scripts or open them as notebooks with Jupytext.
+Rust tutorials use the commands shown on their pages.
 :::
 
 :::tip
@@ -65,13 +66,15 @@ For task-oriented data recipes, see the [how-to guides](../how_to/):
 |:------------------------------------------------------------------------------------|:--------------------------------------------------|:------------------|
 | [Options Data and Greeks (Bybit)](options_data_bybit)                               | Stream Greeks and option chain snapshots.         | Live API          |
 | [Delta‑Neutral Options Strategy (Bybit)](delta_neutral_options_bybit)               | Short strangle with perpetual delta hedging.      | Live API          |
+| [Delta‑Neutral Options Strategy (Derive)](delta_neutral_options_derive)             | Derive ETH strangle hedger with premium entry.    | Live API          |
 
 ## Rust
 
-| Tutorial                                                                            | Description                                          | Data           |
-|:------------------------------------------------------------------------------------|:-----------------------------------------------------|:---------------|
-| [Book Imbalance Backtest (Betfair)](backtest_book_imbalance_betfair)                | Book imbalance actor on Betfair L2 data.             | User‑provided  |
-| [Hurst/VPIN Directional Strategy (Kraken Futures)](hurst_vpin_kraken)               | Regime‑filtered informed‑flow strategy on PF_XBTUSD. | Tardis.dev     |
+| Tutorial                                                                                    | Description                                          | Data                |
+|:--------------------------------------------------------------------------------------------|:-----------------------------------------------------|:--------------------|
+| [Book Imbalance Backtest (Betfair)](backtest_book_imbalance_betfair)                        | Book imbalance actor on Betfair L2 data.             | User‑provided       |
+| [Composite Market Making on Lighter RWA with Databento DBEQ NVDA](lighter_rwa_composite_mm) | Signal‑skewed MM on NVDA‑PERP.                       | Databento + Lighter |
+| [Hurst/VPIN Directional Strategy (Kraken Futures)](hurst_vpin_kraken)                       | Regime‑filtered informed‑flow strategy on PF_XBTUSD. | Tardis.dev          |
 
 [backtest_fx_bars]: https://github.com/nautechsystems/nautilus_trader/blob/develop/docs/tutorials/backtest_fx_bars.py
 [backtest_orderbook_binance]: https://github.com/nautechsystems/nautilus_trader/blob/develop/docs/tutorials/backtest_orderbook_binance.py

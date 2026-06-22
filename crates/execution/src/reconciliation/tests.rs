@@ -19,8 +19,18 @@
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSideSpecified, TimeInForce},
-    events::{OrderAccepted, OrderEventAny, OrderFilled, OrderSubmitted},
-    identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, TradeId, VenueOrderId},
+    events::{
+        OrderAccepted, OrderEventAny, OrderFilled, OrderPendingCancel, OrderPendingUpdate,
+        OrderSubmitted,
+        order::spec::{
+            OrderAcceptedSpec, OrderFilledSpec, OrderPendingCancelSpec, OrderPendingUpdateSpec,
+            OrderSubmittedSpec, OrderUpdatedSpec,
+        },
+    },
+    identifiers::{
+        AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId, TraderId,
+        VenueOrderId,
+    },
     instruments::{
         Instrument, InstrumentAny,
         stubs::{audusd_sim, crypto_perpetual_ethusdt},
@@ -46,6 +56,150 @@ fn instrument() -> InstrumentAny {
 
 fn create_test_venue_order_id(value: &str) -> VenueOrderId {
     VenueOrderId::new(value)
+}
+
+fn build_order_submitted(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    account_id: AccountId,
+    event_id: UUID4,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> OrderSubmitted {
+    OrderSubmittedSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .account_id(account_id)
+        .event_id(event_id)
+        .ts_event(ts_event)
+        .ts_init(ts_init)
+        .build()
+}
+
+fn build_order_accepted(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    account_id: AccountId,
+    event_id: UUID4,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+    reconciliation: bool,
+) -> OrderAccepted {
+    OrderAcceptedSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .venue_order_id(venue_order_id)
+        .account_id(account_id)
+        .event_id(event_id)
+        .ts_event(ts_event)
+        .ts_init(ts_init)
+        .reconciliation(reconciliation)
+        .build()
+}
+
+fn build_order_pending_cancel(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    account_id: AccountId,
+    event_id: UUID4,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+    reconciliation: bool,
+    venue_order_id: Option<VenueOrderId>,
+) -> OrderPendingCancel {
+    OrderPendingCancelSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .account_id(account_id)
+        .event_id(event_id)
+        .ts_event(ts_event)
+        .ts_init(ts_init)
+        .reconciliation(reconciliation)
+        .maybe_venue_order_id(venue_order_id)
+        .build()
+}
+
+fn build_order_pending_update(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    account_id: AccountId,
+    event_id: UUID4,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+    reconciliation: bool,
+    venue_order_id: Option<VenueOrderId>,
+) -> OrderPendingUpdate {
+    OrderPendingUpdateSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .account_id(account_id)
+        .event_id(event_id)
+        .ts_event(ts_event)
+        .ts_init(ts_init)
+        .reconciliation(reconciliation)
+        .maybe_venue_order_id(venue_order_id)
+        .build()
+}
+
+fn build_order_filled(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    account_id: AccountId,
+    trade_id: TradeId,
+    order_side: OrderSide,
+    order_type: OrderType,
+    last_qty: Quantity,
+    last_px: Price,
+    currency: Currency,
+    liquidity_side: LiquiditySide,
+    event_id: UUID4,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+    reconciliation: bool,
+    position_id: Option<PositionId>,
+    commission: Option<Money>,
+) -> OrderFilled {
+    OrderFilledSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .venue_order_id(venue_order_id)
+        .account_id(account_id)
+        .trade_id(trade_id)
+        .order_side(order_side)
+        .order_type(order_type)
+        .last_qty(last_qty)
+        .last_px(last_px)
+        .currency(currency)
+        .liquidity_side(liquidity_side)
+        .event_id(event_id)
+        .ts_event(ts_event)
+        .ts_init(ts_init)
+        .reconciliation(reconciliation)
+        .maybe_position_id(position_id)
+        .maybe_commission(commission)
+        .build()
 }
 
 fn submit_accept(order: &mut OrderAny, account_id: AccountId, venue_order_id: VenueOrderId) {
@@ -75,6 +229,55 @@ fn apply_fill(
         None,
     );
     order.apply(fill).unwrap();
+}
+
+// Builds an accepted order whose cache has been promoted from old_venue_order_id
+// to new_venue_order_id through a confirmed cancel-replace modify, so its
+// venue_order_ids history holds both legs and the current leg is the new one.
+fn build_order_promoted_to_new_leg(
+    instrument: &InstrumentAny,
+    client_order_id: ClientOrderId,
+    old_venue_order_id: VenueOrderId,
+    new_venue_order_id: VenueOrderId,
+    account_id: AccountId,
+) -> OrderAny {
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, old_venue_order_id);
+
+    let pending_update = build_order_pending_update(
+        order.trader_id(),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        account_id,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        false,
+        Some(old_venue_order_id),
+    );
+    order
+        .apply(OrderEventAny::PendingUpdate(pending_update))
+        .unwrap();
+
+    let updated = OrderUpdatedSpec::builder()
+        .trader_id(order.trader_id())
+        .strategy_id(order.strategy_id())
+        .instrument_id(order.instrument_id())
+        .client_order_id(order.client_order_id())
+        .quantity(Quantity::from(100))
+        .maybe_venue_order_id(Some(new_venue_order_id))
+        .maybe_account_id(Some(account_id))
+        .build();
+    order.apply(OrderEventAny::Updated(updated)).unwrap();
+
+    order
 }
 
 #[rstest]
@@ -1162,6 +1365,39 @@ fn test_external_order_status_event_generation(
 }
 
 #[rstest]
+fn test_external_order_rejected_due_post_only() {
+    let instrument = crypto_perpetual_ethusdt();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.0"))
+        .price(Price::from("100.00"))
+        .build();
+    let mut report = make_test_report(
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Rejected,
+        "0",
+        false,
+    );
+    report.cancel_reason = Some("post would execute".to_string());
+
+    let events = generate_external_order_status_events(
+        &order,
+        &report,
+        &AccountId::from("TEST-001"),
+        &InstrumentAny::CryptoPerpetual(instrument),
+        UnixNanos::from(2_000_000),
+    );
+
+    assert_eq!(events.len(), 1);
+    match events.last().unwrap() {
+        OrderEventAny::Rejected(rejected) => assert!(rejected.due_post_only),
+        other => panic!("Expected Rejected event, was {other:?}"),
+    }
+}
+
+#[rstest]
 #[case::market(OrderType::Market, false, LiquiditySide::Taker)]
 #[case::stop_market(OrderType::StopMarket, false, LiquiditySide::Taker)]
 #[case::trailing_stop_market(OrderType::TrailingStopMarket, false, LiquiditySide::Taker)]
@@ -1340,7 +1576,7 @@ fn test_reconcile_fill_report_duplicate_detected(instrument: InstrumentAny) {
     let trade_id = TradeId::from("T-001");
 
     // Submit the order first
-    let submitted = OrderSubmitted::new(
+    let submitted = build_order_submitted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -1353,7 +1589,7 @@ fn test_reconcile_fill_report_duplicate_detected(instrument: InstrumentAny) {
     order.apply(OrderEventAny::Submitted(submitted)).unwrap();
 
     // Accept the order
-    let accepted = OrderAccepted::new(
+    let accepted = build_order_accepted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -1368,7 +1604,7 @@ fn test_reconcile_fill_report_duplicate_detected(instrument: InstrumentAny) {
     order.apply(OrderEventAny::Accepted(accepted)).unwrap();
 
     // Now apply a fill to the order
-    let filled_event = OrderFilled::new(
+    let filled_event = build_order_filled(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -1781,7 +2017,7 @@ fn test_should_reconciliation_update(
             .build(),
     };
 
-    let submitted = OrderSubmitted::new(
+    let submitted = build_order_submitted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -1793,7 +2029,7 @@ fn test_should_reconciliation_update(
     );
     order.apply(OrderEventAny::Submitted(submitted)).unwrap();
 
-    let accepted = OrderAccepted::new(
+    let accepted = build_order_accepted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -1835,7 +2071,7 @@ fn test_reconcile_order_report_already_in_sync(instrument: InstrumentAny) {
         .price(Price::from("1.00000"))
         .build();
 
-    let submitted = OrderSubmitted::new(
+    let submitted = build_order_submitted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -1847,7 +2083,7 @@ fn test_reconcile_order_report_already_in_sync(instrument: InstrumentAny) {
     );
     order.apply(OrderEventAny::Submitted(submitted)).unwrap();
 
-    let accepted = OrderAccepted::new(
+    let accepted = build_order_accepted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -1889,7 +2125,7 @@ fn test_reconcile_order_report_generates_canceled(instrument: InstrumentAny) {
         .price(Price::from("1.00000"))
         .build();
 
-    let submitted = OrderSubmitted::new(
+    let submitted = build_order_submitted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -1901,7 +2137,7 @@ fn test_reconcile_order_report_generates_canceled(instrument: InstrumentAny) {
     );
     order.apply(OrderEventAny::Submitted(submitted)).unwrap();
 
-    let accepted = OrderAccepted::new(
+    let accepted = build_order_accepted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -1931,6 +2167,182 @@ fn test_reconcile_order_report_generates_canceled(instrument: InstrumentAny) {
 }
 
 #[rstest]
+#[case(OrderStatus::PendingUpdate)]
+#[case(OrderStatus::PendingCancel)]
+fn test_reconcile_canceled_forwarded_while_mid_command(
+    instrument: InstrumentAny,
+    #[case] pending_status: OrderStatus,
+) {
+    // A Canceled for the order's current venue_order_id is authoritative and applies even
+    // while locally PendingUpdate/PendingCancel. The cancel-half of a cancel-replace is
+    // caught by venue_order_id provenance, not by deferring on local pending state.
+    let client_order_id = ClientOrderId::from("O-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+    let account_id = AccountId::from("SIM-001");
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+
+    match pending_status {
+        OrderStatus::PendingUpdate => {
+            let pending_update = build_order_pending_update(
+                order.trader_id(),
+                order.strategy_id(),
+                order.instrument_id(),
+                order.client_order_id(),
+                account_id,
+                UUID4::new(),
+                UnixNanos::default(),
+                UnixNanos::default(),
+                false,
+                Some(venue_order_id),
+            );
+            order
+                .apply(OrderEventAny::PendingUpdate(pending_update))
+                .unwrap();
+        }
+        OrderStatus::PendingCancel => {
+            let pending_cancel = build_order_pending_cancel(
+                order.trader_id(),
+                order.strategy_id(),
+                order.instrument_id(),
+                order.client_order_id(),
+                account_id,
+                UUID4::new(),
+                UnixNanos::default(),
+                UnixNanos::default(),
+                false,
+                Some(venue_order_id),
+            );
+            order
+                .apply(OrderEventAny::PendingCancel(pending_cancel))
+                .unwrap();
+        }
+        other => panic!("unexpected pending status {other:?}"),
+    }
+    assert_eq!(order.status(), pending_status);
+
+    let report = create_test_order_status_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Canceled,
+        Quantity::from(100),
+        Quantity::from(0),
+    );
+
+    let result = reconcile_order_report(&order, &report, Some(&instrument), UnixNanos::default());
+    assert!(matches!(result, Some(OrderEventAny::Canceled(_))));
+}
+
+#[rstest]
+fn test_reconcile_canceled_suppressed_for_previously_promoted_venue_order_id(
+    instrument: InstrumentAny,
+) {
+    // Cancel-replace modify promoted the cache from V-001 to V-002. A late
+    // Canceled report on the old V-001 leg must be suppressed, since the
+    // successor V-002 is still live.
+    let client_order_id = ClientOrderId::from("O-001");
+    let old_venue_order_id = VenueOrderId::from("V-001");
+    let new_venue_order_id = VenueOrderId::from("V-002");
+    let account_id = AccountId::from("SIM-001");
+
+    let order = build_order_promoted_to_new_leg(
+        &instrument,
+        client_order_id,
+        old_venue_order_id,
+        new_venue_order_id,
+        account_id,
+    );
+    assert_eq!(order.venue_order_id(), Some(new_venue_order_id));
+    assert_eq!(order.status(), OrderStatus::Accepted);
+
+    let report = create_test_order_status_report(
+        client_order_id,
+        old_venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Canceled,
+        Quantity::from(100),
+        Quantity::from(0),
+    );
+
+    let result = reconcile_order_report(&order, &report, Some(&instrument), UnixNanos::default());
+    assert!(result.is_none());
+}
+
+#[rstest]
+fn test_reconcile_canceled_forwarded_for_current_venue_order_id(instrument: InstrumentAny) {
+    // After the same V-001 -> V-002 promotion, a genuine cancel of the live
+    // successor (V-002, the current cached leg) must still be forwarded.
+    let client_order_id = ClientOrderId::from("O-001");
+    let old_venue_order_id = VenueOrderId::from("V-001");
+    let new_venue_order_id = VenueOrderId::from("V-002");
+    let account_id = AccountId::from("SIM-001");
+
+    let order = build_order_promoted_to_new_leg(
+        &instrument,
+        client_order_id,
+        old_venue_order_id,
+        new_venue_order_id,
+        account_id,
+    );
+
+    let report = create_test_order_status_report(
+        client_order_id,
+        new_venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Canceled,
+        Quantity::from(100),
+        Quantity::from(0),
+    );
+
+    let result = reconcile_order_report(&order, &report, Some(&instrument), UnixNanos::default());
+    assert!(matches!(result, Some(OrderEventAny::Canceled(_))));
+}
+
+#[rstest]
+fn test_reconcile_canceled_forwarded_for_untracked_venue_order_id(instrument: InstrumentAny) {
+    // A Canceled report on a venue_order_id the order never tracked is a real
+    // external cancel, not a stale cancel-replace leg, so it is forwarded. This
+    // pins the history check that keeps the suppression from over-firing.
+    let client_order_id = ClientOrderId::from("O-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+    let untracked_venue_order_id = VenueOrderId::from("V-999");
+    let account_id = AccountId::from("SIM-001");
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+
+    let report = create_test_order_status_report(
+        client_order_id,
+        untracked_venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Canceled,
+        Quantity::from(100),
+        Quantity::from(0),
+    );
+
+    let result = reconcile_order_report(&order, &report, Some(&instrument), UnixNanos::default());
+    assert!(matches!(result, Some(OrderEventAny::Canceled(_))));
+}
+
+#[rstest]
 fn test_generate_reconciliation_order_events_accepts_before_cancel(instrument: InstrumentAny) {
     let client_order_id = ClientOrderId::from("O-001");
     let venue_order_id = VenueOrderId::from("V-001");
@@ -1943,7 +2355,7 @@ fn test_generate_reconciliation_order_events_accepts_before_cancel(instrument: I
         .price(Price::from("1.00000"))
         .build();
 
-    let submitted = OrderSubmitted::new(
+    let submitted = build_order_submitted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -1990,7 +2402,7 @@ fn test_generate_reconciliation_order_events_accepts_before_fill(instrument: Ins
         .price(Price::from("1.00000"))
         .build();
 
-    let submitted = OrderSubmitted::new(
+    let submitted = build_order_submitted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -2040,7 +2452,7 @@ fn test_generate_reconciliation_order_events_does_not_accept_before_reject(
         .price(Price::from("1.00000"))
         .build();
 
-    let submitted = OrderSubmitted::new(
+    let submitted = build_order_submitted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -2087,7 +2499,7 @@ fn test_reconcile_order_report_generates_expired(instrument: InstrumentAny) {
         .price(Price::from("1.00000"))
         .build();
 
-    let submitted = OrderSubmitted::new(
+    let submitted = build_order_submitted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -2099,7 +2511,7 @@ fn test_reconcile_order_report_generates_expired(instrument: InstrumentAny) {
     );
     order.apply(OrderEventAny::Submitted(submitted)).unwrap();
 
-    let accepted = OrderAccepted::new(
+    let accepted = build_order_accepted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -2141,7 +2553,7 @@ fn test_reconcile_order_report_generates_rejected(instrument: InstrumentAny) {
         .price(Price::from("1.00000"))
         .build();
 
-    let submitted = OrderSubmitted::new(
+    let submitted = build_order_submitted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -2187,7 +2599,7 @@ fn test_reconcile_order_report_generates_updated(instrument: InstrumentAny) {
         .price(Price::from("1.00000"))
         .build();
 
-    let submitted = OrderSubmitted::new(
+    let submitted = build_order_submitted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -2199,7 +2611,7 @@ fn test_reconcile_order_report_generates_updated(instrument: InstrumentAny) {
     );
     order.apply(OrderEventAny::Submitted(submitted)).unwrap();
 
-    let accepted = OrderAccepted::new(
+    let accepted = build_order_accepted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -2243,7 +2655,7 @@ fn test_reconcile_order_report_generates_fill_for_qty_mismatch(instrument: Instr
         .price(Price::from("1.00000"))
         .build();
 
-    let submitted = OrderSubmitted::new(
+    let submitted = build_order_submitted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -2255,7 +2667,7 @@ fn test_reconcile_order_report_generates_fill_for_qty_mismatch(instrument: Instr
     );
     order.apply(OrderEventAny::Submitted(submitted)).unwrap();
 
-    let accepted = OrderAccepted::new(
+    let accepted = build_order_accepted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -2299,7 +2711,7 @@ fn test_create_reconciliation_rejected_with_reason() {
         .price(Price::from("1.00000"))
         .build();
 
-    let submitted = OrderSubmitted::new(
+    let submitted = build_order_submitted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -2324,6 +2736,42 @@ fn test_create_reconciliation_rejected_with_reason() {
 }
 
 #[rstest]
+fn test_create_reconciliation_rejected_due_post_only() {
+    let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+    let client_order_id = ClientOrderId::from("O-001");
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+
+    let submitted = build_order_submitted(
+        order.trader_id(),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        AccountId::from("SIM-001"),
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    );
+    order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+
+    let result = create_reconciliation_rejected(&order, Some("post-only"), UnixNanos::from(1_000));
+    assert!(result.is_some());
+    if let OrderEventAny::Rejected(rejected) = result.unwrap() {
+        assert_eq!(rejected.reason.as_str(), "post-only");
+        assert!(rejected.reconciliation);
+        assert!(rejected.due_post_only);
+    } else {
+        panic!("Expected Rejected event");
+    }
+}
+
+#[rstest]
 fn test_create_reconciliation_rejected_without_reason() {
     let instrument = InstrumentAny::CurrencyPair(audusd_sim());
     let client_order_id = ClientOrderId::from("O-001");
@@ -2336,7 +2784,7 @@ fn test_create_reconciliation_rejected_without_reason() {
         .price(Price::from("1.00000"))
         .build();
 
-    let submitted = OrderSubmitted::new(
+    let submitted = build_order_submitted(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -2372,6 +2820,60 @@ fn test_create_reconciliation_rejected_no_account_id() {
         .build();
 
     let result = create_reconciliation_rejected(&order, Some("TEST"), UnixNanos::from(1_000));
+    assert!(result.is_none());
+}
+
+#[rstest]
+fn test_create_reconciliation_accepted_no_account_id() {
+    let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+    let client_order_id = ClientOrderId::from("O-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    let report = create_test_order_status_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Accepted,
+        Quantity::from(100),
+        Quantity::from(0),
+    );
+
+    let result = create_reconciliation_accepted(&order, &report, UnixNanos::from(1_000));
+
+    assert!(result.is_none());
+}
+
+#[rstest]
+fn test_reconcile_order_report_accepted_no_account_id_returns_none() {
+    let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+    let client_order_id = ClientOrderId::from("O-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    let report = create_test_order_status_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Accepted,
+        Quantity::from(100),
+        Quantity::from(0),
+    );
+
+    let result = reconcile_order_report(&order, &report, Some(&instrument), UnixNanos::from(1_000));
+
     assert!(result.is_none());
 }
 
@@ -4413,7 +4915,6 @@ fn test_continuous_reconciliation_skips_pre_emit_when_local_pending_cancel(
     // guard must skip the pre-emit rather than fail apply silently. The
     // inferred Filled still flows; qty drift persists as a documented
     // limitation until the pending cancel resolves.
-    use nautilus_model::events::OrderPendingCancel;
 
     let client_order_id = ClientOrderId::from("O-001");
     let venue_order_id = VenueOrderId::from("V-001");
@@ -4428,7 +4929,7 @@ fn test_continuous_reconciliation_skips_pre_emit_when_local_pending_cancel(
         .build();
     submit_accept(&mut order, account_id, venue_order_id);
 
-    let pending_cancel = OrderPendingCancel::new(
+    let pending_cancel = build_order_pending_cancel(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -4481,7 +4982,6 @@ fn test_continuous_reconciliation_skips_update_when_local_pending_update(
     // surfaces a confirmed status, reconciliation must not synthesize an
     // OrderUpdated; doing so resolves the local PendingUpdate back to the
     // previous status and mutates qty/price ahead of venue confirmation.
-    use nautilus_model::events::OrderPendingUpdate;
 
     let client_order_id = ClientOrderId::from("O-001");
     let venue_order_id = VenueOrderId::from("V-001");
@@ -4496,7 +4996,7 @@ fn test_continuous_reconciliation_skips_update_when_local_pending_update(
         .build();
     submit_accept(&mut order, account_id, venue_order_id);
 
-    let pending_update = OrderPendingUpdate::new(
+    let pending_update = build_order_pending_update(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),

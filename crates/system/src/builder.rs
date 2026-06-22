@@ -18,8 +18,9 @@ use std::{cell::RefCell, fmt::Debug, rc::Rc, time::Duration};
 use nautilus_common::{
     cache::{CacheConfig, database::CacheDatabaseAdapter},
     clock::Clock,
-    enums::Environment,
+    enums::{Environment, SerializationEncoding},
     logging::logger::LoggerConfig,
+    msgbus::MessageBusPublisher,
 };
 use nautilus_core::UUID4;
 use nautilus_data::engine::config::DataEngineConfig;
@@ -45,6 +46,7 @@ pub struct NautilusKernelBuilder {
     instance_id: Option<UUID4>,
     load_state: bool,
     save_state: bool,
+    shutdown_on_error: bool,
     logging: Option<LoggerConfig>,
     timeout_connection: Duration,
     timeout_reconciliation: Duration,
@@ -59,6 +61,7 @@ pub struct NautilusKernelBuilder {
     exec_engine: Option<ExecutionEngineConfig>,
     portfolio: Option<PortfolioConfig>,
     event_store_factory: Option<EventStoreFactory>,
+    msgbus_publisher: Option<Box<dyn MessageBusPublisher>>,
 }
 
 impl Debug for NautilusKernelBuilder {
@@ -70,6 +73,7 @@ impl Debug for NautilusKernelBuilder {
             .field("instance_id", &self.instance_id)
             .field("load_state", &self.load_state)
             .field("save_state", &self.save_state)
+            .field("shutdown_on_error", &self.shutdown_on_error)
             .field("logging", &self.logging)
             .field("timeout_connection", &self.timeout_connection)
             .field("timeout_reconciliation", &self.timeout_reconciliation)
@@ -84,6 +88,7 @@ impl Debug for NautilusKernelBuilder {
             .field("exec_engine", &self.exec_engine)
             .field("portfolio", &self.portfolio)
             .field("event_store_factory", &self.event_store_factory.is_some())
+            .field("msgbus_publisher", &self.msgbus_publisher.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -99,8 +104,9 @@ impl NautilusKernelBuilder {
             instance_id: None,
             load_state: true,
             save_state: true,
+            shutdown_on_error: false,
             logging: None,
-            timeout_connection: Duration::from_secs(60),
+            timeout_connection: Duration::from_mins(1),
             timeout_reconciliation: Duration::from_secs(30),
             timeout_portfolio: Duration::from_secs(10),
             timeout_disconnection: Duration::from_secs(10),
@@ -113,6 +119,7 @@ impl NautilusKernelBuilder {
             exec_engine: None,
             portfolio: None,
             event_store_factory: None,
+            msgbus_publisher: None,
         }
     }
 
@@ -134,6 +141,15 @@ impl NautilusKernelBuilder {
     #[must_use]
     pub const fn with_save_state(mut self, save_state: bool) -> Self {
         self.save_state = save_state;
+        self
+    }
+
+    /// Configure whether an error log shuts down the system.
+    ///
+    /// Filtered or bypassed error logs still request shutdown.
+    #[must_use]
+    pub const fn with_shutdown_on_error(mut self, shutdown_on_error: bool) -> Self {
+        self.shutdown_on_error = shutdown_on_error;
         self
     }
 
@@ -251,6 +267,13 @@ impl NautilusKernelBuilder {
         self
     }
 
+    /// Inject an external publisher for serialized message bus publications.
+    #[must_use]
+    pub fn with_msgbus_publisher(mut self, publisher: Box<dyn MessageBusPublisher>) -> Self {
+        self.msgbus_publisher = Some(publisher);
+        self
+    }
+
     /// Build the [`NautilusKernel`] with the configured settings.
     ///
     /// # Errors
@@ -262,6 +285,7 @@ impl NautilusKernelBuilder {
             trader_id: self.trader_id,
             load_state: self.load_state,
             save_state: self.save_state,
+            shutdown_on_error: self.shutdown_on_error,
             logging: self.logging.unwrap_or_default(),
             instance_id: self.instance_id,
             timeout_connection: self.timeout_connection,
@@ -279,12 +303,24 @@ impl NautilusKernelBuilder {
             streaming: None,
         };
 
-        NautilusKernel::new_with(
+        let kernel = NautilusKernel::new_with(
             self.name,
             config,
             self.cache_database,
             self.event_store_factory,
-        )
+        )?;
+
+        if let Some(publisher) = self.msgbus_publisher {
+            let encoding = kernel
+                .config
+                .msgbus()
+                .map_or(SerializationEncoding::Json, |config| config.encoding);
+            nautilus_common::msgbus::get_message_bus()
+                .borrow_mut()
+                .set_publisher(publisher, encoding);
+        }
+
+        Ok(kernel)
     }
 }
 
@@ -301,6 +337,8 @@ impl Default for NautilusKernelBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use ahash::AHashMap;
     use bytes::Bytes;
     use nautilus_common::{
@@ -328,7 +366,7 @@ mod tests {
         orderbook::OrderBook,
         orders::OrderAny,
         position::Position,
-        types::Currency,
+        types::{Currency, Money},
     };
     use rstest::*;
     use ustr::Ustr;
@@ -395,6 +433,34 @@ mod tests {
         let builder = NautilusKernelBuilder::default().with_cache_database(Box::new(NoopAdapter));
 
         assert!(builder.cache_database.is_some());
+    }
+
+    #[rstest]
+    fn test_builder_with_msgbus_publisher_forwards_published_quote() {
+        let (publisher, publications, closed) = CapturingPublisher::new();
+        let kernel = NautilusKernelBuilder::default()
+            .with_msgbus_publisher(Box::new(publisher))
+            .build()
+            .expect("kernel builds with msgbus publisher");
+        let quote = QuoteTick::default();
+
+        nautilus_common::msgbus::publish_quote("data.quotes.TEST".into(), &quote);
+
+        let publications = publications.borrow();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].topic, "data.quotes.TEST");
+        assert_eq!(
+            serde_json::from_slice::<QuoteTick>(&publications[0].payload)
+                .expect("JSON payload must decode as QuoteTick"),
+            quote
+        );
+        drop(publications);
+
+        nautilus_common::msgbus::get_message_bus()
+            .borrow_mut()
+            .dispose();
+        assert!(closed.get());
+        drop(kernel);
     }
 
     #[rstest]
@@ -479,19 +545,65 @@ mod tests {
         assert_eq!(builder.timeout_portfolio, Duration::from_secs(30));
         assert_eq!(builder.timeout_disconnection, Duration::from_secs(40));
         assert_eq!(builder.delay_post_stop, Duration::from_secs(50));
-        assert_eq!(builder.timeout_shutdown, Duration::from_secs(60));
+        assert_eq!(builder.timeout_shutdown, Duration::from_mins(1));
     }
 
     #[rstest]
     fn test_builder_default_timeouts() {
         let builder = NautilusKernelBuilder::default();
 
-        assert_eq!(builder.timeout_connection, Duration::from_secs(60));
+        assert_eq!(builder.timeout_connection, Duration::from_mins(1));
         assert_eq!(builder.timeout_reconciliation, Duration::from_secs(30));
         assert_eq!(builder.timeout_portfolio, Duration::from_secs(10));
         assert_eq!(builder.timeout_disconnection, Duration::from_secs(10));
         assert_eq!(builder.delay_post_stop, Duration::from_secs(10));
         assert_eq!(builder.timeout_shutdown, Duration::from_secs(5));
+    }
+
+    #[derive(Debug)]
+    struct CapturedPublication {
+        topic: String,
+        payload: Bytes,
+    }
+
+    type CapturedPublications = Rc<RefCell<Vec<CapturedPublication>>>;
+    type SharedClosed = Rc<Cell<bool>>;
+
+    struct CapturingPublisher {
+        publications: CapturedPublications,
+        closed: SharedClosed,
+    }
+
+    impl CapturingPublisher {
+        fn new() -> (Self, CapturedPublications, SharedClosed) {
+            let publications = Rc::new(RefCell::new(Vec::new()));
+            let closed = Rc::new(Cell::new(false));
+            (
+                Self {
+                    publications: publications.clone(),
+                    closed: closed.clone(),
+                },
+                publications,
+                closed,
+            )
+        }
+    }
+
+    impl MessageBusPublisher for CapturingPublisher {
+        fn is_closed(&self) -> bool {
+            self.closed.get()
+        }
+
+        fn publish(&self, topic: Ustr, payload: Bytes) {
+            self.publications.borrow_mut().push(CapturedPublication {
+                topic: topic.to_string(),
+                payload,
+            });
+        }
+
+        fn close(&mut self) {
+            self.closed.set(true);
+        }
     }
 
     struct NoopAdapter;
@@ -540,7 +652,7 @@ mod tests {
             Ok(AHashMap::new())
         }
 
-        fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, Position>> {
+        fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, PositionId>> {
             Ok(AHashMap::new())
         }
 
@@ -754,11 +866,19 @@ mod tests {
             Ok(())
         }
 
-        fn update_actor(&self) -> anyhow::Result<()> {
+        fn update_actor(
+            &self,
+            _component_id: &ComponentId,
+            _state: &AHashMap<String, Bytes>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 
-        fn update_strategy(&self) -> anyhow::Result<()> {
+        fn update_strategy(
+            &self,
+            _strategy_id: &StrategyId,
+            _state: &AHashMap<String, Bytes>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -778,7 +898,12 @@ mod tests {
             Ok(())
         }
 
-        fn snapshot_position_state(&self, _position: &Position) -> anyhow::Result<()> {
+        fn snapshot_position_state(
+            &self,
+            _position: &Position,
+            _ts_snapshot: UnixNanos,
+            _unrealized_pnl: Option<Money>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 

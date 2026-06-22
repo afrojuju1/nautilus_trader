@@ -45,8 +45,10 @@ use std::{
 
 use nautilus_core::{Params, UnixNanos};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value as JsonValue, to_string};
+use serde_json::Value as JsonValue;
 
+#[cfg(feature = "defi")]
+use crate::defi::DefiData;
 // Re-exports
 #[rustfmt::skip]  // Keep these grouped
 pub use bar::{Bar, BarSpecification, BarType};
@@ -106,9 +108,13 @@ pub enum Data {
     Bar(Bar),
     MarkPriceUpdate(MarkPriceUpdate), // TODO: Rename to MarkPrice once Cython gone
     IndexPriceUpdate(IndexPriceUpdate), // TODO: Rename to IndexPrice once Cython gone
+    FundingRateUpdate(FundingRateUpdate),
     InstrumentStatus(InstrumentStatus),
+    OptionGreeks(OptionGreeks),
     InstrumentClose(InstrumentClose),
     Custom(CustomData),
+    #[cfg(feature = "defi")]
+    Defi(Box<DefiData>), // This variant is significantly larger
 }
 
 /// A C-compatible representation of [`Data`] for FFI.
@@ -145,11 +151,19 @@ impl TryFrom<Data> for DataFFI {
             Data::Bar(x) => Ok(Self::Bar(x)),
             Data::MarkPriceUpdate(x) => Ok(Self::MarkPriceUpdate(x)),
             Data::IndexPriceUpdate(x) => Ok(Self::IndexPriceUpdate(x)),
+            Data::FundingRateUpdate(_) => {
+                anyhow::bail!("Cannot convert Data::FundingRateUpdate to DataFFI")
+            }
             Data::InstrumentStatus(_) => {
                 anyhow::bail!("Cannot convert Data::InstrumentStatus to DataFFI")
             }
+            Data::OptionGreeks(_) => {
+                anyhow::bail!("Cannot convert Data::OptionGreeks to DataFFI")
+            }
             Data::InstrumentClose(x) => Ok(Self::InstrumentClose(x)),
             Data::Custom(_) => anyhow::bail!("Cannot convert Data::Custom to DataFFI"),
+            #[cfg(feature = "defi")]
+            Data::Defi(_) => anyhow::bail!("Cannot convert Data::Defi to DataFFI"),
         }
     }
 }
@@ -209,7 +223,13 @@ impl<'de> Deserialize<'de> for Data {
             "IndexPriceUpdate" => Ok(Self::IndexPriceUpdate(
                 serde_json::from_value(value).map_err(D::Error::custom)?,
             )),
+            "FundingRateUpdate" => Ok(Self::FundingRateUpdate(
+                serde_json::from_value(value).map_err(D::Error::custom)?,
+            )),
             "InstrumentStatus" => Ok(Self::InstrumentStatus(
+                serde_json::from_value(value).map_err(D::Error::custom)?,
+            )),
+            "OptionGreeks" => Ok(Self::OptionGreeks(
                 serde_json::from_value(value).map_err(D::Error::custom)?,
             )),
             "InstrumentClose" => Ok(Self::InstrumentClose(
@@ -239,9 +259,13 @@ impl Clone for Data {
             Self::Bar(x) => Self::Bar(*x),
             Self::MarkPriceUpdate(x) => Self::MarkPriceUpdate(*x),
             Self::IndexPriceUpdate(x) => Self::IndexPriceUpdate(*x),
+            Self::FundingRateUpdate(x) => Self::FundingRateUpdate(*x),
             Self::InstrumentStatus(x) => Self::InstrumentStatus(*x),
+            Self::OptionGreeks(x) => Self::OptionGreeks(*x),
             Self::InstrumentClose(x) => Self::InstrumentClose(*x),
             Self::Custom(x) => Self::Custom(x.clone()),
+            #[cfg(feature = "defi")]
+            Self::Defi(x) => Self::Defi(x.clone()),
         }
     }
 }
@@ -257,9 +281,13 @@ impl PartialEq for Data {
             (Self::Bar(a), Self::Bar(b)) => a == b,
             (Self::MarkPriceUpdate(a), Self::MarkPriceUpdate(b)) => a == b,
             (Self::IndexPriceUpdate(a), Self::IndexPriceUpdate(b)) => a == b,
+            (Self::FundingRateUpdate(a), Self::FundingRateUpdate(b)) => a == b,
             (Self::InstrumentStatus(a), Self::InstrumentStatus(b)) => a == b,
+            (Self::OptionGreeks(a), Self::OptionGreeks(b)) => a == b,
             (Self::InstrumentClose(a), Self::InstrumentClose(b)) => a == b,
             (Self::Custom(a), Self::Custom(b)) => a == b,
+            #[cfg(feature = "defi")]
+            (Self::Defi(a), Self::Defi(b)) => a == b,
             _ => false,
         }
     }
@@ -279,9 +307,15 @@ impl Serialize for Data {
             Self::Bar(x) => x.serialize(serializer),
             Self::MarkPriceUpdate(x) => x.serialize(serializer),
             Self::IndexPriceUpdate(x) => x.serialize(serializer),
+            Self::FundingRateUpdate(x) => x.serialize(serializer),
             Self::InstrumentStatus(x) => x.serialize(serializer),
+            Self::OptionGreeks(x) => x.serialize(serializer),
             Self::InstrumentClose(x) => x.serialize(serializer),
             Self::Custom(x) => x.serialize(serializer),
+            #[cfg(feature = "defi")]
+            Self::Defi(_) => Err(serde::ser::Error::custom(
+                "Data::Defi serialization is not supported",
+            )),
         }
     }
 }
@@ -319,7 +353,9 @@ impl_try_from_data!(Trade, TradeTick);
 impl_try_from_data!(Bar, Bar);
 impl_try_from_data!(MarkPriceUpdate, MarkPriceUpdate);
 impl_try_from_data!(IndexPriceUpdate, IndexPriceUpdate);
+impl_try_from_data!(FundingRateUpdate, FundingRateUpdate);
 impl_try_from_data!(InstrumentStatus, InstrumentStatus);
+impl_try_from_data!(OptionGreeks, OptionGreeks);
 impl_try_from_data!(InstrumentClose, InstrumentClose);
 
 /// Converts a vector of `Data` items to a specific variant type.
@@ -346,7 +382,9 @@ impl Data {
             Self::Bar(bar) => bar.bar_type.instrument_id(),
             Self::MarkPriceUpdate(mark_price) => mark_price.instrument_id,
             Self::IndexPriceUpdate(index_price) => index_price.instrument_id,
+            Self::FundingRateUpdate(funding_rate) => funding_rate.instrument_id,
             Self::InstrumentStatus(status) => status.instrument_id,
+            Self::OptionGreeks(greeks) => greeks.instrument_id,
             Self::InstrumentClose(close) => close.instrument_id,
             Self::Custom(custom) => custom
                 .data_type
@@ -360,6 +398,8 @@ impl Data {
                         .and_then(|s| InstrumentId::from_str(s).ok())
                 })
                 .unwrap_or_else(|| InstrumentId::from("NULL.NULL")),
+            #[cfg(feature = "defi")]
+            Self::Defi(defi) => defi.instrument_id(),
         }
     }
 
@@ -416,6 +456,7 @@ impl_catalog_path_prefix!(IndexPriceUpdate, "index_prices");
 impl_catalog_path_prefix!(MarkPriceUpdate, "mark_prices");
 impl_catalog_path_prefix!(FundingRateUpdate, "funding_rate_update");
 impl_catalog_path_prefix!(InstrumentStatus, "instrument_status");
+impl_catalog_path_prefix!(OptionGreeks, "option_greeks");
 impl_catalog_path_prefix!(InstrumentClose, "instrument_closes");
 
 use crate::instruments::InstrumentAny;
@@ -432,9 +473,13 @@ impl HasTsInit for Data {
             Self::Bar(b) => b.ts_init,
             Self::MarkPriceUpdate(p) => p.ts_init,
             Self::IndexPriceUpdate(p) => p.ts_init,
+            Self::FundingRateUpdate(f) => f.ts_init,
             Self::InstrumentStatus(s) => s.ts_init,
+            Self::OptionGreeks(g) => g.ts_init,
             Self::InstrumentClose(c) => c.ts_init,
             Self::Custom(c) => c.data.ts_init(),
+            #[cfg(feature = "defi")]
+            Self::Defi(d) => d.ts_init(),
         }
     }
 }
@@ -495,15 +540,34 @@ impl From<IndexPriceUpdate> for Data {
     }
 }
 
+impl From<FundingRateUpdate> for Data {
+    fn from(value: FundingRateUpdate) -> Self {
+        Self::FundingRateUpdate(value)
+    }
+}
+
 impl From<InstrumentStatus> for Data {
     fn from(value: InstrumentStatus) -> Self {
         Self::InstrumentStatus(value)
     }
 }
 
+impl From<OptionGreeks> for Data {
+    fn from(value: OptionGreeks) -> Self {
+        Self::OptionGreeks(value)
+    }
+}
+
 impl From<InstrumentClose> for Data {
     fn from(value: InstrumentClose) -> Self {
         Self::InstrumentClose(value)
+    }
+}
+
+#[cfg(feature = "defi")]
+impl From<DefiData> for Data {
+    fn from(value: DefiData) -> Self {
+        Self::Defi(Box::new(value))
     }
 }
 
@@ -537,8 +601,11 @@ fn value_to_topic_string(v: &JsonValue) -> String {
 
 /// Builds the topic suffix from Params (string-only view: key=value joined by ".").
 fn params_to_topic_suffix(params: &Params) -> String {
-    params
-        .iter()
+    let mut entries = params.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| *key);
+
+    entries
+        .into_iter()
         .map(|(k, v)| format!("{k}={}", value_to_topic_string(v)))
         .collect::<Vec<_>>()
         .join(".")
@@ -682,7 +749,17 @@ impl DataType {
     pub fn metadata_str(&self) -> String {
         self.metadata.as_ref().map_or_else(
             || "null".to_string(),
-            |metadata| to_string(metadata).unwrap_or_default(),
+            |metadata| {
+                let mut entries = metadata.iter().collect::<Vec<_>>();
+                entries.sort_by_key(|(key, _)| *key);
+
+                let mut metadata_map = serde_json::Map::new();
+                for (key, value) in entries {
+                    metadata_map.insert(key.clone(), value.clone());
+                }
+
+                serde_json::to_string(&metadata_map).unwrap_or_default()
+            },
         )
     }
 
@@ -719,11 +796,10 @@ impl DataType {
     /// # Panics
     ///
     /// This function panics if:
-    /// - There is no metadata.
     /// - The `instrument_id` value contained in the metadata is invalid.
     #[must_use]
     pub fn instrument_id(&self) -> Option<InstrumentId> {
-        let metadata = self.metadata.as_ref().expect("metadata was `None`");
+        let metadata = self.metadata.as_ref()?;
         let instrument_id = metadata.get_str("instrument_id")?;
         Some(
             InstrumentId::from_str(instrument_id)
@@ -736,11 +812,10 @@ impl DataType {
     /// # Panics
     ///
     /// This function panics if:
-    /// - There is no metadata.
     /// - The `venue` value contained in the metadata is invalid.
     #[must_use]
     pub fn venue(&self) -> Option<Venue> {
-        let metadata = self.metadata.as_ref().expect("metadata was `None`");
+        let metadata = self.metadata.as_ref()?;
         let venue_str = metadata.get_str("venue")?;
         Some(Venue::from(venue_str))
     }
@@ -750,7 +825,6 @@ impl DataType {
     /// # Panics
     ///
     /// This function panics if:
-    /// - There is no metadata.
     /// - The `start` value contained in the metadata is invalid.
     #[must_use]
     pub fn start(&self) -> Option<UnixNanos> {
@@ -764,7 +838,6 @@ impl DataType {
     /// # Panics
     ///
     /// This function panics if:
-    /// - There is no metadata.
     /// - The `end` value contained in the metadata is invalid.
     #[must_use]
     pub fn end(&self) -> Option<UnixNanos> {
@@ -778,7 +851,6 @@ impl DataType {
     /// # Panics
     ///
     /// This function panics if:
-    /// - There is no metadata.
     /// - The `limit` value contained in the metadata is invalid.
     #[must_use]
     pub fn limit(&self) -> Option<usize> {
@@ -846,6 +918,26 @@ mod tests {
         serde_json::from_value(value).expect("valid Params JSON")
     }
 
+    #[cfg(feature = "ffi")]
+    #[rstest]
+    fn test_funding_rate_update_does_not_convert_to_data_ffi() {
+        let funding_rate = FundingRateUpdate::new(
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            "0.0001".parse().unwrap(),
+            Some(480),
+            Some(UnixNanos::from(1_000_000_000)),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+        );
+
+        let err = DataFFI::try_from(Data::FundingRateUpdate(funding_rate)).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Cannot convert Data::FundingRateUpdate to DataFFI"
+        );
+    }
+
     #[rstest]
     fn test_data_type_creation_with_metadata() {
         let metadata = Some(params_from_json(
@@ -856,6 +948,33 @@ mod tests {
         assert_eq!(data_type.type_name(), "ExampleType");
         assert_eq!(data_type.topic(), "ExampleType.key1=value1.key2=value2");
         assert_eq!(data_type.metadata(), metadata.as_ref());
+    }
+
+    #[rstest]
+    fn test_data_type_topic_identity_uses_canonical_metadata_order() {
+        let mut metadata1 = Params::new();
+        metadata1.insert("b".to_string(), json!(2));
+        metadata1.insert("a".to_string(), json!(1));
+        let mut metadata2 = Params::new();
+        metadata2.insert("a".to_string(), json!(1));
+        metadata2.insert("b".to_string(), json!(2));
+
+        let data_type1 = DataType::new("ExampleType", Some(metadata1), None);
+        let data_type2 = DataType::new("ExampleType", Some(metadata2), None);
+        let mut hasher1 = DefaultHasher::new();
+        data_type1.hash(&mut hasher1);
+        let hash1 = hasher1.finish();
+        let mut hasher2 = DefaultHasher::new();
+        data_type2.hash(&mut hasher2);
+        let hash2 = hasher2.finish();
+
+        assert_eq!(data_type1.topic(), "ExampleType.a=1.b=2");
+        assert_eq!(data_type1.topic(), data_type2.topic());
+        assert_eq!(data_type1, data_type2);
+        assert_eq!(hash1, hash2);
+        assert_eq!(format!("{data_type1}"), format!("{data_type2}"));
+        assert_eq!(data_type1.metadata_str(), r#"{"a":1,"b":2}"#);
+        assert_eq!(data_type1.metadata_str(), data_type2.metadata_str());
     }
 
     #[rstest]
@@ -988,6 +1107,16 @@ mod tests {
     }
 
     #[rstest]
+    fn test_data_type_metadata_accessors_return_none_without_metadata() {
+        let data_type = DataType::new(stringify!(TradeTick), None, None);
+
+        assert_eq!(data_type.instrument_id(), None);
+        assert_eq!(data_type.venue(), None);
+        assert_eq!(data_type.start(), None);
+        assert_eq!(data_type.end(), None);
+    }
+
+    #[rstest]
     fn test_data_type_persistence_json_with_identifier() {
         let data_type = DataType::new("MyCustomType", None, Some("venue//symbol".to_string()));
         let json = data_type.to_persistence_json().unwrap();
@@ -997,6 +1126,19 @@ mod tests {
         assert_eq!(restored.type_name(), "MyCustomType");
         assert_eq!(restored.identifier(), Some("venue//symbol"));
         assert_eq!(restored.topic(), "MyCustomType");
+    }
+
+    #[rstest]
+    fn test_data_type_from_persistence_json_rebuilds_canonical_topic() {
+        let json = r#"{
+            "type_name": "ExampleType",
+            "topic": "ExampleType.z=9.a=1",
+            "metadata": {"z": 9, "a": 1}
+        }"#;
+
+        let restored = DataType::from_persistence_json(json).unwrap();
+
+        assert_eq!(restored.topic(), "ExampleType.a=1.z=9");
     }
 
     #[rstest]

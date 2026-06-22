@@ -35,21 +35,23 @@
 //! payload types are `#[repr(C)]`-clean end-to-end:
 //!
 //! - Lifecycle: `start`, `stop`, `resume`, `reset`, `dispose`, `degrade`, `fault`
-//! - Market data: quotes, trades, bars, mark/index/funding prices,
-//!   instrument status, instrument close, book deltas (via
-//!   [`crate::surfaces::book::OrderBookDeltasHandle`]), instruments
+//! - Market data: instruments
 //!   (via [`crate::surfaces::instrument::InstrumentAnyHandle`]),
-//!   option chain slices (via
-//!   [`crate::surfaces::option_chain::OptionChainSliceHandle`])
-//! - Historical market data: bulk historical quotes, trades, bars,
-//!   funding rates, mark prices, index prices delivered as
-//!   [`crate::boundary::Slice`] payloads
+//!   book snapshots (via [`crate::surfaces::book::OrderBookHandle`]),
+//!   book deltas (via [`crate::surfaces::book::OrderBookDeltasHandle`]),
+//!   quotes, trades, bars, mark/index/funding prices, option greeks, option chain slices
+//!   (via [`crate::surfaces::option_chain::OptionChainSliceHandle`]),
+//!   instrument status, and instrument close
+//! - Historical market data: bulk historical book deltas, book depth,
+//!   quotes, trades, bars, mark prices, index prices, funding rates
+//!   delivered as [`crate::boundary::Slice`] payloads
 //! - Order events: filled, canceled
+//! - Custom data: values registered through `PluginCustomData`, including
+//!   historical custom-data responses routed through `on_data`
 //! - Other: signal, time event
 //!
-//! Deferred: `on_book` (stateful), `on_data` (CustomData routing through
-//! actors), `on_historical_data` (`&dyn Any` payload), DeFi pool/block
-//! events. The authoritative list lives in
+//! Deferred: generic non-plugin `on_historical_data` (`&dyn Any` payload),
+//! DeFi pool/block events. The authoritative list lives in
 //! `tests/surface_alignment.rs`.
 
 #![allow(unsafe_code)]
@@ -60,18 +62,23 @@ use nautilus_common::{signal::Signal, timer::TimeEvent};
 use nautilus_model::{
     data::{
         Bar, FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus,
-        MarkPriceUpdate, OptionChainSlice, OptionGreeks, OrderBookDeltas, QuoteTick, TradeTick,
+        MarkPriceUpdate, OptionChainSlice, OptionGreeks, OrderBookDelta, OrderBookDeltas,
+        OrderBookDepth10, QuoteTick, TradeTick,
     },
     events::{OrderCanceled, OrderFilled},
     instruments::InstrumentAny,
+    orderbook::OrderBook,
 };
 
 use crate::{
     boundary::{BorrowedStr, PluginError, PluginErrorCode, PluginResult, Slice},
     host::{HostContext, HostVTable},
-    panic::{guard, guard_infallible},
+    normalize::BoundaryNormalize,
+    panic::{guard, guard_drop, guard_or_null},
     surfaces::{
-        book::OrderBookDeltasHandle, instrument::InstrumentAnyHandle,
+        book::{OrderBookDeltasHandle, OrderBookHandle},
+        custom_data::PluginCustomDataRef,
+        instrument::InstrumentAnyHandle,
         option_chain::OptionChainSliceHandle,
     },
 };
@@ -92,9 +99,9 @@ pub struct PluginActorHandle {
 /// also powers [`custom_data_vtable`](crate::surfaces::custom_data::custom_data_vtable).
 ///
 /// Every callback that returns [`PluginResult<()>`] runs inside
-/// [`crate::panic::guard`]. The infallible `create`/`drop` callbacks run
-/// inside [`crate::panic::guard_infallible`], which aborts the host on
-/// panic since their signatures cannot carry an error.
+/// [`crate::panic::guard`]. A `create` panic returns null (the host treats
+/// it as a failed construction) and a `drop` panic leaks the instance; see
+/// [`crate::panic::guard_or_null`] and [`crate::panic::guard_drop`].
 ///
 /// Slots are nullable at the ABI type level so the host can reject malformed
 /// manifests with null callbacks before constructing an actor. Macro-generated
@@ -137,7 +144,31 @@ pub struct ActorVTable {
             event: *const TimeEvent,
         ) -> PluginResult<()>,
     >,
+    pub on_data: Option<
+        unsafe extern "C" fn(
+            handle: *mut PluginActorHandle,
+            data: PluginCustomDataRef,
+        ) -> PluginResult<()>,
+    >,
 
+    pub on_instrument: Option<
+        unsafe extern "C" fn(
+            handle: *mut PluginActorHandle,
+            instrument: *const InstrumentAnyHandle,
+        ) -> PluginResult<()>,
+    >,
+    pub on_book_deltas: Option<
+        unsafe extern "C" fn(
+            handle: *mut PluginActorHandle,
+            deltas: *const OrderBookDeltasHandle,
+        ) -> PluginResult<()>,
+    >,
+    pub on_book: Option<
+        unsafe extern "C" fn(
+            handle: *mut PluginActorHandle,
+            book: *const OrderBookHandle,
+        ) -> PluginResult<()>,
+    >,
     pub on_quote: Option<
         unsafe extern "C" fn(
             handle: *mut PluginActorHandle,
@@ -152,24 +183,6 @@ pub struct ActorVTable {
     >,
     pub on_bar: Option<
         unsafe extern "C" fn(handle: *mut PluginActorHandle, bar: *const Bar) -> PluginResult<()>,
-    >,
-    pub on_book_deltas: Option<
-        unsafe extern "C" fn(
-            handle: *mut PluginActorHandle,
-            deltas: *const OrderBookDeltasHandle,
-        ) -> PluginResult<()>,
-    >,
-    pub on_instrument: Option<
-        unsafe extern "C" fn(
-            handle: *mut PluginActorHandle,
-            instrument: *const InstrumentAnyHandle,
-        ) -> PluginResult<()>,
-    >,
-    pub on_option_chain: Option<
-        unsafe extern "C" fn(
-            handle: *mut PluginActorHandle,
-            chain: *const OptionChainSliceHandle,
-        ) -> PluginResult<()>,
     >,
     pub on_mark_price: Option<
         unsafe extern "C" fn(
@@ -193,6 +206,12 @@ pub struct ActorVTable {
         unsafe extern "C" fn(
             handle: *mut PluginActorHandle,
             greeks: *const OptionGreeks,
+        ) -> PluginResult<()>,
+    >,
+    pub on_option_chain: Option<
+        unsafe extern "C" fn(
+            handle: *mut PluginActorHandle,
+            chain: *const OptionChainSliceHandle,
         ) -> PluginResult<()>,
     >,
     pub on_instrument_status: Option<
@@ -228,6 +247,18 @@ pub struct ActorVTable {
         ) -> PluginResult<()>,
     >,
 
+    pub on_historical_book_deltas: Option<
+        unsafe extern "C" fn(
+            handle: *mut PluginActorHandle,
+            deltas: Slice<'_, OrderBookDelta>,
+        ) -> PluginResult<()>,
+    >,
+    pub on_historical_book_depth: Option<
+        unsafe extern "C" fn(
+            handle: *mut PluginActorHandle,
+            depths: Slice<'_, OrderBookDepth10>,
+        ) -> PluginResult<()>,
+    >,
     pub on_historical_quotes: Option<
         unsafe extern "C" fn(
             handle: *mut PluginActorHandle,
@@ -246,12 +277,6 @@ pub struct ActorVTable {
             bars: Slice<'_, Bar>,
         ) -> PluginResult<()>,
     >,
-    pub on_historical_funding_rates: Option<
-        unsafe extern "C" fn(
-            handle: *mut PluginActorHandle,
-            funding_rates: Slice<'_, FundingRateUpdate>,
-        ) -> PluginResult<()>,
-    >,
     pub on_historical_mark_prices: Option<
         unsafe extern "C" fn(
             handle: *mut PluginActorHandle,
@@ -264,6 +289,12 @@ pub struct ActorVTable {
             index_prices: Slice<'_, IndexPriceUpdate>,
         ) -> PluginResult<()>,
     >,
+    pub on_historical_funding_rates: Option<
+        unsafe extern "C" fn(
+            handle: *mut PluginActorHandle,
+            funding_rates: Slice<'_, FundingRateUpdate>,
+        ) -> PluginResult<()>,
+    >,
 }
 
 /// Author-facing trait for a plug-in actor.
@@ -271,6 +302,15 @@ pub struct ActorVTable {
 /// Every callback has a no-op default; authors override the ones they care
 /// about. Callbacks receive borrowed references to host-owned values; the
 /// references are only valid for the duration of the call.
+///
+/// # Errors
+///
+/// Hook implementations may return an error to abort the current callback.
+/// Default hook implementations never error.
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "hook error behavior is documented once at the trait level"
+)]
 pub trait PluginActor: 'static + Send + Sized {
     /// Canonical type name. Must be unique across a Nautilus deployment.
     const TYPE_NAME: &'static str;
@@ -324,6 +364,26 @@ pub trait PluginActor: 'static + Send + Sized {
     }
 
     #[allow(unused_variables)]
+    fn on_data(&mut self, data: PluginCustomDataRef) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    fn on_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    fn on_book(&mut self, book: &OrderBook) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
     fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
         Ok(())
     }
@@ -335,21 +395,6 @@ pub trait PluginActor: 'static + Send + Sized {
 
     #[allow(unused_variables)]
     fn on_bar(&mut self, bar: &Bar) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    #[allow(unused_variables)]
-    fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    #[allow(unused_variables)]
-    fn on_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    #[allow(unused_variables)]
-    fn on_option_chain(&mut self, chain: &OptionChainSlice) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -370,6 +415,11 @@ pub trait PluginActor: 'static + Send + Sized {
 
     #[allow(unused_variables)]
     fn on_option_greeks(&mut self, greeks: &OptionGreeks) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    fn on_option_chain(&mut self, chain: &OptionChainSlice) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -399,6 +449,16 @@ pub trait PluginActor: 'static + Send + Sized {
     }
 
     #[allow(unused_variables)]
+    fn on_historical_book_deltas(&mut self, deltas: &[OrderBookDelta]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    fn on_historical_book_depth(&mut self, depths: &[OrderBookDepth10]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
     fn on_historical_quotes(&mut self, quotes: &[QuoteTick]) -> anyhow::Result<()> {
         Ok(())
     }
@@ -414,14 +474,6 @@ pub trait PluginActor: 'static + Send + Sized {
     }
 
     #[allow(unused_variables)]
-    fn on_historical_funding_rates(
-        &mut self,
-        funding_rates: &[FundingRateUpdate],
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    #[allow(unused_variables)]
     fn on_historical_mark_prices(&mut self, mark_prices: &[MarkPriceUpdate]) -> anyhow::Result<()> {
         Ok(())
     }
@@ -430,6 +482,14 @@ pub trait PluginActor: 'static + Send + Sized {
     fn on_historical_index_prices(
         &mut self,
         index_prices: &[IndexPriceUpdate],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    fn on_historical_funding_rates(
+        &mut self,
+        funding_rates: &[FundingRateUpdate],
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -465,27 +525,31 @@ where
         on_degrade: Some(on_degrade_thunk::<T>),
         on_fault: Some(on_fault_thunk::<T>),
         on_time_event: Some(on_time_event_thunk::<T>),
+        on_data: Some(on_data_thunk::<T>),
+        on_instrument: Some(on_instrument_thunk::<T>),
+        on_book_deltas: Some(on_book_deltas_thunk::<T>),
+        on_book: Some(on_book_thunk::<T>),
         on_quote: Some(on_quote_thunk::<T>),
         on_trade: Some(on_trade_thunk::<T>),
         on_bar: Some(on_bar_thunk::<T>),
-        on_book_deltas: Some(on_book_deltas_thunk::<T>),
-        on_instrument: Some(on_instrument_thunk::<T>),
-        on_option_chain: Some(on_option_chain_thunk::<T>),
         on_mark_price: Some(on_mark_price_thunk::<T>),
         on_index_price: Some(on_index_price_thunk::<T>),
         on_funding_rate: Some(on_funding_rate_thunk::<T>),
         on_option_greeks: Some(on_option_greeks_thunk::<T>),
+        on_option_chain: Some(on_option_chain_thunk::<T>),
         on_instrument_status: Some(on_instrument_status_thunk::<T>),
         on_instrument_close: Some(on_instrument_close_thunk::<T>),
         on_order_filled: Some(on_order_filled_thunk::<T>),
         on_order_canceled: Some(on_order_canceled_thunk::<T>),
         on_signal: Some(on_signal_thunk::<T>),
+        on_historical_book_deltas: Some(on_historical_book_deltas_thunk::<T>),
+        on_historical_book_depth: Some(on_historical_book_depth_thunk::<T>),
         on_historical_quotes: Some(on_historical_quotes_thunk::<T>),
         on_historical_trades: Some(on_historical_trades_thunk::<T>),
         on_historical_bars: Some(on_historical_bars_thunk::<T>),
-        on_historical_funding_rates: Some(on_historical_funding_rates_thunk::<T>),
         on_historical_mark_prices: Some(on_historical_mark_prices_thunk::<T>),
         on_historical_index_prices: Some(on_historical_index_prices_thunk::<T>),
+        on_historical_funding_rates: Some(on_historical_funding_rates_thunk::<T>),
     };
 }
 
@@ -494,7 +558,7 @@ unsafe extern "C" fn create_thunk<T: PluginActor>(
     ctx: *const HostContext,
     config_json: BorrowedStr<'_>,
 ) -> *mut PluginActorHandle {
-    guard_infallible("actor::create", || {
+    guard_or_null("actor::create", || {
         // SAFETY: host promises `config_json` borrows storage that is live
         // for the duration of this call.
         let cfg = unsafe { config_json.as_str() };
@@ -506,7 +570,7 @@ unsafe extern "C" fn drop_handle_thunk<T: PluginActor>(handle: *mut PluginActorH
     if handle.is_null() {
         return;
     }
-    guard_infallible("actor::drop", || {
+    guard_drop("actor::drop", || {
         // SAFETY: handle was allocated via `Box::into_raw(Box::new(T))`.
         unsafe {
             drop(Box::from_raw(handle.cast::<T>()));
@@ -558,29 +622,23 @@ macro_rules! event_thunk {
             guard(|| {
                 // SAFETY: host keeps `value` live for the duration of the call;
                 // the plug-in only borrows it for the trait-method invocation.
-                let v = unsafe { &*value };
+                let v = unsafe { &*value }.boundary_normalized();
                 let actor = handle_as_mut::<T>(handle);
-                ok_or_err(actor.$method(v))
+                ok_or_err(actor.$method(&v))
             })
         }
     };
 }
 
 event_thunk!(on_time_event_thunk, on_time_event, TimeEvent);
-event_thunk!(on_quote_thunk, on_quote, QuoteTick);
-event_thunk!(on_trade_thunk, on_trade, TradeTick);
-event_thunk!(on_bar_thunk, on_bar, Bar);
 
-unsafe extern "C" fn on_book_deltas_thunk<T: PluginActor>(
+unsafe extern "C" fn on_data_thunk<T: PluginActor>(
     handle: *mut PluginActorHandle,
-    deltas: *const OrderBookDeltasHandle,
+    data: PluginCustomDataRef,
 ) -> PluginResult<()> {
     guard(|| {
-        // SAFETY: host keeps the handle live for the duration of the call;
-        // the plug-in only borrows the wrapped deltas via the trait method.
-        let v: &OrderBookDeltas = unsafe { (*deltas).deltas() };
         let actor = handle_as_mut::<T>(handle);
-        ok_or_err(actor.on_book_deltas(v))
+        ok_or_err(actor.on_data(data))
     })
 }
 
@@ -591,11 +649,45 @@ unsafe extern "C" fn on_instrument_thunk<T: PluginActor>(
     guard(|| {
         // SAFETY: host keeps the handle live for the duration of the call;
         // the plug-in only borrows the wrapped instrument via the trait method.
-        let v: &InstrumentAny = unsafe { (*instrument).instrument() };
+        let v: InstrumentAny = unsafe { (*instrument).instrument() }.boundary_normalized();
         let actor = handle_as_mut::<T>(handle);
-        ok_or_err(actor.on_instrument(v))
+        ok_or_err(actor.on_instrument(&v))
     })
 }
+
+unsafe extern "C" fn on_book_deltas_thunk<T: PluginActor>(
+    handle: *mut PluginActorHandle,
+    deltas: *const OrderBookDeltasHandle,
+) -> PluginResult<()> {
+    guard(|| {
+        // SAFETY: host keeps the handle live for the duration of the call;
+        // the plug-in only borrows the wrapped deltas via the trait method.
+        let v: OrderBookDeltas = unsafe { (*deltas).deltas() }.boundary_normalized();
+        let actor = handle_as_mut::<T>(handle);
+        ok_or_err(actor.on_book_deltas(&v))
+    })
+}
+
+unsafe extern "C" fn on_book_thunk<T: PluginActor>(
+    handle: *mut PluginActorHandle,
+    book: *const OrderBookHandle,
+) -> PluginResult<()> {
+    guard(|| {
+        // SAFETY: host keeps the handle live for the duration of the call;
+        // the plug-in only borrows the wrapped book via the trait method.
+        let v: OrderBook = unsafe { (*book).book() }.boundary_normalized();
+        let actor = handle_as_mut::<T>(handle);
+        ok_or_err(actor.on_book(&v))
+    })
+}
+
+event_thunk!(on_quote_thunk, on_quote, QuoteTick);
+event_thunk!(on_trade_thunk, on_trade, TradeTick);
+event_thunk!(on_bar_thunk, on_bar, Bar);
+event_thunk!(on_mark_price_thunk, on_mark_price, MarkPriceUpdate);
+event_thunk!(on_index_price_thunk, on_index_price, IndexPriceUpdate);
+event_thunk!(on_funding_rate_thunk, on_funding_rate, FundingRateUpdate);
+event_thunk!(on_option_greeks_thunk, on_option_greeks, OptionGreeks);
 
 unsafe extern "C" fn on_option_chain_thunk<T: PluginActor>(
     handle: *mut PluginActorHandle,
@@ -604,16 +696,12 @@ unsafe extern "C" fn on_option_chain_thunk<T: PluginActor>(
     guard(|| {
         // SAFETY: host keeps the handle live for the duration of the call;
         // the plug-in only borrows the wrapped chain via the trait method.
-        let v: &OptionChainSlice = unsafe { (*chain).chain() };
+        let v: OptionChainSlice = unsafe { (*chain).chain() }.boundary_normalized();
         let actor = handle_as_mut::<T>(handle);
-        ok_or_err(actor.on_option_chain(v))
+        ok_or_err(actor.on_option_chain(&v))
     })
 }
 
-event_thunk!(on_mark_price_thunk, on_mark_price, MarkPriceUpdate);
-event_thunk!(on_index_price_thunk, on_index_price, IndexPriceUpdate);
-event_thunk!(on_funding_rate_thunk, on_funding_rate, FundingRateUpdate);
-event_thunk!(on_option_greeks_thunk, on_option_greeks, OptionGreeks);
 event_thunk!(
     on_instrument_status_thunk,
     on_instrument_status,
@@ -637,22 +725,30 @@ macro_rules! slice_thunk {
             guard(|| {
                 // SAFETY: host keeps the slice storage live for the call;
                 // the plug-in only borrows it for the trait-method invocation.
-                let v = unsafe { values.as_slice() };
+                let v: Vec<$ty> = unsafe { values.as_slice() }
+                    .iter()
+                    .map(BoundaryNormalize::boundary_normalized)
+                    .collect();
                 let actor = handle_as_mut::<T>(handle);
-                ok_or_err(actor.$method(v))
+                ok_or_err(actor.$method(&v))
             })
         }
     };
 }
 
+slice_thunk!(
+    on_historical_book_deltas_thunk,
+    on_historical_book_deltas,
+    OrderBookDelta
+);
+slice_thunk!(
+    on_historical_book_depth_thunk,
+    on_historical_book_depth,
+    OrderBookDepth10
+);
 slice_thunk!(on_historical_quotes_thunk, on_historical_quotes, QuoteTick);
 slice_thunk!(on_historical_trades_thunk, on_historical_trades, TradeTick);
 slice_thunk!(on_historical_bars_thunk, on_historical_bars, Bar);
-slice_thunk!(
-    on_historical_funding_rates_thunk,
-    on_historical_funding_rates,
-    FundingRateUpdate
-);
 slice_thunk!(
     on_historical_mark_prices_thunk,
     on_historical_mark_prices,
@@ -662,4 +758,9 @@ slice_thunk!(
     on_historical_index_prices_thunk,
     on_historical_index_prices,
     IndexPriceUpdate
+);
+slice_thunk!(
+    on_historical_funding_rates_thunk,
+    on_historical_funding_rates,
+    FundingRateUpdate
 );

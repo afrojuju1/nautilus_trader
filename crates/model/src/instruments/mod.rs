@@ -21,7 +21,9 @@ pub mod binary_option;
 pub mod cfd;
 pub mod commodity;
 pub mod crypto_future;
+pub mod crypto_futures_spread;
 pub mod crypto_option;
+pub mod crypto_option_spread;
 pub mod crypto_perpetual;
 pub mod currency_pair;
 pub mod equity;
@@ -59,7 +61,9 @@ pub use crate::instruments::{
     cfd::Cfd,
     commodity::Commodity,
     crypto_future::CryptoFuture,
+    crypto_futures_spread::CryptoFuturesSpread,
     crypto_option::CryptoOption,
+    crypto_option_spread::CryptoOptionSpread,
     crypto_perpetual::CryptoPerpetual,
     currency_pair::CurrencyPair,
     equity::Equity,
@@ -69,8 +73,11 @@ pub use crate::instruments::{
     option_contract::OptionContract,
     option_spread::OptionSpread,
     perpetual_contract::PerpetualContract,
-    synthetic::SyntheticInstrument,
-    tick_scheme::{FixedTickScheme, TickScheme, TickSchemeRule, TieredTickScheme},
+    synthetic::{SyntheticInstrument, SyntheticInstrumentError},
+    tick_scheme::{
+        FixedTickScheme, TickScheme, TickSchemeError, TickSchemeRule, TieredTickScheme,
+        tick_scheme_rule_from_name,
+    },
     tokenized_asset::TokenizedAsset,
 };
 use crate::{
@@ -167,10 +174,30 @@ pub fn validate_instrument_common(
     Ok(())
 }
 
+fn currencies_equivalent_for_quanto(left: Currency, right: Currency) -> bool {
+    if left == right {
+        return true;
+    }
+
+    is_usd_equivalent_currency(left) && is_usd_equivalent_currency(right)
+}
+
+fn is_usd_equivalent_currency(currency: Currency) -> bool {
+    matches!(
+        currency.code.as_str(),
+        "BUSD" | "FDUSD" | "pUSD" | "TUSD" | "USD" | "USDC" | "USDC.e" | "USDP" | "USDT"
+    )
+}
+
 #[enum_dispatch]
 pub trait Instrument: 'static + Send {
-    fn tick_scheme(&self) -> Option<&dyn TickSchemeRule> {
+    fn tick_scheme(&self) -> Option<Ustr> {
         None
+    }
+
+    fn tick_scheme_rule(&self) -> Option<&dyn TickSchemeRule> {
+        self.tick_scheme()
+            .and_then(|scheme| tick_scheme_rule_from_name(scheme.as_str()))
     }
 
     fn into_any(self) -> InstrumentAny
@@ -205,6 +232,8 @@ pub trait Instrument: 'static + Send {
         if self.is_inverse() {
             self.base_currency()
                 .expect("inverse instrument without base_currency")
+        } else if self.is_quanto() {
+            self.settlement_currency()
         } else {
             self.quote_currency()
         }
@@ -214,6 +243,9 @@ pub trait Instrument: 'static + Send {
     fn option_kind(&self) -> Option<OptionKind>;
     fn exchange(&self) -> Option<Ustr>;
     fn strike_price(&self) -> Option<Price>;
+    fn strategy_type(&self) -> Option<Ustr> {
+        None
+    }
 
     fn activation_ns(&self) -> Option<UnixNanos>;
     fn expiration_ns(&self) -> Option<UnixNanos>;
@@ -221,10 +253,19 @@ pub trait Instrument: 'static + Send {
         self.instrument_class().has_expiration()
     }
 
+    fn allows_negative_price(&self) -> bool {
+        self.instrument_class().allows_negative_price()
+    }
+
     fn is_inverse(&self) -> bool;
     fn is_quanto(&self) -> bool {
-        self.base_currency()
-            .is_some_and(|currency| currency != self.settlement_currency())
+        self.base_currency().is_some_and(|base_currency| {
+            self.settlement_currency() != base_currency
+                && !currencies_equivalent_for_quanto(
+                    self.settlement_currency(),
+                    self.quote_currency(),
+                )
+        })
     }
 
     fn price_precision(&self) -> u8;
@@ -269,28 +310,33 @@ pub trait Instrument: 'static + Send {
 
     /// # Errors
     ///
-    /// Returns an error if the value is not finite or cannot be converted to a `Price`.
+    /// Returns an error if the value is not finite, not representable as a `Decimal`, or cannot
+    /// be converted to a `Price`.
     #[inline(always)]
     fn try_make_price(&self, value: f64) -> anyhow::Result<Price> {
         let dec_value = Decimal::from_str(&value.to_string())
-            .map_err(|_| anyhow::anyhow!("non-finite value passed to make_price"))?;
+            .map_err(|_| anyhow::anyhow!("invalid `value` for make_price, was {value}"))?;
         let precision = u32::from(self.min_price_increment_precision());
         let rounded_decimal =
             dec_value.round_dp_with_strategy(precision, RoundingStrategy::MidpointNearestEven);
         Price::from_decimal_dp(rounded_decimal, self.price_precision()).map_err(Into::into)
     }
 
+    /// # Panics
+    ///
+    /// Panics if the value cannot be converted to a `Price` (see `try_make_price`).
     fn make_price(&self, value: f64) -> Price {
         self.try_make_price(value).unwrap()
     }
 
     /// # Errors
     ///
-    /// Returns an error if the value is not finite or cannot be converted to a `Quantity`.
+    /// Returns an error if the value is not finite, not representable as a `Decimal`, rounds to
+    /// zero, or cannot be converted to a `Quantity`.
     #[inline(always)]
     fn try_make_qty(&self, value: f64, round_down: Option<bool>) -> anyhow::Result<Quantity> {
         let dec_value = Decimal::from_str(&value.to_string())
-            .map_err(|_| anyhow::anyhow!("non-finite value passed to make_qty"))?;
+            .map_err(|_| anyhow::anyhow!("invalid `value` for make_qty, was {value}"))?;
         let precision = u32::from(self.min_size_increment_precision());
         let strategy = if round_down.unwrap_or(false) {
             RoundingStrategy::ToZero
@@ -304,24 +350,36 @@ pub trait Instrument: 'static + Send {
         Quantity::from_decimal_dp(rounded, self.size_precision()).map_err(Into::into)
     }
 
+    /// # Panics
+    ///
+    /// Panics if the value cannot be converted to a `Quantity` (see `try_make_qty`).
     fn make_qty(&self, value: f64, round_down: Option<bool>) -> Quantity {
         self.try_make_qty(value, round_down).unwrap()
     }
 
     /// # Errors
     ///
-    /// Returns an error if the value cannot be converted to a `Quantity`.
+    /// Returns an error if `last_price` is zero, or if the value cannot be converted to a
+    /// `Quantity`.
     fn try_calculate_base_quantity(
         &self,
         quantity: Quantity,
         last_price: Price,
     ) -> anyhow::Result<Quantity> {
+        let last_px = last_price.as_decimal();
+        if last_px.is_zero() {
+            anyhow::bail!("`last_price` was zero when calculating base quantity");
+        }
         let precision = u32::from(self.min_size_increment_precision());
-        let value = (quantity.as_decimal() / last_price.as_decimal())
+        let value = (quantity.as_decimal() / last_px)
             .round_dp_with_strategy(precision, RoundingStrategy::MidpointNearestEven);
         Quantity::from_decimal_dp(value, self.size_precision()).map_err(Into::into)
     }
 
+    /// # Panics
+    ///
+    /// Panics if `last_price` is zero, or if the value cannot be converted to a `Quantity`
+    /// (see `try_calculate_base_quantity`).
     fn calculate_base_quantity(&self, quantity: Quantity, last_price: Price) -> Quantity {
         self.try_calculate_base_quantity(quantity, last_price)
             .unwrap()
@@ -329,7 +387,9 @@ pub trait Instrument: 'static + Send {
 
     /// # Panics
     ///
-    /// Panics if the instrument is inverse and does not have a base currency.
+    /// Panics if the instrument is inverse and does not have a base currency, if the
+    /// instrument is inverse and `price` is zero, or if the notional amount cannot be
+    /// represented as `Money`.
     #[inline(always)]
     fn calculate_notional_value(
         &self,
@@ -364,7 +424,11 @@ pub trait Instrument: 'static + Send {
 
     #[inline(always)]
     fn next_bid_price(&self, value: f64, n: i32) -> Option<Price> {
-        let price = if let Some(scheme) = self.tick_scheme() {
+        if n < 0 {
+            return None;
+        }
+
+        let price = if let Some(scheme) = self.tick_scheme_rule() {
             scheme.next_bid_price(value, n, self.price_precision())?
         } else {
             let value = Decimal::from_str(&value.to_string()).ok()?;
@@ -388,7 +452,11 @@ pub trait Instrument: 'static + Send {
 
     #[inline(always)]
     fn next_ask_price(&self, value: f64, n: i32) -> Option<Price> {
-        let price = if let Some(scheme) = self.tick_scheme() {
+        if n < 0 {
+            return None;
+        }
+
+        let price = if let Some(scheme) = self.tick_scheme_rule() {
             scheme.next_ask_price(value, n, self.price_precision())?
         } else {
             let value = Decimal::from_str(&value.to_string()).ok()?;
@@ -415,7 +483,8 @@ pub trait Instrument: 'static + Send {
         let mut prices = Vec::with_capacity(n);
 
         for i in 0..n {
-            if let Some(price) = self.next_bid_price(value, i as i32) {
+            let Ok(i) = i32::try_from(i) else { break };
+            if let Some(price) = self.next_bid_price(value, i) {
                 prices.push(price);
             } else {
                 break;
@@ -430,7 +499,8 @@ pub trait Instrument: 'static + Send {
         let mut prices = Vec::with_capacity(n);
 
         for i in 0..n {
-            if let Some(price) = self.next_ask_price(value, i as i32) {
+            let Ok(i) = i32::try_from(i) else { break };
+            if let Some(price) = self.next_ask_price(value, i) {
                 prices.push(price);
             } else {
                 break;
@@ -581,6 +651,12 @@ mod tests {
     }
 
     #[rstest]
+    fn currency_pair_is_not_quanto(currency_pair_btcusdt: CurrencyPair) {
+        assert!(!currency_pair_btcusdt.is_quanto());
+        assert_eq!(currency_pair_btcusdt.cost_currency(), Currency::USDT());
+    }
+
+    #[rstest]
     fn tick_navigation(currency_pair_btcusdt: CurrencyPair) {
         let start = 10_000.123_4;
         let bid_0 = currency_pair_btcusdt.next_bid_price(start, 0).unwrap();
@@ -589,6 +665,82 @@ mod tests {
         let asks = currency_pair_btcusdt.next_ask_prices(start, 3);
         assert_eq!(asks.len(), 3);
         assert!(asks[0] > bid_0);
+    }
+
+    #[rstest]
+    fn tick_navigation_uses_tick_scheme() {
+        let instrument = CurrencyPair::new(
+            InstrumentId::from("TEST.VENUE"),
+            Symbol::from("TEST"),
+            Currency::from("BTC"),
+            Currency::from("USD"),
+            2,
+            2,
+            Price::new(0.01, 2),
+            Quantity::from("0.01"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Ustr::from("FIXED_PRECISION_1")),
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+
+        assert_eq!(
+            instrument.tick_scheme(),
+            Some(Ustr::from("FIXED_PRECISION_1"))
+        );
+        assert_eq!(instrument.next_bid_price(1.23, 0), Some(Price::new(1.2, 2)));
+        assert_eq!(instrument.next_ask_price(1.23, 0), Some(Price::new(1.3, 2)));
+    }
+
+    #[rstest]
+    #[case("BOGUS")]
+    #[case("FIXED_PRECISION_99")]
+    fn invalid_tick_scheme_returns_error(#[case] tick_scheme: &str) {
+        let err = CurrencyPair::new_checked(
+            InstrumentId::from("TEST.VENUE"),
+            Symbol::from("TEST"),
+            Currency::from("BTC"),
+            Currency::from("USD"),
+            2,
+            2,
+            Price::new(0.01, 2),
+            Quantity::from("0.01"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Ustr::from(tick_scheme)),
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        )
+        .expect_err("invalid tick scheme must fail");
+
+        assert!(
+            err.to_string()
+                .contains("tick_scheme not found in tick schemes"),
+            "{err}"
+        );
     }
 
     #[rstest]
@@ -676,6 +828,44 @@ mod tests {
         let price = currency_pair_btcusdt.make_price(10_000.0);
         let base = currency_pair_btcusdt.calculate_base_quantity(quantity, price);
         assert_eq!(base.to_string(), "0.000200");
+    }
+
+    #[rstest]
+    fn base_quantity_zero_last_price_returns_error(currency_pair_btcusdt: CurrencyPair) {
+        let quantity = currency_pair_btcusdt.make_qty(2.0, None);
+        let error = currency_pair_btcusdt
+            .try_calculate_base_quantity(quantity, Price::new(0.0, 2))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("`last_price` was zero"),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    #[case(f64::NAN)]
+    #[case(f64::INFINITY)]
+    #[case(1e30)] // Finite but not representable as a Decimal
+    fn make_price_invalid_value_returns_error(
+        currency_pair_btcusdt: CurrencyPair,
+        #[case] value: f64,
+    ) {
+        let error = currency_pair_btcusdt.try_make_price(value).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid `value` for make_price"),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    fn make_qty_invalid_value_returns_error(currency_pair_btcusdt: CurrencyPair) {
+        let error = currency_pair_btcusdt
+            .try_make_qty(f64::NAN, None)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("invalid `value` for make_qty"),
+            "{error}"
+        );
     }
 
     #[rstest]
@@ -850,6 +1040,42 @@ mod tests {
         let notional = ethbtc_quanto.calculate_notional_value(quantity, price, None);
         let expected = Money::new(0.18, ethbtc_quanto.settlement_currency());
         assert_eq!(notional, expected);
+    }
+
+    #[rstest]
+    #[case("USD", "BUSD")]
+    #[case("USD", "FDUSD")]
+    #[case("USD", "pUSD")]
+    #[case("USD", "TUSD")]
+    #[case("USD", "USD")]
+    #[case("USD", "USDC")]
+    #[case("USD", "USDC.e")]
+    #[case("USD", "USDP")]
+    #[case("USD", "USDT")]
+    #[case("BUSD", "USD")]
+    #[case("FDUSD", "USD")]
+    #[case("pUSD", "USD")]
+    #[case("TUSD", "USD")]
+    #[case("USDC", "USD")]
+    #[case("USDC.e", "USD")]
+    #[case("USDP", "USD")]
+    #[case("USDT", "USD")]
+    fn usd_equivalent_settlement_is_not_quanto(
+        #[case] quote_currency_code: &str,
+        #[case] settlement_currency_code: &str,
+    ) {
+        let quote_currency =
+            Currency::try_from_str(quote_currency_code).expect("quote currency must exist");
+        let settlement_currency = Currency::try_from_str(settlement_currency_code)
+            .expect("settlement currency must exist");
+        let instrument = crypto_future_with_quote_settlement(quote_currency, settlement_currency);
+        let quantity = instrument.make_qty(5.0, None);
+        let price = instrument.make_price(1000.0);
+        let notional = instrument.calculate_notional_value(quantity, price, None);
+
+        assert!(!instrument.is_quanto());
+        assert_eq!(instrument.cost_currency(), quote_currency);
+        assert_eq!(notional, Money::new(5000.0, quote_currency));
     }
 
     #[rstest]
@@ -1158,6 +1384,42 @@ mod tests {
         check_positive_money(money, "money").unwrap();
     }
 
+    fn crypto_future_with_quote_settlement(
+        quote_currency: Currency,
+        settlement_currency: Currency,
+    ) -> CryptoFuture {
+        CryptoFuture::new(
+            InstrumentId::from("ETHUSD-QUANTO-TEST.BINANCE"),
+            Symbol::from("ETHUSD-QUANTO-TEST"),
+            Currency::ETH(),
+            quote_currency,
+            settlement_currency,
+            false,
+            0.into(),
+            0.into(),
+            2,
+            0,
+            Price::from("0.01"),
+            Quantity::from("1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(),
+            0.into(),
+        )
+    }
+
     #[rstest]
     fn make_price_with_trailing_zeros_in_increment() {
         // Test instrument with price_increment 0.50 (precision 2, but min_increment_precision 1)
@@ -1171,6 +1433,7 @@ mod tests {
             2,                   // size_precision
             Price::new(0.50, 2), // price_increment with trailing zero
             Quantity::from("0.01"),
+            None,
             None,
             None,
             None,
@@ -1220,6 +1483,7 @@ mod tests {
             2, // size_precision
             Price::new(0.01, 2),
             Quantity::new(0.50, 2), // size_increment with trailing zero
+            None,
             None,
             None,
             None,

@@ -17,6 +17,7 @@
 
 use ahash::AHashMap;
 use alloy_primitives::{Address, I256, U160, U256};
+use nautilus_core::UnixNanos;
 
 use crate::defi::{
     PoolLiquidityUpdate, PoolSwap, SharedPool,
@@ -86,6 +87,8 @@ pub struct PoolProfiler {
     pub analytics: PoolAnalytics,
     /// The block position of the last processed event.
     pub last_processed_event: Option<BlockPosition>,
+    /// The event timestamp of the last processed event.
+    pub last_processed_ts: Option<UnixNanos>,
     /// Flag indicating whether the pool has been initialized with a starting price.
     pub is_initialized: bool,
     /// Optional progress reporter for tracking event processing.
@@ -110,6 +113,7 @@ impl PoolProfiler {
             state: PoolState::default(),
             analytics: PoolAnalytics::default(),
             last_processed_event: None,
+            last_processed_ts: None,
             is_initialized: false,
             reporter: None,
             last_reported_block: 0,
@@ -308,7 +312,7 @@ impl PoolProfiler {
 
         // Verify simulation against event data - correct with event values if mismatch detected
         if swap.tick != self.state.current_tick {
-            log::error!(
+            log::warn!(
                 "Inconsistency in swap processing: Current tick mismatch: simulated {}, event {} on block {}",
                 self.state.current_tick,
                 swap.tick,
@@ -318,7 +322,7 @@ impl PoolProfiler {
         }
 
         if swap.liquidity != self.tick_map.liquidity {
-            log::error!(
+            log::warn!(
                 "Inconsistency in swap processing: Active liquidity mismatch: simulated {}, event {} on block {}",
                 self.tick_map.liquidity,
                 swap.liquidity,
@@ -327,12 +331,23 @@ impl PoolProfiler {
             self.tick_map.liquidity = swap.liquidity;
         }
 
+        if swap.sqrt_price_x96 != self.state.price_sqrt_ratio_x96 {
+            log::warn!(
+                "Inconsistency in swap processing: Sqrt price mismatch: simulated {}, event {} on block {}",
+                self.state.price_sqrt_ratio_x96,
+                swap.sqrt_price_x96,
+                swap.block
+            );
+            self.state.price_sqrt_ratio_x96 = swap.sqrt_price_x96;
+        }
+
         self.last_processed_event = Some(BlockPosition::new(
             swap.block,
             swap.transaction_hash.clone(),
             swap.transaction_index,
             swap.log_index,
         ));
+        self.last_processed_ts = Some(swap.ts_event);
         self.update_reporter_if_enabled(swap.block);
         self.update_liquidity_analytics();
 
@@ -374,7 +389,8 @@ impl PoolProfiler {
             block.transaction_hash,
             block.transaction_index,
             block.log_index,
-            None,
+            self.pool.ts_init, // ts_event (simulated; pool init time)
+            self.pool.ts_init, // ts_init
             sender,
             recipient,
             swap_quote.amount0,
@@ -849,6 +865,7 @@ impl PoolProfiler {
             update.transaction_index,
             update.log_index,
         ));
+        self.last_processed_ts = Some(update.ts_event);
         self.update_reporter_if_enabled(update.block);
         self.update_liquidity_analytics();
 
@@ -936,7 +953,8 @@ impl PoolProfiler {
             amount1,
             tick_lower,
             tick_upper,
-            None,
+            self.pool.ts_init, // ts_event (simulated; pool init time)
+            self.pool.ts_init, // ts_init
         );
 
         Ok(event)
@@ -989,6 +1007,7 @@ impl PoolProfiler {
             update.transaction_index,
             update.log_index,
         ));
+        self.last_processed_ts = Some(update.ts_event);
         self.update_reporter_if_enabled(update.block);
         self.update_liquidity_analytics();
 
@@ -1055,7 +1074,8 @@ impl PoolProfiler {
             amount1,
             tick_lower,
             tick_upper,
-            None,
+            self.pool.ts_init, // ts_event (simulated; pool init time)
+            self.pool.ts_init, // ts_init
         );
 
         Ok(event)
@@ -1103,6 +1123,7 @@ impl PoolProfiler {
             collect.transaction_index,
             collect.log_index,
         ));
+        self.last_processed_ts = Some(collect.ts_event);
         self.update_reporter_if_enabled(collect.block);
         self.update_liquidity_analytics();
 
@@ -1132,6 +1153,7 @@ impl PoolProfiler {
             flash.transaction_index,
             flash.log_index,
         ));
+        self.last_processed_ts = Some(flash.ts_event);
         self.update_reporter_if_enabled(flash.block);
         self.update_liquidity_analytics();
 
@@ -1186,7 +1208,8 @@ impl PoolProfiler {
             block.transaction_hash,
             block.transaction_index,
             block.log_index,
-            None,
+            self.pool.ts_init, // ts_event (simulated; pool init time)
+            self.pool.ts_init, // ts_init
             sender,
             recipient,
             amount0,
@@ -1514,6 +1537,7 @@ impl PoolProfiler {
 
         // Set last processed event
         self.last_processed_event = Some(snapshot.block_position);
+        self.last_processed_ts = Some(snapshot.ts_event);
 
         // Mark as initialized
         self.is_initialized = true;
@@ -1640,27 +1664,32 @@ impl PoolProfiler {
     /// [`PoolSnapshot`] structure. This snapshot can be serialized, persisted
     /// to database, or used to restore pool state later.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if no events have been processed yet.
-    #[must_use]
-    pub fn extract_snapshot(&self) -> PoolSnapshot {
+    /// Returns an error if no events have been processed yet, since there is no event watermark to
+    /// anchor the snapshot to.
+    pub fn extract_snapshot(&self) -> anyhow::Result<PoolSnapshot> {
         let positions: Vec<_> = self.positions.values().cloned().collect();
         let ticks: Vec<_> = self.tick_map.get_all_ticks().values().copied().collect();
 
         let mut state = self.state.clone();
         state.liquidity = self.tick_map.liquidity;
 
-        PoolSnapshot::new(
+        let last_processed_event = self
+            .last_processed_event
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Cannot extract snapshot: no events processed yet"))?;
+
+        Ok(PoolSnapshot::new(
             self.pool.instrument_id,
             state,
             positions,
             ticks,
             self.analytics.clone(),
-            self.last_processed_event
-                .clone()
-                .expect("No events processed yet"),
-        )
+            last_processed_event,
+            self.last_processed_ts.unwrap_or(self.pool.ts_init), // ts_event (last processed event)
+            self.last_processed_ts.unwrap_or(self.pool.ts_init), // ts_init
+        ))
     }
 
     /// Gets the count of positions that are currently active.

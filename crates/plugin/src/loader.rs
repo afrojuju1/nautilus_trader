@@ -33,12 +33,17 @@ use std::{
 use libloading::{Library, Symbol};
 
 use crate::{
-    NAUTILUS_PLUGIN_ABI_VERSION, NAUTILUS_PLUGIN_INIT_SYMBOL,
+    NAUTILUS_PLUGIN_ABI_VERSION, NAUTILUS_PLUGIN_INIT_SYMBOL, PLUGIN_BUILD_ID_VERSION,
     boundary::{BorrowedStr, PluginError, PluginErrorCode, PluginResult},
     host::{HostContext, HostLogLevel, HostVTable},
     manifest::{
         PluginBuildId, PluginInitFn, PluginManifest, PluginManifestValidationErrors,
-        ValidatedPluginManifest,
+        ValidatedCustomDataRegistration, ValidatedPluginManifest,
+    },
+    surfaces::commands::{
+        CancelAllOrdersHandle, CancelOrderHandle, CancelOrdersHandle, CloseAllPositionsHandle,
+        ClosePositionHandle, ModifyOrderHandle, QueryAccountHandle, QueryOrderHandle,
+        SubmitOrderHandle, SubmitOrderListHandle,
     },
 };
 
@@ -77,6 +82,25 @@ pub enum LoadError {
         #[source]
         errors: PluginManifestValidationErrors,
     },
+
+    #[error(
+        "plug-in '{path}' redeclares custom-data type '{type_name}' already provided by '{existing_path}'"
+    )]
+    DuplicateCustomDataType {
+        path: PathBuf,
+        type_name: String,
+        existing_path: PathBuf,
+    },
+
+    #[error(
+        "plug-in '{path}' build mismatch: host {host}, plug-in {plugin}; rebuild the plug-in \
+         against the host toolchain or call `PluginLoader::set_allow_build_mismatch`"
+    )]
+    BuildMismatch {
+        path: PathBuf,
+        host: Box<PluginBuildIdDiagnostics>,
+        plugin: Box<PluginBuildIdDiagnostics>,
+    },
 }
 
 /// Owned manifest diagnostics captured before a rejected plug-in is unloaded.
@@ -96,6 +120,25 @@ impl PluginManifestDiagnostics {
             plugin_name: borrowed_str_diagnostic(manifest.plugin_name),
             plugin_version: borrowed_str_diagnostic(manifest.plugin_version),
             build_id: PluginBuildIdDiagnostics::from_build_id(&manifest.build_id),
+        }
+    }
+
+    // Reading manifest fields beyond `abi_version` here relies on the
+    // append-only manifest evolution contract (see `PluginManifest` docs):
+    // the header prefix (name, vendor, version, build_id) stays
+    // layout-stable across ABI revisions, so these reads are sound for
+    // conforming plug-ins. Non-conforming binaries are bounded by the
+    // length-capped diagnostic reads.
+    fn from_abi_mismatch_manifest(manifest: &PluginManifest) -> Self {
+        let build_id = if manifest.build_id.schema_version == PLUGIN_BUILD_ID_VERSION {
+            PluginBuildIdDiagnostics::from_build_id(&manifest.build_id)
+        } else {
+            PluginBuildIdDiagnostics::schema_only(manifest.build_id.schema_version)
+        };
+        Self {
+            plugin_name: borrowed_str_diagnostic(manifest.plugin_name),
+            plugin_version: borrowed_str_diagnostic(manifest.plugin_version),
+            build_id,
         }
     }
 }
@@ -125,6 +168,10 @@ pub struct PluginBuildIdDiagnostics {
     pub target_triple: String,
     /// Cargo build profile, or empty when unavailable.
     pub build_profile: String,
+    /// Model fixed-point precision mode, or empty when unavailable.
+    pub precision_mode: String,
+    /// Maximum fixed-point decimal precision, or none when unavailable.
+    pub fixed_precision: Option<u8>,
 }
 
 impl PluginBuildIdDiagnostics {
@@ -135,6 +182,20 @@ impl PluginBuildIdDiagnostics {
             rustc_version: borrowed_str_diagnostic(build_id.rustc_version),
             target_triple: borrowed_str_diagnostic(build_id.target_triple),
             build_profile: borrowed_str_diagnostic(build_id.build_profile),
+            precision_mode: borrowed_str_diagnostic(build_id.precision_mode),
+            fixed_precision: Some(build_id.fixed_precision),
+        }
+    }
+
+    fn schema_only(schema_version: u32) -> Self {
+        Self {
+            schema_version,
+            nautilus_plugin_version: String::new(),
+            rustc_version: String::new(),
+            target_triple: String::new(),
+            build_profile: String::new(),
+            precision_mode: String::new(),
+            fixed_precision: None,
         }
     }
 }
@@ -146,10 +207,18 @@ impl Display for PluginBuildIdDiagnostics {
         let rustc_version = unknown_if_empty(&self.rustc_version);
         let target_triple = unknown_if_empty(&self.target_triple);
         let build_profile = unknown_if_empty(&self.build_profile);
+        let precision_mode = unknown_if_empty(&self.precision_mode);
+        let fixed_precision = self
+            .fixed_precision
+            .map_or_else(|| "<unknown>".to_string(), |value| value.to_string());
+        write!(f, "build_id(schema={schema_version}, ")?;
+        write!(f, "nautilus_plugin_version='{nautilus_plugin_version}', ")?;
+        write!(f, "rustc='{rustc_version}', target='{target_triple}', ")?;
         write!(
             f,
-            "build_id(schema={schema_version}, nautilus_plugin_version='{nautilus_plugin_version}', rustc='{rustc_version}', target='{target_triple}', profile='{build_profile}')"
-        )
+            "profile='{build_profile}', precision_mode='{precision_mode}', "
+        )?;
+        write!(f, "fixed_precision={fixed_precision})")
     }
 }
 
@@ -157,14 +226,23 @@ fn unknown_if_empty(value: &str) -> &str {
     if value.is_empty() { "<unknown>" } else { value }
 }
 
+/// Maximum bytes read when capturing a manifest string for diagnostics.
+///
+/// Diagnostics also run on the ABI-mismatch path, where the manifest layout
+/// is not trusted and a corrupt descriptor could carry an absurd length; the
+/// cap bounds the raw read. Genuine values (names, versions, targets) fit
+/// comfortably.
+const MAX_DIAGNOSTIC_STR_LEN: usize = 256;
+
 fn borrowed_str_diagnostic(value: BorrowedStr<'_>) -> String {
     if value.ptr.is_null() || value.len == 0 {
         return String::new();
     }
 
+    let len = value.len.min(MAX_DIAGNOSTIC_STR_LEN);
     // SAFETY: manifest strings live in static cdylib storage while the
-    // library is loaded.
-    let bytes = unsafe { slice::from_raw_parts(value.ptr, value.len) };
+    // library is loaded; the read is length-capped for untrusted descriptors.
+    let bytes = unsafe { slice::from_raw_parts(value.ptr, len) };
     String::from_utf8_lossy(bytes).into_owned()
 }
 
@@ -187,7 +265,7 @@ impl Debug for LoadedPlugin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(LoadedPlugin))
             .field("path", &self.path)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -226,6 +304,7 @@ impl LoadedPlugin {
 pub struct PluginLoader {
     loaded: Vec<LoadedPlugin>,
     host: Option<*const HostVTable>,
+    allow_build_mismatch: bool,
 }
 
 /// SAFETY: `*const HostVTable` is a process-lifetime static pointer; the host
@@ -245,6 +324,7 @@ impl PluginLoader {
         Self {
             loaded: Vec::new(),
             host: None,
+            allow_build_mismatch: false,
         }
     }
 
@@ -258,10 +338,28 @@ impl PluginLoader {
         Self {
             loaded: Vec::new(),
             host: Some(host),
+            allow_build_mismatch: false,
         }
     }
 
+    /// Allows loading plug-ins whose build identifier does not match the host.
+    ///
+    /// The loader rejects mismatched `rustc_version` or
+    /// `nautilus_plugin_version` by default: boundary payloads include
+    /// `repr(Rust)` interiors whose layout is only guaranteed when host and
+    /// plug-in share a toolchain and crate version. Allowing a mismatch
+    /// downgrades the rejection to a warning; the operator owns the layout
+    /// risk.
+    pub fn set_allow_build_mismatch(&mut self, allow: bool) {
+        self.allow_build_mismatch = allow;
+    }
+
     /// Loads every plug-in path in order. Stops on the first error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`LoadError`] raised while loading the provided
+    /// paths.
     pub fn load_all<P>(&mut self, paths: impl IntoIterator<Item = P>) -> Result<(), LoadError>
     where
         P: AsRef<OsStr>,
@@ -273,6 +371,12 @@ impl PluginLoader {
     }
 
     /// Loads a single plug-in cdylib.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LoadError`] if the library cannot be opened, the init
+    /// symbol is missing, the manifest is invalid, or the manifest conflicts
+    /// with an already loaded plug-in.
     pub fn load(&mut self, path: impl AsRef<OsStr>) -> Result<&LoadedPlugin, LoadError> {
         let path_buf = PathBuf::from(path.as_ref());
 
@@ -283,6 +387,13 @@ impl PluginLoader {
             path: path_buf.clone(),
             source: e,
         })?;
+
+        // Leak the handle immediately: by this point the cdylib's static
+        // initializers have run (and `nautilus_plugin_init` runs below), so
+        // `dlclose` on a rejection path could unload code that registered
+        // atexit callbacks or spawned threads. v1 never unloads; rejected
+        // plug-ins leak the handle the same way accepted ones do.
+        let library = ManuallyDrop::new(library);
 
         let manifest_ptr = {
             // SAFETY: looking up a known symbol name in an opened library.
@@ -299,25 +410,58 @@ impl PluginLoader {
         };
 
         let manifest = validate_manifest_ptr(manifest_ptr, &path_buf)?;
+        validate_build_pinning(manifest, &path_buf, self.allow_build_mismatch)?;
+
+        let collision = {
+            let new_types: Vec<&str> = manifest
+                .custom_data()
+                .map(ValidatedCustomDataRegistration::type_name)
+                .collect();
+            let existing: Vec<(&str, &Path)> = self
+                .loaded
+                .iter()
+                .flat_map(|loaded| {
+                    let loaded_path = loaded.path();
+                    loaded
+                        .validated_manifest()
+                        .custom_data()
+                        .map(move |entry| (entry.type_name(), loaded_path))
+                })
+                .collect();
+            first_duplicate_custom_data_type(&new_types, &existing).map(
+                |(type_name, existing_path)| (type_name.to_string(), existing_path.to_path_buf()),
+            )
+        };
+
+        if let Some((type_name, existing_path)) = collision {
+            return Err(LoadError::DuplicateCustomDataType {
+                path: path_buf,
+                type_name,
+                existing_path,
+            });
+        }
+
         let manifest_ref = manifest.manifest();
         let abi = manifest_ref.abi_version;
         let custom_data_count = manifest.custom_data().len();
         let actor_count = manifest.actors().len();
         let strategy_count = manifest.strategies().len();
+        let controller_count = manifest.controllers().len();
         let build_id = PluginBuildIdDiagnostics::from_build_id(&manifest_ref.build_id);
         log::info!(
             target: "nautilus_plugin",
-            "Loaded plug-in '{}' (abi={abi}, {build_id}, custom_data={custom_data_count}, actors={actor_count}, strategies={strategy_count}) from {}",
+            "Loaded plug-in '{}' (abi={abi}, {build_id}, custom_data={custom_data_count}, actors={actor_count}, strategies={strategy_count}, controllers={controller_count}) from {}",
             manifest.plugin_name(),
             path_buf.display(),
         );
 
+        let loaded_index = self.loaded.len();
         self.loaded.push(LoadedPlugin {
             path: path_buf,
-            _library: ManuallyDrop::new(library),
+            _library: library,
             manifest,
         });
-        Ok(self.loaded.last().expect("just pushed"))
+        Ok(&self.loaded[loaded_index])
     }
 
     /// Returns every loaded plug-in in load order.
@@ -361,7 +505,9 @@ fn validate_manifest_ptr(
             path: path.to_path_buf(),
             expected: NAUTILUS_PLUGIN_ABI_VERSION,
             actual: abi,
-            diagnostics: Box::new(PluginManifestDiagnostics::from_manifest(manifest)),
+            diagnostics: Box::new(PluginManifestDiagnostics::from_abi_mismatch_manifest(
+                manifest,
+            )),
         });
     }
 
@@ -375,11 +521,107 @@ fn validate_manifest_ptr(
     }
 }
 
+/// Verifies the manifest's build identifier is pinned to the host's.
+///
+/// Boundary payloads include `repr(Rust)` interiors (`Box<OrderBook>`,
+/// `Vec<OrderAny>`, `String` fields) whose layout is only guaranteed when
+/// host and plug-in share a toolchain and `nautilus-plugin` crate version,
+/// so the loader compares `rustc_version` and `nautilus_plugin_version` by
+/// default. A field that is empty on either side cannot be compared and
+/// logs a warning instead of failing.
+fn validate_build_pinning(
+    manifest: ValidatedPluginManifest<'_>,
+    path: &Path,
+    allow_mismatch: bool,
+) -> Result<(), LoadError> {
+    let host_build = PluginBuildId::current();
+    let plugin_build = &manifest.manifest().build_id;
+
+    let mut mismatch = false;
+
+    for (field, host_value, plugin_value) in [
+        (
+            "rustc_version",
+            host_build.rustc_version,
+            plugin_build.rustc_version,
+        ),
+        (
+            "nautilus_plugin_version",
+            host_build.nautilus_plugin_version,
+            plugin_build.nautilus_plugin_version,
+        ),
+    ] {
+        // SAFETY: host values live in compiled-in static storage; plug-in
+        // values passed manifest validation (UTF-8 checked) and live in
+        // static cdylib storage.
+        let host_value = unsafe { host_value.as_str() };
+        // SAFETY: see above.
+        let plugin_value = unsafe { plugin_value.as_str() };
+        if host_value.is_empty() || plugin_value.is_empty() {
+            log::warn!(
+                target: "nautilus_plugin",
+                "Cannot verify build_id.{field} for plug-in '{}': value unavailable",
+                path.display(),
+            );
+            continue;
+        }
+
+        if host_value != plugin_value {
+            mismatch = true;
+        }
+    }
+
+    if !mismatch {
+        return Ok(());
+    }
+
+    let host = Box::new(PluginBuildIdDiagnostics::from_build_id(&host_build));
+    let plugin = Box::new(PluginBuildIdDiagnostics::from_build_id(plugin_build));
+
+    if allow_mismatch {
+        log::warn!(
+            target: "nautilus_plugin",
+            "Plug-in '{}' build mismatch allowed by configuration: host {host}, plug-in {plugin}",
+            path.display(),
+        );
+        return Ok(());
+    }
+
+    Err(LoadError::BuildMismatch {
+        path: path.to_path_buf(),
+        host,
+        plugin,
+    })
+}
+
+/// Returns the first custom-data type name in `new_types` that a previously
+/// loaded plug-in (`existing`) already declares, paired with the path that
+/// declared it first.
+///
+/// Host JSON-deserializer registration is keyed by type name and keeps the
+/// first registration, so a second plug-in declaring an already-registered
+/// type name would have its decoder silently ignored. The loader rejects the
+/// collision instead of letting it pass unnoticed. The intra-plug-in case
+/// (one manifest declaring a name twice) is already caught by manifest
+/// validation; this guards the cross-plug-in case the single-manifest check
+/// cannot see.
+fn first_duplicate_custom_data_type<'a>(
+    new_types: &[&'a str],
+    existing: &[(&'a str, &'a Path)],
+) -> Option<(&'a str, &'a Path)> {
+    new_types.iter().find_map(|&new_type| {
+        existing
+            .iter()
+            .find(|(existing_type, _)| *existing_type == new_type)
+            .map(|&(_, path)| (new_type, path))
+    })
+}
+
 /// Returns the process-wide static `HostVTable` exposed to plug-ins.
 ///
 /// One `&'static HostVTable` is enough because plug-ins never compare
-/// vtables; they only call through the function pointers. Methods can be
-/// added by bumping [`NAUTILUS_PLUGIN_ABI_VERSION`].
+/// vtables; they only call through the function pointers. During alpha,
+/// methods can be added by rebuilding plug-ins to match the host.
 fn host_vtable() -> *const HostVTable {
     static HOST: OnceLock<HostVTable> = OnceLock::new();
     std::ptr::from_ref(HOST.get_or_init(|| HostVTable {
@@ -416,6 +658,11 @@ fn host_vtable() -> *const HostVTable {
         close_all_positions: host_close_all_positions_unbound,
         query_account: host_query_account_unbound,
         query_order: host_query_order_unbound,
+        trader_id: host_trader_id_unbound,
+        strategy_id: host_strategy_id_unbound,
+        component_state: host_component_state_unbound,
+        generate_client_order_id: host_generate_client_order_id_unbound,
+        generate_order_list_id: host_generate_order_list_id_unbound,
     }))
 }
 
@@ -439,6 +686,15 @@ macro_rules! unbound_bytes_fn {
 macro_rules! unbound_unit_fn {
     ($name:ident, $message:literal, ($($arg:ident : $ty:ty),* $(,)?)) => {
         unsafe extern "C" fn $name($($arg: $ty),*) -> PluginResult<()> {
+            $(let _ = $arg;)*
+            PluginResult::Err(PluginError::new(PluginErrorCode::NotImplemented, $message))
+        }
+    };
+}
+
+macro_rules! unbound_u8_fn {
+    ($name:ident, $message:literal, ($($arg:ident : $ty:ty),* $(,)?)) => {
+        unsafe extern "C" fn $name($($arg: $ty),*) -> PluginResult<u8> {
             $(let _ = $arg;)*
             PluginResult::Err(PluginError::new(PluginErrorCode::NotImplemented, $message))
         }
@@ -474,6 +730,31 @@ unbound_bytes_fn!(
     host_cache_positions_for_strategy_unbound,
     "cache_positions_for_strategy is not wired into this host vtable",
     (ctx: *const HostContext, strategy_id: BorrowedStr<'_>)
+);
+unbound_bytes_fn!(
+    host_trader_id_unbound,
+    "trader_id is not wired into this host vtable",
+    (ctx: *const HostContext)
+);
+unbound_bytes_fn!(
+    host_strategy_id_unbound,
+    "strategy_id is not wired into this host vtable",
+    (ctx: *const HostContext)
+);
+unbound_u8_fn!(
+    host_component_state_unbound,
+    "component_state is not wired into this host vtable",
+    (ctx: *const HostContext)
+);
+unbound_bytes_fn!(
+    host_generate_client_order_id_unbound,
+    "generate_client_order_id is not wired into this host vtable",
+    (ctx: *const HostContext)
+);
+unbound_bytes_fn!(
+    host_generate_order_list_id_unbound,
+    "generate_order_list_id is not wired into this host vtable",
+    (ctx: *const HostContext)
 );
 
 unbound_unit_fn!(
@@ -623,7 +904,7 @@ unbound_unit_fn!(
 
 unsafe extern "C" fn host_submit_order_unbound(
     _ctx: *const HostContext,
-    _command_json: BorrowedStr<'_>,
+    _command: *const SubmitOrderHandle,
 ) -> PluginResult<()> {
     PluginResult::Err(PluginError::new(
         PluginErrorCode::NotImplemented,
@@ -633,7 +914,7 @@ unsafe extern "C" fn host_submit_order_unbound(
 
 unsafe extern "C" fn host_cancel_order_unbound(
     _ctx: *const HostContext,
-    _command_json: BorrowedStr<'_>,
+    _command: *const CancelOrderHandle,
 ) -> PluginResult<()> {
     PluginResult::Err(PluginError::new(
         PluginErrorCode::NotImplemented,
@@ -643,7 +924,7 @@ unsafe extern "C" fn host_cancel_order_unbound(
 
 unsafe extern "C" fn host_modify_order_unbound(
     _ctx: *const HostContext,
-    _command_json: BorrowedStr<'_>,
+    _command: *const ModifyOrderHandle,
 ) -> PluginResult<()> {
     PluginResult::Err(PluginError::new(
         PluginErrorCode::NotImplemented,
@@ -653,7 +934,7 @@ unsafe extern "C" fn host_modify_order_unbound(
 
 unsafe extern "C" fn host_submit_order_list_unbound(
     _ctx: *const HostContext,
-    _command_json: BorrowedStr<'_>,
+    _command: *const SubmitOrderListHandle,
 ) -> PluginResult<()> {
     PluginResult::Err(PluginError::new(
         PluginErrorCode::NotImplemented,
@@ -663,7 +944,7 @@ unsafe extern "C" fn host_submit_order_list_unbound(
 
 unsafe extern "C" fn host_cancel_orders_unbound(
     _ctx: *const HostContext,
-    _command_json: BorrowedStr<'_>,
+    _command: *const CancelOrdersHandle,
 ) -> PluginResult<()> {
     PluginResult::Err(PluginError::new(
         PluginErrorCode::NotImplemented,
@@ -673,7 +954,7 @@ unsafe extern "C" fn host_cancel_orders_unbound(
 
 unsafe extern "C" fn host_cancel_all_orders_unbound(
     _ctx: *const HostContext,
-    _command_json: BorrowedStr<'_>,
+    _command: *const CancelAllOrdersHandle,
 ) -> PluginResult<()> {
     PluginResult::Err(PluginError::new(
         PluginErrorCode::NotImplemented,
@@ -683,7 +964,7 @@ unsafe extern "C" fn host_cancel_all_orders_unbound(
 
 unsafe extern "C" fn host_close_position_unbound(
     _ctx: *const HostContext,
-    _command_json: BorrowedStr<'_>,
+    _command: *const ClosePositionHandle,
 ) -> PluginResult<()> {
     PluginResult::Err(PluginError::new(
         PluginErrorCode::NotImplemented,
@@ -693,7 +974,7 @@ unsafe extern "C" fn host_close_position_unbound(
 
 unsafe extern "C" fn host_close_all_positions_unbound(
     _ctx: *const HostContext,
-    _command_json: BorrowedStr<'_>,
+    _command: *const CloseAllPositionsHandle,
 ) -> PluginResult<()> {
     PluginResult::Err(PluginError::new(
         PluginErrorCode::NotImplemented,
@@ -703,7 +984,7 @@ unsafe extern "C" fn host_close_all_positions_unbound(
 
 unsafe extern "C" fn host_query_account_unbound(
     _ctx: *const HostContext,
-    _command_json: BorrowedStr<'_>,
+    _command: *const QueryAccountHandle,
 ) -> PluginResult<()> {
     PluginResult::Err(PluginError::new(
         PluginErrorCode::NotImplemented,
@@ -713,7 +994,7 @@ unsafe extern "C" fn host_query_account_unbound(
 
 unsafe extern "C" fn host_query_order_unbound(
     _ctx: *const HostContext,
-    _command_json: BorrowedStr<'_>,
+    _command: *const QueryOrderHandle,
 ) -> PluginResult<()> {
     PluginResult::Err(PluginError::new(
         PluginErrorCode::NotImplemented,
@@ -726,21 +1007,26 @@ unsafe extern "C" fn host_log(
     target: BorrowedStr<'_>,
     message: BorrowedStr<'_>,
 ) {
-    // SAFETY: producer holds the storage live across the call.
-    let target = unsafe { target.as_str() };
-    // SAFETY: see above.
-    let message = unsafe { message.as_str() };
-    match level {
-        HostLogLevel::Error => log::error!(target: "nautilus_plugin", "[{target}] {message}"),
-        HostLogLevel::Warn => log::warn!(target: "nautilus_plugin", "[{target}] {message}"),
-        HostLogLevel::Info => log::info!(target: "nautilus_plugin", "[{target}] {message}"),
-        HostLogLevel::Debug => log::debug!(target: "nautilus_plugin", "[{target}] {message}"),
-        HostLogLevel::Trace => log::trace!(target: "nautilus_plugin", "[{target}] {message}"),
-    }
+    // No error channel here, so a panicking logger must be swallowed rather
+    // than unwind out of the `extern "C"` thunk and abort the process.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: producer holds the storage live across the call.
+        let target = unsafe { target.to_string_lossy() };
+        // SAFETY: see above.
+        let message = unsafe { message.to_string_lossy() };
+        match level {
+            HostLogLevel::Error => log::error!(target: "nautilus_plugin", "[{target}] {message}"),
+            HostLogLevel::Warn => log::warn!(target: "nautilus_plugin", "[{target}] {message}"),
+            HostLogLevel::Info => log::info!(target: "nautilus_plugin", "[{target}] {message}"),
+            HostLogLevel::Debug => log::debug!(target: "nautilus_plugin", "[{target}] {message}"),
+            HostLogLevel::Trace => log::trace!(target: "nautilus_plugin", "[{target}] {message}"),
+        }
+    }));
 }
 
 #[cfg(test)]
 mod tests {
+    use nautilus_model::types::fixed::FIXED_PRECISION;
     use rstest::rstest;
 
     use super::*;
@@ -817,6 +1103,43 @@ mod tests {
     }
 
     #[rstest]
+    fn first_duplicate_custom_data_type_finds_cross_plugin_collision() {
+        let path_a = Path::new("/plugins/a.so");
+        let path_b = Path::new("/plugins/b.so");
+        let existing = [
+            ("AlphaTick", path_a),
+            ("BetaTick", path_a),
+            ("GammaTick", path_b),
+        ];
+        let new_types = ["DeltaTick", "BetaTick"];
+
+        let hit = first_duplicate_custom_data_type(&new_types, &existing);
+
+        assert_eq!(hit, Some(("BetaTick", path_a)));
+    }
+
+    #[rstest]
+    fn first_duplicate_custom_data_type_returns_none_when_disjoint() {
+        let path_a = Path::new("/plugins/a.so");
+        let existing = [("AlphaTick", path_a)];
+        let new_types = ["BetaTick", "GammaTick"];
+
+        assert_eq!(
+            first_duplicate_custom_data_type(&new_types, &existing),
+            None
+        );
+    }
+
+    #[rstest]
+    fn first_duplicate_custom_data_type_handles_empty_inputs() {
+        let path_a = Path::new("/plugins/a.so");
+        let existing = [("AlphaTick", path_a)];
+
+        assert_eq!(first_duplicate_custom_data_type(&[], &existing), None);
+        assert_eq!(first_duplicate_custom_data_type(&["AlphaTick"], &[]), None);
+    }
+
+    #[rstest]
     fn missing_file_reports_open_error_with_path_and_source() {
         let mut loader = PluginLoader::new();
         let path = "/nonexistent/path/to/plugin.so";
@@ -867,6 +1190,98 @@ mod tests {
         unsafe { (v.log)(HostLogLevel::Info, target, message) };
     }
 
+    fn pinning_test_manifest(build_id: PluginBuildId) -> PluginManifest {
+        PluginManifest {
+            abi_version: NAUTILUS_PLUGIN_ABI_VERSION,
+            plugin_name: BorrowedStr::from_str("pinning-test"),
+            plugin_vendor: BorrowedStr::from_str(""),
+            plugin_version: BorrowedStr::from_str("0.0.0"),
+            build_id,
+            custom_data: Slice::empty(),
+            actors: Slice::empty(),
+            strategies: Slice::empty(),
+            controllers: Slice::empty(),
+        }
+    }
+
+    #[rstest]
+    fn validate_build_pinning_accepts_matching_build() {
+        let manifest = pinning_test_manifest(PluginBuildId::current());
+        let manifest = ValidatedPluginManifest::new(&manifest).expect("manifest validates");
+        let path = Path::new("/test/plugin.so");
+
+        assert!(validate_build_pinning(manifest, path, false).is_ok());
+    }
+
+    #[rstest]
+    fn validate_build_pinning_rejects_crate_version_mismatch() {
+        let build_id = PluginBuildId {
+            nautilus_plugin_version: BorrowedStr::from_str("0.0.0-test"),
+            ..PluginBuildId::current()
+        };
+        let manifest = pinning_test_manifest(build_id);
+        let manifest = ValidatedPluginManifest::new(&manifest).expect("manifest validates");
+        let path = Path::new("/test/plugin.so");
+
+        let err = validate_build_pinning(manifest, path, false).unwrap_err();
+        match &err {
+            LoadError::BuildMismatch {
+                path: p,
+                host,
+                plugin,
+            } => {
+                assert_eq!(p, path);
+                assert_eq!(
+                    host.nautilus_plugin_version.as_str(),
+                    env!("CARGO_PKG_VERSION")
+                );
+                assert_eq!(plugin.nautilus_plugin_version.as_str(), "0.0.0-test");
+            }
+            other => panic!("expected BuildMismatch, was {other:?}"),
+        }
+        let rendered = format!("{err}");
+        assert!(rendered.contains("build mismatch"));
+        assert!(rendered.contains("0.0.0-test"));
+        assert!(rendered.contains("set_allow_build_mismatch"));
+    }
+
+    #[rstest]
+    fn validate_build_pinning_allows_mismatch_when_configured() {
+        let build_id = PluginBuildId {
+            nautilus_plugin_version: BorrowedStr::from_str("0.0.0-test"),
+            ..PluginBuildId::current()
+        };
+        let manifest = pinning_test_manifest(build_id);
+        let manifest = ValidatedPluginManifest::new(&manifest).expect("manifest validates");
+        let path = Path::new("/test/plugin.so");
+
+        assert!(validate_build_pinning(manifest, path, true).is_ok());
+    }
+
+    #[rstest]
+    fn validate_build_pinning_skips_unavailable_fields() {
+        // An empty value cannot be compared, so it warns instead of failing.
+        let build_id = PluginBuildId {
+            rustc_version: BorrowedStr::empty(),
+            ..PluginBuildId::current()
+        };
+        let manifest = pinning_test_manifest(build_id);
+        let manifest = ValidatedPluginManifest::new(&manifest).expect("manifest validates");
+        let path = Path::new("/test/plugin.so");
+
+        assert!(validate_build_pinning(manifest, path, false).is_ok());
+    }
+
+    #[rstest]
+    fn borrowed_str_diagnostic_caps_read_length() {
+        let long = "x".repeat(MAX_DIAGNOSTIC_STR_LEN * 4);
+        let value = BorrowedStr::from_str(&long);
+
+        let captured = borrowed_str_diagnostic(value);
+
+        assert_eq!(captured.len(), MAX_DIAGNOSTIC_STR_LEN);
+    }
+
     #[rstest]
     fn validate_manifest_ptr_rejects_null() {
         let path = std::path::Path::new("/test/plugin.so");
@@ -888,6 +1303,7 @@ mod tests {
             custom_data: Slice::empty(),
             actors: Slice::empty(),
             strategies: Slice::empty(),
+            controllers: Slice::empty(),
         };
         let path = std::path::Path::new("/test/plugin.so");
         let err = validate_manifest_ptr(&raw const bad_manifest, path).unwrap_err();
@@ -907,6 +1323,7 @@ mod tests {
                     diagnostics.build_id.nautilus_plugin_version.as_str(),
                     env!("CARGO_PKG_VERSION")
                 );
+                assert_eq!(diagnostics.build_id.fixed_precision, Some(FIXED_PRECISION));
             }
             other => panic!("expected AbiMismatch, was {other:?}"),
         }
@@ -917,6 +1334,8 @@ mod tests {
         assert!(rendered.contains("rustc='"));
         assert!(rendered.contains("target='"));
         assert!(rendered.contains("profile='"));
+        assert!(rendered.contains("precision_mode='"));
+        assert!(rendered.contains("fixed_precision="));
     }
 
     #[rstest]
@@ -932,18 +1351,24 @@ mod tests {
                 rustc_version: BorrowedStr::empty(),
                 target_triple: BorrowedStr::empty(),
                 build_profile: BorrowedStr::empty(),
+                precision_mode: BorrowedStr::empty(),
+                fixed_precision: 0,
             },
             custom_data: Slice::empty(),
             actors: Slice::empty(),
             strategies: Slice::empty(),
+            controllers: Slice::empty(),
         };
         let path = std::path::Path::new("/test/plugin.so");
         let err = validate_manifest_ptr(&raw const bad_manifest, path).unwrap_err();
         let rendered = format!("{err}");
 
         assert!(rendered.contains("plug-in '/test/plugin.so' ABI mismatch"));
-        assert!(rendered.contains("host = 1"));
-        assert!(rendered.contains("plug-in = 2"));
+        assert!(rendered.contains(&format!("host = {NAUTILUS_PLUGIN_ABI_VERSION}")));
+        assert!(rendered.contains(&format!(
+            "plug-in = {}",
+            NAUTILUS_PLUGIN_ABI_VERSION.wrapping_add(1)
+        )));
         assert!(rendered.contains("manifest name='<unknown>'"));
         assert!(rendered.contains("version='<unknown>'"));
         assert!(rendered.contains("build_id(schema=7"));
@@ -951,6 +1376,8 @@ mod tests {
         assert!(rendered.contains("rustc='<unknown>'"));
         assert!(rendered.contains("target='<unknown>'"));
         assert!(rendered.contains("profile='<unknown>'"));
+        assert!(rendered.contains("precision_mode='<unknown>'"));
+        assert!(rendered.contains("fixed_precision=<unknown>"));
     }
 
     #[rstest]
@@ -968,6 +1395,7 @@ mod tests {
             custom_data: Slice::from_slice(registrations),
             actors: Slice::empty(),
             strategies: Slice::empty(),
+            controllers: Slice::empty(),
         };
         let path = std::path::Path::new("/test/plugin.so");
         let manifest = validate_manifest_ptr(&raw const good_manifest, path)
@@ -998,6 +1426,7 @@ mod tests {
             custom_data: Slice::from_slice(&NULL_VTABLE_CUSTOM_DATA),
             actors: Slice::empty(),
             strategies: Slice::empty(),
+            controllers: Slice::empty(),
         };
         let path = std::path::Path::new("/test/plugin.so");
         let err = validate_manifest_ptr(&raw const bad_manifest, path).unwrap_err();
@@ -1055,6 +1484,7 @@ mod tests {
             custom_data: Slice::from_slice(registrations),
             actors: Slice::empty(),
             strategies: Slice::empty(),
+            controllers: Slice::empty(),
         };
         let path = std::path::Path::new("/test/plugin.so");
         let err = validate_manifest_ptr(&raw const bad_manifest, path).unwrap_err();
@@ -1090,45 +1520,135 @@ mod tests {
     #[case::query_account("query_account is not wired into this host vtable")]
     #[case::query_order("query_order is not wired into this host vtable")]
     fn host_order_command_stubs_return_not_implemented(#[case] expected: &str) {
+        use nautilus_core::{UUID4, UnixNanos};
+        use nautilus_model::{
+            enums::{OrderSide, OrderType, TimeInForce},
+            identifiers::{
+                AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TraderId,
+            },
+            orders::{MarketOrder, OrderAny},
+            types::Quantity,
+        };
+
+        use crate::surfaces::commands::{
+            CancelAllOrdersCommand, CancelOrderCommand, CancelOrdersCommand,
+            CloseAllPositionsCommand, ClosePositionCommand, ModifyOrderCommand,
+            QueryAccountCommand, QueryOrderCommand, SubmitOrderCommand, SubmitOrderListCommand,
+        };
+
+        let _ = OrderType::Market;
+
         // The default loader's host vtable installs NotImplemented stubs for
         // callbacks that need live-node state.
         let p = host_vtable();
         // SAFETY: pointer is to a static `OnceLock`-backed HostVTable.
         let v = unsafe { &*p };
         let ctx = std::ptr::null::<HostContext>();
-        let payload = BorrowedStr::from_str("{}");
+        let order = OrderAny::Market(MarketOrder::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("S-001"),
+            InstrumentId::from("ETH-USDT.BINANCE"),
+            ClientOrderId::from("O-1"),
+            OrderSide::Buy,
+            Quantity::from("1.0"),
+            TimeInForce::Gtc,
+            UUID4::new(),
+            UnixNanos::default(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let submit_handle =
+            SubmitOrderHandle::new(SubmitOrderCommand::new(order.clone(), None, None, None));
+        let cancel_handle = CancelOrderHandle::new(CancelOrderCommand::new(
+            ClientOrderId::from("O-1"),
+            None,
+            None,
+        ));
+        let modify_handle = ModifyOrderHandle::new(ModifyOrderCommand::new(
+            ClientOrderId::from("O-1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let submit_list_handle =
+            SubmitOrderListHandle::new(SubmitOrderListCommand::new(vec![order], None, None, None));
+        let cancel_orders_handle =
+            CancelOrdersHandle::new(CancelOrdersCommand::new(vec![], None, None));
+        let cancel_all_handle = CancelAllOrdersHandle::new(CancelAllOrdersCommand::new(
+            InstrumentId::from("ETH-USDT.BINANCE"),
+            None,
+            None,
+            None,
+        ));
+        let close_handle = ClosePositionHandle::new(ClosePositionCommand::new(
+            PositionId::from("P-001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let close_all_handle = CloseAllPositionsHandle::new(CloseAllPositionsCommand::new(
+            InstrumentId::from("ETH-USDT.BINANCE"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let query_account_handle = QueryAccountHandle::new(QueryAccountCommand::new(
+            AccountId::from("BINANCE-001"),
+            None,
+            None,
+        ));
+        let query_order_handle = QueryOrderHandle::new(QueryOrderCommand::new(
+            ClientOrderId::from("O-1"),
+            None,
+            None,
+        ));
 
         let r = match expected {
             s if s.starts_with("submit_order_list") =>
-            // SAFETY: stub does not deref ctx; payload outlives the call.
-            unsafe { (v.submit_order_list)(ctx, payload) },
+            // SAFETY: stub does not deref ctx; handle outlives the call.
+            unsafe { (v.submit_order_list)(ctx, &raw const submit_list_handle) },
             s if s.starts_with("submit_order") =>
             // SAFETY: see above.
-            unsafe { (v.submit_order)(ctx, payload) },
+            unsafe { (v.submit_order)(ctx, &raw const submit_handle) },
             s if s.starts_with("cancel_orders") =>
             // SAFETY: see above.
-            unsafe { (v.cancel_orders)(ctx, payload) },
+            unsafe { (v.cancel_orders)(ctx, &raw const cancel_orders_handle) },
             s if s.starts_with("cancel_all_orders") =>
             // SAFETY: see above.
-            unsafe { (v.cancel_all_orders)(ctx, payload) },
+            unsafe { (v.cancel_all_orders)(ctx, &raw const cancel_all_handle) },
             s if s.starts_with("cancel_order") =>
             // SAFETY: see above.
-            unsafe { (v.cancel_order)(ctx, payload) },
+            unsafe { (v.cancel_order)(ctx, &raw const cancel_handle) },
             s if s.starts_with("modify_order") =>
             // SAFETY: see above.
-            unsafe { (v.modify_order)(ctx, payload) },
+            unsafe { (v.modify_order)(ctx, &raw const modify_handle) },
             s if s.starts_with("close_position") =>
             // SAFETY: see above.
-            unsafe { (v.close_position)(ctx, payload) },
+            unsafe { (v.close_position)(ctx, &raw const close_handle) },
             s if s.starts_with("close_all_positions") =>
             // SAFETY: see above.
-            unsafe { (v.close_all_positions)(ctx, payload) },
+            unsafe { (v.close_all_positions)(ctx, &raw const close_all_handle) },
             s if s.starts_with("query_account") =>
             // SAFETY: see above.
-            unsafe { (v.query_account)(ctx, payload) },
+            unsafe { (v.query_account)(ctx, &raw const query_account_handle) },
             s if s.starts_with("query_order") =>
             // SAFETY: see above.
-            unsafe { (v.query_order)(ctx, payload) },
+            unsafe { (v.query_order)(ctx, &raw const query_order_handle) },
             _ => unreachable!(),
         };
 
@@ -1169,14 +1689,65 @@ mod tests {
             _ => unreachable!(),
         };
 
-        let err = match r.into_result() {
-            Ok(_) => panic!("{method} unexpectedly succeeded"),
-            Err(e) => e,
+        let Err(e) = r.into_result() else {
+            panic!("{method} unexpectedly succeeded");
         };
-        assert_eq!(err.code, PluginErrorCode::NotImplemented);
+        assert_eq!(e.code, PluginErrorCode::NotImplemented);
         assert_eq!(
-            err.message_string(),
+            e.message_string(),
             format!("{method} is not wired into this host vtable")
+        );
+    }
+
+    #[rstest]
+    #[case::trader_id("trader_id")]
+    #[case::strategy_id("strategy_id")]
+    #[case::generate_client_order_id("generate_client_order_id")]
+    #[case::generate_order_list_id("generate_order_list_id")]
+    fn host_context_bytes_stubs_return_not_implemented(#[case] method: &str) {
+        let p = host_vtable();
+        // SAFETY: pointer is to a static `OnceLock`-backed HostVTable.
+        let v = unsafe { &*p };
+        let ctx = std::ptr::null::<HostContext>();
+
+        let r = match method {
+            // SAFETY: stubs do not dereference ctx.
+            "trader_id" => unsafe { (v.trader_id)(ctx) },
+            // SAFETY: see above.
+            "strategy_id" => unsafe { (v.strategy_id)(ctx) },
+            // SAFETY: see above.
+            "generate_client_order_id" => unsafe { (v.generate_client_order_id)(ctx) },
+            // SAFETY: see above.
+            "generate_order_list_id" => unsafe { (v.generate_order_list_id)(ctx) },
+            _ => unreachable!(),
+        };
+
+        let Err(e) = r.into_result() else {
+            panic!("{method} unexpectedly succeeded");
+        };
+        assert_eq!(e.code, PluginErrorCode::NotImplemented);
+        assert_eq!(
+            e.message_string(),
+            format!("{method} is not wired into this host vtable")
+        );
+    }
+
+    #[rstest]
+    fn host_component_state_stub_returns_not_implemented() {
+        let p = host_vtable();
+        // SAFETY: pointer is to a static `OnceLock`-backed HostVTable.
+        let v = unsafe { &*p };
+        let ctx = std::ptr::null::<HostContext>();
+
+        // SAFETY: stub does not dereference ctx.
+        let r = unsafe { (v.component_state)(ctx) };
+        let Err(e) = r.into_result() else {
+            panic!("component_state unexpectedly succeeded");
+        };
+        assert_eq!(e.code, PluginErrorCode::NotImplemented);
+        assert_eq!(
+            e.message_string(),
+            "component_state is not wired into this host vtable"
         );
     }
 

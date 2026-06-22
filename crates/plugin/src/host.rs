@@ -15,15 +15,21 @@
 
 //! Host-side function table given to plug-ins for re-entrant callbacks.
 //!
-//! The surface stays explicit and versioned: every host service is a concrete
-//! function pointer, and every added method requires an ABI bump. This avoids
-//! exposing `Arc<MessageBus>` or any `dyn Trait` across the boundary.
+//! The surface stays explicit: every host service is a concrete function
+//! pointer. During alpha, added methods require rebuilding plug-ins to match
+//! the host rather than changing the ABI version. This avoids exposing
+//! `Arc<MessageBus>` or any `dyn Trait` across the boundary.
 
 #![allow(unsafe_code)]
 
 use crate::{
     NAUTILUS_PLUGIN_ABI_VERSION,
     boundary::{BorrowedStr, OwnedBytes, PluginResult, Slice},
+    surfaces::commands::{
+        CancelAllOrdersHandle, CancelOrderHandle, CancelOrdersHandle, CloseAllPositionsHandle,
+        ClosePositionHandle, ModifyOrderHandle, QueryAccountHandle, QueryOrderHandle,
+        SubmitOrderHandle, SubmitOrderListHandle,
+    },
 };
 
 /// Log levels mirrored from the host's `log` crate without dragging the
@@ -50,12 +56,94 @@ pub struct HostContext {
     _opaque: [u8; 0],
 }
 
+/// Opaque per-instance context the host supplies to controller plug-ins.
+///
+/// Controller host services use this context to attribute runtime-created
+/// strategies and lifecycle commands to the calling controller instance.
+#[repr(C)]
+pub struct ControllerHostContext {
+    _opaque: [u8; 0],
+}
+
+/// Function table the host passes to every controller plug-in instance.
+///
+/// Each service accepts a JSON request envelope and returns a JSON response
+/// envelope as [`OwnedBytes`]. The producing side owns and frees returned
+/// allocations so host and plug-in allocators remain isolated.
+#[repr(C)]
+pub struct ControllerHostVTable {
+    /// ABI version of this vtable. Must equal [`NAUTILUS_PLUGIN_ABI_VERSION`].
+    pub abi_version: u32,
+
+    /// Creates a plug-in strategy through the host's registered controller.
+    pub create_plugin_strategy: unsafe extern "C" fn(
+        ctx: *const ControllerHostContext,
+        request_json: BorrowedStr<'_>,
+    ) -> PluginResult<OwnedBytes>,
+
+    /// Starts a strategy through the host's system controller command path.
+    pub start_strategy: unsafe extern "C" fn(
+        ctx: *const ControllerHostContext,
+        request_json: BorrowedStr<'_>,
+    ) -> PluginResult<OwnedBytes>,
+
+    /// Stops a strategy through the host's system controller command path.
+    pub stop_strategy: unsafe extern "C" fn(
+        ctx: *const ControllerHostContext,
+        request_json: BorrowedStr<'_>,
+    ) -> PluginResult<OwnedBytes>,
+
+    /// Exits the market for a strategy through the system controller.
+    pub exit_market: unsafe extern "C" fn(
+        ctx: *const ControllerHostContext,
+        request_json: BorrowedStr<'_>,
+    ) -> PluginResult<OwnedBytes>,
+
+    /// Removes a strategy through the system controller.
+    pub remove_strategy: unsafe extern "C" fn(
+        ctx: *const ControllerHostContext,
+        request_json: BorrowedStr<'_>,
+    ) -> PluginResult<OwnedBytes>,
+
+    /// Checks whether an instrument is present in the host cache.
+    pub instrument_exists: unsafe extern "C" fn(
+        ctx: *const ControllerHostContext,
+        request_json: BorrowedStr<'_>,
+    ) -> PluginResult<OwnedBytes>,
+
+    /// Emits a structured log record through the host logger.
+    pub log: unsafe extern "C" fn(
+        ctx: *const ControllerHostContext,
+        request_json: BorrowedStr<'_>,
+    ) -> PluginResult<OwnedBytes>,
+
+    /// Returns the host clock reading in a JSON response envelope.
+    pub clock_now_ns: unsafe extern "C" fn(
+        ctx: *const ControllerHostContext,
+        request_json: BorrowedStr<'_>,
+    ) -> PluginResult<OwnedBytes>,
+}
+
+impl ControllerHostVTable {
+    /// Asserts that the embedded ABI version matches the compiled-in constant.
+    #[must_use]
+    pub fn matches_compiled_abi(&self) -> bool {
+        self.abi_version == NAUTILUS_PLUGIN_ABI_VERSION
+    }
+}
+
+/// SAFETY: function pointers are thread-safe by construction; the host
+/// guarantees the underlying implementations are `Sync`.
+unsafe impl Send for ControllerHostVTable {}
+/// SAFETY: see above.
+unsafe impl Sync for ControllerHostVTable {}
+
 /// Function table the host passes to every plug-in at load time.
 ///
 /// All function pointers are non-null and stable for the process lifetime.
 /// Plug-ins stash the pointer and call back through it whenever they need
-/// host services. Adding a method is a breaking ABI change and requires a
-/// [`NAUTILUS_PLUGIN_ABI_VERSION`] bump.
+/// host services. Adding a method is a breaking ABI change and requires
+/// rebuilding plug-ins to match the host during alpha.
 #[repr(C)]
 pub struct HostVTable {
     /// ABI version of this vtable. Must equal [`NAUTILUS_PLUGIN_ABI_VERSION`].
@@ -252,113 +340,143 @@ pub struct HostVTable {
 
     /// Submits an order on behalf of the calling strategy.
     ///
-    /// `ctx` is the [`HostContext`] the host passed into the
-    /// strategy's `create`. `command_json` is a serialised order-submit
-    /// command; the host parses it into the in-engine `SubmitOrder` shape
-    /// and routes it through the execution engine.
+    /// `ctx` is the [`HostContext`] the host passed into the strategy's
+    /// `create`. `command` is a boundary-owned [`SubmitOrderHandle`] the
+    /// plug-in constructs around the order and its routing/position
+    /// metadata. The plug-in owns the box and frees it when this call
+    /// returns; the host only borrows the handle for the duration of the
+    /// call.
     pub submit_order: unsafe extern "C" fn(
         ctx: *const HostContext,
-        command_json: BorrowedStr<'_>,
+        command: *const SubmitOrderHandle,
     ) -> PluginResult<()>,
 
     /// Cancels an in-flight order on behalf of the calling strategy.
     ///
-    /// `command_json` carries the cancel command identifying the order to
-    /// cancel (typically by `client_order_id` and `instrument_id`).
+    /// `command` is a boundary-owned [`CancelOrderHandle`] the plug-in
+    /// constructs around the cancel parameters (typically `client_order_id`,
+    /// optional `client_id`, optional venue params). The plug-in owns the
+    /// box and frees it when this call returns; the host only borrows the
+    /// handle for the duration of the call.
     pub cancel_order: unsafe extern "C" fn(
         ctx: *const HostContext,
-        command_json: BorrowedStr<'_>,
+        command: *const CancelOrderHandle,
     ) -> PluginResult<()>,
 
     /// Modifies an in-flight order on behalf of the calling strategy.
     ///
-    /// `command_json` carries the modify command (new quantity, price, etc.).
+    /// `command` is a boundary-owned [`ModifyOrderHandle`] the plug-in
+    /// constructs around the modify parameters (new quantity, price,
+    /// trigger price, etc.). The plug-in owns the box and frees it when
+    /// this call returns; the host only borrows the handle for the
+    /// duration of the call.
     pub modify_order: unsafe extern "C" fn(
         ctx: *const HostContext,
-        command_json: BorrowedStr<'_>,
+        command: *const ModifyOrderHandle,
     ) -> PluginResult<()>,
 
     /// Submits a list of orders as a single batch on behalf of the calling
     /// strategy.
     ///
-    /// `command_json` carries the serialised order list plus optional
-    /// position id, client id, and routing params. The host expands the
-    /// payload into the in-engine `SubmitOrderList` shape and dispatches
-    /// the batch atomically through the execution engine.
+    /// `command` is a boundary-owned [`SubmitOrderListHandle`] the plug-in
+    /// constructs around the order list and optional position id, client
+    /// id, and routing params. The host dispatches the batch atomically
+    /// through the execution engine.
     pub submit_order_list: unsafe extern "C" fn(
         ctx: *const HostContext,
-        command_json: BorrowedStr<'_>,
+        command: *const SubmitOrderListHandle,
     ) -> PluginResult<()>,
 
     /// Cancels every order named in the supplied list on behalf of the
     /// calling strategy.
     ///
-    /// `command_json` carries the `client_order_id` list plus optional
-    /// client id and routing params.
+    /// `command` is a boundary-owned [`CancelOrdersHandle`] carrying the
+    /// `client_order_id` list plus optional client id and routing params.
     pub cancel_orders: unsafe extern "C" fn(
         ctx: *const HostContext,
-        command_json: BorrowedStr<'_>,
+        command: *const CancelOrdersHandle,
     ) -> PluginResult<()>,
 
     /// Cancels every open order matching the supplied filter on behalf of
     /// the calling strategy.
     ///
-    /// `command_json` carries the `instrument_id` and optional `order_side`,
-    /// `client_id`, and routing params. The host scans its cache for
-    /// matching open orders and issues the cancels.
+    /// `command` is a boundary-owned [`CancelAllOrdersHandle`] carrying the
+    /// `instrument_id` and optional `order_side`, `client_id`, and routing
+    /// params. The host scans its cache for matching open orders and
+    /// issues the cancels.
     pub cancel_all_orders: unsafe extern "C" fn(
         ctx: *const HostContext,
-        command_json: BorrowedStr<'_>,
+        command: *const CancelAllOrdersHandle,
     ) -> PluginResult<()>,
 
     /// Closes the position identified by the command on behalf of the
     /// calling strategy.
     ///
-    /// `command_json` carries the `position_id` plus optional `client_id`,
-    /// `tags`, `time_in_force`, `reduce_only`, and `quote_quantity`. The
-    /// host reads the position from its cache and submits a closing market
-    /// order through the strategy's order factory.
+    /// `command` is a boundary-owned [`ClosePositionHandle`] carrying the
+    /// `position_id` plus optional `client_id`, `tags`, `time_in_force`,
+    /// `reduce_only`, and `quote_quantity`. The host reads the position
+    /// from its cache and submits a closing market order through the
+    /// strategy's order factory.
     pub close_position: unsafe extern "C" fn(
         ctx: *const HostContext,
-        command_json: BorrowedStr<'_>,
+        command: *const ClosePositionHandle,
     ) -> PluginResult<()>,
 
     /// Closes every open position matching the supplied filter on behalf
     /// of the calling strategy.
     ///
-    /// `command_json` carries the `instrument_id` plus optional
-    /// `position_side`, `client_id`, `tags`, `time_in_force`,
-    /// `reduce_only`, and `quote_quantity`. The host scans its cache for
-    /// matching open positions and submits closing market orders.
+    /// `command` is a boundary-owned [`CloseAllPositionsHandle`] carrying
+    /// the `instrument_id` plus optional `position_side`, `client_id`,
+    /// `tags`, `time_in_force`, `reduce_only`, and `quote_quantity`. The
+    /// host scans its cache for matching open positions and submits
+    /// closing market orders.
     pub close_all_positions: unsafe extern "C" fn(
         ctx: *const HostContext,
-        command_json: BorrowedStr<'_>,
+        command: *const CloseAllPositionsHandle,
     ) -> PluginResult<()>,
 
     /// Queries the venue for the latest snapshot of `account_id` on
     /// behalf of the calling strategy.
     ///
-    /// `command_json` carries the `account_id` plus optional `client_id`
-    /// and routing params. The result is delivered asynchronously through
-    /// the host's normal account-state event flow; this call only fires
-    /// the query, it does not return the snapshot inline.
+    /// `command` is a boundary-owned [`QueryAccountHandle`] carrying the
+    /// `account_id` plus optional `client_id` and routing params. The
+    /// result is delivered asynchronously through the host's normal
+    /// account-state event flow; this call only fires the query, it does
+    /// not return the snapshot inline.
     pub query_account: unsafe extern "C" fn(
         ctx: *const HostContext,
-        command_json: BorrowedStr<'_>,
+        command: *const QueryAccountHandle,
     ) -> PluginResult<()>,
 
     /// Queries the venue for the latest snapshot of `client_order_id` on
     /// behalf of the calling strategy.
     ///
-    /// `command_json` carries the `client_order_id` plus optional
-    /// `client_id` and routing params. The result is delivered
-    /// asynchronously through the host's normal order-status event flow;
-    /// this call only fires the query, it does not return the snapshot
-    /// inline.
+    /// `command` is a boundary-owned [`QueryOrderHandle`] carrying the
+    /// `client_order_id` plus optional `client_id` and routing params.
+    /// The result is delivered asynchronously through the host's normal
+    /// order-status event flow; this call only fires the query, it does
+    /// not return the snapshot inline.
     pub query_order: unsafe extern "C" fn(
         ctx: *const HostContext,
-        command_json: BorrowedStr<'_>,
+        command: *const QueryOrderHandle,
     ) -> PluginResult<()>,
+
+    /// Returns the calling actor or strategy trader ID as a JSON string.
+    pub trader_id: unsafe extern "C" fn(ctx: *const HostContext) -> PluginResult<OwnedBytes>,
+
+    /// Returns the calling strategy ID as a JSON string.
+    pub strategy_id: unsafe extern "C" fn(ctx: *const HostContext) -> PluginResult<OwnedBytes>,
+
+    /// Returns the calling actor or strategy component state discriminant.
+    pub component_state: unsafe extern "C" fn(ctx: *const HostContext) -> PluginResult<u8>,
+
+    /// Generates the next client order ID from the calling strategy's order factory.
+    pub generate_client_order_id:
+        unsafe extern "C" fn(ctx: *const HostContext) -> PluginResult<OwnedBytes>,
+
+    /// Generates the next order list ID from the calling strategy's order factory.
+    pub generate_order_list_id:
+        unsafe extern "C" fn(ctx: *const HostContext) -> PluginResult<OwnedBytes>,
 }
 
 impl HostVTable {
@@ -377,6 +495,7 @@ impl HostVTable {
     ///
     /// The vtable pointer must originate from the host's `nautilus_plugin_init`
     /// call and the host's library must still be live.
+    #[must_use]
     pub unsafe fn now_ns(&self) -> u64 {
         // SAFETY: caller upholds liveness of the host.
         unsafe { (self.clock_now_ns)() }
@@ -428,7 +547,7 @@ mod tests {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     unsafe extern "C" fn fixed_clock_now_ns() -> u64 {
@@ -454,6 +573,17 @@ mod tests {
         };
     }
 
+    macro_rules! stub_controller_bytes {
+        ($name:ident) => {
+            unsafe extern "C" fn $name(
+                _ctx: *const ControllerHostContext,
+                _a: BorrowedStr<'_>,
+            ) -> PluginResult<OwnedBytes> {
+                PluginResult::Ok(OwnedBytes::empty())
+            }
+        };
+    }
+
     macro_rules! stub_unit {
         ($name:ident, ($($arg:ident : $ty:ty),* $(,)?)) => {
             unsafe extern "C" fn $name($($arg: $ty),*) -> PluginResult<()> {
@@ -469,6 +599,14 @@ mod tests {
     stub_bytes!(stub_cache_position);
     stub_bytes!(stub_cache_orders_for_strategy);
     stub_bytes!(stub_cache_positions_for_strategy);
+    stub_controller_bytes!(stub_controller_create_plugin_strategy);
+    stub_controller_bytes!(stub_controller_start_strategy);
+    stub_controller_bytes!(stub_controller_stop_strategy);
+    stub_controller_bytes!(stub_controller_exit_market);
+    stub_controller_bytes!(stub_controller_remove_strategy);
+    stub_controller_bytes!(stub_controller_instrument_exists);
+    stub_controller_bytes!(stub_controller_log);
+    stub_controller_bytes!(stub_controller_clock_now_ns);
 
     stub_unit!(
         stub_subscribe,
@@ -544,9 +682,53 @@ mod tests {
     );
     stub_unit!(stub_cancel_timer, (ctx: *const HostContext, n: BorrowedStr<'_>));
     stub_unit!(
-        stub_order_cmd,
-        (ctx: *const HostContext, c: BorrowedStr<'_>)
+        stub_submit_order,
+        (ctx: *const HostContext, c: *const SubmitOrderHandle)
     );
+    stub_unit!(
+        stub_cancel_order,
+        (ctx: *const HostContext, c: *const CancelOrderHandle)
+    );
+    stub_unit!(
+        stub_modify_order,
+        (ctx: *const HostContext, c: *const ModifyOrderHandle)
+    );
+    stub_unit!(
+        stub_submit_order_list,
+        (ctx: *const HostContext, c: *const SubmitOrderListHandle)
+    );
+    stub_unit!(
+        stub_cancel_orders,
+        (ctx: *const HostContext, c: *const CancelOrdersHandle)
+    );
+    stub_unit!(
+        stub_cancel_all_orders,
+        (ctx: *const HostContext, c: *const CancelAllOrdersHandle)
+    );
+    stub_unit!(
+        stub_close_position,
+        (ctx: *const HostContext, c: *const ClosePositionHandle)
+    );
+    stub_unit!(
+        stub_close_all_positions,
+        (ctx: *const HostContext, c: *const CloseAllPositionsHandle)
+    );
+    stub_unit!(
+        stub_query_account,
+        (ctx: *const HostContext, c: *const QueryAccountHandle)
+    );
+    stub_unit!(
+        stub_query_order,
+        (ctx: *const HostContext, c: *const QueryOrderHandle)
+    );
+
+    unsafe extern "C" fn stub_host_bytes(_ctx: *const HostContext) -> PluginResult<OwnedBytes> {
+        PluginResult::Ok(OwnedBytes::empty())
+    }
+
+    unsafe extern "C" fn stub_component_state(_ctx: *const HostContext) -> PluginResult<u8> {
+        PluginResult::Ok(0)
+    }
 
     fn build_test_host(abi: u32) -> HostVTable {
         HostVTable {
@@ -573,16 +755,35 @@ mod tests {
             set_time_alert: stub_set_time_alert,
             set_timer: stub_set_timer,
             cancel_timer: stub_cancel_timer,
-            submit_order: stub_order_cmd,
-            cancel_order: stub_order_cmd,
-            modify_order: stub_order_cmd,
-            submit_order_list: stub_order_cmd,
-            cancel_orders: stub_order_cmd,
-            cancel_all_orders: stub_order_cmd,
-            close_position: stub_order_cmd,
-            close_all_positions: stub_order_cmd,
-            query_account: stub_order_cmd,
-            query_order: stub_order_cmd,
+            submit_order: stub_submit_order,
+            cancel_order: stub_cancel_order,
+            modify_order: stub_modify_order,
+            submit_order_list: stub_submit_order_list,
+            cancel_orders: stub_cancel_orders,
+            cancel_all_orders: stub_cancel_all_orders,
+            close_position: stub_close_position,
+            close_all_positions: stub_close_all_positions,
+            query_account: stub_query_account,
+            query_order: stub_query_order,
+            trader_id: stub_host_bytes,
+            strategy_id: stub_host_bytes,
+            component_state: stub_component_state,
+            generate_client_order_id: stub_host_bytes,
+            generate_order_list_id: stub_host_bytes,
+        }
+    }
+
+    fn build_controller_test_host(abi: u32) -> ControllerHostVTable {
+        ControllerHostVTable {
+            abi_version: abi,
+            create_plugin_strategy: stub_controller_create_plugin_strategy,
+            start_strategy: stub_controller_start_strategy,
+            stop_strategy: stub_controller_stop_strategy,
+            exit_market: stub_controller_exit_market,
+            remove_strategy: stub_controller_remove_strategy,
+            instrument_exists: stub_controller_instrument_exists,
+            log: stub_controller_log,
+            clock_now_ns: stub_controller_clock_now_ns,
         }
     }
 
@@ -593,11 +794,26 @@ mod tests {
     }
 
     #[rstest]
+    fn controller_matches_compiled_abi_accepts_compiled_version() {
+        let host = build_controller_test_host(NAUTILUS_PLUGIN_ABI_VERSION);
+        assert!(host.matches_compiled_abi());
+    }
+
+    #[rstest]
     #[case::off_by_one(NAUTILUS_PLUGIN_ABI_VERSION.wrapping_add(1))]
     #[case::zero(0)]
     #[case::max(u32::MAX)]
     fn matches_compiled_abi_rejects_mismatch(#[case] abi: u32) {
         let host = build_test_host(abi);
+        assert!(!host.matches_compiled_abi());
+    }
+
+    #[rstest]
+    #[case::off_by_one(NAUTILUS_PLUGIN_ABI_VERSION.wrapping_add(1))]
+    #[case::zero(0)]
+    #[case::max(u32::MAX)]
+    fn controller_matches_compiled_abi_rejects_mismatch(#[case] abi: u32) {
+        let host = build_controller_test_host(abi);
         assert!(!host.matches_compiled_abi());
     }
 

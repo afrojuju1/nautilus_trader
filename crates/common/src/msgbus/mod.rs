@@ -37,8 +37,8 @@
 //! See [`core`] module documentation for design decisions and performance details.
 
 mod api;
+pub mod backing;
 pub mod core;
-pub mod database;
 pub mod matching;
 pub mod message;
 pub mod mstr;
@@ -48,7 +48,11 @@ pub mod typed_endpoints;
 pub mod typed_handler;
 pub mod typed_router;
 
-use std::{any::Any, cell::RefCell, rc::Rc};
+use std::{
+    any::Any,
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use nautilus_core::UUID4;
 #[cfg(feature = "defi")]
@@ -65,8 +69,11 @@ use nautilus_model::{
 };
 use smallvec::SmallVec;
 
+#[cfg(feature = "live")]
+pub use self::backing::MessageBusSubscriber;
 pub use self::{
     api::*,
+    backing::MessageBusPublisher,
     core::{MessageBus, Subscription},
     message::BusMessage,
     mstr::{Endpoint, MStr, Pattern, Topic},
@@ -78,6 +85,7 @@ pub use self::{
     },
     typed_router::{TopicRouter, TypedSubscription},
 };
+use crate::timer::TimeEvent;
 
 /// Inline capacity for handler buffers before heap allocation.
 pub(super) const HANDLER_BUFFER_CAP: usize = 64;
@@ -92,6 +100,8 @@ pub(super) const HANDLER_BUFFER_CAP: usize = 64;
 // during handler calls (enabling re-entrant publishes).
 thread_local! {
     pub(super) static MESSAGE_BUS: RefCell<Option<Rc<RefCell<MessageBus>>>> = const { RefCell::new(None) };
+    pub(super) static HAS_PUBLISHER: Cell<bool> = const { Cell::new(false) };
+    pub(super) static SUPPRESS_EXTERNAL_DEPTH: Cell<u32> = const { Cell::new(0) };
 
     pub(super) static ANY_HANDLERS: RefCell<SmallVec<[ShareableMessageHandler; HANDLER_BUFFER_CAP]>> =
         RefCell::new(SmallVec::new());
@@ -151,8 +161,33 @@ thread_local! {
         RefCell::new(SmallVec::new());
 }
 
+/// Guard that prevents republished external messages from being forwarded again.
+#[derive(Debug)]
+pub struct SuppressExternalGuard;
+
+impl SuppressExternalGuard {
+    #[must_use]
+    pub fn new() -> Self {
+        SUPPRESS_EXTERNAL_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self
+    }
+}
+
+impl Default for SuppressExternalGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SuppressExternalGuard {
+    fn drop(&mut self) {
+        SUPPRESS_EXTERNAL_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 /// Sets the thread-local message bus, replacing any existing one.
 pub fn set_message_bus(msgbus: Rc<RefCell<MessageBus>>) {
+    HAS_PUBLISHER.with(|flag| flag.set(msgbus.borrow().has_publisher()));
     MESSAGE_BUS.with(|bus| {
         *bus.borrow_mut() = Some(msgbus);
     });
@@ -167,6 +202,11 @@ pub fn get_message_bus() -> Rc<RefCell<MessageBus>> {
         let rc = slot.get_or_insert_with(|| Rc::new(RefCell::new(MessageBus::default())));
         rc.clone()
     })
+}
+
+/// Returns the thread-local message bus if one has been set for this thread.
+pub fn try_get_message_bus() -> Option<Rc<RefCell<MessageBus>>> {
+    MESSAGE_BUS.with(|bus| bus.borrow().clone())
 }
 
 /// Observes dispatched bus traffic for the durable event store.
@@ -237,4 +277,9 @@ pub(super) fn dispatch_tap_response(correlation_id: &UUID4, message: &dyn Any) {
     if let Some(tap) = tap {
         tap.on_response(correlation_id, message);
     }
+}
+
+#[inline]
+pub(crate) fn dispatch_tap_time_event(event: &TimeEvent) {
+    dispatch_tap_publish(MessagingSwitchboard::time_event_topic(), event);
 }

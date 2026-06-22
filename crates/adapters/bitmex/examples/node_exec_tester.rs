@@ -15,12 +15,14 @@
 
 //! Example demonstrating live execution testing with the BitMEX adapter.
 //!
+//! Edit the constants below to change the environment, target instrument, and order size.
+//!
+//! Run with: `cargo run --example bitmex-exec-tester --package nautilus-bitmex --features examples`
+//!
 //! Credentials are resolved from environment variables automatically when not passed
 //! explicitly in the config (`api_key` / `api_secret` fields):
 //! - Testnet: `BITMEX_TESTNET_API_KEY` / `BITMEX_TESTNET_API_SECRET`
 //! - Mainnet: `BITMEX_API_KEY` / `BITMEX_API_SECRET`
-//!
-//! Run with: `cargo run --example bitmex-exec-tester --package nautilus-bitmex --features examples`
 
 use nautilus_bitmex::{
     common::{consts::BITMEX_CLIENT_ID, enums::BitmexEnvironment},
@@ -28,39 +30,54 @@ use nautilus_bitmex::{
     factories::{BitmexDataClientFactory, BitmexExecFactoryConfig, BitmexExecutionClientFactory},
 };
 use nautilus_common::enums::Environment;
-use nautilus_live::node::LiveNode;
+use nautilus_live::{config::LiveExecEngineConfig, node::LiveNode};
 use nautilus_model::{
+    enums::TimeInForce,
     identifiers::{InstrumentId, StrategyId, TraderId},
     types::Quantity,
 };
 use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
 use nautilus_trading::strategy::StrategyConfig;
 
+const BITMEX_ENVIRONMENT: BitmexEnvironment = BitmexEnvironment::Testnet;
+const TRADER_ID: &str = "TESTER-001";
+const STRATEGY_ID: &str = "EXEC-TESTER-001";
+const INSTRUMENT_ID: &str = "XBTUSD.BITMEX";
+const ORDER_QTY: &str = "100";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
     let environment = Environment::Live;
-    let trader_id = TraderId::from("TESTER-001");
-    let instrument_id = InstrumentId::from("XBTUSD.BITMEX");
+    let trader_id = TraderId::from(TRADER_ID);
+    let instrument_id = InstrumentId::from(INSTRUMENT_ID);
 
     let data_config = BitmexDataClientConfig {
-        environment: BitmexEnvironment::Testnet,
+        environment: BITMEX_ENVIRONMENT,
         ..Default::default()
     };
 
     let exec_config = BitmexExecFactoryConfig::new(
         trader_id,
         BitmexExecClientConfig {
-            environment: BitmexEnvironment::Testnet,
+            environment: BITMEX_ENVIRONMENT,
             ..Default::default()
         },
     );
 
     let data_factory = BitmexDataClientFactory::new();
     let exec_factory = BitmexExecutionClientFactory::new();
+    let exec_engine_config = LiveExecEngineConfig {
+        reconciliation_instrument_ids: Some(vec![instrument_id.to_string()]),
+        filter_unclaimed_external_orders: true,
+        open_check_interval_secs: Some(10.0),
+        position_check_interval_secs: Some(30.0),
+        ..Default::default()
+    };
 
     let mut node = LiveNode::builder(trader_id, environment)?
+        .with_exec_engine_config(exec_engine_config)
         .add_data_client(None, Box::new(data_factory), Box::new(data_config))?
         .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
         .with_reconciliation(true)
@@ -68,18 +85,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_delay_post_stop_secs(5)
         .build()?;
 
+    let order_qty = Quantity::from(ORDER_QTY);
+
     let tester_config = ExecTesterConfig::builder()
         .base(StrategyConfig {
-            strategy_id: Some(StrategyId::from("EXEC-TESTER-001")),
+            strategy_id: Some(StrategyId::from(STRATEGY_ID)),
             external_order_claims: Some(vec![instrument_id]),
             ..Default::default()
         })
         .instrument_id(instrument_id)
         .client_id(*BITMEX_CLIENT_ID)
-        .order_qty(Quantity::from("100"))
+        .order_qty(order_qty)
         .use_post_only(true)
+        .open_position_on_start_qty(order_qty.as_decimal())
+        .open_position_time_in_force(TimeInForce::Ioc)
+        .close_positions_time_in_force(TimeInForce::Ioc)
         .log_data(false)
-        .build();
+        .build()?;
 
     let tester = ExecTester::new(tester_config);
 

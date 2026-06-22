@@ -83,6 +83,7 @@ pub struct BinanceSpotWebSocketClient {
     heartbeat: Option<u64>,
     signal: Arc<AtomicBool>,
     slots: Arc<Mutex<Vec<ConnectionSlot>>>,
+    connect_lock: Arc<tokio::sync::Mutex<()>>,
     out_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<BinanceSpotWsMessage>>>>,
     out_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<BinanceSpotWsMessage>>>>,
     request_id_counter: Arc<AtomicU64>,
@@ -122,7 +123,15 @@ impl BinanceSpotWebSocketClient {
         let url = url.unwrap_or(BINANCE_SPOT_SBE_WS_URL.to_string());
 
         let credential = match (api_key, api_secret) {
-            (Some(key), Some(secret)) => Some(Arc::new(Ed25519Credential::new(key, &secret)?)),
+            (Some(key), Some(secret)) => {
+                let credential = Ed25519Credential::new(key, &secret).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Binance Spot SBE market-data streams require an Ed25519 API key \
+                         (HMAC keys are not supported): {e}"
+                    )
+                })?;
+                Some(Arc::new(credential))
+            }
             _ => None,
         };
 
@@ -132,6 +141,7 @@ impl BinanceSpotWebSocketClient {
             heartbeat,
             signal: Arc::new(AtomicBool::new(false)),
             slots: Arc::new(Mutex::new(Vec::new())),
+            connect_lock: Arc::new(tokio::sync::Mutex::new(())),
             out_tx: Arc::new(Mutex::new(None)),
             out_rx: Arc::new(Mutex::new(None)),
             request_id_counter: Arc::new(AtomicU64::new(1)),
@@ -236,7 +246,11 @@ impl BinanceSpotWebSocketClient {
     /// Returns an error if the pool is exhausted or command delivery fails.
     #[expect(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
     pub async fn subscribe(&self, streams: Vec<String>) -> BinanceWsResult<()> {
-        // Phase 1: filter already-subscribed streams (brief lock)
+        // Serialize all phases so concurrent subscribers see a consistent
+        // pool state and can't trigger spurious `Pool exhausted`.
+        let _connect_guard = self.connect_lock.lock().await;
+
+        // Phase 1: filter already-subscribed streams (brief lock).
         let new_streams: Vec<String> = {
             let slots = self.slots.lock().expect("slots lock poisoned");
             streams
@@ -249,7 +263,7 @@ impl BinanceSpotWebSocketClient {
             return Ok(());
         }
 
-        // Phase 2: create connections if needed (no lock held during async connect)
+        // Phase 2: create connections if needed.
         loop {
             let (remaining_capacity, slot_count) = {
                 let slots = self.slots.lock().expect("slots lock poisoned");
@@ -541,5 +555,40 @@ impl BinanceSpotWebSocketClient {
             cancellation_token,
             connection_mode,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_new_rejects_hmac_secret_with_actionable_error() {
+        // An all-zero 48-byte buffer base64-encodes to a non-Ed25519 secret
+        // (no PKCS#8 OID), standing in for an HMAC key. SBE market-data streams
+        // require Ed25519, so construction must fail with guidance that names
+        // HMAC, not the raw OID error.
+        let secret = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 48]);
+
+        let result = BinanceSpotWebSocketClient::new(
+            None,
+            Some("test_key".to_string()),
+            Some(secret),
+            None,
+            TransportBackend::default(),
+        );
+
+        let err = result.expect_err("HMAC secret must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Ed25519"),
+            "error should mention Ed25519, was: {msg}"
+        );
+        assert!(
+            msg.contains("HMAC"),
+            "error should mention HMAC, was: {msg}"
+        );
     }
 }

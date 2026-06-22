@@ -27,6 +27,7 @@ use std::{
 
 use ahash::AHashMap;
 use chrono::{DateTime, Utc};
+use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
     AtomicMap, AtomicTime, UUID4, consts::NAUTILUS_USER_AGENT, nanos::UnixNanos,
     time::get_atomic_clock_realtime,
@@ -72,6 +73,7 @@ use crate::{
         urls::get_kraken_http_base_url,
     },
     http::{
+        apply_count_limit,
         error::{KrakenHttpError, kraken_http_should_retry},
         models::OhlcData,
     },
@@ -882,16 +884,25 @@ impl KrakenFuturesRawHttpClient {
         &self,
         order_ids: Vec<String>,
     ) -> anyhow::Result<FuturesBatchCancelResponse, KrakenHttpError> {
+        let batch_items: Vec<KrakenFuturesBatchCancelItem> = order_ids
+            .into_iter()
+            .map(KrakenFuturesBatchCancelItem::from_order_id)
+            .collect();
+
+        self.cancel_order_items_batch(batch_items).await
+    }
+
+    /// Cancels multiple order IDs or client order IDs in a single batch request
+    /// (requires authentication).
+    pub async fn cancel_order_items_batch(
+        &self,
+        batch_items: Vec<KrakenFuturesBatchCancelItem>,
+    ) -> anyhow::Result<FuturesBatchCancelResponse, KrakenHttpError> {
         if self.credential.is_none() {
             return Err(KrakenHttpError::AuthenticationError(
                 "API credentials required for batch orders".to_string(),
             ));
         }
-
-        let batch_items: Vec<KrakenFuturesBatchCancelItem> = order_ids
-            .into_iter()
-            .map(KrakenFuturesBatchCancelItem::from_order_id)
-            .collect();
 
         let params = KrakenFuturesBatchOrderParams::new(batch_items);
         let post_data = params
@@ -975,7 +986,7 @@ impl KrakenFuturesRawHttpClient {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.kraken")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.kraken")
 )]
 pub struct KrakenFuturesHttpClient {
     pub(crate) inner: Arc<KrakenFuturesRawHttpClient>,
@@ -1227,9 +1238,9 @@ impl KrakenFuturesHttpClient {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}"
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1258,9 +1269,9 @@ impl KrakenFuturesHttpClient {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}"
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1292,9 +1303,9 @@ impl KrakenFuturesHttpClient {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}"
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1303,9 +1314,13 @@ impl KrakenFuturesHttpClient {
         let since = start.map(|dt| dt.timestamp_millis());
         let before = end.map(|dt| dt.timestamp_millis());
 
+        // Executions are oldest-anchored for `sort=asc`; count-only fetches the
+        // newest page with `sort=desc` (reversed to ascending below)
+        let sort = if start.is_some() { "asc" } else { "desc" };
+
         let response = self
             .inner
-            .get_public_executions(&raw_symbol, since, before, Some("asc"), None)
+            .get_public_executions(&raw_symbol, since, before, Some(sort), None)
             .await?;
 
         let mut trades = Vec::new();
@@ -1313,20 +1328,18 @@ impl KrakenFuturesHttpClient {
         for element in &response.elements {
             let execution = &element.event.execution.execution;
             match parse_futures_public_execution(execution, &instrument, ts_init) {
-                Ok(trade_tick) => {
-                    trades.push(trade_tick);
-
-                    if let Some(limit_count) = limit
-                        && trades.len() >= limit_count as usize
-                    {
-                        return Ok(trades);
-                    }
-                }
+                Ok(trade_tick) => trades.push(trade_tick),
                 Err(e) => {
                     log::warn!("Failed to parse futures trade tick: {e}");
                 }
             }
         }
+
+        if start.is_none() {
+            trades.reverse();
+        }
+
+        apply_count_limit(&mut trades, start, limit);
 
         Ok(trades)
     }
@@ -1342,9 +1355,9 @@ impl KrakenFuturesHttpClient {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}"
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1385,18 +1398,16 @@ impl KrakenFuturesHttpClient {
                         continue;
                     }
                     bars.push(bar);
-
-                    if let Some(limit_count) = limit
-                        && bars.len() >= limit_count as usize
-                    {
-                        return Ok(bars);
-                    }
                 }
                 Err(e) => {
                     log::warn!("Failed to parse futures bar: {e}");
                 }
             }
         }
+
+        // Kraken returns the page oldest-first; keep the most recent `limit`
+        // bars for count-only requests rather than the oldest (issue #4254).
+        apply_count_limit(&mut bars, start, limit);
 
         Ok(bars)
     }
@@ -1410,9 +1421,9 @@ impl KrakenFuturesHttpClient {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}"
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1465,9 +1476,9 @@ impl KrakenFuturesHttpClient {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}"
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1799,7 +1810,7 @@ impl KrakenFuturesHttpClient {
     ) -> anyhow::Result<KrakenFuturesSendOrderParams> {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let raw_symbol = instrument.raw_symbol().inner();
 
@@ -1926,7 +1937,7 @@ impl KrakenFuturesHttpClient {
     ) -> anyhow::Result<OrderStatusReport> {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let params = self.build_send_order_params(
             instrument_id,
@@ -2131,7 +2142,7 @@ impl KrakenFuturesHttpClient {
     ) -> anyhow::Result<()> {
         let _ = self
             .get_cached_instrument(&instrument_id.symbol.inner())
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let order_id = venue_order_id.as_ref().map(|id| id.to_string());
         let cli_ord_id = client_order_id.as_ref().map(truncate_cl_ord_id);
@@ -2435,7 +2446,7 @@ impl KrakenFuturesHttpClient {
     ) -> anyhow::Result<KrakenFuturesEditOrderParams> {
         let _ = self
             .get_cached_instrument(&instrument_id.symbol.inner())
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let order_id = venue_order_id.as_ref().map(|id| id.to_string());
         let cli_ord_id = client_order_id.as_ref().map(truncate_cl_ord_id);
@@ -2980,6 +2991,7 @@ mod tests {
             4,
             Price::from("1"),
             Quantity::from("0.0001"),
+            None,
             None,
             None,
             None,

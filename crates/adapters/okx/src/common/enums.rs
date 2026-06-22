@@ -171,7 +171,7 @@ pub enum OKXOrderType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXOrderStatus {
     Canceled,
@@ -265,7 +265,7 @@ impl From<LiquiditySide> for OKXExecType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXInstrumentType {
     #[default]
@@ -283,6 +283,55 @@ pub enum OKXInstrumentType {
     Option,
     /// Event contract products.
     Events,
+}
+
+/// Represents an OKX instrument category code (the `instCategory` field).
+///
+/// OKX also returns a deprecated `category` field that is effectively always
+/// `"1"`; `instCategory` is the meaningful value that drives asset-class
+/// mapping. Unknown or future codes fall back to
+/// [`OKXInstrumentCategory::Unknown`] rather than failing to parse.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+pub enum OKXInstrumentCategory {
+    /// Cryptocurrency (`"1"`).
+    #[serde(rename = "1")]
+    #[strum(serialize = "1")]
+    Crypto,
+    /// Equity-linked (`"3"`).
+    #[serde(rename = "3")]
+    #[strum(serialize = "3")]
+    Equity,
+    /// Commodity-linked (`"4"`).
+    #[serde(rename = "4")]
+    #[strum(serialize = "4")]
+    Commodity,
+    /// FX-linked (`"5"`).
+    #[serde(rename = "5")]
+    #[strum(serialize = "5")]
+    Fx,
+    /// Debt-linked (`"6"`).
+    #[serde(rename = "6")]
+    #[strum(serialize = "6")]
+    Debt,
+    /// Unknown or future category code.
+    #[default]
+    #[serde(other)]
+    #[strum(serialize = "")]
+    Unknown,
 }
 
 /// Represents an instrument status on OKX.
@@ -309,6 +358,56 @@ pub enum OKXInstrumentStatus {
     PostOnly,
     Rebase,
     Settling,
+    /// Unknown or future status.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Represents a spread type on OKX.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OKXSpreadType {
+    Linear,
+    Inverse,
+    Hybrid,
+    /// Unknown or future spread type.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Represents a spread status on OKX.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OKXSpreadState {
+    Live,
+    Suspend,
+    Expired,
     /// Unknown or future status.
     #[serde(other)]
     Unknown,
@@ -343,7 +442,7 @@ pub enum OKXInstrumentStatus {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXContractType {
     #[serde(rename = "")]
@@ -429,7 +528,7 @@ impl TryFrom<OKXOptionType> for OptionKind {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXGreeksType {
     /// Black-Scholes greeks in USD.
@@ -500,7 +599,7 @@ impl From<OKXGreeksType> for GreeksConvention {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXTradeMode {
     #[default]
@@ -576,7 +675,7 @@ pub enum OKXAccountMode {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXMarginMode {
     #[serde(rename = "")]
@@ -618,7 +717,7 @@ pub enum OKXMarginMode {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXPositionMode {
     #[default]
@@ -920,7 +1019,7 @@ pub enum OKXBookChannel {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXVipLevel {
     /// VIP level 0 (default tier).
@@ -1387,7 +1486,7 @@ pub enum OKXQuickMarginType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXEnvironment {
     /// Live trading environment.

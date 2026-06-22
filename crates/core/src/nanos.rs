@@ -28,19 +28,13 @@
 //! - Flexible parsing and serialization.
 //!
 //! # Parsing and Serialization
-#![expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    clippy::cast_possible_wrap
-)]
 //!
 //! `UnixNanos` can be created from and serialized to various formats:
 //!
-//! * Integer values are interpreted as nanoseconds since the UNIX epoch.
-//! * Floating-point values are interpreted as seconds since the UNIX epoch (converted to nanoseconds
+//! - Integer values are interpreted as nanoseconds since the UNIX epoch.
+//! - Floating-point values are interpreted as seconds since the UNIX epoch (converted to nanoseconds
 //!   using truncation, not rounding, for consistency with [`secs_to_nanos`](crate::datetime::secs_to_nanos)).
-//! * String values may be:
+//! - String values may be:
 //!   - A numeric string (interpreted as nanoseconds).
 //!   - A floating-point string (interpreted as seconds, converted to nanoseconds).
 //!   - An RFC 3339 formatted timestamp (ISO 8601 with timezone).
@@ -48,9 +42,9 @@
 //!
 //! # Limitations
 //!
-//! * Negative timestamps are invalid and will result in an error.
-//! * Arithmetic operations will panic on overflow/underflow rather than wrapping.
-//! * The `as_i64()` method and `DateTime<Utc>` conversions will panic for timestamps
+//! - Negative timestamps are invalid and will result in an error.
+//! - Arithmetic operations will panic on overflow/underflow rather than wrapping.
+//! - The `as_i64()` method and `DateTime<Utc>` conversions will panic for timestamps
 //!   beyond approximately year 2262 (when nanoseconds exceed `i64::MAX`).
 
 use std::{
@@ -67,7 +61,9 @@ use serde::{
     de::{self, Visitor},
 };
 
-use crate::datetime::{NANOSECONDS_IN_MICROSECOND, NANOSECONDS_IN_MILLISECOND};
+use crate::datetime::{
+    NANOSECONDS_IN_MICROSECOND, NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND,
+};
 
 /// Represents a duration in nanoseconds.
 pub type DurationNanos = u64;
@@ -100,6 +96,37 @@ impl UnixNanos {
     #[must_use]
     pub const fn as_u64(&self) -> u64 {
         self.0
+    }
+
+    /// Returns the timestamp as seconds, truncating sub-second precision.
+    #[must_use]
+    pub const fn as_seconds(&self) -> u64 {
+        self.0 / NANOSECONDS_IN_SECOND
+    }
+
+    /// Returns the timestamp as milliseconds, truncating sub-millisecond precision.
+    #[must_use]
+    pub const fn as_millis(&self) -> u64 {
+        self.0 / NANOSECONDS_IN_MILLISECOND
+    }
+
+    /// Returns the timestamp as microseconds, truncating sub-microsecond precision.
+    #[must_use]
+    pub const fn as_micros(&self) -> u64 {
+        self.0 / NANOSECONDS_IN_MICROSECOND
+    }
+
+    /// Creates a new [`UnixNanos`] from a second timestamp.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the result overflows `u64`.
+    #[must_use]
+    pub const fn from_seconds(seconds: u64) -> Self {
+        match seconds.checked_mul(NANOSECONDS_IN_SECOND) {
+            Some(nanos) => Self(nanos),
+            None => panic!("UnixNanos overflow in from_seconds"),
+        }
     }
 
     /// Creates a new [`UnixNanos`] from a millisecond timestamp.
@@ -136,14 +163,18 @@ impl UnixNanos {
     #[must_use]
     pub const fn as_i64(&self) -> i64 {
         assert!(
-            self.0 <= i64::MAX as u64,
+            self.0 <= i64::MAX.cast_unsigned(),
             "UnixNanos value exceeds i64::MAX"
         );
-        self.0 as i64
+        self.0.cast_signed()
     }
 
     /// Returns the underlying value as `f64`.
     #[must_use]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "u64 to f64 is inherently lossy above 2^53; accepted for float interop"
+    )]
     pub const fn as_f64(&self) -> f64 {
         self.0 as f64
     }
@@ -174,8 +205,6 @@ impl UnixNanos {
     }
 
     fn parse_string(s: &str) -> Result<Self, String> {
-        const MAX_NS_F64: f64 = u64::MAX as f64;
-
         // Try parsing as an integer (nanoseconds)
         if let Ok(int_value) = s.parse::<u64>() {
             return Ok(Self(int_value));
@@ -192,25 +221,7 @@ impl UnixNanos {
 
         // Try parsing as a floating point number (seconds)
         if let Ok(float_value) = s.parse::<f64>() {
-            if !float_value.is_finite() {
-                return Err("Unix timestamp must be finite".into());
-            }
-
-            if float_value < 0.0 {
-                return Err("Unix timestamp cannot be negative".into());
-            }
-
-            // Convert seconds to nanoseconds while checking for overflow
-            // We perform the multiplication in `f64`, then validate the
-            // result fits inside `u64` *before* rounding / casting.
-            let nanos_f64 = float_value * 1_000_000_000.0;
-
-            if nanos_f64 > MAX_NS_F64 {
-                return Err("Unix timestamp is out of range".into());
-            }
-
-            let nanos = nanos_f64.trunc() as u64;
-            return Ok(Self(nanos));
+            return f64_seconds_to_nanos(float_value).map(Self);
         }
 
         // Try parsing as an RFC 3339 timestamp
@@ -218,30 +229,23 @@ impl UnixNanos {
             let nanos = datetime
                 .timestamp_nanos_opt()
                 .ok_or_else(|| "Timestamp out of range".to_string())?;
-
-            if nanos < 0 {
-                return Err("Unix timestamp cannot be negative".into());
-            }
-
-            // Checked that nanos >= 0, so cast to u64 is safe
-            return Ok(Self(nanos as u64));
+            let nanos = u64::try_from(nanos)
+                .map_err(|_| "Unix timestamp cannot be negative".to_string())?;
+            return Ok(Self(nanos));
         }
 
         // Try parsing as a simple date string (YYYY-MM-DD format)
-        if let Ok(datetime) = NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            // SAFETY: unwrap() is safe here because and_hms_opt(0, 0, 0) always succeeds
-            // for valid dates (midnight is always a valid time)
-            .map(|date| date.and_hms_opt(0, 0, 0).unwrap())
-            .map(|naive_dt| DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc))
-        {
+        if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+            let datetime = date
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| "Invalid midnight time".to_string())
+                .map(|naive_dt| DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc))?;
             let nanos = datetime
                 .timestamp_nanos_opt()
                 .ok_or_else(|| "Timestamp out of range".to_string())?;
-
-            if nanos < 0 {
-                return Err("Unix timestamp cannot be negative".into());
-            }
-            return Ok(Self(nanos as u64));
+            let nanos = u64::try_from(nanos)
+                .map_err(|_| "Unix timestamp cannot be negative".to_string())?;
+            return Ok(Self(nanos));
         }
 
         Err(format!("Invalid format: {s}"))
@@ -270,6 +274,37 @@ impl UnixNanos {
     pub fn saturating_sub_ns<T: Into<u64>>(self, rhs: T) -> Self {
         Self(self.0.saturating_sub(rhs.into()))
     }
+}
+
+// Converts non-negative float seconds to nanoseconds, truncating (not rounding)
+// sub-nanosecond precision for consistency with `datetime::secs_to_nanos`.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "value is checked finite, non-negative, and within u64 range before the cast"
+)]
+fn f64_seconds_to_nanos(value: f64) -> Result<u64, String> {
+    const MAX_NS_F64: f64 = u64::MAX as f64;
+
+    if !value.is_finite() {
+        return Err(format!("Unix timestamp must be finite, was {value}"));
+    }
+
+    if value < 0.0 {
+        return Err("Unix timestamp cannot be negative".to_string());
+    }
+
+    // Convert seconds to nanoseconds while checking for overflow.
+    // We perform the multiplication in `f64`, then validate the
+    // result fits inside `u64` *before* truncating / casting.
+    let nanos_f64 = value * 1_000_000_000.0;
+
+    if nanos_f64 > MAX_NS_F64 {
+        return Err(format!("Unix timestamp {value} seconds is out of range"));
+    }
+
+    Ok(nanos_f64.trunc() as u64)
 }
 
 impl Deref for UnixNanos {
@@ -378,7 +413,7 @@ impl From<DateTime<Utc>> for UnixNanos {
 
         assert!(nanos >= 0, "DateTime timestamp cannot be negative: {nanos}");
 
-        Self::from(nanos as u64)
+        Self::from(nanos.cast_unsigned())
     }
 }
 
@@ -388,13 +423,10 @@ impl From<SystemTime> for UnixNanos {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("SystemTime before UNIX EPOCH");
 
-        let nanos = duration.as_nanos();
-        assert!(
-            nanos <= u128::from(u64::MAX),
-            "SystemTime overflowed u64 nanoseconds"
-        );
+        let nanos =
+            u64::try_from(duration.as_nanos()).expect("SystemTime overflowed u64 nanoseconds");
 
-        Self::from(nanos as u64)
+        Self::from(nanos)
     }
 }
 
@@ -549,37 +581,18 @@ impl<'de> Deserialize<'de> for UnixNanos {
             where
                 E: de::Error,
             {
-                if value < 0 {
-                    return Err(E::custom("Unix timestamp cannot be negative"));
-                }
-                Ok(UnixNanos(value as u64))
+                u64::try_from(value)
+                    .map(UnixNanos)
+                    .map_err(|_| E::custom("Unix timestamp cannot be negative"))
             }
 
             fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                const MAX_NS_F64: f64 = u64::MAX as f64;
-
-                if !value.is_finite() {
-                    return Err(E::custom(format!(
-                        "Unix timestamp must be finite, was {value}"
-                    )));
-                }
-
-                if value < 0.0 {
-                    return Err(E::custom("Unix timestamp cannot be negative"));
-                }
-
-                // Convert from seconds to nanoseconds with overflow check
-                let nanos_f64 = value * 1_000_000_000.0;
-                if nanos_f64 > MAX_NS_F64 {
-                    return Err(E::custom(format!(
-                        "Unix timestamp {value} seconds is out of range"
-                    )));
-                }
-                let nanos = nanos_f64.trunc() as u64;
-                Ok(UnixNanos(nanos))
+                f64_seconds_to_nanos(value)
+                    .map(UnixNanos)
+                    .map_err(E::custom)
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -677,6 +690,12 @@ mod tests {
     }
 
     #[rstest]
+    fn test_from_str_date() {
+        let nanos: UnixNanos = "2024-02-10".parse().unwrap();
+        assert_eq!(nanos.as_u64(), 1_707_523_200_000_000_000);
+    }
+
+    #[rstest]
     fn test_from_str_pre_epoch_date() {
         let err = "1969-12-31".parse::<UnixNanos>().unwrap_err();
         assert_eq!(err.to_string(), "Unix timestamp cannot be negative");
@@ -707,6 +726,15 @@ mod tests {
     #[should_panic(expected = "SystemTime before UNIX EPOCH")]
     fn test_from_system_time_before_epoch() {
         let system_time = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        let _ = UnixNanos::from(system_time);
+    }
+
+    #[rstest]
+    #[should_panic(expected = "SystemTime overflowed u64 nanoseconds")]
+    fn test_from_system_time_overflow_panics() {
+        // One second beyond the largest whole-second duration representable in u64 nanoseconds
+        let system_time =
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::MAX / 1_000_000_000 + 1);
         let _ = UnixNanos::from(system_time);
     }
 
@@ -940,8 +968,26 @@ mod tests {
     fn test_from_str_float_overflow() {
         // Use scientific notation so we take the floating-point parsing path.
         let input = "2e10"; // 20 billion seconds ~ 634 years (> u64::MAX nanoseconds)
-        let result = input.parse::<UnixNanos>();
-        assert!(result.is_err());
+        let err = input.parse::<UnixNanos>().unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    #[rstest]
+    #[case("NaN")]
+    #[case("nan")]
+    #[case("inf")]
+    #[case("-inf")]
+    fn test_from_str_non_finite_float_errors(#[case] input: &str) {
+        let err = input.parse::<UnixNanos>().unwrap_err();
+        assert!(err.to_string().contains("must be finite"));
+    }
+
+    #[rstest]
+    #[case("-1.5")]
+    #[case("-0.000001")]
+    fn test_from_str_negative_float_errors(#[case] input: &str) {
+        let err = input.parse::<UnixNanos>().unwrap_err();
+        assert!(err.to_string().contains("cannot be negative"));
     }
 
     #[rstest]
@@ -992,14 +1038,24 @@ mod tests {
     fn test_deserialize_negative_int_fails() {
         let json = "-123456789";
         let result: Result<UnixNanos, _> = serde_json::from_str(json);
-        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be negative")
+        );
     }
 
     #[rstest]
     fn test_deserialize_negative_float_fails() {
         let json = "-1234.567";
         let result: Result<UnixNanos, _> = serde_json::from_str(json);
-        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be negative")
+        );
     }
 
     #[rstest]
@@ -1075,6 +1131,19 @@ mod tests {
         let _ = nanos.as_i64(); // Should panic
     }
 
+    #[rstest]
+    fn test_as_i64_at_i64_max_boundary() {
+        let nanos = UnixNanos::from(i64::MAX.cast_unsigned());
+        assert_eq!(nanos.as_i64(), i64::MAX);
+    }
+
+    #[rstest]
+    #[should_panic(expected = "UnixNanos value exceeds i64::MAX")]
+    fn test_as_i64_just_above_i64_max_panics() {
+        let nanos = UnixNanos::from(i64::MAX.cast_unsigned() + 1);
+        let _ = nanos.as_i64();
+    }
+
     use proptest::prelude::*;
 
     fn unix_nanos_strategy() -> impl Strategy<Value = UnixNanos> {
@@ -1084,18 +1153,18 @@ mod tests {
             // Medium values (microseconds range)
             1_000_000u64..1_000_000_000_000u64,
             // Large values (nanoseconds since 1970)
-            1_000_000_000_000u64..=i64::MAX as u64,
+            1_000_000_000_000u64..=i64::MAX.cast_unsigned(),
             // Values above i64::MAX (sentinel range, GTC/infinity)
-            (i64::MAX as u64 + 1)..=u64::MAX,
+            (i64::MAX.cast_unsigned() + 1)..=u64::MAX,
             // Edge cases
             Just(0u64),
             Just(1u64),
-            Just(1_000_000_000u64),             // 1 second in nanos
-            Just(1_000_000_000_000u64),         // ~2001 timestamp
-            Just(1_700_000_000_000_000_000u64), // ~2023 timestamp
-            Just((i64::MAX / 2) as u64),        // Safe for doubling
-            Just(i64::MAX as u64),              // i64 boundary
-            Just(u64::MAX),                     // Sentinel / max value
+            Just(1_000_000_000u64),               // 1 second in nanos
+            Just(1_000_000_000_000u64),           // ~2001 timestamp
+            Just(1_700_000_000_000_000_000u64),   // ~2023 timestamp
+            Just((i64::MAX / 2).cast_unsigned()), // Safe for doubling
+            Just(i64::MAX.cast_unsigned()),       // i64 boundary
+            Just(u64::MAX),                       // Sentinel / max value
         ]
         .prop_map(UnixNanos::from)
     }
@@ -1108,6 +1177,7 @@ mod tests {
         #[rstest]
         #[expect(
             clippy::float_cmp,
+            clippy::cast_precision_loss,
             reason = "roundtrip: both sides go through the same u64->f64 cast"
         )]
         fn prop_unix_nanos_construction_roundtrip(nanos in unix_nanos_strategy()) {
@@ -1117,7 +1187,7 @@ mod tests {
 
             // Test i64 conversion only for values within i64 range
             if i64::try_from(value).is_ok() {
-                prop_assert_eq!(nanos.as_i64(), value as i64);
+                prop_assert_eq!(nanos.as_i64(), value.cast_signed());
             }
         }
 
@@ -1324,6 +1394,10 @@ mod tests {
         }
 
         #[rstest]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test bound mirrors the production guard in f64_seconds_to_nanos"
+        )]
         fn prop_unix_nanos_f64_deserialize_never_panics(val: f64) {
             // Use IntoDeserializer to hit visit_f64 directly,
             // bypassing JSON text encoding ambiguity
@@ -1337,6 +1411,35 @@ mod tests {
                 prop_assert!(result.is_err(), "Should error for invalid f64: {}", val);
             }
         }
+    }
+
+    #[rstest]
+    fn test_from_seconds_zero() {
+        let nanos = UnixNanos::from_seconds(0);
+        assert_eq!(nanos.as_u64(), 0);
+    }
+
+    #[rstest]
+    fn test_from_seconds_one() {
+        let nanos = UnixNanos::from_seconds(1);
+        assert_eq!(nanos.as_u64(), 1_000_000_000);
+    }
+
+    #[rstest]
+    fn test_from_seconds_realistic_timestamp() {
+        let nanos = UnixNanos::from_seconds(1_700_000_000);
+        assert_eq!(nanos.as_u64(), 1_700_000_000_000_000_000);
+        assert_eq!(
+            nanos.to_datetime_utc(),
+            Utc.with_ymd_and_hms(2023, 11, 14, 22, 13, 20).unwrap()
+        );
+    }
+
+    #[rstest]
+    fn test_from_seconds_max_safe() {
+        let max_seconds = u64::MAX / 1_000_000_000;
+        let nanos = UnixNanos::from_seconds(max_seconds);
+        assert_eq!(nanos.as_u64(), max_seconds * 1_000_000_000);
     }
 
     #[rstest]
@@ -1380,6 +1483,33 @@ mod tests {
         let ms = 1_625_474_304_765_u64;
         let expected = ms * 1_000_000;
         assert_eq!(UnixNanos::from_millis(ms).as_u64(), expected);
+    }
+
+    #[rstest]
+    #[case(0, 0)]
+    #[case(999_999_999, 0)]
+    #[case(1_000_000_000, 1)]
+    #[case(1_700_000_000_123_456_789, 1_700_000_000)]
+    fn test_as_seconds(#[case] nanos: u64, #[case] expected: u64) {
+        assert_eq!(UnixNanos::from(nanos).as_seconds(), expected);
+    }
+
+    #[rstest]
+    #[case(0, 0)]
+    #[case(999_999, 0)]
+    #[case(1_000_000, 1)]
+    #[case(1_700_000_000_000_123_456, 1_700_000_000_000)]
+    fn test_as_millis(#[case] nanos: u64, #[case] expected: u64) {
+        assert_eq!(UnixNanos::from(nanos).as_millis(), expected);
+    }
+
+    #[rstest]
+    #[case(0, 0)]
+    #[case(999, 0)]
+    #[case(1_000, 1)]
+    #[case(1_700_000_000_000_123_456, 1_700_000_000_000_123)]
+    fn test_as_micros(#[case] nanos: u64, #[case] expected: u64) {
+        assert_eq!(UnixNanos::from(nanos).as_micros(), expected);
     }
 
     #[rstest]
@@ -1429,7 +1559,12 @@ mod tests {
     }
 
     #[rstest]
-    fn test_from_millis_and_micros_consistency() {
+    fn test_from_seconds_millis_and_micros_consistency() {
+        assert_eq!(UnixNanos::from_seconds(1), UnixNanos::from_millis(1_000));
+        assert_eq!(
+            UnixNanos::from_seconds(60),
+            UnixNanos::from_micros(60_000_000)
+        );
         assert_eq!(
             UnixNanos::from_millis(1_000),
             UnixNanos::from_micros(1_000_000)
@@ -1445,7 +1580,7 @@ mod tests {
         let ms = 1_707_577_123_456_u64;
         let nanos = UnixNanos::from_millis(ms);
         let dt = nanos.to_datetime_utc();
-        assert_eq!(dt.timestamp_millis() as u64, ms);
+        assert_eq!(dt.timestamp_millis().cast_unsigned(), ms);
     }
 
     #[rstest]
@@ -1453,6 +1588,12 @@ mod tests {
         let micros = 1_700_000_000_000_123_u64;
         let nanos = UnixNanos::from_micros(micros);
         assert_eq!(nanos.as_u64() % 1_000_000, 123_000);
+    }
+
+    #[rstest]
+    #[should_panic(expected = "UnixNanos overflow in from_seconds")]
+    fn test_from_seconds_overflow_panics() {
+        let _ = UnixNanos::from_seconds(u64::MAX / 1_000_000_000 + 1);
     }
 
     #[rstest]

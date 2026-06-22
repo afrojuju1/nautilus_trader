@@ -325,18 +325,15 @@ fn params_to_hashmap(
 ///
 /// Returns an error if:
 /// - The HTTP client fails to initialize.
+/// - The dedicated runtime cannot be created or the request thread panics.
 /// - The HTTP request fails (e.g., network error, timeout, invalid URL).
 /// - The server returns an error response.
 /// - The params argument is not a dict.
-///
-/// # Panics
-///
-/// Panics if the spawned thread panics or runtime creation fails.
 #[pyfunction]
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.network")]
 #[pyo3(signature = (url, params=None, headers=None, timeout_secs=None))]
 pub fn http_get(
-    _py: Python<'_>,
+    py: Python<'_>,
     url: String,
     params: Option<&Bound<'_, PyAny>>,
     headers: Option<HashMap<String, String>>,
@@ -344,24 +341,23 @@ pub fn http_get(
 ) -> PyResult<HttpResponse> {
     let params_map = params_to_hashmap(params)?;
 
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
+    // Release the GIL while blocking on the request so other Python threads keep running
+    py.detach(|| {
+        join_blocking_http_thread(std::thread::spawn(move || {
+            let runtime = blocking_http_runtime()?;
 
-        runtime.block_on(async {
-            let client = HttpClient::new(HashMap::new(), vec![], vec![], None, timeout_secs, None)
-                .map_err(HttpClientError::into_py_err)?;
+            runtime.block_on(async {
+                let client =
+                    HttpClient::new(HashMap::new(), vec![], vec![], None, timeout_secs, None)
+                        .map_err(HttpClientError::into_py_err)?;
 
-            client
-                .get(url, params_map.as_ref(), headers, timeout_secs, None)
-                .await
-                .map_err(HttpClientError::into_py_err)
-        })
+                client
+                    .get(url, params_map.as_ref(), headers, timeout_secs, None)
+                    .await
+                    .map_err(HttpClientError::into_py_err)
+            })
+        }))
     })
-    .join()
-    .expect("Thread panicked")
 }
 
 /// Blocking HTTP POST request.
@@ -372,18 +368,15 @@ pub fn http_get(
 ///
 /// Returns an error if:
 /// - The HTTP client fails to initialize.
+/// - The dedicated runtime cannot be created or the request thread panics.
 /// - The HTTP request fails (e.g., network error, timeout, invalid URL).
 /// - The server returns an error response.
 /// - The params argument is not a dict.
-///
-/// # Panics
-///
-/// Panics if the spawned thread panics or runtime creation fails.
 #[pyfunction]
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.network")]
 #[pyo3(signature = (url, params=None, headers=None, body=None, timeout_secs=None))]
 pub fn http_post(
-    _py: Python<'_>,
+    py: Python<'_>,
     url: String,
     params: Option<&Bound<'_, PyAny>>,
     headers: Option<HashMap<String, String>>,
@@ -392,24 +385,23 @@ pub fn http_post(
 ) -> PyResult<HttpResponse> {
     let params_map = params_to_hashmap(params)?;
 
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
+    // Release the GIL while blocking on the request so other Python threads keep running
+    py.detach(|| {
+        join_blocking_http_thread(std::thread::spawn(move || {
+            let runtime = blocking_http_runtime()?;
 
-        runtime.block_on(async {
-            let client = HttpClient::new(HashMap::new(), vec![], vec![], None, timeout_secs, None)
-                .map_err(HttpClientError::into_py_err)?;
+            runtime.block_on(async {
+                let client =
+                    HttpClient::new(HashMap::new(), vec![], vec![], None, timeout_secs, None)
+                        .map_err(HttpClientError::into_py_err)?;
 
-            client
-                .post(url, params_map.as_ref(), headers, body, timeout_secs, None)
-                .await
-                .map_err(HttpClientError::into_py_err)
-        })
+                client
+                    .post(url, params_map.as_ref(), headers, body, timeout_secs, None)
+                    .await
+                    .map_err(HttpClientError::into_py_err)
+            })
+        }))
     })
-    .join()
-    .expect("Thread panicked")
 }
 
 /// Blocking HTTP PATCH request.
@@ -420,18 +412,15 @@ pub fn http_post(
 ///
 /// Returns an error if:
 /// - The HTTP client fails to initialize.
+/// - The dedicated runtime cannot be created or the request thread panics.
 /// - The HTTP request fails (e.g., network error, timeout, invalid URL).
 /// - The server returns an error response.
 /// - The params argument is not a dict.
-///
-/// # Panics
-///
-/// Panics if the spawned thread panics or runtime creation fails.
 #[pyfunction]
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.network")]
 #[pyo3(signature = (url, params=None, headers=None, body=None, timeout_secs=None))]
 pub fn http_patch(
-    _py: Python<'_>,
+    py: Python<'_>,
     url: String,
     params: Option<&Bound<'_, PyAny>>,
     headers: Option<HashMap<String, String>>,
@@ -440,24 +429,23 @@ pub fn http_patch(
 ) -> PyResult<HttpResponse> {
     let params_map = params_to_hashmap(params)?;
 
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
+    // Release the GIL while blocking on the request so other Python threads keep running
+    py.detach(|| {
+        join_blocking_http_thread(std::thread::spawn(move || {
+            let runtime = blocking_http_runtime()?;
 
-        runtime.block_on(async {
-            let client = HttpClient::new(HashMap::new(), vec![], vec![], None, timeout_secs, None)
-                .map_err(HttpClientError::into_py_err)?;
+            runtime.block_on(async {
+                let client =
+                    HttpClient::new(HashMap::new(), vec![], vec![], None, timeout_secs, None)
+                        .map_err(HttpClientError::into_py_err)?;
 
-            client
-                .patch(url, params_map.as_ref(), headers, body, timeout_secs, None)
-                .await
-                .map_err(HttpClientError::into_py_err)
-        })
+                client
+                    .patch(url, params_map.as_ref(), headers, body, timeout_secs, None)
+                    .await
+                    .map_err(HttpClientError::into_py_err)
+            })
+        }))
     })
-    .join()
-    .expect("Thread panicked")
 }
 
 /// Blocking HTTP DELETE request.
@@ -468,18 +456,15 @@ pub fn http_patch(
 ///
 /// Returns an error if:
 /// - The HTTP client fails to initialize.
+/// - The dedicated runtime cannot be created or the request thread panics.
 /// - The HTTP request fails (e.g., network error, timeout, invalid URL).
 /// - The server returns an error response.
 /// - The params argument is not a dict.
-///
-/// # Panics
-///
-/// Panics if the spawned thread panics or runtime creation fails.
 #[pyfunction]
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.network")]
 #[pyo3(signature = (url, params=None, headers=None, timeout_secs=None))]
 pub fn http_delete(
-    _py: Python<'_>,
+    py: Python<'_>,
     url: String,
     params: Option<&Bound<'_, PyAny>>,
     headers: Option<HashMap<String, String>>,
@@ -487,24 +472,38 @@ pub fn http_delete(
 ) -> PyResult<HttpResponse> {
     let params_map = params_to_hashmap(params)?;
 
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create runtime");
+    // Release the GIL while blocking on the request so other Python threads keep running
+    py.detach(|| {
+        join_blocking_http_thread(std::thread::spawn(move || {
+            let runtime = blocking_http_runtime()?;
 
-        runtime.block_on(async {
-            let client = HttpClient::new(HashMap::new(), vec![], vec![], None, timeout_secs, None)
-                .map_err(HttpClientError::into_py_err)?;
+            runtime.block_on(async {
+                let client =
+                    HttpClient::new(HashMap::new(), vec![], vec![], None, timeout_secs, None)
+                        .map_err(HttpClientError::into_py_err)?;
 
-            client
-                .delete(url, params_map.as_ref(), headers, timeout_secs, None)
-                .await
-                .map_err(HttpClientError::into_py_err)
-        })
+                client
+                    .delete(url, params_map.as_ref(), headers, timeout_secs, None)
+                    .await
+                    .map_err(HttpClientError::into_py_err)
+            })
+        }))
     })
-    .join()
-    .expect("Thread panicked")
+}
+
+fn blocking_http_runtime() -> PyResult<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(to_pyruntime_err)
+}
+
+fn join_blocking_http_thread(
+    handle: std::thread::JoinHandle<PyResult<HttpResponse>>,
+) -> PyResult<HttpResponse> {
+    handle
+        .join()
+        .map_err(|_| to_pyruntime_err("HTTP request thread panicked"))?
 }
 
 /// Downloads a file from URL to filepath using streaming.
@@ -525,7 +524,7 @@ pub fn http_delete(
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.network")]
 #[pyo3(signature = (url, filepath, params=None, headers=None, timeout_secs=None))]
 pub fn http_download(
-    _py: Python<'_>,
+    py: Python<'_>,
     url: String,
     filepath: &str,
     params: Option<&Bound<'_, PyAny>>,
@@ -554,40 +553,44 @@ pub fn http_download(
         url
     };
 
-    let filepath = Path::new(filepath);
+    // Release the GIL for the blocking request and streaming copy so other
+    // Python threads keep running during large downloads
+    py.detach(|| {
+        let filepath = Path::new(filepath);
 
-    if let Some(parent) = filepath.parent() {
-        std::fs::create_dir_all(parent).map_err(to_pyvalue_err)?;
-    }
-
-    let mut client_builder = Client::builder();
-
-    if let Some(timeout) = timeout_secs {
-        client_builder = client_builder.timeout(Duration::from_secs(timeout));
-    }
-    let client = client_builder.build().map_err(to_pyvalue_err)?;
-
-    let mut request_builder = client.get(&full_url);
-
-    if let Some(headers_map) = headers {
-        for (key, value) in headers_map {
-            request_builder = request_builder.header(key, value);
+        if let Some(parent) = filepath.parent() {
+            std::fs::create_dir_all(parent).map_err(to_pyvalue_err)?;
         }
-    }
 
-    let mut response = request_builder.send().map_err(to_pyvalue_err)?;
+        let mut client_builder = Client::builder();
 
-    if !response.status().is_success() {
-        return Err(to_pyruntime_err(format!(
-            "HTTP error: {}",
-            response.status()
-        )));
-    }
+        if let Some(timeout) = timeout_secs {
+            client_builder = client_builder.timeout(Duration::from_secs(timeout));
+        }
+        let client = client_builder.build().map_err(to_pyvalue_err)?;
 
-    let mut file = File::create(filepath).map_err(to_pyvalue_err)?;
-    copy(&mut response, &mut file).map_err(to_pyvalue_err)?;
+        let mut request_builder = client.get(&full_url);
 
-    Ok(())
+        if let Some(headers_map) = headers {
+            for (key, value) in headers_map {
+                request_builder = request_builder.header(key, value);
+            }
+        }
+
+        let mut response = request_builder.send().map_err(to_pyvalue_err)?;
+
+        if !response.status().is_success() {
+            return Err(to_pyruntime_err(format!(
+                "HTTP error: {}",
+                response.status()
+            )));
+        }
+
+        let mut file = File::create(filepath).map_err(to_pyvalue_err)?;
+        copy(&mut response, &mut file).map_err(to_pyvalue_err)?;
+
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -826,6 +829,25 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("params must be a dict"));
+    }
+
+    #[rstest]
+    fn test_join_blocking_http_thread_returns_runtime_error_on_panic() {
+        pyo3::Python::initialize();
+
+        let result = join_blocking_http_thread(std::thread::spawn(|| -> PyResult<HttpResponse> {
+            panic!("synthetic blocking HTTP panic")
+        }));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        pyo3::Python::attach(|py| {
+            assert!(err.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+        });
+        assert_eq!(
+            err.to_string(),
+            "RuntimeError: HTTP request thread panicked"
+        );
     }
 
     fn create_test_router() -> Router {

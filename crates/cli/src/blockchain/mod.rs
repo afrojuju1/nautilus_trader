@@ -17,7 +17,7 @@
 
 use crate::{
     blockchain::{
-        analyze::run_analyze_pool,
+        analyze::{run_analyze_pool, run_analyze_pools},
         sync::{run_sync_blocks, run_sync_dex},
     },
     opt::{BlockchainCommand, BlockchainOpt},
@@ -65,6 +65,9 @@ pub(crate) async fn run_blockchain_command(opt: BlockchainOpt) -> anyhow::Result
             to_block,
             rpc_url,
             reset,
+            require_existing_snapshot,
+            checkpoint_blocks,
+            skip_validation,
             database,
             multicall_calls_per_rpc_request,
         } => {
@@ -77,6 +80,43 @@ pub(crate) async fn run_blockchain_command(opt: BlockchainOpt) -> anyhow::Result
                 rpc_url,
                 database,
                 reset,
+                require_existing_snapshot,
+                checkpoint_blocks,
+                skip_validation,
+                multicall_calls_per_rpc_request,
+            )
+            .await
+        }
+        BlockchainCommand::AnalyzePools {
+            chain,
+            dex,
+            addresses,
+            addresses_file,
+            from_block,
+            to_block,
+            rpc_url,
+            reset,
+            require_existing_snapshot,
+            checkpoint_blocks,
+            skip_validation,
+            concurrency,
+            database,
+            multicall_calls_per_rpc_request,
+        } => {
+            run_analyze_pools(
+                chain,
+                dex,
+                addresses,
+                addresses_file,
+                from_block,
+                to_block,
+                rpc_url,
+                database,
+                reset,
+                require_existing_snapshot,
+                checkpoint_blocks,
+                skip_validation,
+                concurrency,
                 multicall_calls_per_rpc_request,
             )
             .await

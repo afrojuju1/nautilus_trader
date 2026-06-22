@@ -34,15 +34,21 @@
 )]
 
 use std::{
+    any::Any,
     fmt::Debug,
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
-use nautilus_common::{actor::DataActor, signal::Signal, timer::TimeEvent};
+use nautilus_common::{
+    actor::{DataActor, DataActorNative},
+    signal::Signal,
+    timer::TimeEvent,
+};
 use nautilus_model::{
     data::{
-        Bar, FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus,
-        MarkPriceUpdate, OptionChainSlice, OptionGreeks, OrderBookDeltas, QuoteTick, TradeTick,
+        Bar, CustomData, FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus,
+        MarkPriceUpdate, OptionChainSlice, OptionGreeks, OrderBookDelta, OrderBookDeltas,
+        OrderBookDepth10, QuoteTick, TradeTick,
     },
     events::{
         OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
@@ -50,8 +56,9 @@ use nautilus_model::{
         OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered,
         OrderUpdated, PositionChanged, PositionClosed, PositionOpened,
     },
-    identifiers::ActorId,
+    identifiers::{ActorId, InstrumentId},
     instruments::InstrumentAny,
+    orderbook::OrderBook,
 };
 use nautilus_trading::{
     nautilus_strategy,
@@ -60,12 +67,18 @@ use nautilus_trading::{
 
 use crate::{
     boundary::{BorrowedStr, PluginResult, Slice},
-    bridge::registry::{HostContextInner, drop_host_context, leak_host_context},
+    bridge::{
+        custom_data::{try_custom_data_boundary_ref, try_historical_custom_data_boundary_ref},
+        registry::{HostContextInner, drop_host_context, leak_host_context},
+    },
     host::{HostContext, HostVTable},
     manifest::ValidatedStrategyVTable,
     surfaces::{
-        book::OrderBookDeltasHandle, instrument::InstrumentAnyHandle,
-        option_chain::OptionChainSliceHandle, strategy::PluginStrategyHandle,
+        book::{OrderBookDeltasHandle, OrderBookHandle},
+        custom_data::PluginCustomDataRef,
+        instrument::InstrumentAnyHandle,
+        option_chain::OptionChainSliceHandle,
+        strategy::PluginStrategyHandle,
     },
 };
 
@@ -92,8 +105,8 @@ impl Debug for PluginStrategyAdapter {
         f.debug_struct(stringify!(PluginStrategyAdapter))
             .field("plugin_name", &self.plugin_name)
             .field("type_name", &self.type_name)
-            .field("actor_id", &self.core.actor_id())
-            .finish()
+            .field("actor_id", &DataActorNative::core(&self.core).actor_id())
+            .finish_non_exhaustive()
     }
 }
 
@@ -143,7 +156,7 @@ impl PluginStrategyAdapter {
         // SAFETY: vtable comes from a validated manifest entry.
         let create = unsafe { validated_slot!(StrategyVTable, vtable.as_ptr(), create) };
         let core = StrategyCore::new(strategy_config);
-        let actor_id = ActorId::from(core.actor_id().inner().as_str());
+        let actor_id = ActorId::from(DataActorNative::core(&core).actor_id().inner().as_str());
 
         let ctx = leak_host_context(HostContextInner {
             actor_id,
@@ -165,7 +178,9 @@ impl PluginStrategyAdapter {
         if handle.is_null() {
             // SAFETY: ctx came from leak_host_context above.
             unsafe { drop_host_context(ctx) };
-            anyhow::bail!("plug-in strategy '{type_name}' returned a null handle from create");
+            anyhow::bail!(
+                "plug-in strategy '{type_name}' returned a null handle from create (constructor failure or panic)"
+            );
         }
 
         Ok(Self {
@@ -209,6 +224,10 @@ impl Drop for PluginStrategyAdapter {
 }
 
 nautilus_strategy!(PluginStrategyAdapter, core, {
+    fn external_order_claims(&self) -> Option<Vec<InstrumentId>> {
+        self.core.config.external_order_claims.clone()
+    }
+
     fn on_order_initialized(&mut self, event: OrderInitialized) {
         log_strategy_hook_error(
             "on_order_initialized",
@@ -357,6 +376,42 @@ impl DataActor for PluginStrategyAdapter {
         })
     }
 
+    fn on_data(&mut self, data: &CustomData) -> anyhow::Result<()> {
+        let Some(data_ref) = try_custom_data_boundary_ref(data) else {
+            return Ok(());
+        };
+        invoke_custom_data(self, "on_data", data_ref, |adapter, value| unsafe {
+            validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_data)(adapter.handle, value)
+        })
+    }
+
+    fn on_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
+        let handle = InstrumentAnyHandle::new(instrument.clone());
+        invoke_event(self, "on_instrument", &handle, |adapter, p| unsafe {
+            validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_instrument)(
+                adapter.handle,
+                p,
+            )
+        })
+    }
+
+    fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
+        let handle = OrderBookDeltasHandle::new(deltas.clone());
+        invoke_event(self, "on_book_deltas", &handle, |adapter, p| unsafe {
+            validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_book_deltas)(
+                adapter.handle,
+                p,
+            )
+        })
+    }
+
+    fn on_book(&mut self, book: &OrderBook) -> anyhow::Result<()> {
+        let handle = OrderBookHandle::new(book.clone());
+        invoke_event(self, "on_book", &handle, |adapter, p| unsafe {
+            validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_book)(adapter.handle, p)
+        })
+    }
+
     fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
         invoke_event(self, "on_quote", quote, |adapter, p| unsafe {
             validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_quote)(adapter.handle, p)
@@ -372,36 +427,6 @@ impl DataActor for PluginStrategyAdapter {
     fn on_bar(&mut self, bar: &Bar) -> anyhow::Result<()> {
         invoke_event(self, "on_bar", bar, |adapter, p| unsafe {
             validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_bar)(adapter.handle, p)
-        })
-    }
-
-    fn on_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
-        let handle = OrderBookDeltasHandle::new(deltas.clone());
-        invoke_event(self, "on_book_deltas", &handle, |adapter, p| unsafe {
-            validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_book_deltas)(
-                adapter.handle,
-                p,
-            )
-        })
-    }
-
-    fn on_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
-        let handle = InstrumentAnyHandle::new(instrument.clone());
-        invoke_event(self, "on_instrument", &handle, |adapter, p| unsafe {
-            validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_instrument)(
-                adapter.handle,
-                p,
-            )
-        })
-    }
-
-    fn on_option_chain(&mut self, chain: &OptionChainSlice) -> anyhow::Result<()> {
-        let handle = OptionChainSliceHandle::new(chain.clone());
-        invoke_event(self, "on_option_chain", &handle, |adapter, p| unsafe {
-            validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_option_chain)(
-                adapter.handle,
-                p,
-            )
         })
     }
 
@@ -435,6 +460,16 @@ impl DataActor for PluginStrategyAdapter {
     fn on_option_greeks(&mut self, greeks: &OptionGreeks) -> anyhow::Result<()> {
         invoke_event(self, "on_option_greeks", greeks, |adapter, p| unsafe {
             validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_option_greeks)(
+                adapter.handle,
+                p,
+            )
+        })
+    }
+
+    fn on_option_chain(&mut self, chain: &OptionChainSlice) -> anyhow::Result<()> {
+        let handle = OptionChainSliceHandle::new(chain.clone());
+        invoke_event(self, "on_option_chain", &handle, |adapter, p| unsafe {
+            validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_option_chain)(
                 adapter.handle,
                 p,
             )
@@ -484,6 +519,53 @@ impl DataActor for PluginStrategyAdapter {
         })
     }
 
+    fn on_historical_data(&mut self, data: &dyn Any) -> anyhow::Result<()> {
+        let Some(data_ref) = try_historical_custom_data_boundary_ref(data) else {
+            return Ok(());
+        };
+        invoke_custom_data(
+            self,
+            "on_historical_data",
+            data_ref,
+            |adapter, value| unsafe {
+                validated_slot!(StrategyVTable, adapter.vtable.as_ptr(), on_data)(
+                    adapter.handle,
+                    value,
+                )
+            },
+        )
+    }
+
+    fn on_historical_book_deltas(&mut self, deltas: &[OrderBookDelta]) -> anyhow::Result<()> {
+        invoke_slice(
+            self,
+            "on_historical_book_deltas",
+            deltas,
+            |adapter, s| unsafe {
+                validated_slot!(
+                    StrategyVTable,
+                    adapter.vtable.as_ptr(),
+                    on_historical_book_deltas
+                )(adapter.handle, s)
+            },
+        )
+    }
+
+    fn on_historical_book_depth(&mut self, depths: &[OrderBookDepth10]) -> anyhow::Result<()> {
+        invoke_slice(
+            self,
+            "on_historical_book_depth",
+            depths,
+            |adapter, s| unsafe {
+                validated_slot!(
+                    StrategyVTable,
+                    adapter.vtable.as_ptr(),
+                    on_historical_book_depth
+                )(adapter.handle, s)
+            },
+        )
+    }
+
     fn on_historical_quotes(&mut self, quotes: &[QuoteTick]) -> anyhow::Result<()> {
         invoke_slice(self, "on_historical_quotes", quotes, |adapter, s| unsafe {
             validated_slot!(
@@ -511,24 +593,6 @@ impl DataActor for PluginStrategyAdapter {
                 s,
             )
         })
-    }
-
-    fn on_historical_funding_rates(
-        &mut self,
-        funding_rates: &[FundingRateUpdate],
-    ) -> anyhow::Result<()> {
-        invoke_slice(
-            self,
-            "on_historical_funding_rates",
-            funding_rates,
-            |adapter, s| unsafe {
-                validated_slot!(
-                    StrategyVTable,
-                    adapter.vtable.as_ptr(),
-                    on_historical_funding_rates
-                )(adapter.handle, s)
-            },
-        )
     }
 
     fn on_historical_mark_prices(&mut self, mark_prices: &[MarkPriceUpdate]) -> anyhow::Result<()> {
@@ -559,6 +623,24 @@ impl DataActor for PluginStrategyAdapter {
                     StrategyVTable,
                     adapter.vtable.as_ptr(),
                     on_historical_index_prices
+                )(adapter.handle, s)
+            },
+        )
+    }
+
+    fn on_historical_funding_rates(
+        &mut self,
+        funding_rates: &[FundingRateUpdate],
+    ) -> anyhow::Result<()> {
+        invoke_slice(
+            self,
+            "on_historical_funding_rates",
+            funding_rates,
+            |adapter, s| unsafe {
+                validated_slot!(
+                    StrategyVTable,
+                    adapter.vtable.as_ptr(),
+                    on_historical_funding_rates
                 )(adapter.handle, s)
             },
         )
@@ -798,6 +880,18 @@ fn invoke_event<T>(
     finish(result, &plugin_name, &type_name, method)
 }
 
+fn invoke_custom_data(
+    adapter: &PluginStrategyAdapter,
+    method: &str,
+    payload: PluginCustomDataRef,
+    f: impl FnOnce(&PluginStrategyAdapter, PluginCustomDataRef) -> PluginResult<()>,
+) -> anyhow::Result<()> {
+    let plugin_name = adapter.plugin_name.clone();
+    let type_name = adapter.type_name.clone();
+    let result = guard_call(&plugin_name, &type_name, method, || f(adapter, payload));
+    finish(result, &plugin_name, &type_name, method)
+}
+
 fn invoke_slice<T>(
     adapter: &PluginStrategyAdapter,
     method: &str,
@@ -920,5 +1014,30 @@ mod tests {
 
         drop(adapter);
         assert_eq!(host_context_live_count(), before);
+    }
+
+    #[rstest]
+    fn external_order_claims_returns_configured_instruments() {
+        let claims = vec![InstrumentId::from("ETH-USDT.BINANCE")];
+        let config = StrategyConfig::builder()
+            .strategy_id(StrategyId::from("PluginStrategyAdapter-Claims"))
+            .order_id_tag("001".to_string())
+            .external_order_claims(claims.clone())
+            .build();
+
+        // SAFETY: host_vtable is process-lifetime static.
+        let adapter = unsafe {
+            PluginStrategyAdapter::new(
+                config,
+                "plug-in",
+                DropTestStrategy::TYPE_NAME,
+                drop_test_strategy_vtable(),
+                host_vtable(),
+                "{}",
+            )
+        }
+        .expect("adapter construction");
+
+        assert_eq!(Strategy::external_order_claims(&adapter), Some(claims));
     }
 }

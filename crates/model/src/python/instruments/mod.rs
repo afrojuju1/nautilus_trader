@@ -15,18 +15,19 @@
 
 //! Instrument definitions the trading domain model.
 
-use nautilus_core::python::to_pyvalue_err;
+use nautilus_core::python::{serialization::from_dict_pyo3, to_pyvalue_err};
 use pyo3::{
     IntoPyObjectExt, Py, PyAny, PyResult, Python,
     types::{PyAnyMethods, PyDict, PyDictMethods},
 };
+use serde::de::DeserializeOwned;
 
 use crate::{
     instruments::{
-        BettingInstrument, BinaryOption, Cfd, Commodity, CryptoFuture, CryptoPerpetual,
-        CurrencyPair, Equity, FuturesContract, FuturesSpread, IndexInstrument, InstrumentAny,
-        OptionContract, OptionSpread, PerpetualContract, TokenizedAsset,
-        crypto_option::CryptoOption,
+        BettingInstrument, BinaryOption, Cfd, Commodity, CryptoFuture, CryptoFuturesSpread,
+        CryptoOptionSpread, CryptoPerpetual, CurrencyPair, Equity, FuturesContract, FuturesSpread,
+        IndexInstrument, Instrument, InstrumentAny, OptionContract, OptionSpread,
+        PerpetualContract, TokenizedAsset, crypto_option::CryptoOption,
     },
     types::{Currency, Money, Price, Quantity},
 };
@@ -64,6 +65,34 @@ pub(crate) fn register_crypto_currencies_from_dict(
     }
 }
 
+pub(crate) fn tick_scheme_to_py(instrument: &impl Instrument) -> Option<String> {
+    instrument.tick_scheme().map(|name| name.to_string())
+}
+
+pub(crate) fn from_dict_instrument_pyo3<T>(py: Python<'_>, values: Py<PyDict>) -> PyResult<T>
+where
+    T: DeserializeOwned,
+{
+    let values = instrument_dict_with_tick_scheme_alias(py, values)?;
+    from_dict_pyo3(py, values)
+}
+
+fn instrument_dict_with_tick_scheme_alias(
+    py: Python<'_>,
+    values: Py<PyDict>,
+) -> PyResult<Py<PyDict>> {
+    let dict = values.bind(py);
+    if dict.contains("tick_scheme")? || !dict.contains("tick_scheme_name")? {
+        return Ok(values);
+    }
+
+    let dict = dict.copy()?;
+    if let Some(value) = dict.get_item("tick_scheme_name")? {
+        dict.set_item("tick_scheme", value)?;
+    }
+    Ok(dict.unbind())
+}
+
 macro_rules! impl_instrument_common_pymethods {
     ($type:ty) => {
         #[pyo3::pymethods]
@@ -77,6 +106,59 @@ macro_rules! impl_instrument_common_pymethods {
                     self.price_precision(),
                     self.size_precision(),
                 )
+            }
+
+            #[getter]
+            #[pyo3(name = "tick_scheme")]
+            fn py_tick_scheme(&self) -> Option<String> {
+                use crate::instruments::Instrument;
+                self.tick_scheme().map(|name| name.to_string())
+            }
+
+            /// Returns the price `num_ticks` bid ticks away from value.
+            #[pyo3(name = "next_bid_price")]
+            #[pyo3(signature = (value, num_ticks=0))]
+            fn py_next_bid_price(&self, value: f64, num_ticks: i32) -> Option<Price> {
+                use crate::instruments::Instrument;
+                self.next_bid_price(value, num_ticks)
+            }
+
+            /// Returns the price `num_ticks` ask ticks away from value.
+            #[pyo3(name = "next_ask_price")]
+            #[pyo3(signature = (value, num_ticks=0))]
+            fn py_next_ask_price(&self, value: f64, num_ticks: i32) -> Option<Price> {
+                use crate::instruments::Instrument;
+                self.next_ask_price(value, num_ticks)
+            }
+
+            /// Returns prices up to `num_ticks` bid ticks away from value.
+            #[pyo3(name = "next_bid_prices")]
+            #[pyo3(signature = (value, num_ticks=100))]
+            fn py_next_bid_prices(
+                &self,
+                value: f64,
+                num_ticks: usize,
+            ) -> Vec<rust_decimal::Decimal> {
+                use crate::instruments::Instrument;
+                self.next_bid_prices(value, num_ticks)
+                    .into_iter()
+                    .map(|price| price.as_decimal())
+                    .collect()
+            }
+
+            /// Returns prices up to `num_ticks` ask ticks away from value.
+            #[pyo3(name = "next_ask_prices")]
+            #[pyo3(signature = (value, num_ticks=100))]
+            fn py_next_ask_prices(
+                &self,
+                value: f64,
+                num_ticks: usize,
+            ) -> Vec<rust_decimal::Decimal> {
+                use crate::instruments::Instrument;
+                self.next_ask_prices(value, num_ticks)
+                    .into_iter()
+                    .map(|price| price.as_decimal())
+                    .collect()
             }
 
             /// Returns a price rounded to the instruments price precision.
@@ -117,7 +199,9 @@ impl_instrument_common_pymethods!(BinaryOption);
 impl_instrument_common_pymethods!(Cfd);
 impl_instrument_common_pymethods!(Commodity);
 impl_instrument_common_pymethods!(CryptoFuture);
+impl_instrument_common_pymethods!(CryptoFuturesSpread);
 impl_instrument_common_pymethods!(CryptoOption);
+impl_instrument_common_pymethods!(CryptoOptionSpread);
 impl_instrument_common_pymethods!(CryptoPerpetual);
 impl_instrument_common_pymethods!(CurrencyPair);
 impl_instrument_common_pymethods!(Equity);
@@ -134,7 +218,9 @@ pub mod binary_option;
 pub mod cfd;
 pub mod commodity;
 pub mod crypto_future;
+pub mod crypto_futures_spread;
 pub mod crypto_option;
+pub mod crypto_option_spread;
 pub mod crypto_perpetual;
 pub mod currency_pair;
 pub mod equity;
@@ -159,7 +245,9 @@ pub fn instrument_any_to_pyobject(py: Python, instrument: InstrumentAny) -> PyRe
         InstrumentAny::Cfd(inst) => inst.into_py_any(py),
         InstrumentAny::Commodity(inst) => inst.into_py_any(py),
         InstrumentAny::CryptoFuture(inst) => inst.into_py_any(py),
+        InstrumentAny::CryptoFuturesSpread(inst) => inst.into_py_any(py),
         InstrumentAny::CryptoOption(inst) => inst.into_py_any(py),
+        InstrumentAny::CryptoOptionSpread(inst) => inst.into_py_any(py),
         InstrumentAny::CryptoPerpetual(inst) => inst.into_py_any(py),
         InstrumentAny::CurrencyPair(inst) => inst.into_py_any(py),
         InstrumentAny::Equity(inst) => inst.into_py_any(py),
@@ -194,8 +282,14 @@ pub fn pyobject_to_instrument_any(py: Python, instrument: Py<PyAny>) -> PyResult
         stringify!(CryptoFuture) => Ok(InstrumentAny::CryptoFuture(
             instrument.extract::<CryptoFuture>(py)?,
         )),
+        stringify!(CryptoFuturesSpread) => Ok(InstrumentAny::CryptoFuturesSpread(
+            instrument.extract::<CryptoFuturesSpread>(py)?,
+        )),
         stringify!(CryptoOption) => Ok(InstrumentAny::CryptoOption(
             instrument.extract::<CryptoOption>(py)?,
+        )),
+        stringify!(CryptoOptionSpread) => Ok(InstrumentAny::CryptoOptionSpread(
+            instrument.extract::<CryptoOptionSpread>(py)?,
         )),
         stringify!(CryptoPerpetual) => Ok(InstrumentAny::CryptoPerpetual(
             instrument.extract::<CryptoPerpetual>(py)?,

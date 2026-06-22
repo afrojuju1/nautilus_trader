@@ -69,6 +69,7 @@ pub fn parse_option_contract(contract: &AlpacaOptionContract) -> Result<OptionCo
         None,
         None,
         None,
+        None,
         0.into(),
         0.into(),
     )

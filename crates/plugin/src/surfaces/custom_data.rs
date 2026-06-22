@@ -25,7 +25,7 @@ use std::marker::PhantomData;
 
 use crate::{
     boundary::{BorrowedStr, OwnedBytes, PluginError, PluginErrorCode, PluginResult, Slice},
-    panic::{guard, guard_infallible},
+    panic::{guard, guard_drop, guard_infallible, guard_or_null},
 };
 
 /// Opaque handle to a single custom-data value owned by the plug-in.
@@ -35,6 +35,72 @@ use crate::{
 #[repr(C)]
 pub struct CustomDataHandle {
     _opaque: [u8; 0],
+}
+
+/// Borrowed view of a plug-in custom-data value during `on_data` dispatch.
+///
+/// The value stays owned by the host-side wrapper. Plug-in code can inspect
+/// the type name and downcast to a concrete custom-data type that was declared
+/// in the same cdylib manifest.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PluginCustomDataRef {
+    type_name: BorrowedStr<'static>,
+    vtable: *const CustomDataVTable,
+    handle: *const CustomDataHandle,
+}
+
+impl PluginCustomDataRef {
+    /// Constructs a borrowed custom-data reference from raw boundary parts.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be null or point at a live value allocated by `vtable`,
+    /// and `type_name` must name the same concrete custom-data type for the
+    /// duration of the call.
+    #[must_use]
+    pub unsafe fn from_raw_parts(
+        type_name: BorrowedStr<'static>,
+        vtable: *const CustomDataVTable,
+        handle: *const CustomDataHandle,
+    ) -> Self {
+        Self {
+            type_name,
+            vtable,
+            handle,
+        }
+    }
+
+    /// Returns the canonical custom-data type name.
+    #[must_use]
+    pub fn type_name(&self) -> &str {
+        // SAFETY: constructor requires process-lifetime valid UTF-8 storage.
+        unsafe { self.type_name.as_str() }
+    }
+
+    /// Returns whether this value was allocated by the vtable for `T`.
+    #[must_use]
+    pub fn is<T>(&self) -> bool
+    where
+        T: PluginCustomData + PartialEq + Clone,
+    {
+        self.vtable == custom_data_vtable::<T>()
+    }
+
+    /// Returns the value as `T` when it was allocated by `T`'s vtable.
+    #[must_use]
+    pub fn downcast_ref<T>(&self) -> Option<&T>
+    where
+        T: PluginCustomData + PartialEq + Clone,
+    {
+        if self.handle.is_null() || !self.is::<T>() {
+            return None;
+        }
+
+        // SAFETY: matching vtable proves the handle came from `T`'s
+        // generated custom-data thunks and is live for this callback.
+        Some(unsafe { &*self.handle.cast::<T>() })
+    }
 }
 
 /// Function table for a single custom-data type.
@@ -125,9 +191,13 @@ pub struct MetadataEntry<'a> {
 /// [`nautilus_plugin!`](crate::nautilus_plugin) macro generates the
 /// `extern "C"` thunks that adapt this trait to a [`CustomDataVTable`].
 ///
-/// All trait methods run inside [`crate::panic::guard`] in the generated
-/// thunks, so a panic surfaces as a [`PluginError`] with code
+/// Fallible trait methods run inside [`crate::panic::guard`] in the
+/// generated thunks, so a panic surfaces as a [`PluginError`] with code
 /// [`PluginErrorCode::Panic`] instead of unwinding through the FFI.
+/// `clone_value` returns null on panic ([`crate::panic::guard_or_null`])
+/// and drops leak on panic ([`crate::panic::guard_drop`]); `ts_event`,
+/// `ts_init`, and `equals` run inside [`crate::panic::guard_infallible`],
+/// which aborts on panic because no sound sentinel value exists.
 pub trait PluginCustomData: 'static + Send + Sync + Sized {
     /// Canonical type name. Must be unique across a Nautilus deployment.
     const TYPE_NAME: &'static str;
@@ -139,18 +209,39 @@ pub trait PluginCustomData: 'static + Send + Sync + Sized {
     fn ts_init(&self) -> u64;
 
     /// Serializes this value to a JSON payload (no envelope, payload only).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the value cannot be encoded as JSON.
     fn to_json(&self) -> anyhow::Result<Vec<u8>>;
 
     /// Deserializes a value from a JSON payload (no envelope).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `payload` cannot be decoded into this type.
     fn from_json(payload: &[u8]) -> anyhow::Result<Self>;
 
     /// Returns the Arrow schema for this type as an Arrow IPC byte stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the schema cannot be encoded as Arrow IPC.
     fn schema_ipc() -> anyhow::Result<Vec<u8>>;
 
     /// Encodes a batch of values into an Arrow IPC byte stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch cannot be encoded as Arrow IPC.
     fn encode_batch(items: &[&Self]) -> anyhow::Result<Vec<u8>>;
 
     /// Decodes an Arrow IPC byte stream into a vector of values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `ipc_bytes` or `metadata` cannot be decoded into
+    /// this type.
     fn decode_batch(ipc_bytes: &[u8], metadata: &[(String, String)]) -> anyhow::Result<Vec<Self>>;
 
     /// Tests two values of this type for equality. Default implementation
@@ -305,6 +396,10 @@ unsafe extern "C" fn decode_batch_thunk<T: PluginCustomData>(
     })
 }
 
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "pointer was produced from Vec<*mut CustomDataHandle> with pointer alignment"
+)]
 unsafe extern "C" fn drop_handle_array(ptr: *mut u8, len: usize, cap: usize) {
     if ptr.is_null() {
         return;
@@ -355,7 +450,7 @@ unsafe extern "C" fn to_json_thunk<T: PluginCustomData>(
 unsafe extern "C" fn clone_handle_thunk<T: PluginCustomData + Clone>(
     handle: *const CustomDataHandle,
 ) -> *mut CustomDataHandle {
-    guard_infallible("clone_handle", || {
+    guard_or_null("clone_handle", || {
         // SAFETY: see ts_event_thunk.
         let value = unsafe { &*handle.cast::<T>() };
         let cloned = value.clone_value();
@@ -367,7 +462,7 @@ unsafe extern "C" fn drop_handle_thunk<T: PluginCustomData>(handle: *mut CustomD
     if handle.is_null() {
         return;
     }
-    guard_infallible("drop_handle", || {
+    guard_drop("drop_handle", || {
         // SAFETY: handle was allocated via `Box::into_raw(Box::new(T))`.
         unsafe {
             drop(Box::from_raw(handle.cast::<T>()));

@@ -2604,8 +2604,8 @@ mod tests {
         events::OrderInitialized,
         identifiers::{OrderListId, StrategyId, TraderId},
         instruments::{
-            stubs::{equity_aapl, option_contract_appl},
             InstrumentAny,
+            stubs::{equity_aapl, option_contract_appl},
         },
         orders::OrderList,
     };

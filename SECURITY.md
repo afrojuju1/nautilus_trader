@@ -1,8 +1,10 @@
 # Security Policy
 
 Security is a priority for the NautilusTrader project, and we value the work of
-those who help identify and resolve vulnerabilities. If you have found a
-security issue, please follow the guidelines below.
+those who help identify and resolve vulnerabilities. We apply layered controls across the
+development and release lifecycle, with signed releases, continuous vulnerability management, and
+transparent development practices. If you have found a security issue, please follow the guidelines
+below.
 
 For our full security policies, see <https://nautilustrader.io/security/>.
 
@@ -65,8 +67,13 @@ do our best to properly recognize and credit your contributions.
 
 ## Security Infrastructure
 
-NautilusTrader employs multiple layers of security across the development and
-release lifecycle:
+The sections below detail the controls at each layer of that lifecycle.
+
+### Public posture
+
+- **OpenSSF Scorecard**: The repository publishes Scorecard results for the public badge and API,
+  and uploads SARIF to GitHub code scanning. Scorecard is an automated repository-health signal
+  that complements manual review and security audits.
 
 ### Source and review controls
 
@@ -86,8 +93,9 @@ release lifecycle:
   within the last 3 days via `exclude-newer` in `pyproject.toml`. Development tools are pinned to
   explicit versions across `tools.toml`, `Cargo.toml`, and related manifests, and version bumps are
   reviewed during security audits. Rust crate updates are reviewed through our cargo-vet audit
-  process and policy. The cooldown gives the community time to detect and quarantine compromised
-  releases.
+  process and policy, and in practice are not adopted within roughly 3 days of publication unless
+  they carry a security fix or are needed for development after extensive review. The cooldown gives
+  the community time to detect and quarantine compromised releases.
 - **Wheel-only Python installs**: The `no-build-package` list in `[tool.uv]` enumerates every
   third-party package locked in `uv.lock` and forbids `uv` from building any of them from source.
   In normal operation uv prefers wheels, so the setting is a no-op; it kicks in only if a listed
@@ -109,6 +117,8 @@ release lifecycle:
   and OSV Scanner (Rust), pip-audit (Python), and Zizmor (GitHub Actions).
 - **Supply chain provenance**: cargo-vet verifies Rust dependency provenance by importing trusted
   audit data from organizations including Bytecode Alliance, Google, Mozilla, and Embark Studios.
+- **Fuzzing**: cargo-fuzz targets cover selected adapter and signing surfaces, including Derive
+  wire-model/signing internals and Lighter cryptographic/signing internals.
 - **Code scanning**: CodeQL static analysis covers Python and Rust code on PRs to `master`,
   pushes to `nightly`, and manual dispatch. The scheduled security audit also uploads Zizmor SARIF
   results for GitHub Actions workflow findings when token permissions allow it.
@@ -142,14 +152,18 @@ release lifecycle:
 
 ### Runtime cryptography
 
-- **Cryptography**: All TLS and cryptographic operations use
-  [aws-lc-rs](https://github.com/aws/aws-lc-rs), the Rust binding for AWS-LC. The library runs in
+- **Cryptography**: TLS and most runtime cryptography use
+  [aws-lc-rs](https://github.com/aws/aws-lc-rs), the Rust binding for AWS-LC. Ed25519 signing uses
+  [ed25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek). AWS-LC runs in
   non-FIPS mode because the FIPS 140-3 module (`aws-lc-fips-sys`) requires the Go toolchain as a
-  build dependency. The underlying cryptographic primitives (AES-GCM, SHA-2, ECDSA,
-  ChaCha20-Poly1305) are identical in both modes; the FIPS module adds runtime self-tests and
-  module boundary enforcement required for federal certification.
+  build dependency. The AWS-LC primitives used here (AES-GCM, SHA-2, ECDSA, ChaCha20-Poly1305)
+  are identical in both modes; the FIPS module adds runtime self-tests and module boundary
+  enforcement required for federal certification.
 
 For our full supply chain security policy, see <https://nautilustrader.io/security/supply-chain/>.
+
+For the end-to-end release supply chain model, see
+[Release Security Architecture](docs/developer_guide/release_security.md).
 
 For detailed CI/CD security practices, see [.github/OVERVIEW.md](.github/OVERVIEW.md#security).
 
@@ -192,8 +206,10 @@ above; the cooldown can be bypassed when a CVE warrants immediate response.
 Python release artifacts and Docker images are signed or attested via Sigstore-backed workflows.
 Cargo crates are published through crates.io Trusted Publishing. The release verifier records
 whether each crate version was published by the current release commit or already existed from an
-earlier trusted-published commit in this repository. You can independently verify artifacts before
-installing them.
+earlier trusted-published commit in this repository. Emergency token-publish recovery requires an
+explicit `CRATES_IO_MANUAL_PUBLISH_EXCEPTIONS` `crate@version` entry, and the recovered crate
+version is recorded in `crates-manifest.json` with `release_status: "manual_token_publish"`. You
+can independently verify artifacts before installing them.
 
 ### Python wheels and sdist
 

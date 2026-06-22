@@ -63,19 +63,20 @@ pub(super) fn apply_trailing_order_policy(
         return Ok(());
     }
 
-    match order.trailing_offset_type() {
-        Some(TrailingOffsetType::Price | TrailingOffsetType::NoTrailingOffset) | None => {}
-        Some(other) => anyhow::bail!(
-            "`TrailingOffsetType` {:?} is not supported (only PRICE is supported)",
-            other
-        ),
-    }
-
     if let Some(trailing_offset) = order.trailing_offset() {
         let trailing_offset_f64 = trailing_offset.to_string().parse::<f64>().map_err(|e| {
             anyhow::anyhow!("Failed to convert trailing offset {trailing_offset} to f64: {e}")
         })?;
-        ib_order.aux_price = Some(trailing_offset_f64);
+
+        match order.trailing_offset_type() {
+            Some(TrailingOffsetType::BasisPoints) => {
+                ib_order.trailing_percent = Some(trailing_offset_f64 / 100.0);
+            }
+            Some(TrailingOffsetType::Price | TrailingOffsetType::NoTrailingOffset) | None => {
+                ib_order.aux_price = Some(trailing_offset_f64);
+            }
+            Some(other) => anyhow::bail!("`TrailingOffsetType` {:?} is not supported", other),
+        }
     }
 
     if let Some(trigger_price) = order.trigger_price() {
@@ -96,10 +97,7 @@ pub(super) fn apply_display_quantity_policy(ib_order: &mut IBOrder, order: &Orde
     }
 }
 
-pub(super) fn apply_order_list_policy(ib_order: &mut IBOrder, order: &OrderAny) {
-    if let Some(order_list_id) = order.order_list_id()
-        && ib_order.oca_group.is_empty()
-    {
-        ib_order.oca_group = order_list_id.to_string();
-    }
+pub(super) fn apply_order_list_policy(_ib_order: &mut IBOrder, _order: &OrderAny) {
+    // Order lists only control parent/transmit behavior at the execution client layer.
+    // IB OCA groups must be requested explicitly through IB order tags.
 }

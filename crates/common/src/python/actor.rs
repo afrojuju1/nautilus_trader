@@ -23,6 +23,8 @@ use std::{
     rc::Rc,
 };
 
+use chrono::{DateTime, Utc};
+use indexmap::IndexMap;
 use nautilus_core::{
     from_pydict,
     nanos::UnixNanos,
@@ -45,19 +47,27 @@ use nautilus_model::{
     orderbook::OrderBook,
     python::{data::option_chain::PyStrikeRange, instruments::instrument_any_to_pyobject},
 };
-use pyo3::{prelude::*, types::PyDict};
+use pyo3::{
+    prelude::*,
+    types::{PyBytes, PyDict, PyList},
+};
 
 use crate::{
     actor::{
-        Actor, DataActor,
+        Actor, DataActor, DataActorNative,
         data_actor::{DataActorConfig, DataActorCore, ImportableActorConfig},
-        registry::{get_actor_registry, try_get_actor_unchecked},
+        registry::{try_get_actor_unchecked, with_actor_registry},
     },
     cache::Cache,
     clock::Clock,
-    component::{Component, get_component_registry},
+    component::{Component, with_component_registry},
     enums::ComponentState,
-    python::{cache::PyCache, clock::PyClock, logging::PyLogger},
+    python::{
+        cache::PyCache,
+        clock::PyClock,
+        indicators::{registered_python_indicators, wrap_python_indicator},
+        logging::PyLogger,
+    },
     signal::Signal,
     timer::{TimeEvent, TimeEventCallback},
 };
@@ -67,8 +77,13 @@ use crate::{
 impl DataActorConfig {
     /// Common configuration for `DataActor` based components.
     #[new]
-    #[pyo3(signature = (actor_id=None, log_events=true, log_commands=true))]
-    fn py_new(actor_id: Option<ActorId>, log_events: bool, log_commands: bool) -> Self {
+    #[pyo3(signature = (actor_id=None, log_events=true, log_commands=true, **_kwargs))]
+    fn py_new(
+        actor_id: Option<ActorId>,
+        log_events: bool,
+        log_commands: bool,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> Self {
         Self {
             actor_id,
             log_events,
@@ -170,6 +185,16 @@ impl DerefMut for PyDataActorInner {
     }
 }
 
+impl DataActorNative for PyDataActorInner {
+    fn core(&self) -> &DataActorCore {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut DataActorCore {
+        &mut self.core
+    }
+}
+
 #[expect(clippy::needless_pass_by_ref_mut)]
 impl PyDataActorInner {
     fn dispatch_on_start(&self) -> PyResult<()> {
@@ -217,6 +242,29 @@ impl PyDataActorInner {
     fn dispatch_on_fault(&mut self) -> PyResult<()> {
         if let Some(ref py_self) = self.py_self {
             Python::attach(|py| py_self.call_method0(py, "on_fault"))?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_on_save(&self) -> PyResult<IndexMap<String, Vec<u8>>> {
+        if let Some(ref py_self) = self.py_self {
+            Python::attach(|py| {
+                let py_state = py_self.call_method0(py, "on_save")?;
+                let py_state: &Bound<'_, PyDict> = py_state.cast_bound::<PyDict>(py)?;
+                pydict_to_state(py_state)
+            })
+        } else {
+            Ok(IndexMap::new())
+        }
+    }
+
+    fn dispatch_on_load(&mut self, state: &IndexMap<String, Vec<u8>>) -> PyResult<()> {
+        if let Some(ref py_self) = self.py_self {
+            Python::attach(|py| -> PyResult<()> {
+                let py_state = state_to_pydict(py, state)?;
+                py_self.call_method1(py, "on_load", (py_state,))?;
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -529,6 +577,22 @@ fn dict_to_params(
     }
 }
 
+fn state_to_pydict(py: Python<'_>, state: &IndexMap<String, Vec<u8>>) -> PyResult<Py<PyDict>> {
+    let py_state = PyDict::new(py);
+    for (key, value) in state {
+        py_state.set_item(key, PyBytes::new(py, value))?;
+    }
+    Ok(py_state.unbind())
+}
+
+fn pydict_to_state(state: &Bound<'_, PyDict>) -> PyResult<IndexMap<String, Vec<u8>>> {
+    let mut rust_state = IndexMap::with_capacity(state.len());
+    for (key, value) in state.iter() {
+        rust_state.insert(key.extract()?, value.extract()?);
+    }
+    Ok(rust_state)
+}
+
 /// Python-facing wrapper for `DataActor`.
 ///
 /// This wrapper holds shared ownership of `PyDataActorInner` via `Rc<UnsafeCell<>>`.
@@ -701,10 +765,10 @@ impl PyDataActor {
         let inner_ref: Rc<UnsafeCell<PyDataActorInner>> = self.inner.clone();
 
         let component_trait_ref: Rc<UnsafeCell<dyn Component>> = inner_ref.clone();
-        get_component_registry().insert(component_id, component_trait_ref);
+        with_component_registry(|registry| registry.insert(component_id, component_trait_ref));
 
         let actor_trait_ref: Rc<UnsafeCell<dyn Actor>> = inner_ref;
-        get_actor_registry().insert(actor_id, actor_trait_ref);
+        with_actor_registry(|registry| registry.insert(actor_id, actor_trait_ref));
     }
 }
 
@@ -742,6 +806,16 @@ impl DataActor for PyDataActorInner {
     fn on_fault(&mut self) -> anyhow::Result<()> {
         self.dispatch_on_fault()
             .map_err(|e| anyhow::anyhow!("Python on_fault failed: {e}"))
+    }
+
+    fn on_save(&self) -> anyhow::Result<IndexMap<String, Vec<u8>>> {
+        self.dispatch_on_save()
+            .map_err(|e| anyhow::anyhow!("Python on_save failed: {e}"))
+    }
+
+    fn on_load(&mut self, state: IndexMap<String, Vec<u8>>) -> anyhow::Result<()> {
+        self.dispatch_on_load(&state)
+            .map_err(|e| anyhow::anyhow!("Python on_load failed: {e}"))
     }
 
     fn on_time_event(&mut self, event: &TimeEvent) -> anyhow::Result<()> {
@@ -1022,6 +1096,18 @@ impl PyDataActor {
         Component::stop(self.inner_mut()).map_err(to_pyruntime_err)
     }
 
+    #[pyo3(name = "save")]
+    fn py_save(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let state = DataActor::on_save(self.inner()).map_err(to_pyruntime_err)?;
+        state_to_pydict(py, &state)
+    }
+
+    #[pyo3(name = "load")]
+    fn py_load(&mut self, state: &Bound<'_, PyDict>) -> PyResult<()> {
+        let state = pydict_to_state(state)?;
+        DataActor::on_load(self.inner_mut(), state).map_err(to_pyruntime_err)
+    }
+
     #[pyo3(name = "resume")]
     fn py_resume(&mut self) -> PyResult<()> {
         Component::resume(self.inner_mut()).map_err(to_pyruntime_err)
@@ -1050,17 +1136,20 @@ impl PyDataActor {
     #[pyo3(name = "shutdown_system")]
     #[pyo3(signature = (reason=None))]
     fn py_shutdown_system(&self, reason: Option<String>) {
-        self.inner().core.shutdown_system(reason);
+        self.inner().shutdown_system(reason);
     }
 
     #[pyo3(name = "publish_data")]
     fn py_publish_data(&self, data_type: &DataType, data: &CustomData) {
-        self.inner().core.publish_data(data_type, data);
+        self.inner().publish_data(data_type, data);
     }
 
     #[pyo3(name = "publish_signal")]
     #[pyo3(signature = (name, value, ts_event=0))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "PyO3 accepts an owned PyAny handle for Python signal values"
+    )]
     fn py_publish_signal(
         &self,
         py: Python<'_>,
@@ -1071,7 +1160,6 @@ impl PyDataActor {
         // Accept any int / float / str / bool — match v1 behaviour by coercing with `str(value)`.
         let value_str: String = value.bind(py).str()?.extract()?;
         self.inner()
-            .core
             .publish_signal(name, value_str, UnixNanos::from(ts_event));
         Ok(())
     }
@@ -1079,7 +1167,6 @@ impl PyDataActor {
     #[pyo3(name = "add_synthetic")]
     fn py_add_synthetic(&self, synthetic: SyntheticInstrument) -> PyResult<()> {
         self.inner()
-            .core
             .add_synthetic(synthetic)
             .map_err(to_pyvalue_err)
     }
@@ -1087,9 +1174,61 @@ impl PyDataActor {
     #[pyo3(name = "update_synthetic")]
     fn py_update_synthetic(&self, synthetic: SyntheticInstrument) -> PyResult<()> {
         self.inner()
-            .core
             .update_synthetic(synthetic)
             .map_err(to_pyvalue_err)
+    }
+
+    #[getter]
+    #[pyo3(name = "registered_indicators")]
+    fn py_registered_indicators(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        registered_python_indicators(py, self.inner().core.registered_indicators())
+    }
+
+    #[pyo3(name = "indicators_initialized")]
+    fn py_indicators_initialized(&self, _py: Python<'_>) -> PyResult<bool> {
+        self.inner()
+            .core
+            .indicators_initialized()
+            .map_err(to_pyruntime_err)
+    }
+
+    #[pyo3(name = "register_indicator_for_quote_ticks")]
+    fn py_register_indicator_for_quote_ticks(
+        &mut self,
+        py: Python<'_>,
+        instrument_id: InstrumentId,
+        indicator: Py<PyAny>,
+    ) {
+        let indicator = wrap_python_indicator(py, indicator);
+        self.inner_mut()
+            .core
+            .register_indicator_for_quote_ticks(instrument_id, indicator);
+    }
+
+    #[pyo3(name = "register_indicator_for_trade_ticks")]
+    fn py_register_indicator_for_trade_ticks(
+        &mut self,
+        py: Python<'_>,
+        instrument_id: InstrumentId,
+        indicator: Py<PyAny>,
+    ) {
+        let indicator = wrap_python_indicator(py, indicator);
+        self.inner_mut()
+            .core
+            .register_indicator_for_trade_ticks(instrument_id, indicator);
+    }
+
+    #[pyo3(name = "register_indicator_for_bars")]
+    fn py_register_indicator_for_bars(
+        &mut self,
+        py: Python<'_>,
+        bar_type: BarType,
+        indicator: Py<PyAny>,
+    ) {
+        let indicator = wrap_python_indicator(py, indicator);
+        self.inner_mut()
+            .core
+            .register_indicator_for_bars(bar_type, indicator);
     }
 
     #[pyo3(name = "on_start")]
@@ -1112,6 +1251,15 @@ impl PyDataActor {
 
     #[pyo3(name = "on_fault")]
     fn py_on_fault(&mut self) {}
+
+    #[pyo3(name = "on_save")]
+    fn py_on_save(&self, py: Python<'_>) -> Py<PyDict> {
+        PyDict::new(py).unbind()
+    }
+
+    #[allow(unused_variables)]
+    #[pyo3(name = "on_load")]
+    fn py_on_load(&mut self, state: &Bound<'_, PyDict>) {}
 
     #[allow(unused_variables, clippy::needless_pass_by_value)]
     #[pyo3(name = "on_time_event")]
@@ -1690,16 +1838,13 @@ impl PyDataActor {
         py: Python<'_>,
         data_type: DataType,
         client_id: ClientId,
-        start: Option<u64>,
-        end: Option<u64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         limit: Option<usize>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let start = start.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-        let end = end.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-
         let request_id = DataActor::request_data(
             self.inner_mut(),
             data_type,
@@ -1719,15 +1864,12 @@ impl PyDataActor {
         &mut self,
         py: Python<'_>,
         instrument_id: InstrumentId,
-        start: Option<u64>,
-        end: Option<u64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
         let params = dict_to_params(py, params)?;
-        let start = start.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-        let end = end.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-
         let request_id = DataActor::request_instrument(
             self.inner_mut(),
             instrument_id,
@@ -1746,15 +1888,12 @@ impl PyDataActor {
         &mut self,
         py: Python<'_>,
         venue: Option<Venue>,
-        start: Option<u64>,
-        end: Option<u64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
         let params = dict_to_params(py, params)?;
-        let start = start.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-        let end = end.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-
         let request_id =
             DataActor::request_instruments(self.inner_mut(), venue, start, end, client_id, params)
                 .map_err(to_pyvalue_err)?;
@@ -1785,6 +1924,65 @@ impl PyDataActor {
         Ok(request_id.to_string())
     }
 
+    #[pyo3(name = "request_book_deltas")]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None))]
+    #[expect(clippy::too_many_arguments)]
+    fn py_request_book_deltas(
+        &mut self,
+        py: Python<'_>,
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<usize>,
+        client_id: Option<ClientId>,
+        params: Option<Py<PyDict>>,
+    ) -> PyResult<String> {
+        let params = dict_to_params(py, params)?;
+        let limit = limit.and_then(NonZeroUsize::new);
+        let request_id = DataActor::request_book_deltas(
+            self.inner_mut(),
+            instrument_id,
+            start,
+            end,
+            limit,
+            client_id,
+            params,
+        )
+        .map_err(to_pyvalue_err)?;
+        Ok(request_id.to_string())
+    }
+
+    #[pyo3(name = "request_book_depth")]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, depth=None, client_id=None, params=None))]
+    #[expect(clippy::too_many_arguments)]
+    fn py_request_book_depth(
+        &mut self,
+        py: Python<'_>,
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<usize>,
+        depth: Option<usize>,
+        client_id: Option<ClientId>,
+        params: Option<Py<PyDict>>,
+    ) -> PyResult<String> {
+        let params = dict_to_params(py, params)?;
+        let limit = limit.and_then(NonZeroUsize::new);
+        let depth = depth.and_then(NonZeroUsize::new);
+        let request_id = DataActor::request_book_depth(
+            self.inner_mut(),
+            instrument_id,
+            start,
+            end,
+            limit,
+            depth,
+            client_id,
+            params,
+        )
+        .map_err(to_pyvalue_err)?;
+        Ok(request_id.to_string())
+    }
+
     #[pyo3(name = "request_quotes")]
     #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None))]
     #[expect(clippy::too_many_arguments)]
@@ -1792,17 +1990,14 @@ impl PyDataActor {
         &mut self,
         py: Python<'_>,
         instrument_id: InstrumentId,
-        start: Option<u64>,
-        end: Option<u64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let start = start.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-        let end = end.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-
         let request_id = DataActor::request_quotes(
             self.inner_mut(),
             instrument_id,
@@ -1823,17 +2018,14 @@ impl PyDataActor {
         &mut self,
         py: Python<'_>,
         instrument_id: InstrumentId,
-        start: Option<u64>,
-        end: Option<u64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let start = start.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-        let end = end.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-
         let request_id = DataActor::request_trades(
             self.inner_mut(),
             instrument_id,
@@ -1854,17 +2046,14 @@ impl PyDataActor {
         &mut self,
         py: Python<'_>,
         instrument_id: InstrumentId,
-        start: Option<u64>,
-        end: Option<u64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let start = start.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-        let end = end.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-
         let request_id = DataActor::request_funding_rates(
             self.inner_mut(),
             instrument_id,
@@ -1885,17 +2074,14 @@ impl PyDataActor {
         &mut self,
         py: Python<'_>,
         bar_type: BarType,
-        start: Option<u64>,
-        end: Option<u64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
         let params = dict_to_params(py, params)?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let start = start.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-        let end = end.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-
         let request_id = DataActor::request_bars(
             self.inner_mut(),
             bar_type,
@@ -2171,10 +2357,11 @@ impl PyDataActor {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc, str::FromStr, sync::Arc};
+    use std::{cell::RefCell, collections::HashMap, rc::Rc, str::FromStr, sync::Arc};
 
     #[cfg(feature = "defi")]
     use alloy_primitives::{I256, U160, U256};
+    use indexmap::IndexMap;
     use nautilus_core::{UUID4, UnixNanos, python::IntoPyObjectNautilusExt};
     #[cfg(feature = "defi")]
     use nautilus_model::defi::{
@@ -2199,7 +2386,11 @@ mod tests {
         orderbook::OrderBook,
         types::{Price, Quantity},
     };
-    use pyo3::{Py, PyAny, PyResult, Python, ffi::c_str, types::PyAnyMethods};
+    use pyo3::{
+        Bound, Py, PyAny, PyResult, Python,
+        ffi::c_str,
+        types::{PyAnyMethods, PyBytes, PyDict, PyList},
+    };
     use rstest::{fixture, rstest};
     use ustr::Ustr;
 
@@ -2208,7 +2399,9 @@ mod tests {
         actor::DataActor,
         cache::Cache,
         clock::TestClock,
+        component::Component,
         enums::ComponentState,
+        messages::data::{BarsResponse, QuotesResponse, TradesResponse},
         runner::{SyncDataCommandSender, set_data_cmd_sender},
         signal::Signal,
         timer::TimeEvent,
@@ -2283,6 +2476,7 @@ mod tests {
 
         let error = result.unwrap_err();
         pyo3::Python::initialize();
+
         pyo3::Python::attach(|py| {
             assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
         });
@@ -2350,6 +2544,7 @@ mod tests {
         let mut actor = create_registered_actor(clock, cache, trader_id);
 
         pyo3::Python::initialize();
+
         pyo3::Python::attach(|py| {
             assert!(
                 actor
@@ -2448,6 +2643,7 @@ mod tests {
         msgbus::subscribe_any(pattern, handler, None);
 
         pyo3::Python::initialize();
+
         Python::attach(|py| {
             let val1: Py<PyAny> = 1.0_f64.into_py_any_unwrap(py);
             let val2: Py<PyAny> = "HIGH".into_py_any_unwrap(py);
@@ -2497,6 +2693,7 @@ mod tests {
         msgbus::subscribe_any(pattern, handler, None);
 
         pyo3::Python::initialize();
+
         Python::attach(|py| {
             let int_value: Py<PyAny> = 42_i64.into_py_any_unwrap(py);
             let float_value: Py<PyAny> = 3.5_f64.into_py_any_unwrap(py);
@@ -2565,6 +2762,7 @@ mod tests {
         *get_message_bus().borrow_mut() = MessageBus::default();
 
         pyo3::Python::initialize();
+
         Python::attach(|py| {
             let py_actor = create_tracking_python_actor(py).unwrap();
 
@@ -2598,6 +2796,7 @@ mod tests {
         *get_message_bus().borrow_mut() = MessageBus::default();
 
         pyo3::Python::initialize();
+
         Python::attach(|py| {
             let py_actor = create_tracking_python_actor(py).unwrap();
 
@@ -2633,6 +2832,7 @@ mod tests {
         *get_message_bus().borrow_mut() = MessageBus::default();
 
         pyo3::Python::initialize();
+
         Python::attach(|py| {
             let py_actor = create_tracking_python_actor(py).unwrap();
 
@@ -2669,6 +2869,7 @@ mod tests {
         *get_message_bus().borrow_mut() = MessageBus::default();
 
         pyo3::Python::initialize();
+
         Python::attach(|py| {
             let py_actor = create_tracking_python_actor(py).unwrap();
 
@@ -2706,6 +2907,7 @@ mod tests {
         *get_message_bus().borrow_mut() = MessageBus::default();
 
         pyo3::Python::initialize();
+
         Python::attach(|py| {
             let capture_code = c_str!(
                 r#"
@@ -2829,6 +3031,7 @@ class CapturingActor:
         audusd_sim: CurrencyPair,
     ) {
         pyo3::Python::initialize();
+
         let mut actor = create_registered_actor(clock, cache, trader_id);
 
         pyo3::Python::attach(|py| {
@@ -3095,6 +3298,7 @@ class CapturingActor:
         let pool_identifier: PoolIdentifier = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"
             .parse()
             .unwrap();
+
         let pool = Pool::new(
             chain.clone(),
             dex.clone(),
@@ -3123,7 +3327,8 @@ class CapturingActor:
             "0xabc123".to_string(),
             0,
             0,
-            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
             "0x742E4422b21FB8B4dF463F28689AC98bD56c39e0"
                 .parse()
                 .unwrap(),
@@ -3164,7 +3369,8 @@ class CapturingActor:
             U256::from(2_000u64),
             -10,
             10,
-            Some(UnixNanos::default()),
+            UnixNanos::default(),
+            UnixNanos::default(),
         )
     }
 
@@ -3187,7 +3393,8 @@ class CapturingActor:
             200,
             -10,
             10,
-            Some(UnixNanos::default()),
+            UnixNanos::default(),
+            UnixNanos::default(),
         )
     }
 
@@ -3203,7 +3410,8 @@ class CapturingActor:
             "0xabc123".to_string(),
             0,
             0,
-            Some(UnixNanos::default()),
+            UnixNanos::default(),
+            UnixNanos::default(),
             "0x742E4422b21FB8B4dF463F28689AC98bD56c39e0"
                 .parse()
                 .unwrap(),
@@ -3230,6 +3438,8 @@ class TrackingActor:
         "on_dispose",
         "on_degrade",
         "on_fault",
+        "on_save",
+        "on_load",
         "on_time_event",
         "on_data",
         "on_signal",
@@ -3273,6 +3483,20 @@ class TrackingActor:
     def call_count(self, method_name):
         return sum(1 for call in self.calls if call[0] == method_name)
 
+    def last_loaded_state(self):
+
+        for method_name, args in reversed(self.calls):
+            if method_name == "on_load":
+                return args[0]
+        return None
+
+    def on_save(self):
+        self._record("on_save")
+        return {"actor": b"saved"}
+
+    def on_load(self, state):
+        self._record("on_load", dict(state))
+
     def __getattr__(self, name):
         if name in self.TRACKED_METHODS:
             return lambda *args: self._record(name, *args)
@@ -3296,6 +3520,107 @@ class TrackingActor:
 
     fn python_method_call_count(py_actor: &Py<PyAny>, py: Python<'_>, method_name: &str) -> i32 {
         py_actor
+            .call_method1(py, "call_count", (method_name,))
+            .and_then(|r| r.extract::<i32>(py))
+            .unwrap_or(0)
+    }
+
+    fn python_last_loaded_state(
+        py_actor: &Py<PyAny>,
+        py: Python<'_>,
+    ) -> Option<HashMap<String, Vec<u8>>> {
+        py_actor
+            .call_method0(py, "last_loaded_state")
+            .and_then(|result| result.extract::<Option<HashMap<String, Vec<u8>>>>(py))
+            .unwrap_or(None)
+    }
+
+    const TRACKING_INDICATOR_CODE: &std::ffi::CStr = c_str!(
+        r#"
+class TrackingIndicator:
+    def __init__(self, events=None):
+        self.initialized = False
+        self.calls = []
+        self.events = events
+
+    def handle_quote_tick(self, quote):
+        self.calls.append("quote")
+        if self.events is not None:
+            self.events.append("indicator:quote")
+
+    def handle_trade_tick(self, trade):
+        self.calls.append("trade")
+        if self.events is not None:
+            self.events.append("indicator:trade")
+
+    def handle_bar(self, bar):
+        self.calls.append("bar")
+        if self.events is not None:
+            self.events.append("indicator:bar")
+
+    def call_count(self, name):
+        return self.calls.count(name)
+
+class RaisingIndicator:
+    initialized = True
+
+    def handle_quote_tick(self, quote):
+        raise RuntimeError("indicator failed")
+
+class IndicatorEventActor:
+    def __init__(self, events):
+        self.events = events
+
+    def on_start(self):
+        pass
+
+    def on_quote(self, quote):
+        self.events.append("actor:quote")
+
+    def on_trade(self, trade):
+        self.events.append("actor:trade")
+
+    def on_bar(self, bar):
+        self.events.append("actor:bar")
+"#
+    );
+
+    fn create_tracking_python_indicator(py: Python<'_>) -> PyResult<Py<PyAny>> {
+        py.run(TRACKING_INDICATOR_CODE, None, None)?;
+        let indicator_class = py.eval(c_str!("TrackingIndicator"), None, None)?;
+        Ok(indicator_class.call0()?.unbind())
+    }
+
+    fn create_event_tracking_python_indicator(
+        py: Python<'_>,
+        events: &Bound<'_, PyList>,
+    ) -> PyResult<Py<PyAny>> {
+        py.run(TRACKING_INDICATOR_CODE, None, None)?;
+        let indicator_class = py.eval(c_str!("TrackingIndicator"), None, None)?;
+        Ok(indicator_class.call1((events,))?.unbind())
+    }
+
+    fn create_raising_python_indicator(py: Python<'_>) -> PyResult<Py<PyAny>> {
+        py.run(TRACKING_INDICATOR_CODE, None, None)?;
+        let indicator_class = py.eval(c_str!("RaisingIndicator"), None, None)?;
+        Ok(indicator_class.call0()?.unbind())
+    }
+
+    fn create_indicator_event_actor(
+        py: Python<'_>,
+        events: &Bound<'_, PyList>,
+    ) -> PyResult<Py<PyAny>> {
+        py.run(TRACKING_INDICATOR_CODE, None, None)?;
+        let actor_class = py.eval(c_str!("IndicatorEventActor"), None, None)?;
+        Ok(actor_class.call1((events,))?.unbind())
+    }
+
+    fn python_indicator_call_count(
+        indicator: &Py<PyAny>,
+        py: Python<'_>,
+        method_name: &str,
+    ) -> i32 {
+        indicator
             .call_method1(py, "call_count", (method_name,))
             .and_then(|r| r.extract::<i32>(py))
             .unwrap_or(0)
@@ -3339,6 +3664,7 @@ class TrackingActor:
         #[case] method_name: &str,
     ) {
         pyo3::Python::initialize();
+
         Python::attach(|py| {
             assert_python_dispatch(py, clock, cache, trader_id, method_name, |rust_actor| {
                 match method_name {
@@ -3352,6 +3678,415 @@ class TrackingActor:
                     _ => unreachable!("unhandled lifecycle case: {method_name}"),
                 }
             });
+        });
+    }
+
+    #[rstest]
+    #[case("on_save")]
+    #[case("on_load")]
+    fn test_python_dispatch_persistence_matrix(
+        clock: Rc<RefCell<TestClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+        #[case] method_name: &str,
+    ) {
+        pyo3::Python::initialize();
+
+        Python::attach(|py| {
+            assert_python_dispatch(py, clock, cache, trader_id, method_name, |rust_actor| {
+                match method_name {
+                    "on_save" => {
+                        let state = DataActor::on_save(rust_actor.inner()).unwrap();
+                        assert_eq!(
+                            state.get("actor").map(Vec::as_slice),
+                            Some(b"saved".as_slice())
+                        );
+                        Ok(())
+                    }
+                    "on_load" => {
+                        let mut state = IndexMap::new();
+                        state.insert("actor".to_string(), b"loaded".to_vec());
+                        DataActor::on_load(rust_actor.inner_mut(), state)
+                    }
+                    _ => unreachable!("unhandled persistence case: {method_name}"),
+                }
+            });
+        });
+    }
+
+    #[rstest]
+    fn test_python_persistence_methods_convert_state(
+        clock: Rc<RefCell<TestClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+    ) {
+        pyo3::Python::initialize();
+
+        Python::attach(|py| {
+            let py_actor = create_tracking_python_actor(py).unwrap();
+
+            let mut rust_actor = PyDataActor::new(None);
+            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.register(trader_id, clock, cache).unwrap();
+
+            let saved = rust_actor.py_save(py).unwrap();
+            let saved_state = saved
+                .bind(py)
+                .extract::<HashMap<String, Vec<u8>>>()
+                .unwrap();
+            assert_eq!(
+                saved_state.get("actor").map(Vec::as_slice),
+                Some(&b"saved"[..])
+            );
+
+            let load_state = PyDict::new(py);
+            load_state
+                .set_item("actor", PyBytes::new(py, b"loaded-from-python"))
+                .unwrap();
+
+            rust_actor.py_load(&load_state).unwrap();
+
+            let loaded_state = python_last_loaded_state(&py_actor, py).unwrap();
+            assert_eq!(
+                loaded_state.get("actor").map(Vec::as_slice),
+                Some(&b"loaded-from-python"[..])
+            );
+        });
+    }
+
+    #[rstest]
+    fn test_indicator_registration_exposes_readiness_and_registered_view(
+        audusd_sim: CurrencyPair,
+        bar_type: BarType,
+    ) {
+        pyo3::Python::initialize();
+
+        Python::attach(|py| {
+            let mut rust_actor = PyDataActor::new(None);
+            let indicator = create_tracking_python_indicator(py).unwrap();
+
+            assert_eq!(
+                rust_actor
+                    .py_registered_indicators(py)
+                    .unwrap()
+                    .bind(py)
+                    .len()
+                    .unwrap(),
+                0
+            );
+            assert!(!rust_actor.py_indicators_initialized(py).unwrap());
+
+            rust_actor.py_register_indicator_for_quote_ticks(
+                py,
+                audusd_sim.id,
+                indicator.clone_ref(py),
+            );
+            rust_actor.py_register_indicator_for_trade_ticks(
+                py,
+                audusd_sim.id,
+                indicator.clone_ref(py),
+            );
+            rust_actor.py_register_indicator_for_bars(py, bar_type, indicator.clone_ref(py));
+
+            let registered = rust_actor.py_registered_indicators(py).unwrap();
+            let registered = registered.bind(py);
+
+            assert_eq!(registered.len().unwrap(), 1);
+            assert_eq!(
+                registered.get_item(0).unwrap().as_ptr(),
+                indicator.bind(py).as_ptr()
+            );
+            assert!(!rust_actor.py_indicators_initialized(py).unwrap());
+
+            indicator.bind(py).setattr("initialized", true).unwrap();
+
+            assert!(rust_actor.py_indicators_initialized(py).unwrap());
+        });
+    }
+
+    #[rstest]
+    fn test_registered_indicators_receive_quote_trade_and_bar_before_actor_callbacks(
+        clock: Rc<RefCell<TestClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+    ) {
+        pyo3::Python::initialize();
+
+        Python::attach(|py| {
+            let events = PyList::empty(py);
+            let py_actor = create_indicator_event_actor(py, &events).unwrap();
+            let indicator = create_event_tracking_python_indicator(py, &events).unwrap();
+
+            let mut rust_actor = PyDataActor::new(None);
+            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.register(trader_id, clock, cache).unwrap();
+            Component::start(rust_actor.inner_mut()).unwrap();
+
+            let quote = sample_quote();
+            let trade = sample_trade();
+            let bar = sample_bar();
+            let external_bar_type = BarType::from_str(&format!(
+                "{}-1-MINUTE-LAST-EXTERNAL",
+                bar.bar_type.instrument_id()
+            ))
+            .unwrap();
+
+            rust_actor.py_register_indicator_for_quote_ticks(
+                py,
+                quote.instrument_id,
+                indicator.clone_ref(py),
+            );
+            rust_actor.py_register_indicator_for_trade_ticks(
+                py,
+                trade.instrument_id,
+                indicator.clone_ref(py),
+            );
+            rust_actor.py_register_indicator_for_bars(
+                py,
+                external_bar_type,
+                indicator.clone_ref(py),
+            );
+
+            DataActor::handle_quote(rust_actor.inner_mut(), &quote);
+            DataActor::handle_trade(rust_actor.inner_mut(), &trade);
+            DataActor::handle_bar(rust_actor.inner_mut(), &bar);
+
+            let events = events.extract::<Vec<String>>().unwrap();
+
+            assert_eq!(python_indicator_call_count(&indicator, py, "quote"), 1);
+            assert_eq!(python_indicator_call_count(&indicator, py, "trade"), 1);
+            assert_eq!(python_indicator_call_count(&indicator, py, "bar"), 1);
+            assert_eq!(
+                events,
+                vec![
+                    "indicator:quote",
+                    "actor:quote",
+                    "indicator:trade",
+                    "actor:trade",
+                    "indicator:bar",
+                    "actor:bar",
+                ]
+            );
+        });
+    }
+
+    #[rstest]
+    fn test_registered_indicators_receive_live_data_when_actor_not_running(
+        clock: Rc<RefCell<TestClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+    ) {
+        pyo3::Python::initialize();
+
+        Python::attach(|py| {
+            let events = PyList::empty(py);
+            let py_actor = create_indicator_event_actor(py, &events).unwrap();
+            let indicator = create_event_tracking_python_indicator(py, &events).unwrap();
+
+            let mut rust_actor = PyDataActor::new(None);
+            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.register(trader_id, clock, cache).unwrap();
+
+            let quote = sample_quote();
+
+            rust_actor.py_register_indicator_for_quote_ticks(
+                py,
+                quote.instrument_id,
+                indicator.clone_ref(py),
+            );
+
+            DataActor::handle_quote(rust_actor.inner_mut(), &quote);
+
+            let events = events.extract::<Vec<String>>().unwrap();
+
+            assert_eq!(python_indicator_call_count(&indicator, py, "quote"), 1);
+            assert_eq!(events, vec!["indicator:quote"]);
+        });
+    }
+
+    #[rstest]
+    fn test_registered_indicators_receive_historical_quote_trade_and_bar_batches() {
+        pyo3::Python::initialize();
+
+        Python::attach(|py| {
+            let mut rust_actor = PyDataActor::new(None);
+            let indicator = create_tracking_python_indicator(py).unwrap();
+            let quote = sample_quote();
+            let trade = sample_trade();
+            let bar = sample_bar();
+            let quotes = vec![quote];
+            let trades = vec![trade];
+            let bars = vec![bar];
+
+            rust_actor.py_register_indicator_for_quote_ticks(
+                py,
+                quote.instrument_id,
+                indicator.clone_ref(py),
+            );
+            rust_actor.py_register_indicator_for_trade_ticks(
+                py,
+                trade.instrument_id,
+                indicator.clone_ref(py),
+            );
+            rust_actor.py_register_indicator_for_bars(py, bar.bar_type, indicator.clone_ref(py));
+
+            let client_id = ClientId::new("TEST");
+            let quotes_response = QuotesResponse::new(
+                UUID4::new(),
+                client_id,
+                quote.instrument_id,
+                quotes,
+                None,
+                None,
+                UnixNanos::default(),
+                None,
+            );
+            let trades_response = TradesResponse::new(
+                UUID4::new(),
+                client_id,
+                trade.instrument_id,
+                trades,
+                None,
+                None,
+                UnixNanos::default(),
+                None,
+            );
+            let bars_response = BarsResponse::new(
+                UUID4::new(),
+                client_id,
+                bar.bar_type,
+                bars,
+                None,
+                None,
+                UnixNanos::default(),
+                None,
+            );
+
+            DataActor::handle_quotes_response(rust_actor.inner_mut(), &quotes_response);
+            DataActor::handle_trades_response(rust_actor.inner_mut(), &trades_response);
+            DataActor::handle_bars_response(rust_actor.inner_mut(), &bars_response);
+
+            assert_eq!(python_indicator_call_count(&indicator, py, "quote"), 1);
+            assert_eq!(python_indicator_call_count(&indicator, py, "trade"), 1);
+            assert_eq!(python_indicator_call_count(&indicator, py, "bar"), 1);
+        });
+    }
+
+    #[rstest]
+    fn test_indicators_initialized_requires_all_registered_indicators(audusd_sim: CurrencyPair) {
+        pyo3::Python::initialize();
+
+        Python::attach(|py| {
+            let mut rust_actor = PyDataActor::new(None);
+            let first = create_tracking_python_indicator(py).unwrap();
+            let second = create_tracking_python_indicator(py).unwrap();
+
+            rust_actor.py_register_indicator_for_quote_ticks(
+                py,
+                audusd_sim.id,
+                first.clone_ref(py),
+            );
+            rust_actor.py_register_indicator_for_quote_ticks(
+                py,
+                audusd_sim.id,
+                second.clone_ref(py),
+            );
+
+            first.bind(py).setattr("initialized", true).unwrap();
+
+            assert!(!rust_actor.py_indicators_initialized(py).unwrap());
+
+            second.bind(py).setattr("initialized", true).unwrap();
+
+            assert!(rust_actor.py_indicators_initialized(py).unwrap());
+        });
+    }
+
+    #[rstest]
+    fn test_duplicate_indicator_registration_does_not_duplicate_callbacks(
+        clock: Rc<RefCell<TestClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+    ) {
+        pyo3::Python::initialize();
+
+        Python::attach(|py| {
+            let mut rust_actor = PyDataActor::new(None);
+            let indicator = create_tracking_python_indicator(py).unwrap();
+            let quote = sample_quote();
+            let trade = sample_trade();
+            let bar = sample_bar();
+            rust_actor.register(trader_id, clock, cache).unwrap();
+            Component::start(rust_actor.inner_mut()).unwrap();
+
+            rust_actor.py_register_indicator_for_quote_ticks(
+                py,
+                quote.instrument_id,
+                indicator.clone_ref(py),
+            );
+            rust_actor.py_register_indicator_for_quote_ticks(
+                py,
+                quote.instrument_id,
+                indicator.clone_ref(py),
+            );
+            rust_actor.py_register_indicator_for_trade_ticks(
+                py,
+                trade.instrument_id,
+                indicator.clone_ref(py),
+            );
+            rust_actor.py_register_indicator_for_trade_ticks(
+                py,
+                trade.instrument_id,
+                indicator.clone_ref(py),
+            );
+            rust_actor.py_register_indicator_for_bars(py, bar.bar_type, indicator.clone_ref(py));
+            rust_actor.py_register_indicator_for_bars(py, bar.bar_type, indicator.clone_ref(py));
+
+            DataActor::handle_quote(rust_actor.inner_mut(), &quote);
+            DataActor::handle_trade(rust_actor.inner_mut(), &trade);
+            DataActor::handle_bar(rust_actor.inner_mut(), &bar);
+
+            assert_eq!(
+                rust_actor
+                    .py_registered_indicators(py)
+                    .unwrap()
+                    .bind(py)
+                    .len()
+                    .unwrap(),
+                1
+            );
+            assert_eq!(python_indicator_call_count(&indicator, py, "quote"), 1);
+            assert_eq!(python_indicator_call_count(&indicator, py, "trade"), 1);
+            assert_eq!(python_indicator_call_count(&indicator, py, "bar"), 1);
+        });
+    }
+
+    #[rstest]
+    fn test_indicator_error_prevents_actor_callback(
+        clock: Rc<RefCell<TestClock>>,
+        cache: Rc<RefCell<Cache>>,
+        trader_id: TraderId,
+    ) {
+        pyo3::Python::initialize();
+
+        Python::attach(|py| {
+            let events = PyList::empty(py);
+            let py_actor = create_indicator_event_actor(py, &events).unwrap();
+            let indicator = create_raising_python_indicator(py).unwrap();
+
+            let mut rust_actor = PyDataActor::new(None);
+            rust_actor.set_python_instance(py_actor.clone_ref(py));
+            rust_actor.register(trader_id, clock, cache).unwrap();
+            Component::start(rust_actor.inner_mut()).unwrap();
+
+            let quote = sample_quote();
+
+            rust_actor.py_register_indicator_for_quote_ticks(py, quote.instrument_id, indicator);
+
+            DataActor::handle_quote(rust_actor.inner_mut(), &quote);
+            let events = events.extract::<Vec<String>>().unwrap();
+
+            assert!(events.is_empty());
         });
     }
 
@@ -3379,6 +4114,7 @@ class TrackingActor:
         #[case] method_name: &str,
     ) {
         pyo3::Python::initialize();
+
         Python::attach(|py| {
             assert_python_dispatch(py, clock, cache, trader_id, method_name, |rust_actor| {
                 match method_name {
@@ -3467,6 +4203,7 @@ class TrackingActor:
         #[case] method_name: &str,
     ) {
         pyo3::Python::initialize();
+
         Python::attach(|py| {
             assert_python_dispatch(py, clock, cache, trader_id, method_name, |rust_actor| {
                 match method_name {
@@ -3525,6 +4262,7 @@ class TrackingActor:
         #[case] method_name: &str,
     ) {
         pyo3::Python::initialize();
+
         Python::attach(|py| {
             assert_python_dispatch(py, clock, cache, trader_id, method_name, |rust_actor| {
                 match method_name {
@@ -3566,6 +4304,7 @@ class TrackingActor:
         audusd_sim: CurrencyPair,
     ) {
         pyo3::Python::initialize();
+
         Python::attach(|py| {
             let py_actor = create_tracking_python_actor(py).unwrap();
 
@@ -3598,6 +4337,7 @@ class TrackingActor:
         trader_id: TraderId,
     ) {
         pyo3::Python::initialize();
+
         Python::attach(|_py| {
             let mut rust_actor = PyDataActor::new(None);
             rust_actor.register(trader_id, clock, cache).unwrap();
@@ -3615,6 +4355,7 @@ class TrackingActor:
         trader_id: TraderId,
     ) {
         pyo3::Python::initialize();
+
         let mut rust_actor = PyDataActor::new(None);
         rust_actor.register(trader_id, clock, cache).unwrap();
 

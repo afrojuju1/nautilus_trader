@@ -401,13 +401,17 @@ Upstream references:
 - Order book depth10 snapshots: fixed 10 levels via `orderBook10` channel.
 - Quotes, trades, and instrument updates are supported via WebSocket.
 - Funding rates, mark prices, and index prices are supported where applicable.
-- Historical requests via REST:
+- REST requests:
+  - Current L2 order book snapshots with optional depth.
   - Trade ticks with optional `start`, `end`, and `limit` filters (up to 1,000 results per call).
   - Time bars (`1m`, `5m`, `1h`, `1d`) for externally aggregated LAST prices, including optional partial bins.
+  - Funding rates with optional `start`, `end`, and `limit` filters.
 
 :::note
-BitMEX caps each REST response at 1,000 rows and requires manual pagination via `start`/`startTime`. The current adapter returns only the
-first page; wider pagination support is scheduled for a future update.
+BitMEX table REST page sizes vary by endpoint. Funding rate requests paginate in
+500-row pages until the requested limit or time range is exhausted; trade tick
+and bar requests currently return one venue page per request and allow up to
+1,000 rows.
 :::
 
 ### Trade ID derivation
@@ -786,47 +790,49 @@ The adapter automatically routes requests to the correct endpoints when
 
 The BitMEX data client provides the following configuration options:
 
-| Option                            | Default  | Description |
-|-----------------------------------|----------|-------------|
-| `api_key`                         | `None`   | Optional API key; if `None`, loaded from the environment selected by `environment`. |
-| `api_secret`                      | `None`   | Optional API secret; if `None`, loaded from the environment selected by `environment`. |
-| `environment`                     | `None`   | Environment enum (`MAINNET` or `TESTNET`). |
-| `base_url_http`                   | `None`   | Override for the REST base URL (defaults to production). |
-| `base_url_ws`                     | `None`   | Override for the WebSocket base URL (defaults to production). |
-| `http_timeout_secs`               | `60`     | Request timeout applied to HTTP calls. |
-| `max_retries`                     | `3`      | Maximum retry attempts for HTTP calls. |
-| `retry_delay_initial_ms`          | `1,000`  | Initial backoff delay (milliseconds) between retries. |
-| `retry_delay_max_ms`              | `10,000` | Maximum backoff delay (milliseconds) between retries. |
-| `recv_window_ms`                  | `10,000` | Expiration window (milliseconds) for signed requests. See [Request authentication](#request-authentication-and-expiration). |
-| `update_instruments_interval_mins`| `60`     | Interval (minutes) between instrument catalogue refreshes. |
-| `max_requests_per_second`         | `10`     | Burst rate limit enforced by the adapter for REST calls. |
-| `max_requests_per_minute`         | `120`    | Rolling minute rate limit enforced by the adapter for REST calls. |
-| `proxy_url`                       | `None`   | Optional proxy URL for HTTP and WebSocket transports. |
+| Option                             | Default   | Description |
+|------------------------------------|-----------|-------------|
+| `api_key`                          | `None`    | Optional API key; if `None`, loaded from the environment selected by `environment`. |
+| `api_secret`                       | `None`    | Optional API secret; if `None`, loaded from the environment selected by `environment`. |
+| `environment`                      | `None`    | Environment enum (`MAINNET` or `TESTNET`). |
+| `base_url_http`                    | `None`    | Override for the REST base URL (defaults to production). |
+| `base_url_ws`                      | `None`    | Override for the WebSocket base URL (defaults to production). |
+| `http_timeout_secs`                | `60`      | Request timeout applied to HTTP calls. |
+| `max_retries`                      | `3`       | Maximum retry attempts for HTTP calls. |
+| `retry_delay_initial_ms`           | `1,000`   | Initial backoff delay (milliseconds) between retries. |
+| `retry_delay_max_ms`               | `10,000`  | Maximum backoff delay (milliseconds) between retries. |
+| `recv_window_ms`                   | `10,000`  | Expiration window (milliseconds) for signed requests. See [Request authentication](#request-authentication-and-expiration). |
+| `update_instruments_interval_mins` | `60`      | Interval (minutes) between instrument catalogue refreshes. |
+| `max_requests_per_second`          | `10`      | Burst rate limit enforced by the adapter for REST calls. |
+| `max_requests_per_minute`          | `120`     | Rolling minute rate limit enforced by the adapter for REST calls. |
+| `proxy_url`                        | `None`    | Optional proxy URL for HTTP and WebSocket transports. |
+| `transport_backend`                | `Sockudo` | WebSocket transport backend. |
 
 ### Execution client configuration options
 
 The BitMEX execution client provides the following configuration options:
 
-| Option                   | Default  | Description |
-|--------------------------|----------|-------------|
-| `api_key`                | `None`   | Optional API key; if `None`, loaded from the environment selected by `environment`. |
-| `api_secret`             | `None`   | Optional API secret; if `None`, loaded from the environment selected by `environment`. |
-| `environment`            | `None`   | Environment enum (`MAINNET` or `TESTNET`). |
-| `base_url_http`          | `None`   | Override for the REST base URL (defaults to production). |
-| `base_url_ws`            | `None`   | Override for the WebSocket base URL (defaults to production). |
-| `http_timeout_secs`      | `60`     | Request timeout applied to HTTP calls. |
-| `max_retries`            | `3`      | Maximum retry attempts for HTTP calls. |
-| `retry_delay_initial_ms` | `1,000`  | Initial backoff delay (milliseconds) between retries. |
-| `retry_delay_max_ms`     | `10,000` | Maximum backoff delay (milliseconds) between retries. |
-| `recv_window_ms`         | `10,000` | Expiration window (milliseconds) for signed requests. See [Request authentication](#request-authentication-and-expiration). |
-| `max_requests_per_second`| `10`     | Burst rate limit enforced by the adapter for REST calls. |
-| `max_requests_per_minute`| `120`    | Rolling minute rate limit enforced by the adapter for REST calls. |
-| `deadmans_switch_timeout_secs` | `None`   | Timeout in seconds for the dead man's switch. `None` disables. See [Dead man's switch](#dead-mans-switch). |
-| `canceller_pool_size`    | `None`   | Number of HTTP clients in the cancel broadcaster pool. `None` resolves to 1. See [Cancel broadcaster](#cancel-broadcaster). |
-| `submitter_pool_size`    | `None`   | Number of HTTP clients in the submit broadcaster pool. `None` resolves to 1. See [Submit broadcaster](#submit-broadcaster). |
-| `proxy_url`              | `None`   | Optional proxy URL for HTTP and WebSocket transports. |
-| `submitter_proxy_urls`   | `None`   | Optional list of proxy URLs for submit broadcaster path diversity. *Not yet wired through Python integration.* |
-| `canceller_proxy_urls`   | `None`   | Optional list of proxy URLs for cancel broadcaster path diversity. *Not yet wired through Python integration.* |
+| Option                         | Default   | Description |
+|--------------------------------|-----------|-------------|
+| `api_key`                      | `None`    | Optional API key; if `None`, loaded from the environment selected by `environment`. |
+| `api_secret`                   | `None`    | Optional API secret; if `None`, loaded from the environment selected by `environment`. |
+| `environment`                  | `None`    | Environment enum (`MAINNET` or `TESTNET`). |
+| `base_url_http`                | `None`    | Override for the REST base URL (defaults to production). |
+| `base_url_ws`                  | `None`    | Override for the WebSocket base URL (defaults to production). |
+| `http_timeout_secs`            | `60`      | Request timeout applied to HTTP calls. |
+| `max_retries`                  | `3`       | Maximum retry attempts for HTTP calls. |
+| `retry_delay_initial_ms`       | `1,000`   | Initial backoff delay (milliseconds) between retries. |
+| `retry_delay_max_ms`           | `10,000`  | Maximum backoff delay (milliseconds) between retries. |
+| `recv_window_ms`               | `10,000`  | Expiration window (milliseconds) for signed requests. See [Request authentication](#request-authentication-and-expiration). |
+| `max_requests_per_second`      | `10`      | Burst rate limit enforced by the adapter for REST calls. |
+| `max_requests_per_minute`      | `120`     | Rolling minute rate limit enforced by the adapter for REST calls. |
+| `deadmans_switch_timeout_secs` | `None`    | Timeout in seconds for the dead man's switch. `None` disables. See [Dead man's switch](#dead-mans-switch). |
+| `canceller_pool_size`          | `None`    | Number of HTTP clients in the cancel broadcaster pool. `None` resolves to 1. See [Cancel broadcaster](#cancel-broadcaster). |
+| `submitter_pool_size`          | `None`    | Number of HTTP clients in the submit broadcaster pool. `None` resolves to 1. See [Submit broadcaster](#submit-broadcaster). |
+| `proxy_url`                    | `None`    | Optional proxy URL for HTTP and WebSocket transports. |
+| `submitter_proxy_urls`         | `None`    | Optional list of proxy URLs for submit broadcaster path diversity. *Not yet wired through Python integration.* |
+| `canceller_proxy_urls`         | `None`    | Optional list of proxy URLs for cancel broadcaster path diversity. *Not yet wired through Python integration.* |
+| `transport_backend`            | `Sockudo` | WebSocket transport backend. |
 
 ### Configuration examples
 
@@ -860,21 +866,24 @@ mainnet_exec_config = BitmexExecClientConfig(
 
 ### Contingent orders
 
-The BitMEX execution adapter now maps Nautilus contingent order lists to the exchange's
+The BitMEX execution adapter maps Nautilus contingent order lists to the exchange's
 native `clOrdLinkID`/`contingencyType` mechanics. When the engine submits
-`ContingencyType::Oco` or `ContingencyType::Oto` orders the adapter will:
+`ContingencyType::Oco` or `ContingencyType::Oto` orders, the adapter:
 
-- Create/maintain the linked order group on BitMEX so child stops and targets inherit the
+- Creates/maintains the linked order group on BitMEX so child stops and targets inherit the
   parent order status.
-- Propagate order list updates and cancellations so that contingent peers stay aligned with
+- Propagates order list updates and cancellations so that contingent peers stay aligned with
   the current position state.
-- Surface execution reports with the appropriate contingency metadata, enabling strategy-level
+- Surfaces execution reports with the appropriate contingency metadata, enabling strategy-level
   tracking without additional manual wiring.
 
-This means common bracket flows (entry + stop + take-profit) and multi-leg stop structures can
-now be managed directly by BitMEX instead of being emulated client-side. When defining
-strategies, continue to use Nautilus `OrderList`/`ContingencyType` abstractions. The adapter
-handles the required BitMEX wiring automatically.
+The adapter does not map Nautilus `ContingencyType::Ouo` to BitMEX. For bracket
+flows with an entry, stop, and take-profit, BitMEX can natively link the OTO
+entry-to-contingent activation step, but the mutual cancel or update behavior
+between the stop-loss and take-profit legs requires strategy-level emulation.
+When defining strategies, continue to use Nautilus `OrderList`/`ContingencyType`
+abstractions, but do not rely on the adapter to provide OUO pairing for the
+contingent exit legs.
 
 ### Contract specifications
 

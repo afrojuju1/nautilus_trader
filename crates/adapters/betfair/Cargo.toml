@@ -22,6 +22,15 @@ crate-type = ["rlib"]
 
 [features]
 examples = ["nautilus-live/node", "nautilus-trading/examples"]
+extension-module = [
+  "nautilus-common/extension-module",
+  "nautilus-core/extension-module",
+  "nautilus-live/extension-module",
+  "nautilus-model/extension-module",
+  "nautilus-network/extension-module",
+  "pyo3/extension-module",
+  "python",
+]
 high-precision = ["nautilus-model/high-precision"]
 python = [
   "dep:nautilus-system",
@@ -76,6 +85,10 @@ pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
 nautilus-backtest = { workspace = true }
+nautilus-execution = { workspace = true }
+nautilus-live = { workspace = true, features = ["node"] }
+nautilus-portfolio = { workspace = true }
+nautilus-risk = { workspace = true }
 nautilus-testkit = { workspace = true }
 nautilus-trading = { workspace = true }
 
@@ -111,3 +124,8 @@ name = "betfair-backtest"
 path = "examples/betfair_backtest.rs"
 required-features = ["examples"]
 doc = false
+
+[[test]]
+name = "python"
+path = "tests/python.rs"
+required-features = ["python"]

@@ -423,6 +423,7 @@ fn add_equity_instrument(
         None,
         None,
         None,
+        None,
         ts,
         ts,
     );

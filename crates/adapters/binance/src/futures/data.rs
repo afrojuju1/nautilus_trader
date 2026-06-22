@@ -21,6 +21,7 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
+    time::Duration,
 };
 
 use ahash::AHashMap;
@@ -32,15 +33,15 @@ use nautilus_common::{
     messages::{
         DataEvent,
         data::{
-            BarsResponse, CustomDataResponse, DataResponse, InstrumentResponse,
-            InstrumentsResponse, RequestBars, RequestCustomData, RequestInstrument,
-            RequestInstruments, RequestTrades, SubscribeBars, SubscribeBookDeltas,
-            SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
-            SubscribeInstruments, SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades,
-            TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeCustomData,
-            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeMarkPrices,
-            UnsubscribeQuotes, UnsubscribeTrades, subscribe::SubscribeInstrumentStatus,
-            unsubscribe::UnsubscribeInstrumentStatus,
+            BarsResponse, CustomDataResponse, DataResponse, FundingRatesResponse,
+            InstrumentResponse, InstrumentsResponse, RequestBars, RequestCustomData,
+            RequestFundingRates, RequestInstrument, RequestInstruments, RequestTrades,
+            SubscribeBars, SubscribeBookDeltas, SubscribeCustomData, SubscribeFundingRates,
+            SubscribeIndexPrices, SubscribeInstrument, SubscribeInstruments, SubscribeMarkPrices,
+            SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
+            UnsubscribeBookDeltas, UnsubscribeCustomData, UnsubscribeFundingRates,
+            UnsubscribeIndexPrices, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
+            subscribe::SubscribeInstrumentStatus, unsubscribe::UnsubscribeInstrumentStatus,
         },
     },
 };
@@ -68,7 +69,10 @@ use crate::{
     common::{
         consts::{BINANCE_BOOK_DEPTHS, BINANCE_VENUE},
         enums::{BinanceEnvironment, BinanceProductType},
-        parse::bar_spec_to_binance_interval,
+        parse::{
+            bar_spec_to_binance_interval, parse_price_at_precision, parse_quantity_at_precision,
+            parse_required_price_at_precision, parse_required_quantity_at_precision,
+        },
         status::diff_and_emit_statuses,
         symbol::{format_binance_stream_symbol, format_binance_symbol},
         urls::{get_usdm_ws_route_base_url, get_ws_public_base_url},
@@ -89,11 +93,16 @@ use crate::{
             messages::BinanceFuturesWsStreamsMessage,
             parse_data::{
                 parse_agg_trade, parse_book_ticker, parse_depth_update, parse_kline,
-                parse_mark_price, parse_trade,
+                parse_mark_price, parse_ticker, parse_trade,
             },
         },
     },
 };
+
+const MAX_SNAPSHOT_RETRIES: u32 = 5;
+const MAX_BUFFERED_DEPTH_UPDATES: usize = 10_000;
+const SNAPSHOT_RETRY_BACKOFF_BASE_MS: u64 = 250;
+const SNAPSHOT_RETRY_BACKOFF_CAP_MS: u64 = 3_000;
 
 #[derive(Debug, Clone)]
 struct BufferedDepthUpdate {
@@ -137,6 +146,7 @@ pub struct BinanceFuturesDataClient {
     book_buffers: Arc<AtomicMap<InstrumentId, BookBuffer>>,
     book_subscriptions: Arc<AtomicMap<InstrumentId, u32>>,
     mark_price_refs: Arc<AtomicMap<InstrumentId, u32>>,
+    ticker_refs: Arc<AtomicMap<InstrumentId, u32>>,
     force_order_refs: Arc<AtomicMap<InstrumentId, u32>>,
     force_order_all_market_refs: Arc<AtomicU32>,
     force_order_all_market_stream_active: Arc<AtomicBool>,
@@ -240,6 +250,7 @@ impl BinanceFuturesDataClient {
             book_buffers: Arc::new(AtomicMap::new()),
             book_subscriptions: Arc::new(AtomicMap::new()),
             mark_price_refs: Arc::new(AtomicMap::new()),
+            ticker_refs: Arc::new(AtomicMap::new()),
             force_order_refs: Arc::new(AtomicMap::new()),
             force_order_all_market_refs: Arc::new(AtomicU32::new(0)),
             force_order_all_market_stream_active: Arc::new(AtomicBool::new(false)),
@@ -457,6 +468,7 @@ impl BinanceFuturesDataClient {
         book_buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
         book_subscriptions: &Arc<AtomicMap<InstrumentId, u32>>,
         force_order_refs: &Arc<AtomicMap<InstrumentId, u32>>,
+        ticker_refs: &Arc<AtomicMap<InstrumentId, u32>>,
         force_order_all_market_refs: &Arc<AtomicU32>,
         force_order_all_market_stream_active: &Arc<AtomicBool>,
         book_epoch: &Arc<RwLock<u64>>,
@@ -512,6 +524,7 @@ impl BinanceFuturesDataClient {
                                             final_update_id,
                                             prev_final_update_id,
                                         });
+                                        trim_buffered_depth_updates(&mut buffer.updates);
                                         was_buffered = true;
                                     }
                                 });
@@ -557,17 +570,19 @@ impl BinanceFuturesDataClient {
             BinanceFuturesWsStreamsMessage::ForceOrder(ref liq_msg) => {
                 if let Some(instrument) = cache.get(&liq_msg.order.symbol) {
                     let parse_price = |value: &str, field: &str| -> anyhow::Result<Price> {
-                        let value_f64 = value
-                            .parse::<f64>()
-                            .with_context(|| format!("invalid {field} value `{value}`"))?;
-                        Ok(Price::new(value_f64, instrument.price_precision()))
+                        parse_required_price_at_precision(
+                            value,
+                            instrument.price_precision(),
+                            field,
+                        )
                     };
 
                     let parse_quantity = |value: &str, field: &str| -> anyhow::Result<Quantity> {
-                        let value_f64 = value
-                            .parse::<f64>()
-                            .with_context(|| format!("invalid {field} value `{value}`"))?;
-                        Ok(Quantity::new(value_f64, instrument.size_precision()))
+                        parse_required_quantity_at_precision(
+                            value,
+                            instrument.size_precision(),
+                            field,
+                        )
                     };
 
                     match (
@@ -635,12 +650,23 @@ impl BinanceFuturesDataClient {
                 }
             }
             BinanceFuturesWsStreamsMessage::Ticker(ref ticker_msg) => {
-                log::debug!(
-                    "Ticker: {} last={} vol={}",
-                    ticker_msg.symbol,
-                    ticker_msg.last_price,
-                    ticker_msg.volume,
-                );
+                if let Some(instrument) = cache.get(&ticker_msg.symbol) {
+                    let instrument_id = instrument.id();
+                    if !ticker_refs.load().contains_key(&instrument_id) {
+                        return;
+                    }
+
+                    match parse_ticker(ticker_msg, instrument, ts_init) {
+                        Ok(ticker) => {
+                            let data_type = ticker_data_type(instrument_id);
+                            Self::send_data(
+                                data_sender,
+                                Data::Custom(CustomData::new(Arc::new(ticker), data_type)),
+                            );
+                        }
+                        Err(e) => log::warn!("Failed to parse ticker: {e}"),
+                    }
+                }
             }
             // Execution messages ignored by data client
             BinanceFuturesWsStreamsMessage::AccountUpdate(_)
@@ -651,7 +677,7 @@ impl BinanceFuturesDataClient {
             | BinanceFuturesWsStreamsMessage::AccountConfigUpdate(_)
             | BinanceFuturesWsStreamsMessage::ListenKeyExpired => {}
             BinanceFuturesWsStreamsMessage::Error(e) => {
-                log::error!(
+                log::warn!(
                     "Binance Futures WebSocket error: code={}, msg={}",
                     e.code,
                     e.msg
@@ -739,7 +765,12 @@ impl BinanceFuturesDataClient {
         clock: &'static AtomicTime,
         retry_count: u32,
     ) {
-        const MAX_RETRIES: u32 = 3;
+        if wait_for_buffered_update(&buffers, instrument_id, epoch)
+            .await
+            .is_none()
+        {
+            return;
+        }
 
         let symbol = format_binance_stream_symbol(&instrument_id).to_uppercase();
         let params = BinanceDepthParams {
@@ -788,65 +819,57 @@ impl BinanceFuturesDataClient {
                     }
                 };
 
-                // Validate first applicable update per Binance spec:
-                // First update must satisfy: U <= lastUpdateId+1 AND u >= lastUpdateId+1
-                let first_valid = {
-                    let guard = buffers.load();
-                    guard.get(&instrument_id).and_then(|buffer| {
-                        buffer
-                            .updates
-                            .iter()
-                            .find(|u| u.final_update_id > last_update_id)
-                            .cloned()
-                    })
+                let Some(first) = wait_for_first_applicable_update(
+                    &buffers,
+                    instrument_id,
+                    epoch,
+                    last_update_id,
+                )
+                .await
+                else {
+                    return;
                 };
 
-                if let Some(first) = &first_valid {
-                    let target = last_update_id + 1;
-                    let valid_overlap =
-                        first.first_update_id <= target && first.final_update_id >= target;
+                // Validate first applicable update per Binance Futures spec:
+                // First update must satisfy: U <= lastUpdateId AND u >= lastUpdateId
+                let target = last_update_id;
+                let valid_overlap =
+                    first.first_update_id <= target && first.final_update_id >= target;
 
-                    if !valid_overlap {
-                        if retry_count < MAX_RETRIES {
-                            log::warn!(
-                                "OrderBook overlap validation failed for {instrument_id}: \
-                                lastUpdateId={last_update_id}, first_update_id={}, \
-                                final_update_id={} (need U <= {} <= u), \
-                                retrying snapshot (attempt {}/{})",
-                                first.first_update_id,
-                                first.final_update_id,
-                                target,
-                                retry_count + 1,
-                                MAX_RETRIES
-                            );
-
-                            buffers.rcu(|m| {
-                                if let Some(buffer) = m.get_mut(&instrument_id)
-                                    && buffer.epoch == epoch
-                                {
-                                    buffer.updates.clear();
-                                }
-                            });
-
-                            Box::pin(Self::fetch_and_emit_snapshot_inner(
-                                http,
-                                sender,
-                                buffers,
-                                instruments,
-                                instrument_id,
-                                depth,
-                                epoch,
-                                clock,
-                                retry_count + 1,
-                            ))
-                            .await;
-                            return;
-                        }
-                        log::error!(
-                            "OrderBook overlap validation failed for {instrument_id} after \
-                            {MAX_RETRIES} retries; book may be inconsistent"
+                if !valid_overlap {
+                    if retry_count < MAX_SNAPSHOT_RETRIES {
+                        log::warn!(
+                            "OrderBook overlap validation failed for {instrument_id}: \
+                            lastUpdateId={last_update_id}, first_update_id={}, \
+                            final_update_id={} (need U <= {} <= u), \
+                            retrying snapshot (attempt {}/{})",
+                            first.first_update_id,
+                            first.final_update_id,
+                            target,
+                            retry_count + 1,
+                            MAX_SNAPSHOT_RETRIES
                         );
+
+                        tokio::time::sleep(futures_snapshot_retry_backoff(retry_count)).await;
+
+                        Box::pin(Self::fetch_and_emit_snapshot_inner(
+                            http,
+                            sender,
+                            buffers,
+                            instruments,
+                            instrument_id,
+                            depth,
+                            epoch,
+                            clock,
+                            retry_count + 1,
+                        ))
+                        .await;
+                        return;
                     }
+                    log::error!(
+                        "OrderBook overlap validation failed for {instrument_id} after \
+                        {MAX_SNAPSHOT_RETRIES} retries; book may be inconsistent"
+                    );
                 }
 
                 let snapshot_deltas = parse_order_book_snapshot(
@@ -856,12 +879,6 @@ impl BinanceFuturesDataClient {
                     size_precision,
                     ts_init,
                 );
-
-                if let Err(e) = sender.send(DataEvent::Data(Data::Deltas(
-                    OrderBookDeltas_API::new(snapshot_deltas),
-                ))) {
-                    log::error!("Failed to send snapshot: {e}");
-                }
 
                 // Take buffered updates but keep buffer entry during replay
                 let buffered = {
@@ -888,33 +905,35 @@ impl BinanceFuturesDataClient {
                 // Replay buffered updates with continuity validation
                 let mut replayed = 0;
                 let mut last_final_update_id = last_update_id;
+                let mut is_first = true;
+                let mut replay_ready = Vec::with_capacity(buffered.len());
 
                 for update in buffered {
-                    // Drop updates where u <= lastUpdateId
-                    if update.final_update_id <= last_update_id {
+                    if update.final_update_id < last_update_id {
                         continue;
                     }
 
-                    // Validate continuity: pu should equal last emitted final_update_id
-                    // (for first update, this validates pu == snapshot lastUpdateId)
-                    if update.prev_final_update_id != last_final_update_id {
-                        if retry_count < MAX_RETRIES {
+                    if update.final_update_id == last_update_id {
+                        last_final_update_id = update.final_update_id;
+                        is_first = false;
+                        continue;
+                    }
+
+                    // The first diff is anchored by the snapshot overlap check. After that,
+                    // Binance Futures requires each diff's pu to match the previous diff's u.
+                    if !is_first && update.prev_final_update_id != last_final_update_id {
+                        if retry_count < MAX_SNAPSHOT_RETRIES {
                             log::warn!(
                                 "OrderBook continuity break for {instrument_id}: \
                                 expected pu={last_final_update_id}, was pu={}, \
                                 triggering resync (attempt {}/{})",
                                 update.prev_final_update_id,
                                 retry_count + 1,
-                                MAX_RETRIES
+                                MAX_SNAPSHOT_RETRIES
                             );
 
-                            buffers.rcu(|m| {
-                                if let Some(buffer) = m.get_mut(&instrument_id)
-                                    && buffer.epoch == epoch
-                                {
-                                    buffer.updates.clear();
-                                }
-                            });
+                            reset_book_sync_buffer(&buffers, instrument_id, epoch);
+                            tokio::time::sleep(futures_snapshot_retry_backoff(retry_count)).await;
 
                             Box::pin(Self::fetch_and_emit_snapshot_inner(
                                 http,
@@ -931,16 +950,26 @@ impl BinanceFuturesDataClient {
                             return;
                         }
                         log::error!(
-                            "OrderBook continuity break for {instrument_id} after {MAX_RETRIES} \
-                            retries: expected pu={last_final_update_id}, was pu={}; \
-                            book may be inconsistent",
+                            "OrderBook continuity break for {instrument_id} after \
+                            {MAX_SNAPSHOT_RETRIES} retries: expected pu={last_final_update_id}, \
+                            was pu={}; book may be inconsistent",
                             update.prev_final_update_id
                         );
                     }
 
                     last_final_update_id = update.final_update_id;
+                    is_first = false;
                     replayed += 1;
+                    replay_ready.push(update);
+                }
 
+                if let Err(e) = sender.send(DataEvent::Data(Data::Deltas(
+                    OrderBookDeltas_API::new(snapshot_deltas),
+                ))) {
+                    log::error!("Failed to send snapshot: {e}");
+                }
+
+                for update in replay_ready {
                     if let Err(e) = sender.send(DataEvent::Data(Data::Deltas(
                         OrderBookDeltas_API::new(update.deltas),
                     ))) {
@@ -982,23 +1011,19 @@ impl BinanceFuturesDataClient {
                         }
 
                         if update.prev_final_update_id != last_final_update_id {
-                            if retry_count < MAX_RETRIES {
+                            if retry_count < MAX_SNAPSHOT_RETRIES {
                                 log::warn!(
                                     "OrderBook continuity break for {instrument_id}: \
                                     expected pu={last_final_update_id}, was pu={}, \
                                     triggering resync (attempt {}/{})",
                                     update.prev_final_update_id,
                                     retry_count + 1,
-                                    MAX_RETRIES
+                                    MAX_SNAPSHOT_RETRIES
                                 );
 
-                                buffers.rcu(|m| {
-                                    if let Some(buffer) = m.get_mut(&instrument_id)
-                                        && buffer.epoch == epoch
-                                    {
-                                        buffer.updates.clear();
-                                    }
-                                });
+                                reset_book_sync_buffer(&buffers, instrument_id, epoch);
+                                tokio::time::sleep(futures_snapshot_retry_backoff(retry_count))
+                                    .await;
 
                                 Box::pin(Self::fetch_and_emit_snapshot_inner(
                                     http,
@@ -1016,7 +1041,7 @@ impl BinanceFuturesDataClient {
                             }
                             log::error!(
                                 "OrderBook continuity break for {instrument_id} after \
-                                {MAX_RETRIES} retries; book may be inconsistent"
+                                {MAX_SNAPSHOT_RETRIES} retries; book may be inconsistent"
                             );
                         }
 
@@ -1037,7 +1062,35 @@ impl BinanceFuturesDataClient {
                 );
             }
             Err(e) => {
-                log::error!("Failed to request order book snapshot for {instrument_id}: {e}");
+                if retry_count < MAX_SNAPSHOT_RETRIES {
+                    log::warn!(
+                        "Failed to request order book snapshot for {instrument_id}: {e}; \
+                        retrying snapshot (attempt {}/{})",
+                        retry_count + 1,
+                        MAX_SNAPSHOT_RETRIES
+                    );
+
+                    tokio::time::sleep(futures_snapshot_retry_backoff(retry_count)).await;
+
+                    Box::pin(Self::fetch_and_emit_snapshot_inner(
+                        http,
+                        sender,
+                        buffers,
+                        instruments,
+                        instrument_id,
+                        depth,
+                        epoch,
+                        clock,
+                        retry_count + 1,
+                    ))
+                    .await;
+                    return;
+                }
+
+                log::error!(
+                    "Failed to request order book snapshot for {instrument_id} after \
+                    {MAX_SNAPSHOT_RETRIES} retries: {e}"
+                );
                 buffers.remove(&instrument_id);
             }
         }
@@ -1049,6 +1102,93 @@ fn upsert_instrument(
     instrument: InstrumentAny,
 ) {
     cache.insert(instrument.id(), instrument);
+}
+
+fn reset_book_sync_buffer(
+    buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
+    instrument_id: InstrumentId,
+    epoch: u64,
+) {
+    buffers.rcu(|m| {
+        if let Some(buffer) = m.get_mut(&instrument_id)
+            && buffer.epoch == epoch
+        {
+            buffer.updates.clear();
+        }
+    });
+}
+
+fn trim_buffered_depth_updates(updates: &mut Vec<BufferedDepthUpdate>) {
+    let excess = updates.len().saturating_sub(MAX_BUFFERED_DEPTH_UPDATES);
+    if excess > 0 {
+        updates.drain(..excess);
+    }
+}
+
+async fn wait_for_buffered_update(
+    buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
+    instrument_id: InstrumentId,
+    epoch: u64,
+) -> Option<()> {
+    loop {
+        let guard = buffers.load();
+        match guard.get(&instrument_id) {
+            Some(buffer) if buffer.epoch == epoch && !buffer.updates.is_empty() => return Some(()),
+            Some(buffer) if buffer.epoch == epoch => {}
+            _ => return None,
+        }
+
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_first_applicable_update(
+    buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
+    instrument_id: InstrumentId,
+    epoch: u64,
+    last_update_id: u64,
+) -> Option<BufferedDepthUpdate> {
+    loop {
+        let mut first = None;
+        let mut waiting = false;
+        buffers.rcu(|m| {
+            first = None;
+            waiting = false;
+
+            if let Some(buffer) = m.get_mut(&instrument_id)
+                && buffer.epoch == epoch
+            {
+                buffer
+                    .updates
+                    .retain(|update| update.final_update_id >= last_update_id);
+                first = buffer
+                    .updates
+                    .iter()
+                    .find(|update| update.final_update_id >= last_update_id)
+                    .cloned();
+                waiting = first.is_none();
+            }
+        });
+
+        if first.is_some() {
+            return first;
+        }
+
+        if !waiting {
+            return None;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn futures_snapshot_retry_backoff(retry_count: u32) -> Duration {
+    let multiplier = 1_u64 << retry_count.min(4);
+    let millis = SNAPSHOT_RETRY_BACKOFF_BASE_MS
+        .saturating_mul(multiplier)
+        .min(SNAPSHOT_RETRY_BACKOFF_CAP_MS);
+    Duration::from_millis(millis)
 }
 
 fn parse_order_book_snapshot(
@@ -1074,54 +1214,66 @@ fn parse_order_book_snapshot(
         ts_init,
     ));
 
-    for (i, (price_str, qty_str)) in order_book.bids.iter().enumerate() {
-        let price: f64 = price_str.parse().unwrap_or(0.0);
-        let size: f64 = qty_str.parse().unwrap_or(0.0);
+    for (price_str, qty_str) in &order_book.bids {
+        let Some(price) = parse_price_at_precision(price_str, price_precision) else {
+            log::warn!(
+                "Skipping Futures order book bid level for {instrument_id}: invalid or \
+                non-positive price='{price_str}'"
+            );
+            continue;
+        };
+        let Some(size) = parse_quantity_at_precision(qty_str, size_precision) else {
+            log::warn!(
+                "Skipping Futures order book bid level for {instrument_id}: invalid or \
+                non-positive quantity='{qty_str}'"
+            );
+            continue;
+        };
 
-        let is_last = i == order_book.bids.len() - 1 && order_book.asks.is_empty();
-        let flags = if is_last { RecordFlag::F_LAST as u8 } else { 0 };
-
-        let order = BookOrder::new(
-            OrderSide::Buy,
-            Price::new(price, price_precision),
-            Quantity::new(size, size_precision),
-            0,
-        );
+        let order = BookOrder::new(OrderSide::Buy, price, size, 0);
 
         deltas.push(OrderBookDelta::new(
             instrument_id,
             BookAction::Add,
             order,
-            flags,
+            0,
             sequence,
             ts_event,
             ts_init,
         ));
     }
 
-    for (i, (price_str, qty_str)) in order_book.asks.iter().enumerate() {
-        let price: f64 = price_str.parse().unwrap_or(0.0);
-        let size: f64 = qty_str.parse().unwrap_or(0.0);
+    for (price_str, qty_str) in &order_book.asks {
+        let Some(price) = parse_price_at_precision(price_str, price_precision) else {
+            log::warn!(
+                "Skipping Futures order book ask level for {instrument_id}: invalid or \
+                non-positive price='{price_str}'"
+            );
+            continue;
+        };
+        let Some(size) = parse_quantity_at_precision(qty_str, size_precision) else {
+            log::warn!(
+                "Skipping Futures order book ask level for {instrument_id}: invalid or \
+                non-positive quantity='{qty_str}'"
+            );
+            continue;
+        };
 
-        let is_last = i == order_book.asks.len() - 1;
-        let flags = if is_last { RecordFlag::F_LAST as u8 } else { 0 };
-
-        let order = BookOrder::new(
-            OrderSide::Sell,
-            Price::new(price, price_precision),
-            Quantity::new(size, size_precision),
-            0,
-        );
+        let order = BookOrder::new(OrderSide::Sell, price, size, 0);
 
         deltas.push(OrderBookDelta::new(
             instrument_id,
             BookAction::Add,
             order,
-            flags,
+            0,
             sequence,
             ts_event,
             ts_init,
         ));
+    }
+
+    if let Some(delta) = deltas.last_mut() {
+        delta.flags |= RecordFlag::F_LAST as u8;
     }
 
     OrderBookDeltas::new(instrument_id, deltas)
@@ -1170,6 +1322,7 @@ impl DataClient for BinanceFuturesDataClient {
 
         // Clear subscription state so resubscribes issue fresh WS subscribes
         self.mark_price_refs.store(AHashMap::new());
+        self.ticker_refs.store(AHashMap::new());
         self.force_order_refs.store(AHashMap::new());
         self.force_order_all_market_refs.store(0, Ordering::Relaxed);
         self.force_order_all_market_stream_active
@@ -1267,6 +1420,7 @@ impl DataClient for BinanceFuturesDataClient {
         let buffers = self.book_buffers.clone();
         let book_subs = self.book_subscriptions.clone();
         let force_order_refs = self.force_order_refs.clone();
+        let ticker_refs = self.ticker_refs.clone();
         let force_order_all_market_refs = self.force_order_all_market_refs.clone();
         let force_order_all_market_stream_active =
             self.force_order_all_market_stream_active.clone();
@@ -1289,6 +1443,7 @@ impl DataClient for BinanceFuturesDataClient {
                             &buffers,
                             &book_subs,
                             &force_order_refs,
+                            &ticker_refs,
                             &force_order_all_market_refs,
                             &force_order_all_market_stream_active,
                             &book_epoch,
@@ -1313,6 +1468,7 @@ impl DataClient for BinanceFuturesDataClient {
         let pub_buffers = self.book_buffers.clone();
         let pub_book_subs = self.book_subscriptions.clone();
         let pub_force_order_refs = self.force_order_refs.clone();
+        let pub_ticker_refs = self.ticker_refs.clone();
         let pub_force_order_all_market_refs = self.force_order_all_market_refs.clone();
         let pub_force_order_all_market_stream_active =
             self.force_order_all_market_stream_active.clone();
@@ -1334,6 +1490,7 @@ impl DataClient for BinanceFuturesDataClient {
                             &pub_buffers,
                             &pub_book_subs,
                             &pub_force_order_refs,
+                            &pub_ticker_refs,
                             &pub_force_order_all_market_refs,
                             &pub_force_order_all_market_stream_active,
                             &pub_book_epoch,
@@ -1434,6 +1591,7 @@ impl DataClient for BinanceFuturesDataClient {
 
         // Clear subscription state so resubscribes issue fresh WS subscribes
         self.mark_price_refs.store(AHashMap::new());
+        self.ticker_refs.store(AHashMap::new());
         self.force_order_refs.store(AHashMap::new());
         self.force_order_all_market_refs.store(0, Ordering::Relaxed);
         self.force_order_all_market_stream_active
@@ -1456,6 +1614,10 @@ impl DataClient for BinanceFuturesDataClient {
 
     fn subscribe(&mut self, cmd: SubscribeCustomData) -> anyhow::Result<()> {
         let data_type = cmd.data_type.type_name();
+        if data_type == "BinanceFuturesTicker" {
+            return subscribe_ticker(self, &cmd.data_type);
+        }
+
         if data_type != "BinanceFuturesLiquidation" {
             log::warn!("Unsupported custom data subscription: {data_type}");
             return Ok(());
@@ -1564,7 +1726,7 @@ impl DataClient for BinanceFuturesDataClient {
 
         log::info!("OrderBook snapshot rebuild for {instrument_id} @ depth {depth} starting");
 
-        // Subscribe to WebSocket depth stream (0ms = unthrottled for Futures)
+        // Subscribe to the unthrottled diff depth stream for Futures.
         let ws = self.ws_public_client.clone();
         let stream = format!("{}@depth@0ms", format_binance_stream_symbol(&instrument_id));
 
@@ -1798,7 +1960,6 @@ impl DataClient for BinanceFuturesDataClient {
             format!("{symbol_lower}@depth"),
             format!("{symbol_lower}@depth@0ms"),
             format!("{symbol_lower}@depth@100ms"),
-            format!("{symbol_lower}@depth@250ms"),
             format!("{symbol_lower}@depth@500ms"),
         ];
 
@@ -1852,6 +2013,10 @@ impl DataClient for BinanceFuturesDataClient {
 
     fn unsubscribe(&mut self, cmd: &UnsubscribeCustomData) -> anyhow::Result<()> {
         let data_type = cmd.data_type.type_name();
+        if data_type == "BinanceFuturesTicker" {
+            return unsubscribe_ticker(self, &cmd.data_type);
+        }
+
         if data_type != "BinanceFuturesLiquidation" {
             log::warn!("Unsupported custom data unsubscription: {data_type}");
             return Ok(());
@@ -2449,6 +2614,49 @@ impl DataClient for BinanceFuturesDataClient {
         Ok(())
     }
 
+    fn request_funding_rates(&self, request: RequestFundingRates) -> anyhow::Result<()> {
+        let http = self.http_client.clone();
+        let sender = self.data_sender.clone();
+        let instrument_id = request.instrument_id;
+        let start = request.start;
+        let end = request.end;
+        let limit = request.limit.map(|n| n.get() as u32);
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let params = request.params;
+        let clock = self.clock;
+        let start_nanos = datetime_to_unix_nanos(start);
+        let end_nanos = datetime_to_unix_nanos(end);
+
+        get_runtime().spawn(async move {
+            match http
+                .request_funding_rates(instrument_id, start, end, limit)
+                .await
+                .context("failed to request funding rates from Binance Futures")
+            {
+                Ok(funding_rates) => {
+                    let response = DataResponse::FundingRates(FundingRatesResponse::new(
+                        request_id,
+                        client_id,
+                        instrument_id,
+                        funding_rates,
+                        start_nanos,
+                        end_nanos,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send funding rates response: {e}");
+                    }
+                }
+                Err(e) => log::error!("Funding rates request failed for {instrument_id}: {e:?}"),
+            }
+        });
+
+        Ok(())
+    }
+
     fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
@@ -2490,5 +2698,183 @@ impl DataClient for BinanceFuturesDataClient {
         });
 
         Ok(())
+    }
+}
+
+fn subscribe_ticker(client: &BinanceFuturesDataClient, data_type: &DataType) -> anyhow::Result<()> {
+    let instrument_id = BinanceFuturesDataClient::required_instrument_id_metadata(data_type)?;
+    if instrument_id.venue != client.venue() {
+        anyhow::bail!(
+            "Binance Futures ticker custom data requires BINANCE venue instrument, received {instrument_id}"
+        );
+    }
+
+    let should_subscribe = {
+        let prev = client
+            .ticker_refs
+            .load()
+            .get(&instrument_id)
+            .copied()
+            .unwrap_or(0);
+        client.ticker_refs.rcu(|m| {
+            let count = m.entry(instrument_id).or_insert(0);
+            *count += 1;
+        });
+        prev == 0
+    };
+
+    if should_subscribe {
+        let ws = client.ws_client.clone();
+        let stream = ticker_stream(&instrument_id);
+        client.spawn_ws(
+            async move {
+                ws.subscribe(vec![stream])
+                    .await
+                    .context("ticker subscription")
+            },
+            "ticker subscription",
+        );
+    }
+
+    Ok(())
+}
+
+fn unsubscribe_ticker(
+    client: &BinanceFuturesDataClient,
+    data_type: &DataType,
+) -> anyhow::Result<()> {
+    let instrument_id = BinanceFuturesDataClient::required_instrument_id_metadata(data_type)?;
+    if instrument_id.venue != client.venue() {
+        anyhow::bail!(
+            "Binance Futures ticker custom data requires BINANCE venue instrument, received {instrument_id}"
+        );
+    }
+
+    let should_unsubscribe = {
+        let prev = client.ticker_refs.load().get(&instrument_id).copied();
+        match prev {
+            Some(count) if count <= 1 => {
+                client.ticker_refs.remove(&instrument_id);
+                true
+            }
+            Some(_) => {
+                client.ticker_refs.rcu(|m| {
+                    if let Some(count) = m.get_mut(&instrument_id) {
+                        *count = count.saturating_sub(1);
+                    }
+                });
+                false
+            }
+            None => false,
+        }
+    };
+
+    if should_unsubscribe {
+        let ws = client.ws_client.clone();
+        let stream = ticker_stream(&instrument_id);
+        client.spawn_ws(
+            async move {
+                ws.unsubscribe(vec![stream])
+                    .await
+                    .context("ticker unsubscribe")
+            },
+            "ticker unsubscribe",
+        );
+    }
+
+    Ok(())
+}
+
+fn ticker_data_type(instrument_id: InstrumentId) -> DataType {
+    let mut metadata = Params::new();
+    metadata.insert(
+        "instrument_id".to_string(),
+        serde_json::Value::String(instrument_id.to_string()),
+    );
+    DataType::new(
+        "BinanceFuturesTicker",
+        Some(metadata),
+        Some(instrument_id.to_string()),
+    )
+}
+
+fn ticker_stream(instrument_id: &InstrumentId) -> String {
+    format!("{}@ticker", format_binance_stream_symbol(instrument_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use rust_decimal_macros::dec;
+
+    use super::*;
+
+    #[rstest]
+    #[case(0, 250)]
+    #[case(1, 500)]
+    #[case(2, 1_000)]
+    #[case(3, 2_000)]
+    #[case(4, 3_000)]
+    #[case(5, 3_000)]
+    fn test_snapshot_retry_backoff_exponentially_increases_then_caps(
+        #[case] retry_count: u32,
+        #[case] expected_ms: u64,
+    ) {
+        assert_eq!(
+            futures_snapshot_retry_backoff(retry_count),
+            Duration::from_millis(expected_ms)
+        );
+    }
+
+    #[rstest]
+    fn test_parse_order_book_snapshot_skips_invalid_levels() {
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let order_book = BinanceOrderBook {
+            last_update_id: 10,
+            bids: vec![
+                ("not-a-price".to_string(), "1.0".to_string()),
+                ("100.00".to_string(), "0.5".to_string()),
+            ],
+            asks: vec![
+                ("101.00".to_string(), "not-a-quantity".to_string()),
+                ("102.00".to_string(), "0.7".to_string()),
+            ],
+            event_time: None,
+            transaction_time: None,
+        };
+
+        let deltas =
+            parse_order_book_snapshot(&order_book, instrument_id, 2, 3, UnixNanos::from(1));
+
+        assert_eq!(deltas.deltas.len(), 3);
+        assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy);
+        assert_eq!(deltas.deltas[1].order.price.as_decimal(), dec!(100.00));
+        assert_eq!(deltas.deltas[1].order.size.as_decimal(), dec!(0.500));
+        assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell);
+        assert_eq!(deltas.deltas[2].order.price.as_decimal(), dec!(102.00));
+        assert_eq!(deltas.deltas[2].order.size.as_decimal(), dec!(0.700));
+        assert_eq!(deltas.deltas[2].flags, RecordFlag::F_LAST as u8);
+    }
+
+    #[rstest]
+    fn test_parse_order_book_snapshot_all_invalid_levels_marks_clear_last() {
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let order_book = BinanceOrderBook {
+            last_update_id: 10,
+            bids: vec![("not-a-price".to_string(), "1.0".to_string())],
+            asks: vec![("101.00".to_string(), "not-a-quantity".to_string())],
+            event_time: None,
+            transaction_time: None,
+        };
+
+        let deltas =
+            parse_order_book_snapshot(&order_book, instrument_id, 2, 3, UnixNanos::from(1));
+
+        assert_eq!(deltas.deltas.len(), 1);
+        assert_eq!(deltas.deltas[0].action, BookAction::Clear);
+        assert_eq!(
+            deltas.deltas[0].flags,
+            RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
+        );
     }
 }
