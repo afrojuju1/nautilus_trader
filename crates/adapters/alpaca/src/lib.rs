@@ -66,8 +66,6 @@ pub mod options_engine;
 pub mod options_entry;
 #[cfg(feature = "live")]
 pub mod options_runtime;
-#[cfg(feature = "live")]
-pub mod order_plan;
 pub mod orders;
 pub mod parse;
 #[cfg(feature = "live")]

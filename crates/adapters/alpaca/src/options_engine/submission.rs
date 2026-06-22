@@ -5,20 +5,22 @@ use std::{cell::RefCell, env, rc::Rc, str::FromStr, time::Duration};
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
-    live::runner::replace_exec_event_sender,
+    factories::OrderFactory,
+    live::{clock::LiveClock, runner::replace_exec_event_sender},
     messages::{
         ExecutionEvent,
         execution::{SubmitOrder, SubmitOrderList},
     },
 };
-use nautilus_core::time::get_atomic_clock_realtime;
+use nautilus_core::{UUID4, time::get_atomic_clock_realtime};
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
-    enums::{AccountType, OmsType, OrderSide},
-    events::OrderEventAny,
+    enums::{AccountType, OmsType, OrderSide, TimeInForce},
+    events::{OrderEventAny, OrderInitialized},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TraderId, Venue,
     },
+    orders::{OrderAny, OrderList},
     types::{Price, Quantity},
 };
 use tokio::{
@@ -32,12 +34,7 @@ use crate::{
     execution::AlpacaExecutionClient,
     http::{client::AlpacaHttpClient, error::Error, models::AlpacaOrder},
     options_runtime::{OptionsEngineConfig, SelectedOptionsEntry},
-    order_plan::{OrderLegSpec, SubmitPlan},
     runtime::StrategyStateEntry,
-    submit::{
-        MlegSubmitLeg, MlegSubmitOrderListRequest, SimpleSubmitOrderRequest,
-        build_mleg_submit_order_list, build_simple_submit_order,
-    },
 };
 
 use super::{CloseQuote, DEFAULT_EVENT_TIMEOUT_SECS, STRATEGY_FAMILY, SubmitOutcome};
@@ -48,9 +45,21 @@ pub(super) async fn submit_selected_entry(
     quantity: u64,
     config: &OptionsEngineConfig,
 ) -> anyhow::Result<SubmitOutcome> {
-    submit_order_plan(
-        selected_entry_submit_plan(entry, order_list_id, quantity)?,
+    submit_with_execution_session(
+        order_list_id,
         config.cancel_after_accept,
+        |client, trader_id, client_id, strategy_id| {
+            let orders =
+                selected_entry_orders(entry, order_list_id, quantity, trader_id, strategy_id)?;
+            submit_orders(
+                client,
+                order_list_id,
+                orders,
+                trader_id,
+                client_id,
+                strategy_id,
+            )
+        },
     )
     .await
 }
@@ -61,12 +70,26 @@ pub(super) async fn submit_close_entry(
     order_list_id: &str,
     _config: &OptionsEngineConfig,
 ) -> anyhow::Result<SubmitOutcome> {
-    submit_order_plan(close_entry_submit_plan(entry, quote, order_list_id), false).await
+    submit_with_execution_session(
+        order_list_id,
+        false,
+        |client, trader_id, client_id, strategy_id| {
+            let orders = close_entry_orders(entry, quote, order_list_id, trader_id, strategy_id)?;
+            submit_orders(
+                client,
+                order_list_id,
+                orders,
+                trader_id,
+                client_id,
+                strategy_id,
+            )
+        },
+    )
+    .await
 }
 
 async fn submit_with_execution_session<F>(
     order_list_id: &str,
-    expected_events: usize,
     cancel_after_accept: bool,
     submit: F,
 ) -> anyhow::Result<SubmitOutcome>
@@ -76,7 +99,7 @@ where
         TraderId,
         Option<ClientId>,
         StrategyId,
-    ) -> anyhow::Result<()>,
+    ) -> anyhow::Result<usize>,
 {
     let exec_config = exec_config_from_env();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -101,7 +124,7 @@ where
     client.start()?;
     client.connect().await?;
 
-    submit(&mut client, trader_id, Some(client_id), strategy_id)?;
+    let expected_events = submit(&mut client, trader_id, Some(client_id), strategy_id)?;
 
     let (accepted, rejected, rejection_reasons) =
         collect_execution_events(&mut rx, expected_events).await;
@@ -121,162 +144,223 @@ where
     })
 }
 
-async fn submit_order_plan(
-    plan: SubmitPlan,
-    cancel_after_accept: bool,
-) -> anyhow::Result<SubmitOutcome> {
-    let order_list_id = plan.client_order_id.clone();
-    let expected_events = plan.expected_events();
-    submit_with_execution_session(
-        &order_list_id,
-        expected_events,
-        cancel_after_accept,
-        |client, trader_id, client_id, strategy_id| {
-            if plan.is_single_leg() {
-                client.submit_order(build_simple_submit_order_from_plan(
-                    &plan,
-                    trader_id,
-                    client_id,
-                    strategy_id,
-                )?)?;
-            } else {
-                client.submit_order_list(build_mleg_submit_order_list_from_plan(
-                    &plan,
-                    trader_id,
-                    client_id,
-                    strategy_id,
-                )?)?;
-            }
-            Ok(())
-        },
-    )
-    .await
+fn submit_orders(
+    client: &mut AlpacaExecutionClient,
+    order_list_id: &str,
+    mut orders: Vec<OrderAny>,
+    trader_id: TraderId,
+    client_id: Option<ClientId>,
+    strategy_id: StrategyId,
+) -> anyhow::Result<usize> {
+    if orders.is_empty() {
+        anyhow::bail!("cannot submit empty order set");
+    }
+
+    let expected_events = orders.len();
+    if orders.len() == 1 {
+        let order = orders.remove(0);
+        client.submit_order(submit_order_from_order(&order, trader_id, client_id))?;
+    } else {
+        client.submit_order_list(submit_order_list_from_orders(
+            order_list_id,
+            &mut orders,
+            trader_id,
+            client_id,
+            strategy_id,
+        )?)?;
+    }
+    Ok(expected_events)
 }
 
-fn selected_entry_submit_plan(
+fn submit_order_from_order(
+    order: &OrderAny,
+    trader_id: TraderId,
+    client_id: Option<ClientId>,
+) -> SubmitOrder {
+    SubmitOrder::from_order(
+        order,
+        trader_id,
+        client_id,
+        None,
+        UUID4::new(),
+        get_atomic_clock_realtime().get_time_ns(),
+    )
+}
+
+fn submit_order_list_from_orders(
+    order_list_id: &str,
+    orders: &mut [OrderAny],
+    trader_id: TraderId,
+    client_id: Option<ClientId>,
+    strategy_id: StrategyId,
+) -> anyhow::Result<SubmitOrderList> {
+    if orders.is_empty() {
+        anyhow::bail!("cannot build empty order list");
+    }
+
+    let order_list_id = OrderListId::from(order_list_id);
+    for order in orders.iter_mut() {
+        order.set_order_list_id(order_list_id);
+    }
+
+    let ts_init = get_atomic_clock_realtime().get_time_ns();
+    let order_list = OrderList::from_orders(orders, ts_init);
+    order_list.validate()?;
+    let order_inits = orders
+        .iter()
+        .map(OrderInitialized::from)
+        .collect::<Vec<_>>();
+
+    Ok(SubmitOrderList::new(
+        trader_id,
+        client_id,
+        strategy_id,
+        order_list,
+        order_inits,
+        None,
+        None,
+        None,
+        UUID4::new(),
+        ts_init,
+        None,
+    ))
+}
+
+fn selected_entry_orders(
     entry: &SelectedOptionsEntry,
     order_list_id: &str,
     quantity: u64,
-) -> anyhow::Result<SubmitPlan> {
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+) -> anyhow::Result<Vec<OrderAny>> {
     if quantity == 0 {
         anyhow::bail!("quantity must be positive");
     }
+
+    let mut factory = option_order_factory(trader_id, strategy_id);
     Ok(match entry {
-        SelectedOptionsEntry::Credit(entry) => SubmitPlan::new(
-            order_list_id,
-            vec![
-                OrderLegSpec::new(
-                    "short",
-                    &entry.candidate.short.symbol,
-                    OrderSide::Sell,
-                    quantity,
-                    entry.candidate.short.bid,
-                    false,
-                ),
-                OrderLegSpec::new(
-                    "long",
-                    &entry.candidate.long.symbol,
-                    OrderSide::Buy,
-                    quantity,
-                    entry.candidate.long.ask,
-                    false,
-                ),
-            ],
-        ),
-        SelectedOptionsEntry::IronCondor(entry) => SubmitPlan::new(
-            order_list_id,
-            vec![
-                OrderLegSpec::new(
-                    "short-put",
-                    &entry.candidate.put.short.symbol,
-                    OrderSide::Sell,
-                    quantity,
-                    entry.candidate.put.short.bid,
-                    false,
-                ),
-                OrderLegSpec::new(
-                    "long-put",
-                    &entry.candidate.put.long.symbol,
-                    OrderSide::Buy,
-                    quantity,
-                    entry.candidate.put.long.ask,
-                    false,
-                ),
-                OrderLegSpec::new(
-                    "short-call",
-                    &entry.candidate.call.short.symbol,
-                    OrderSide::Sell,
-                    quantity,
-                    entry.candidate.call.short.bid,
-                    false,
-                ),
-                OrderLegSpec::new(
-                    "long-call",
-                    &entry.candidate.call.long.symbol,
-                    OrderSide::Buy,
-                    quantity,
-                    entry.candidate.call.long.ask,
-                    false,
-                ),
-            ],
-        ),
-        SelectedOptionsEntry::Debit(entry) => SubmitPlan::new(
-            order_list_id,
-            vec![
-                OrderLegSpec::new(
-                    "long",
-                    &entry.candidate.long.symbol,
-                    OrderSide::Buy,
-                    quantity,
-                    entry.candidate.long.ask,
-                    false,
-                ),
-                OrderLegSpec::new(
-                    "short",
-                    &entry.candidate.short.symbol,
-                    OrderSide::Sell,
-                    quantity,
-                    entry.candidate.short.bid,
-                    false,
-                ),
-            ],
-        ),
-        SelectedOptionsEntry::NakedOption(entry) => SubmitPlan::new(
-            order_list_id,
-            vec![OrderLegSpec::new(
-                "entry",
+        SelectedOptionsEntry::Credit(entry) => vec![
+            limit_option_order(
+                &mut factory,
+                labeled_client_order_id(order_list_id, "short"),
                 &entry.candidate.short.symbol,
                 OrderSide::Sell,
                 quantity,
                 entry.candidate.short.bid,
                 false,
-            )],
-        ),
+            )?,
+            limit_option_order(
+                &mut factory,
+                labeled_client_order_id(order_list_id, "long"),
+                &entry.candidate.long.symbol,
+                OrderSide::Buy,
+                quantity,
+                entry.candidate.long.ask,
+                false,
+            )?,
+        ],
+        SelectedOptionsEntry::IronCondor(entry) => vec![
+            limit_option_order(
+                &mut factory,
+                labeled_client_order_id(order_list_id, "short-put"),
+                &entry.candidate.put.short.symbol,
+                OrderSide::Sell,
+                quantity,
+                entry.candidate.put.short.bid,
+                false,
+            )?,
+            limit_option_order(
+                &mut factory,
+                labeled_client_order_id(order_list_id, "long-put"),
+                &entry.candidate.put.long.symbol,
+                OrderSide::Buy,
+                quantity,
+                entry.candidate.put.long.ask,
+                false,
+            )?,
+            limit_option_order(
+                &mut factory,
+                labeled_client_order_id(order_list_id, "short-call"),
+                &entry.candidate.call.short.symbol,
+                OrderSide::Sell,
+                quantity,
+                entry.candidate.call.short.bid,
+                false,
+            )?,
+            limit_option_order(
+                &mut factory,
+                labeled_client_order_id(order_list_id, "long-call"),
+                &entry.candidate.call.long.symbol,
+                OrderSide::Buy,
+                quantity,
+                entry.candidate.call.long.ask,
+                false,
+            )?,
+        ],
+        SelectedOptionsEntry::Debit(entry) => vec![
+            limit_option_order(
+                &mut factory,
+                labeled_client_order_id(order_list_id, "long"),
+                &entry.candidate.long.symbol,
+                OrderSide::Buy,
+                quantity,
+                entry.candidate.long.ask,
+                false,
+            )?,
+            limit_option_order(
+                &mut factory,
+                labeled_client_order_id(order_list_id, "short"),
+                &entry.candidate.short.symbol,
+                OrderSide::Sell,
+                quantity,
+                entry.candidate.short.bid,
+                false,
+            )?,
+        ],
+        SelectedOptionsEntry::NakedOption(entry) => vec![limit_option_order(
+            &mut factory,
+            ClientOrderId::from(order_list_id),
+            &entry.candidate.short.symbol,
+            OrderSide::Sell,
+            quantity,
+            entry.candidate.short.bid,
+            false,
+        )?],
     })
 }
 
-fn close_entry_submit_plan(
+fn close_entry_orders(
     entry: &StrategyStateEntry,
     quote: &CloseQuote,
-    client_order_id: &str,
-) -> SubmitPlan {
-    let mut legs = vec![OrderLegSpec::new(
-        "short-close",
+    order_list_id: &str,
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+) -> anyhow::Result<Vec<OrderAny>> {
+    let mut factory = option_order_factory(trader_id, strategy_id);
+    let mut orders = vec![limit_option_order(
+        &mut factory,
+        if entry.is_naked_option() {
+            ClientOrderId::from(order_list_id)
+        } else {
+            labeled_client_order_id(order_list_id, "short-close")
+        },
         &entry.short_symbol,
         OrderSide::Buy,
         entry.quantity,
         quote.short_ask,
         true,
-    )];
+    )?];
+
     if !entry.long_symbol.is_empty() {
-        legs.push(OrderLegSpec::new(
-            "long-close",
+        orders.push(limit_option_order(
+            &mut factory,
+            labeled_client_order_id(order_list_id, "long-close"),
             &entry.long_symbol,
             OrderSide::Sell,
             entry.quantity,
             quote.long_bid,
             true,
-        ));
+        )?);
     }
     if let (
         Some(short_call_symbol),
@@ -289,79 +373,74 @@ fn close_entry_submit_plan(
         quote.short_call_ask,
         quote.long_call_bid,
     ) {
-        legs.push(OrderLegSpec::new(
-            "short-call-close",
+        orders.push(limit_option_order(
+            &mut factory,
+            labeled_client_order_id(order_list_id, "short-call-close"),
             short_call_symbol,
             OrderSide::Buy,
             entry.quantity,
             short_call_ask,
             true,
-        ));
-        legs.push(OrderLegSpec::new(
-            "long-call-close",
+        )?);
+        orders.push(limit_option_order(
+            &mut factory,
+            labeled_client_order_id(order_list_id, "long-call-close"),
             long_call_symbol,
             OrderSide::Sell,
             entry.quantity,
             long_call_bid,
             true,
-        ));
+        )?);
     }
-    SubmitPlan::new(client_order_id, legs)
+
+    Ok(orders)
 }
 
-fn build_simple_submit_order_from_plan(
-    plan: &SubmitPlan,
-    trader_id: TraderId,
-    client_id: Option<ClientId>,
-    strategy_id: StrategyId,
-) -> anyhow::Result<SubmitOrder> {
-    let Some(leg) = plan.legs.first() else {
-        anyhow::bail!("single-leg submit plan missing leg");
-    };
-    build_simple_submit_order(SimpleSubmitOrderRequest {
-        trader_id,
-        client_id,
-        strategy_id,
-        client_order_id: ClientOrderId::from(plan.client_order_id.as_str()),
-        instrument_id: alpaca_instrument_id(&leg.symbol)?,
-        order_side: leg.side,
-        quantity: Quantity::new(leg.quantity as f64, 0),
-        limit_price: Price::new(leg.limit_price, 2),
-        reduce_only: leg.reduce_only,
-        ts_init: get_atomic_clock_realtime().get_time_ns(),
-    })
+fn limit_option_order(
+    factory: &mut OrderFactory,
+    client_order_id: ClientOrderId,
+    symbol: &str,
+    side: OrderSide,
+    quantity: u64,
+    limit_price: f64,
+    reduce_only: bool,
+) -> anyhow::Result<OrderAny> {
+    if quantity == 0 {
+        anyhow::bail!("order {client_order_id} quantity must be positive");
+    }
+    if limit_price <= 0.0 {
+        anyhow::bail!("order {client_order_id} limit price must be positive");
+    }
+
+    Ok(factory.limit(
+        alpaca_instrument_id(symbol)?,
+        side,
+        Quantity::new(quantity as f64, 0),
+        Price::new(limit_price, 2),
+        Some(TimeInForce::Day),
+        None,
+        None,
+        Some(reduce_only),
+        Some(false),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(client_order_id),
+    ))
 }
 
-fn build_mleg_submit_order_list_from_plan(
-    plan: &SubmitPlan,
-    trader_id: TraderId,
-    client_id: Option<ClientId>,
-    strategy_id: StrategyId,
-) -> anyhow::Result<SubmitOrderList> {
-    let order_list_id = OrderListId::from(plan.client_order_id.as_str());
-    build_mleg_submit_order_list(MlegSubmitOrderListRequest {
-        trader_id,
-        client_id,
-        strategy_id,
-        order_list_id,
-        legs: plan
-            .legs
-            .iter()
-            .map(|leg| {
-                Ok(MlegSubmitLeg {
-                    client_order_id: ClientOrderId::from(
-                        format!("{}-{}", plan.client_order_id, leg.label).as_str(),
-                    ),
-                    instrument_id: alpaca_instrument_id(&leg.symbol)?,
-                    order_side: leg.side,
-                    quantity: Quantity::new(leg.quantity as f64, 0),
-                    limit_price: Price::new(leg.limit_price, 2),
-                    reduce_only: leg.reduce_only,
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?,
-        ts_init: get_atomic_clock_realtime().get_time_ns(),
-    })
+fn option_order_factory(trader_id: TraderId, strategy_id: StrategyId) -> OrderFactory {
+    let clock: Rc<RefCell<dyn nautilus_common::clock::Clock>> =
+        Rc::new(RefCell::new(LiveClock::default()));
+    OrderFactory::new(trader_id, strategy_id, None, None, clock, false, false)
+}
+
+fn labeled_client_order_id(order_list_id: &str, label: &str) -> ClientOrderId {
+    let client_order_id = format!("{order_list_id}-{label}");
+    ClientOrderId::from(client_order_id.as_str())
 }
 
 async fn collect_execution_events(
@@ -510,8 +589,10 @@ pub(crate) mod tests_support {
         client_id: Option<ClientId>,
         strategy_id: StrategyId,
     ) -> anyhow::Result<SubmitOrder> {
-        let plan = selected_entry_submit_plan(entry, client_order_id, quantity)?;
-        build_simple_submit_order_from_plan(&plan, trader_id, client_id, strategy_id)
+        let mut orders =
+            selected_entry_orders(entry, client_order_id, quantity, trader_id, strategy_id)?;
+        let order = single_order(&mut orders, "open")?;
+        Ok(submit_order_from_order(order, trader_id, client_id))
     }
 
     pub(crate) fn build_close_order(
@@ -522,7 +603,21 @@ pub(crate) mod tests_support {
         client_id: Option<ClientId>,
         strategy_id: StrategyId,
     ) -> anyhow::Result<SubmitOrder> {
-        let plan = close_entry_submit_plan(entry, quote, client_order_id);
-        build_simple_submit_order_from_plan(&plan, trader_id, client_id, strategy_id)
+        let mut orders = close_entry_orders(entry, quote, client_order_id, trader_id, strategy_id)?;
+        let order = single_order(&mut orders, "close")?;
+        Ok(submit_order_from_order(order, trader_id, client_id))
+    }
+
+    fn single_order<'a>(
+        orders: &'a mut Vec<OrderAny>,
+        operation: &str,
+    ) -> anyhow::Result<&'a OrderAny> {
+        if orders.len() != 1 {
+            anyhow::bail!(
+                "{operation} helper expected one order, found {}",
+                orders.len()
+            );
+        }
+        Ok(&orders[0])
     }
 }

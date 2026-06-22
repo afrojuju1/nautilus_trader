@@ -57,6 +57,12 @@ and strategies.
     `OptionChainOpportunityScanActor`, and never installs an execution client.
 - [ ] Decide whether read-only actor evidence should write to Postgres directly or publish events
   for a separate persistence consumer.
+- [x] Remove the adapter-local order-plan layer from options-engine submission.
+  - Submission now builds standard Nautilus `OrderAny` values through `OrderFactory`, then derives
+    `SubmitOrder` or `SubmitOrderList` commands for `AlpacaExecutionClient`.
+  - Alpaca-specific code remains at symbol normalization and execution-client payload translation;
+    the account engine still owns broker session lifecycle and submit gates until entry admission
+    moves behind a real strategy boundary.
 
 ## Cutover Readiness
 
@@ -81,15 +87,16 @@ green during market hours for the configured paper profiles.
     non-zero cached instruments, and `option_chain_opportunity_scan` events.
   - For undefined-risk profiles, set `ALPACA_OPTION_CHAIN_OPTIONS_BUYING_POWER` or allow the live
     node to read paper-account buying power before scanning.
-- [ ] After side-by-side proof is green, move order-intent construction behind a Nautilus strategy
-  boundary before retiring REST scanner loops.
+- [ ] After side-by-side proof is green, move entry and exit order construction into a Nautilus
+  strategy boundary before retiring REST scanner loops.
 
 ## Next Loops To Retire
 
 - [ ] Entry loop
-  - Move entry selection, risk admission, and order-intent construction into a Nautilus `Strategy`.
+  - Move entry selection and risk admission into a Nautilus `Strategy`.
+  - Build accepted entries as standard Nautilus orders with `OrderFactory` or `OrderApi`.
   - Keep the strategy fed by `OptionsOpportunitySet` or its successor, not Alpaca REST payloads.
-  - Submit through standard Nautilus order flow only.
+  - Submit through standard Nautilus `submit_order` or `submit_order_list` flow only.
 
 - [ ] Management loop
   - Move close, flatten, stale-order, and reprice lifecycle into a dedicated strategy/component.
