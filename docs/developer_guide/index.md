@@ -27,6 +27,7 @@ This approach combines Python's simplicity and ecosystem with Rust's performance
 - [Alpaca TradingNode Gap Plan](alpaca_trading_node_gap_plan.md)
 - [Alpaca Options TradingNode Migration](alpaca_options_trading_node_migration.md)
 - [Nautilus-Native Opportunity Scanning](nautilus_native_opportunity_scanning.md)
+- [Market Data Warehouse Workstream](market_data_warehouse_workstream.md)
 - [Alpaca Official Docs Readiness Checklist](alpaca_official_docs_readiness_checklist.md)
 - [Alpaca NUC Deployment](alpaca_nuc_deployment.md)
 - [Data Testing Spec](spec_data_testing.md)
