@@ -57,6 +57,10 @@ pub mod http;
 #[cfg(feature = "live")]
 pub mod management;
 #[cfg(feature = "live")]
+pub mod opportunity_scan_actor;
+#[cfg(feature = "live")]
+pub mod option_chain_candidates;
+#[cfg(feature = "live")]
 pub mod options_engine;
 #[cfg(feature = "live")]
 pub mod options_entry;

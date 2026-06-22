@@ -38,3 +38,6 @@ pub const ENV_ALPACA_API_SECRET: &str = "ALPACA_API_SECRET";
 
 /// Alpaca option symbol pattern used by the options contracts and market data APIs.
 pub const OPTION_SYMBOL_FORMAT: &str = "O:<ROOT><YYMMDD><C|P><STRIKE>";
+
+/// Instrument metadata key used to preserve Alpaca option contract open interest.
+pub const ALPACA_OPEN_INTEREST_INFO_KEY: &str = "alpaca_open_interest";

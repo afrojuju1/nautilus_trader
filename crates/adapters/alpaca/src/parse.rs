@@ -15,16 +15,18 @@
 
 //! Conversion helpers from Alpaca wire models to Nautilus model objects.
 
+use nautilus_core::Params;
 use nautilus_model::{
     enums::{AssetClass, OptionKind},
     identifiers::{InstrumentId, Symbol},
     instruments::OptionContract,
     types::{Currency, Price, Quantity},
 };
+use serde_json::json;
 use time::{Date, macros::format_description};
 
 use crate::{
-    common::consts::ALPACA_VENUE,
+    common::consts::{ALPACA_OPEN_INTEREST_INFO_KEY, ALPACA_VENUE},
     http::{
         error::{Error, Result},
         models::AlpacaOptionContract,
@@ -44,6 +46,16 @@ pub fn parse_option_contract(contract: &AlpacaOptionContract) -> Result<OptionCo
     let strike_price = Price::from(contract.strike_price.as_str());
     let expiration_ns = parse_expiration_date(&contract.expiration_date)?;
     let multiplier = Quantity::from(contract.size.as_deref().unwrap_or("100"));
+    let info = contract.open_interest.as_ref().and_then(|value| {
+        value.parse::<f64>().ok().map(|open_interest| {
+            let mut params = Params::new();
+            params.insert(
+                ALPACA_OPEN_INTEREST_INFO_KEY.to_string(),
+                json!(open_interest),
+            );
+            params
+        })
+    });
 
     OptionContract::new_checked(
         instrument_id,
@@ -69,7 +81,7 @@ pub fn parse_option_contract(contract: &AlpacaOptionContract) -> Result<OptionCo
         None,
         None,
         None,
-        None,
+        info,
         0.into(),
         0.into(),
     )

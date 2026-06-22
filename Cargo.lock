@@ -5357,11 +5357,13 @@ dependencies = [
  "chrono-tz",
  "dotenvy",
  "log",
+ "nautilus-backtest",
  "nautilus-common",
  "nautilus-core",
  "nautilus-live",
  "nautilus-model",
  "nautilus-network",
+ "nautilus-persistence",
  "pyo3",
  "pyo3-stub-gen",
  "reqwest 0.13.4",
@@ -5375,6 +5377,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml 1.1.2+spec-1.1.0",
  "url",
+ "ustr",
 ]
 
 [[package]]

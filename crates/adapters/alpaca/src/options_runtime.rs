@@ -515,7 +515,7 @@ pub struct OptionsScanReport {
 }
 
 impl OptionsScanReport {
-    fn new(
+    pub fn new(
         underlying: &str,
         strategy: &'static str,
         candidate_count: usize,
@@ -567,7 +567,7 @@ pub struct OptionsOpportunitySet {
 }
 
 impl OptionsOpportunitySet {
-    fn new(trade_date: &str) -> Self {
+    pub fn new(trade_date: &str) -> Self {
         Self {
             trade_date: trade_date.to_string(),
             scans: Vec::new(),
@@ -575,11 +575,11 @@ impl OptionsOpportunitySet {
         }
     }
 
-    fn push_scan(&mut self, report: OptionsScanReport) {
+    pub fn push_scan(&mut self, report: OptionsScanReport) {
         self.scans.push(report);
     }
 
-    fn consider_candidate(&mut self, candidate: SelectedOptionsEntry) {
+    pub fn consider_candidate(&mut self, candidate: SelectedOptionsEntry) {
         self.ranked_entries.push(candidate);
         self.ranked_entries
             .sort_by(|left, right| right.score().total_cmp(&left.score()));
