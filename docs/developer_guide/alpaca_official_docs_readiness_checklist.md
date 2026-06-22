@@ -10,8 +10,8 @@ for official NautilusTrader documentation.
   - [ ] Full official Alpaca adapter alongside integrations such as Bybit and Interactive Brokers.
 - [x] Keep the public wording aligned with the implementation:
   - [x] The Rust Alpaca options execution/runtime path is implemented and actively paper tested.
-  - [x] The standard Python `TradingNode` path is narrow and does not yet cover option/multi-leg
-        trading.
+  - [x] The standard Python `TradingNode` path now covers exact option snapshot data and multi-leg
+        option order lists, but Alpaca still should not be presented as a full official adapter.
   - [x] The Rust adapter has live data and execution factories, but public docs should not present
         Alpaca as a full official adapter yet.
   - [x] The opinionated options strategy engine is separate from the generic adapter surface.
@@ -83,9 +83,9 @@ for official NautilusTrader documentation.
 
 - [x] Implement or explicitly defer `AlpacaLiveDataClientFactory`.
 - [x] Implement or explicitly defer `AlpacaLiveExecClientFactory`.
-- [ ] Wire option-capable clients into the standard Python node path if Alpaca is promoted to a full
+- [x] Wire option-capable clients into the standard Python node path if Alpaca is promoted to a full
       official adapter.
-- [ ] Add a standard Python `TradingNode` options example once option data and multi-leg execution
+- [x] Add a standard Python `TradingNode` options example once option data and multi-leg execution
       are implemented.
 - [x] Update package docstrings so they no longer describe completed Rust runtime work as only a
       scaffold.
@@ -104,7 +104,7 @@ for official NautilusTrader documentation.
       the supported quote path for the release.
 - [ ] Add entitlement-aware feed behavior for indicative versus OPRA option data.
 - [x] Wire exact Alpaca option instrument loading into a standard Rust Nautilus data-client path.
-- [ ] Add option universe loading and snapshot/quote refresh to the standard node path if publishing
+- [x] Add exact option loading and snapshot/quote refresh to the standard node path if publishing
       as a normal adapter.
 - [x] Document option data entitlement requirements.
 - [ ] Document any quote staleness, feed, or market-hours constraints.
@@ -117,7 +117,7 @@ for official NautilusTrader documentation.
 - [x] Add a multi-leg order validation example that does not submit orders.
 - [x] Add a paper-only options engine walkthrough with submission disabled by default.
 - [x] Add a safe paper smoke-test example that cancels accepted test orders.
-- [ ] Add a standard `TradingNode` options example after option data and multi-leg execution exist.
+- [x] Add a standard `TradingNode` options example after option data and multi-leg execution exist.
 - [ ] Add docs or tests that verify public examples import and run in dry-run mode.
 
 ## Operational documentation

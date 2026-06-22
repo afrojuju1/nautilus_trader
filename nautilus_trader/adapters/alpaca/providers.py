@@ -13,18 +13,33 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Instrument provider for Alpaca US equities and ETFs.
+Instrument provider for Alpaca US equities, ETFs, and exact option contracts.
 """
+
+import re
+from dataclasses import dataclass
+from datetime import UTC
+from datetime import datetime
+from decimal import Decimal
 
 from nautilus_trader.adapters.alpaca.constants import ALPACA_VENUE
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import InstrumentProviderConfig
+from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.enums import AssetClass
+from nautilus_trader.model.enums import OptionKind
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.instruments import Equity
+from nautilus_trader.model.instruments import OptionContract
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
+
+
+_OCC_SYMBOL_RE = re.compile(
+    r"^(?P<underlying>[A-Z0-9]{1,6})(?P<expiry>\d{6})(?P<kind>[CP])(?P<strike>\d{8})$",
+)
 
 
 def make_alpaca_equity(symbol: str, ts_init: int = 0) -> Equity:
@@ -45,22 +60,54 @@ def make_alpaca_equity(symbol: str, ts_init: int = 0) -> Equity:
     )
 
 
-class AlpacaEquityInstrumentProvider(InstrumentProvider):
+def make_alpaca_option(symbol: str, ts_init: int = 0) -> OptionContract:
     """
-    Provides static Alpaca equity instruments for configured US equity/ETF symbols.
+    Create a static Nautilus option contract for an exact Alpaca/OCC option symbol.
+    """
+    contract = _parse_occ_option_symbol(symbol)
+    return OptionContract(
+        instrument_id=InstrumentId(Symbol(contract.symbol), ALPACA_VENUE),
+        raw_symbol=Symbol(contract.symbol),
+        asset_class=AssetClass.EQUITY,
+        currency=USD,
+        price_precision=2,
+        price_increment=Price.from_str("0.01"),
+        multiplier=Quantity.from_int(100),
+        lot_size=Quantity.from_int(1),
+        underlying=contract.underlying,
+        option_kind=contract.option_kind,
+        strike_price=Price.from_str(_decimal_to_plain_str(contract.strike_price)),
+        activation_ns=0,
+        expiration_ns=contract.expiration_ns,
+        ts_event=ts_init,
+        ts_init=ts_init,
+        info={"provider": "alpaca-static-option", "occ_symbol": contract.symbol},
+    )
+
+
+class AlpacaInstrumentProvider(InstrumentProvider):
+    """
+    Provides static Alpaca instruments for configured equities and exact option contracts.
     """
 
     def __init__(
         self,
-        symbols: list[str] | None = None,
+        equity_symbols: list[str] | None = None,
+        option_symbols: list[str] | None = None,
         config: InstrumentProviderConfig | None = None,
     ) -> None:
         super().__init__(config=config)
-        self._symbols = tuple(_normalize_symbol(symbol) for symbol in symbols or [])
+        self._equity_symbols = tuple(_normalize_symbol(symbol) for symbol in equity_symbols or [])
+        self._option_symbols = tuple(
+            _normalize_option_symbol(symbol) for symbol in option_symbols or []
+        )
 
     async def load_all_async(self, filters: dict | None = None) -> None:
-        for symbol in self._configured_symbols():
+        equity_symbols, option_symbols = self._configured_symbols()
+        for symbol in equity_symbols:
             self.add(make_alpaca_equity(symbol))
+        for symbol in option_symbols:
+            self.add(make_alpaca_option(symbol))
 
     async def load_ids_async(
         self,
@@ -72,7 +119,11 @@ class AlpacaEquityInstrumentProvider(InstrumentProvider):
                 self._log.warning(f"Skipping non-Alpaca instrument id {instrument_id}")
                 continue
 
-            self.add(make_alpaca_equity(instrument_id.symbol.value))
+            symbol = instrument_id.symbol.value
+            if is_alpaca_option_symbol(symbol):
+                self.add(make_alpaca_option(symbol))
+            else:
+                self.add(make_alpaca_equity(symbol))
 
     async def load_async(
         self,
@@ -81,8 +132,9 @@ class AlpacaEquityInstrumentProvider(InstrumentProvider):
     ) -> None:
         await self.load_ids_async([instrument_id], filters)
 
-    def _configured_symbols(self) -> list[str]:
-        symbols = set(self._symbols)
+    def _configured_symbols(self) -> tuple[list[str], list[str]]:
+        equity_symbols = set(self._equity_symbols)
+        option_symbols = set(self._option_symbols)
         load_ids = self._config.load_ids or frozenset()
 
         for raw_instrument_id in load_ids:
@@ -92,9 +144,34 @@ class AlpacaEquityInstrumentProvider(InstrumentProvider):
                 else InstrumentId.from_str(str(raw_instrument_id))
             )
             if instrument_id.venue == ALPACA_VENUE:
-                symbols.add(_normalize_symbol(instrument_id.symbol.value))
+                symbol = instrument_id.symbol.value
+                if is_alpaca_option_symbol(symbol):
+                    option_symbols.add(_normalize_option_symbol(symbol))
+                else:
+                    equity_symbols.add(_normalize_symbol(symbol))
 
-        return sorted(symbols)
+        return sorted(equity_symbols), sorted(option_symbols)
+
+
+class AlpacaEquityInstrumentProvider(AlpacaInstrumentProvider):
+    """
+    Provides static Alpaca equity instruments for configured US equity/ETF symbols.
+    """
+
+    def __init__(
+        self,
+        symbols: list[str] | None = None,
+        config: InstrumentProviderConfig | None = None,
+    ) -> None:
+        super().__init__(equity_symbols=symbols, config=config)
+
+
+def is_alpaca_option_symbol(symbol: str) -> bool:
+    try:
+        _parse_occ_option_symbol(symbol)
+    except ValueError:
+        return False
+    return True
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -102,3 +179,50 @@ def _normalize_symbol(symbol: str) -> str:
     if not normalized:
         raise ValueError("symbol must not be empty")
     return normalized
+
+
+def _normalize_option_symbol(symbol: str) -> str:
+    return _parse_occ_option_symbol(symbol).symbol
+
+
+@dataclass(frozen=True)
+class _OccOptionSymbol:
+    symbol: str
+    underlying: str
+    option_kind: OptionKind
+    strike_price: Decimal
+    expiration_ns: int
+
+
+def _parse_occ_option_symbol(symbol: str) -> _OccOptionSymbol:
+    normalized = _normalize_symbol(symbol)
+    if normalized.endswith(f".{ALPACA_VENUE.value}"):
+        normalized = normalized[: -(len(ALPACA_VENUE.value) + 1)]
+    normalized = normalized.removeprefix("O:")
+
+    match = _OCC_SYMBOL_RE.fullmatch(normalized)
+    if match is None:
+        raise ValueError(f"Alpaca option symbol must use OCC format, got {symbol!r}")
+
+    expiry = match.group("expiry")
+    year = 2000 + int(expiry[0:2])
+    month = int(expiry[2:4])
+    day = int(expiry[4:6])
+    expiration = datetime(year, month, day, tzinfo=UTC)
+    strike_price = Decimal(match.group("strike")) / Decimal(1000)
+    option_kind = OptionKind.CALL if match.group("kind") == "C" else OptionKind.PUT
+    return _OccOptionSymbol(
+        symbol=normalized,
+        underlying=match.group("underlying"),
+        option_kind=option_kind,
+        strike_price=strike_price,
+        expiration_ns=dt_to_unix_nanos(expiration),
+    )
+
+
+def _decimal_to_plain_str(value: Decimal) -> str:
+    normalized = value.normalize()
+    text = format(normalized, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text

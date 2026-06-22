@@ -17,7 +17,7 @@ from nautilus_trader.adapters.alpaca.config import AlpacaDataClientConfig
 from nautilus_trader.adapters.alpaca.config import AlpacaExecClientConfig
 from nautilus_trader.adapters.alpaca.data import AlpacaDataClient
 from nautilus_trader.adapters.alpaca.execution import AlpacaExecutionClient
-from nautilus_trader.adapters.alpaca.providers import AlpacaEquityInstrumentProvider
+from nautilus_trader.adapters.alpaca.providers import AlpacaInstrumentProvider
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
@@ -39,8 +39,9 @@ class AlpacaLiveDataClientFactory(LiveDataClientFactory):
         cache: Cache,
         clock: LiveClock,
     ):
-        instrument_provider = AlpacaEquityInstrumentProvider(
-            symbols=config.equity_symbols,
+        instrument_provider = AlpacaInstrumentProvider(
+            equity_symbols=config.equity_symbols,
+            option_symbols=config.option_symbols,
             config=config.instrument_provider,
         )
         return AlpacaDataClient(
@@ -58,8 +59,8 @@ class AlpacaLiveExecClientFactory(LiveExecClientFactory):
     """
     Provides an Alpaca execution client factory for Python ``TradingNode`` usage.
 
-    The Python client currently supports simple US equity/ETF DAY limit orders. The Rust Alpaca
-    runtime remains the implemented surface for multi-leg option orders.
+    The Python client supports simple US equity/ETF DAY limit orders and Alpaca option multi-leg
+    order lists.
     """
 
     @staticmethod
@@ -71,7 +72,7 @@ class AlpacaLiveExecClientFactory(LiveExecClientFactory):
         cache: Cache,
         clock: LiveClock,
     ):
-        instrument_provider = AlpacaEquityInstrumentProvider(
+        instrument_provider = AlpacaInstrumentProvider(
             config=config.instrument_provider,
         )
         return AlpacaExecutionClient(

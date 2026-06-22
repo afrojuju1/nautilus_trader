@@ -13,7 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Minimal Alpaca stock-bar data client for Python ``TradingNode`` usage.
+Alpaca data client for Python ``TradingNode`` usage.
 """
 
 import asyncio
@@ -34,7 +34,8 @@ from nautilus_trader.adapters.alpaca.constants import ALPACA_SECRET_KEY_ENV
 from nautilus_trader.adapters.alpaca.constants import ALPACA_VENUE
 from nautilus_trader.adapters.alpaca.constants import APCA_API_KEY_ID_ENV
 from nautilus_trader.adapters.alpaca.constants import APCA_API_SECRET_KEY_ENV
-from nautilus_trader.adapters.alpaca.providers import AlpacaEquityInstrumentProvider
+from nautilus_trader.adapters.alpaca.providers import AlpacaInstrumentProvider
+from nautilus_trader.adapters.alpaca.providers import is_alpaca_option_symbol
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
@@ -44,18 +45,26 @@ from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.data.messages import RequestInstrument
 from nautilus_trader.data.messages import RequestInstruments
+from nautilus_trader.data.messages import RequestQuoteTicks
 from nautilus_trader.data.messages import SubscribeBars
 from nautilus_trader.data.messages import SubscribeInstrument
 from nautilus_trader.data.messages import SubscribeInstruments
+from nautilus_trader.data.messages import SubscribeOptionGreeks
+from nautilus_trader.data.messages import SubscribeQuoteTicks
 from nautilus_trader.data.messages import UnsubscribeBars
 from nautilus_trader.data.messages import UnsubscribeInstrument
 from nautilus_trader.data.messages import UnsubscribeInstruments
+from nautilus_trader.data.messages import UnsubscribeOptionGreeks
+from nautilus_trader.data.messages import UnsubscribeQuoteTicks
 from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
+from nautilus_trader.model.data import OptionGreeks
+from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.enums import BarAggregation
 from nautilus_trader.model.enums import PriceType
 from nautilus_trader.model.identifiers import ClientId
+from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Quantity
 
@@ -67,7 +76,7 @@ ALPACA_STOCK_BARS_PAGE_LIMIT = 10_000
 
 class AlpacaDataClient(LiveMarketDataClient):
     """
-    Provides Alpaca US equity/ETF instruments and historical stock bars.
+    Provides Alpaca instruments, stock bars, and option snapshot quotes/Greeks.
     """
 
     def __init__(
@@ -76,7 +85,7 @@ class AlpacaDataClient(LiveMarketDataClient):
         msgbus: MessageBus,
         cache: Cache,
         clock: LiveClock,
-        instrument_provider: AlpacaEquityInstrumentProvider,
+        instrument_provider: AlpacaInstrumentProvider,
         config: AlpacaDataClientConfig,
         name: str | None = None,
     ) -> None:
@@ -104,8 +113,10 @@ class AlpacaDataClient(LiveMarketDataClient):
         )
         self._bars_timestamp_on_close = config.bars_timestamp_on_close
         self._bar_poll_interval_secs = config.bar_poll_interval_secs
+        self._snapshot_greeks_poll_secs = config.snapshot_greeks_poll_secs
         self._bar_poll_tasks: dict[BarType, asyncio.Task] = {}
         self._last_bar_ts_by_type: dict[BarType, int] = {}
+        self._option_snapshot_poll_tasks: dict[InstrumentId, asyncio.Task] = {}
 
         self._log.info(f"data_base_url={self._data_base_url}", LogColor.BLUE)
         self._log.info(f"stock_feed={config.stock_feed}", LogColor.BLUE)
@@ -115,6 +126,11 @@ class AlpacaDataClient(LiveMarketDataClient):
         )
         self._log.info(
             f"bars_timestamp_on_close={self._bars_timestamp_on_close}",
+            LogColor.BLUE,
+        )
+        self._log.info(f"option_feed={config.option_feed}", LogColor.BLUE)
+        self._log.info(
+            f"snapshot_greeks_poll_secs={self._snapshot_greeks_poll_secs}",
             LogColor.BLUE,
         )
 
@@ -128,13 +144,16 @@ class AlpacaDataClient(LiveMarketDataClient):
         for task in self._bar_poll_tasks.values():
             task.cancel()
         self._bar_poll_tasks.clear()
+        for task in self._option_snapshot_poll_tasks.values():
+            task.cancel()
+        self._option_snapshot_poll_tasks.clear()
 
     async def _subscribe_instruments(self, command: SubscribeInstruments) -> None:
         for instrument in self._instrument_provider.list_all():
             self._handle_data(instrument)
 
     async def _subscribe_instrument(self, command: SubscribeInstrument) -> None:
-        instrument = self._instrument_provider.find(command.instrument_id)
+        instrument = await self._load_instrument_if_needed(command.instrument_id)
         if instrument is not None:
             self._handle_data(instrument)
 
@@ -161,8 +180,64 @@ class AlpacaDataClient(LiveMarketDataClient):
         if task is not None:
             task.cancel()
 
+    async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
+        if not is_alpaca_option_symbol(command.instrument_id.symbol.value):
+            self._log.error(
+                "Alpaca quote subscriptions currently require an option symbol: "
+                f"{command.instrument_id}",
+            )
+            return
+
+        instrument = await self._load_instrument_if_needed(command.instrument_id)
+        if instrument is None:
+            self._log.error(
+                f"Cannot subscribe quotes: no Alpaca instrument {command.instrument_id}",
+            )
+            return
+
+        snapshot = await self._fetch_option_snapshot(command.instrument_id.symbol.value)
+        quote = _quote_tick_from_option_snapshot(
+            instrument=instrument,
+            snapshot=snapshot,
+            ts_init=self._clock.timestamp_ns(),
+        )
+        if quote is not None:
+            self._handle_data(quote)
+        self._ensure_option_snapshot_polling(command.instrument_id)
+
+    async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
+        self._stop_option_snapshot_polling_if_unused(command.instrument_id)
+
+    async def _subscribe_option_greeks(self, command: SubscribeOptionGreeks) -> None:
+        if not is_alpaca_option_symbol(command.instrument_id.symbol.value):
+            self._log.error(
+                "Alpaca option Greeks subscriptions require an option symbol: "
+                f"{command.instrument_id}",
+            )
+            return
+
+        instrument = await self._load_instrument_if_needed(command.instrument_id)
+        if instrument is None:
+            self._log.error(
+                f"Cannot subscribe option Greeks: no Alpaca instrument {command.instrument_id}",
+            )
+            return
+
+        snapshot = await self._fetch_option_snapshot(command.instrument_id.symbol.value)
+        greeks = _greeks_from_option_snapshot(
+            instrument_id=command.instrument_id,
+            snapshot=snapshot,
+            ts_init=self._clock.timestamp_ns(),
+        )
+        if greeks is not None:
+            self._handle_data(greeks)
+        self._ensure_option_snapshot_polling(command.instrument_id)
+
+    async def _unsubscribe_option_greeks(self, command: UnsubscribeOptionGreeks) -> None:
+        self._stop_option_snapshot_polling_if_unused(command.instrument_id)
+
     async def _request_instrument(self, request: RequestInstrument) -> None:
-        instrument = self._instrument_provider.find(request.instrument_id)
+        instrument = await self._load_instrument_if_needed(request.instrument_id)
         if instrument is not None:
             self._handle_instrument(
                 instrument,
@@ -176,6 +251,34 @@ class AlpacaDataClient(LiveMarketDataClient):
         self._handle_instruments(
             ALPACA_VENUE,
             self._instrument_provider.list_all(),
+            request.id,
+            request.start,
+            request.end,
+            request.params,
+        )
+
+    async def _request_quote_ticks(self, request: RequestQuoteTicks) -> None:
+        instrument = await self._load_instrument_if_needed(request.instrument_id)
+        ticks: list[QuoteTick] = []
+        if instrument is not None and is_alpaca_option_symbol(request.instrument_id.symbol.value):
+            try:
+                snapshot = await self._fetch_option_snapshot(request.instrument_id.symbol.value)
+                quote = _quote_tick_from_option_snapshot(
+                    instrument=instrument,
+                    snapshot=snapshot,
+                    ts_init=self._clock.timestamp_ns(),
+                )
+                if quote is not None:
+                    ticks.append(quote)
+            except Exception as e:
+                self._log.exception(
+                    f"Failed to request Alpaca option quote for {request.instrument_id}",
+                    e,
+                )
+
+        self._handle_quote_ticks(
+            request.instrument_id,
+            ticks,
             request.id,
             request.start,
             request.end,
@@ -235,6 +338,95 @@ class AlpacaDataClient(LiveMarketDataClient):
                 self._handle_data(bar)
                 last_ts = bar.ts_event
             self._last_bar_ts_by_type[bar_type] = last_ts
+
+    def _ensure_option_snapshot_polling(self, instrument_id: InstrumentId) -> None:
+        if self._snapshot_greeks_poll_secs is None:
+            return
+        if instrument_id in self._option_snapshot_poll_tasks:
+            return
+
+        task = self.create_task(
+            self._poll_option_snapshot(instrument_id),
+            log_msg=f"alpaca_poll_option_snapshot_{instrument_id}",
+        )
+        if task is not None:
+            self._option_snapshot_poll_tasks[instrument_id] = task
+
+    def _stop_option_snapshot_polling_if_unused(self, instrument_id: InstrumentId) -> None:
+        if self._has_option_snapshot_subscription(instrument_id):
+            return
+        task = self._option_snapshot_poll_tasks.pop(instrument_id, None)
+        if task is not None:
+            task.cancel()
+
+    def _has_option_snapshot_subscription(self, instrument_id: InstrumentId) -> bool:
+        return (
+            self.is_subscribed_quote_ticks(
+                instrument_id,
+            )
+            or instrument_id in self.subscribed_option_greeks()
+        )
+
+    async def _poll_option_snapshot(self, instrument_id: InstrumentId) -> None:
+        while True:
+            await asyncio.sleep(self._snapshot_greeks_poll_secs or 60)
+            if not self._has_option_snapshot_subscription(instrument_id):
+                self._stop_option_snapshot_polling_if_unused(instrument_id)
+                return
+
+            instrument = await self._load_instrument_if_needed(instrument_id)
+            if instrument is None:
+                continue
+
+            try:
+                snapshot = await self._fetch_option_snapshot(instrument_id.symbol.value)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log.exception(f"Failed polling Alpaca option snapshot for {instrument_id}", e)
+                continue
+
+            ts_init = self._clock.timestamp_ns()
+            if self.is_subscribed_quote_ticks(instrument_id):
+                quote = _quote_tick_from_option_snapshot(
+                    instrument=instrument,
+                    snapshot=snapshot,
+                    ts_init=ts_init,
+                )
+                if quote is not None:
+                    self._handle_data(quote)
+            if instrument_id in self.subscribed_option_greeks():
+                greeks = _greeks_from_option_snapshot(
+                    instrument_id=instrument_id,
+                    snapshot=snapshot,
+                    ts_init=ts_init,
+                )
+                if greeks is not None:
+                    self._handle_data(greeks)
+
+    async def _fetch_option_snapshot(self, symbol: str) -> dict[str, Any]:
+        normalized = symbol.strip().upper()
+        endpoint = f"{self._data_base_url}/v1beta1/options/snapshots"
+        params: dict[str, Any] = {
+            "symbols": normalized,
+            "feed": self._config.option_feed,
+            "limit": 1,
+        }
+        response = await self._http_client.get(
+            endpoint,
+            params=params,
+            headers=self._headers(),
+            timeout_secs=self._config.request_timeout_secs,
+        )
+        if not 200 <= response.status < 300:
+            body = response.body.decode("utf-8", errors="replace")
+            raise RuntimeError(f"Alpaca option snapshot request failed: {response.status} {body}")
+
+        payload = msgspec.json.decode(response.body)
+        snapshot = _snapshot_for_symbol(payload, normalized)
+        if snapshot is None:
+            raise RuntimeError(f"Alpaca option snapshot missing {normalized}")
+        return snapshot
 
     async def _fetch_stock_bars(
         self,
@@ -325,6 +517,15 @@ class AlpacaDataClient(LiveMarketDataClient):
             raise RuntimeError(f"No Alpaca instrument loaded for {bar_type.instrument_id}")
         return instrument
 
+    async def _load_instrument_if_needed(self, instrument_id: InstrumentId) -> Instrument | None:
+        instrument = self._instrument_provider.find(instrument_id)
+        if instrument is None:
+            await self._instrument_provider.load_async(instrument_id)
+            instrument = self._instrument_provider.find(instrument_id)
+        if instrument is None:
+            instrument = self._cache.instrument(instrument_id)
+        return instrument
+
     def _record_latest_bar_ts(self, bar_type: BarType, bars: list[Bar]) -> None:
         if bars:
             self._last_bar_ts_by_type[bar_type] = max(bar.ts_event for bar in bars)
@@ -339,6 +540,130 @@ def _first_present(explicit: str | None, *env_names: str) -> str | None:
         if value:
             return value
     return None
+
+
+def _snapshot_for_symbol(payload: Any, symbol: str) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    snapshots = payload.get("snapshots")
+    if not isinstance(snapshots, dict):
+        return None
+    snapshot = snapshots.get(symbol) or snapshots.get(symbol.upper())
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def _quote_tick_from_option_snapshot(
+    instrument: Instrument,
+    snapshot: dict[str, Any],
+    ts_init: int,
+) -> QuoteTick | None:
+    quote = _nested_dict(snapshot, "latestQuote", "latest_quote")
+    if quote is None:
+        return None
+
+    bid_price = _first_float(quote, "bp", "bid_price", "bidPrice")
+    ask_price = _first_float(quote, "ap", "ask_price", "askPrice")
+    if bid_price is None or ask_price is None or bid_price <= 0 or ask_price <= 0:
+        return None
+    if ask_price < bid_price:
+        return None
+
+    bid_size = _first_int(quote, "bs", "bid_size", "bidSize", default=0)
+    ask_size = _first_int(quote, "as", "ask_size", "askSize", default=0)
+    ts_event = _timestamp_ns_from_value(quote.get("t") or quote.get("timestamp"), ts_init)
+    return QuoteTick(
+        instrument_id=instrument.id,
+        bid_price=instrument.make_price(bid_price),
+        ask_price=instrument.make_price(ask_price),
+        bid_size=instrument.make_qty(bid_size),
+        ask_size=instrument.make_qty(ask_size),
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
+
+
+def _greeks_from_option_snapshot(
+    instrument_id: InstrumentId,
+    snapshot: dict[str, Any],
+    ts_init: int,
+) -> OptionGreeks | None:
+    greeks = _nested_dict(snapshot, "greeks")
+    mark_iv = _first_float(snapshot, "impliedVolatility", "implied_volatility", "iv")
+    if greeks is None and mark_iv is None:
+        return None
+    greeks = greeks or {}
+
+    quote = _nested_dict(snapshot, "latestQuote", "latest_quote") or {}
+    ts_event = _timestamp_ns_from_value(
+        quote.get("t") or quote.get("timestamp") or snapshot.get("updated_at"),
+        ts_init,
+    )
+    return OptionGreeks(
+        instrument_id=instrument_id,
+        delta=_first_float(greeks, "d", "delta", default=0.0),
+        gamma=_first_float(greeks, "g", "gamma", default=0.0),
+        vega=_first_float(greeks, "v", "vega", default=0.0),
+        theta=_first_float(greeks, "t", "theta", default=0.0),
+        rho=_first_float(greeks, "r", "rho", default=0.0),
+        mark_iv=mark_iv,
+        bid_iv=None,
+        ask_iv=None,
+        underlying_price=_first_float(snapshot, "underlyingPrice", "underlying_price"),
+        open_interest=_first_float(snapshot, "openInterest", "open_interest"),
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
+
+
+def _nested_dict(data: dict[str, Any], *keys: str) -> dict[str, Any] | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _first_float(
+    data: dict[str, Any],
+    *keys: str,
+    default: float | None = None,
+) -> float | None:
+    for key in keys:
+        value = data.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def _first_int(
+    data: dict[str, Any],
+    *keys: str,
+    default: int = 0,
+) -> int:
+    for key in keys:
+        value = data.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def _timestamp_ns_from_value(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    else:
+        timestamp = timestamp.tz_convert("UTC")
+    return dt_to_unix_nanos(timestamp)
 
 
 def _timeframe_for_bar_type(bar_type: BarType) -> str:

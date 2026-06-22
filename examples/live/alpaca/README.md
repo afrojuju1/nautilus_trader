@@ -1,13 +1,12 @@
 # Alpaca Live Examples
 
-These examples exercise the current Rust Alpaca options runtime and the minimal Python
-`TradingNode` stock-bar path safely. They are designed for paper credentials and do not submit
-broker orders by default.
+These examples exercise the current Rust Alpaca options runtime and Python `TradingNode` paths
+safely. They are designed for paper credentials and do not submit broker orders by default.
 
-The standard Python `TradingNode` Alpaca data factory currently supports static US equity
-instruments and stock bars. The Python execution factory supports simple US equity/ETF `DAY` limit
-orders. Python node examples use the Nautilus sandbox execution client unless `--broker-paper` is
-passed explicitly.
+The standard Python `TradingNode` Alpaca data factory supports static US equity instruments, exact
+OCC option instruments, stock bars, and option snapshot quotes/Greeks. The Python execution factory
+supports simple US equity/ETF `DAY` limit orders and option multi-leg order lists. Python node
+examples use the Nautilus sandbox execution client unless `--broker-paper` is passed explicitly.
 
 ## Credentials
 
@@ -52,6 +51,49 @@ ALPACA_UPSIDE_GAP_SYMBOLS="FXI,SMH,SOXX"
 ALPACA_UPSIDE_GAP_CAPITAL=100
 ALPACA_STOCK_FEED=iex
 ALPACA_EQUITY_DAILY_RUN_SECONDS=3600
+```
+
+## Options multi-leg TradingNode
+
+This node registers exact OCC option instruments, subscribes option snapshot quotes and Greeks
+through the standard Python data engine, and can optionally submit one two-leg opening order list to
+the Alpaca paper broker.
+
+Data-only config check:
+
+```bash
+python examples/live/alpaca/options_mleg_trading_node.py --check-config
+```
+
+Run read-only snapshot polling:
+
+```bash
+python examples/live/alpaca/options_mleg_trading_node.py \
+  --alpaca-profile paper-main \
+  --run-seconds 120
+```
+
+Paper broker submit mode requires an explicit confirmation flag:
+
+```bash
+python examples/live/alpaca/options_mleg_trading_node.py \
+  --broker-paper \
+  --confirm-submit \
+  --alpaca-profile paper-main \
+  --short-symbol SPY270115P00450000 \
+  --long-symbol SPY270115P00445000 \
+  --short-leg-limit 0.50 \
+  --long-leg-limit 0.10 \
+  --qty 1
+```
+
+Useful overrides:
+
+```bash
+ALPACA_OPTION_FEED=indicative
+ALPACA_OPTION_SNAPSHOT_POLL_SECS=60
+ALPACA_OPTIONS_KILL_SWITCH=false
+ALPACA_OPTIONS_NODE_RUN_SECONDS=300
 ```
 
 ## GapDownFragileRebound paper node

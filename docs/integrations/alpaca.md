@@ -3,13 +3,15 @@
 Alpaca Markets is a brokerage API for US equities, ETFs, and listed equity options. The current
 NautilusTrader Alpaca work is an experimental Rust options runtime with broker connectivity,
 option-chain access, a native Rust data-client hook for option instruments, multi-leg order
-submission, reconciliation, and operator tooling for paper trading.
+submission, reconciliation, operator tooling for paper trading, and a Python `TradingNode` path for
+exact option snapshot data and option multi-leg order lists.
 
 :::warning
 This page documents the current experimental Alpaca options runtime. The standard Python
-`TradingNode` data factory has minimal stock-bar support and the Python execution factory supports
-simple equity/ETF DAY limit orders. Multi-leg option execution remains in the Rust runtime, so
-Alpaca should not be presented as a full Python live adapter alongside the stable integrations.
+`TradingNode` data factory supports stock bars plus exact option snapshot quotes/Greeks, and the
+Python execution factory supports simple equity/ETF DAY limit orders plus option multi-leg order
+lists. Alpaca should not be presented as a full Python live adapter alongside the stable
+integrations until this surface has more production proof.
 :::
 
 ## Examples
@@ -37,9 +39,8 @@ The Rust Alpaca runtime currently includes the following implemented components:
 - Operator binaries for read-only account status, option-chain inspection, dry-run scanning,
   multi-leg payload validation, fleet status, alerts, and performance reports.
 
-The Python package exposes config objects, a minimal stock-bar data client, an equity execution
-client, and strategy scaffolds. The Python execution client is limited to simple equity/ETF orders;
-the Rust runtime remains the supported path for multi-leg option execution.
+The Python package exposes config objects, a stock-bar and exact-option snapshot data client, an
+equity plus option multi-leg execution client, and strategy scaffolds.
 
 ## Alpaca documentation
 
@@ -53,7 +54,7 @@ The current documented product scope is intentionally narrow.
 
 | Product Type      | Supported | Notes                                                                 |
 |-------------------|-----------|-----------------------------------------------------------------------|
-| US equity options | ✓         | Primary runtime target. Supports option contracts, snapshots, exact instrument data-client loading, and option orders. |
+| US equity options | ✓         | Primary runtime target. Supports option contracts, snapshots, exact instrument data-client loading, snapshot quotes/Greeks, and option orders. |
 | US equities/ETFs  | Partial   | Static instruments, stock bars, and simple DAY limit broker orders are available for Python `TradingNode`. |
 | Crypto            | -         | Not part of this adapter/runtime slice.                               |
 
@@ -134,6 +135,8 @@ Scanner and contract-loading commands use unqualified US equity or ETF root symb
 |-------------------------------|-----------|--------------------------------------------------------|
 | Static US equity instruments  | ✓         | Configured symbols on venue `ALPACA`.                  |
 | Stock-bar polling             | ✓         | Externally aggregated stock bars.                      |
+| Exact option instruments       | ✓         | Static OCC option contracts on venue `ALPACA`.         |
+| Option snapshot quotes/Greeks | ✓         | REST snapshot polling, not native streaming.           |
 | Account query                 | ✓         | Trading account status and balances.                   |
 | Position query                | ✓         | Used for startup and periodic reconciliation.          |
 | Order lookup/status reports   | ✓         | By venue order ID or client order ID.                  |
@@ -142,7 +145,7 @@ Scanner and contract-loading commands use unqualified US equity or ETF root symb
 | Shared equity risk gates      | ✓         | Kill switch, notional caps, buying power, duplicate symbol, and short-sale gates. |
 | Rust account env profiles     | ✓         | Python examples can load installed `~/.config/nautilus-trader/alpaca` env files. |
 | Trade update stream           | -         | REST reconciliation only in the Python client.         |
-| Option/multi-leg execution    | -         | Use the Rust options runtime for this surface.          |
+| Option multi-leg execution    | ✓         | Two to four option legs through `SubmitOrderList`.      |
 | Bracket/OCO/stop/trailing     | -         | Not implemented for the Python client.                 |
 
 ## Options engine
@@ -174,16 +177,16 @@ explicit configuration, paper proof, account-level caps, and buying-power gates 
 
 The following gaps should remain explicit until they are implemented and proven:
 
-- The Python `TradingNode` path is intentionally narrow: static equities, stock bars, and
-  whole-share equity/ETF `DAY` limit orders.
+- The Python `TradingNode` path is intentionally narrow: static equities, exact OCC option
+  symbols, stock bars, option snapshot quotes/Greeks, whole-share equity/ETF `DAY` limit orders,
+  and option multi-leg `DAY` limit order lists.
 - Current Python strategy ports are equity/ETF daily-bar strategies:
   `GapDownFragileRebound` and `UpsideGapContinuation`.
 - Python shared risk gates are adapter-level guardrails, not a complete portfolio risk system.
 - Python execution uses REST reconciliation; trade update WebSocket handling remains in the Rust
   runtime.
-- Python option and multi-leg broker execution remains unwired; use the Rust runtime for that
-  surface.
-- Streaming market data is not documented as a public supported client yet.
+- Python option data uses REST snapshot polling; native streaming option market data is not
+  documented as a public supported client yet.
 - Historical market data is not documented as a public supported client yet.
 - Assignment, exercise, and expiry require more first-class lifecycle proof before being advertised
   as complete.

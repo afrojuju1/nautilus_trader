@@ -13,10 +13,11 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Alpaca broker execution client for simple US equity/ETF orders.
+Alpaca broker execution client for US equity/ETF orders and option multi-leg orders.
 """
 
 import asyncio
+import math
 import os
 from datetime import datetime
 from decimal import Decimal
@@ -36,8 +37,10 @@ from nautilus_trader.adapters.alpaca.constants import APCA_API_KEY_ID_ENV
 from nautilus_trader.adapters.alpaca.constants import APCA_API_SECRET_KEY_ENV
 from nautilus_trader.adapters.alpaca.data import APCA_API_KEY_HEADER
 from nautilus_trader.adapters.alpaca.data import APCA_API_SECRET_HEADER
-from nautilus_trader.adapters.alpaca.providers import AlpacaEquityInstrumentProvider
+from nautilus_trader.adapters.alpaca.providers import AlpacaInstrumentProvider
+from nautilus_trader.adapters.alpaca.providers import is_alpaca_option_symbol
 from nautilus_trader.adapters.alpaca.providers import make_alpaca_equity
+from nautilus_trader.adapters.alpaca.providers import make_alpaca_option
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
@@ -108,7 +111,7 @@ _ORDER_STATUS_BY_ALPACA_STATUS = {
 
 class AlpacaExecutionClient(LiveExecutionClient):
     """
-    Provides broker execution for Alpaca simple equity/ETF DAY limit orders.
+    Provides broker execution for Alpaca equity/ETF limits and option multi-leg limits.
     """
 
     def __init__(
@@ -117,7 +120,7 @@ class AlpacaExecutionClient(LiveExecutionClient):
         msgbus: MessageBus,
         cache: Cache,
         clock: LiveClock,
-        instrument_provider: AlpacaEquityInstrumentProvider,
+        instrument_provider: AlpacaInstrumentProvider,
         config: AlpacaExecClientConfig,
         name: str | None = None,
     ) -> None:
@@ -165,6 +168,10 @@ class AlpacaExecutionClient(LiveExecutionClient):
         self._remote_open_order_qty_by_symbol_side: dict[tuple[str, OrderSide], Decimal] = {}
         self._remote_open_order_notional_by_symbol: dict[str, Decimal] = {}
         self._remote_open_client_order_ids: set[ClientOrderId] = set()
+        self._mleg_parent_venue_order_id_by_client_order_id: dict[
+            ClientOrderId,
+            VenueOrderId,
+        ] = {}
         self._poll_task: asyncio.Task | None = None
 
         self._log.info(f"environment={config.environment}", LogColor.BLUE)
@@ -271,14 +278,79 @@ class AlpacaExecutionClient(LiveExecutionClient):
         self._emit_order_snapshot(order, submitted)
 
     async def _submit_order_list(self, command: SubmitOrderList) -> None:
-        for order in command.order_list.orders:
+        orders = list(command.order_list.orders)
+        error = _validate_mleg_order_list(command)
+        if error is not None:
+            self._deny_orders(orders, error)
+            return
+
+        try:
+            await self._sync_remote_risk_state()
+        except Exception as e:
+            self._deny_orders(orders, f"RISK_STATE_UNAVAILABLE: {e}")
+            return
+
+        risk_reason = self._mleg_risk_denial_reason(orders)
+        if risk_reason is not None:
+            self._deny_orders(orders, risk_reason)
+            return
+
+        payload = _mleg_payload_from_order_list(command)
+        for order in orders:
+            self.generate_order_submitted(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                ts_event=self._clock.timestamp_ns(),
+            )
+
+        try:
+            submitted = await self._submit_mleg_payload(payload)
+        except Exception as e:
+            self._reject_orders(orders, f"submit-order-list-rejected: {e}")
+            return
+
+        if not isinstance(submitted, dict):
+            self._reject_orders(orders, "Alpaca returned no order object")
+            return
+
+        self._emit_mleg_order_snapshots(orders, submitted)
+
+    def _deny_orders(self, orders: list[Order], reason: str) -> None:
+        for order in orders:
             self.generate_order_denied(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
                 client_order_id=order.client_order_id,
-                reason="UNSUPPORTED_ORDER_LIST",
+                reason=reason,
                 ts_event=self._clock.timestamp_ns(),
             )
+
+    def _reject_orders(self, orders: list[Order], reason: str) -> None:
+        for order in orders:
+            self.generate_order_rejected(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=reason,
+                ts_event=self._clock.timestamp_ns(),
+            )
+
+    async def _submit_mleg_payload(self, payload: dict[str, Any]) -> Any:
+        submitted = await self._post_json("/v2/orders", payload)
+        parent_venue_order_id = _venue_order_id(submitted) if isinstance(submitted, dict) else None
+        if parent_venue_order_id is None or _nested_order_legs(submitted):
+            return submitted
+
+        try:
+            fetched = await self._get_json(
+                f"/v2/orders/{parent_venue_order_id}",
+                {"nested": "true"},
+            )
+        except Exception as e:
+            self._log.warning(f"Failed to fetch nested Alpaca MLeg order: {e}")
+            return submitted
+        return fetched if isinstance(fetched, dict) else submitted
 
     async def _modify_order(self, command: ModifyOrder) -> None:
         self.generate_order_modify_rejected(
@@ -291,8 +363,12 @@ class AlpacaExecutionClient(LiveExecutionClient):
         )
 
     async def _cancel_order(self, command: CancelOrder) -> None:
-        venue_order_id = command.venue_order_id or self._cache.venue_order_id(
-            command.client_order_id
+        venue_order_id = (
+            self._mleg_parent_venue_order_id_by_client_order_id.get(
+                command.client_order_id,
+            )
+            or command.venue_order_id
+            or self._cache.venue_order_id(command.client_order_id)
         )
         if venue_order_id is None:
             order = await self._order_by_client_order_id(command.client_order_id)
@@ -370,7 +446,7 @@ class AlpacaExecutionClient(LiveExecutionClient):
         if command.venue_order_id is not None:
             order = await self._get_json(f"/v2/orders/{command.venue_order_id}", {"nested": "true"})
         elif command.client_order_id is not None:
-            order = await self._order_by_client_order_id(command.client_order_id)
+            order = await self._order_snapshot_by_client_order_id(command.client_order_id)
         else:
             raise ValueError("Either venue_order_id or client_order_id must be provided")
 
@@ -408,7 +484,17 @@ class AlpacaExecutionClient(LiveExecutionClient):
                 self._config.client_order_id_prefix,
             ):
                 continue
-            reports.append(self._order_status_report(order, command.ts_init))
+            nested_legs = _nested_order_legs(order)
+            if nested_legs:
+                for leg in nested_legs:
+                    reports.append(
+                        self._order_status_report(
+                            _mleg_report_leg_snapshot(order, leg),
+                            command.ts_init,
+                        ),
+                    )
+            else:
+                reports.append(self._order_status_report(order, command.ts_init))
         return reports
 
     async def generate_fill_reports(self, command: GenerateFillReports) -> list[FillReport]:
@@ -492,22 +578,9 @@ class AlpacaExecutionClient(LiveExecutionClient):
         positions = await self._get_json("/v2/positions")
         if not isinstance(positions, list):
             positions = []
-
-        position_qty_by_symbol: dict[str, Decimal] = {}
-        position_notional_by_symbol: dict[str, Decimal] = {}
-        for position in positions:
-            if not isinstance(position, dict):
-                continue
-            symbol = _normalize_symbol(_required_str(position, "symbol"))
-            quantity = _signed_position_qty_from_alpaca(position)
-            avg_entry_price = _decimal_from_optional(position.get("avg_entry_price")) or Decimal(0)
-            position_qty_by_symbol[symbol] = (
-                position_qty_by_symbol.get(symbol, Decimal(0)) + quantity
-            )
-            position_notional_by_symbol[symbol] = position_notional_by_symbol.get(
-                symbol,
-                Decimal(0),
-            ) + abs(quantity * avg_entry_price)
+        position_qty_by_symbol, position_notional_by_symbol = _equity_position_risk_maps(
+            positions,
+        )
 
         open_orders = await self._get_json(
             "/v2/orders",
@@ -519,31 +592,11 @@ class AlpacaExecutionClient(LiveExecutionClient):
         )
         if not isinstance(open_orders, list):
             open_orders = []
-
-        order_qty_by_symbol_side: dict[tuple[str, OrderSide], Decimal] = {}
-        order_notional_by_symbol: dict[str, Decimal] = {}
-        open_client_order_ids: set[ClientOrderId] = set()
-        for open_order in open_orders:
-            if not isinstance(open_order, dict):
-                continue
-            symbol = _normalize_symbol(_required_str(open_order, "symbol"))
-            side = _order_side_from_alpaca(_required_str(open_order, "side"))
-            quantity = _required_decimal(open_order, "qty")
-            price = (
-                _decimal_from_optional(open_order.get("limit_price"))
-                or _decimal_from_optional(open_order.get("stop_price"))
-                or Decimal(0)
-            )
-            order_qty_by_symbol_side[(symbol, side)] = (
-                order_qty_by_symbol_side.get((symbol, side), Decimal(0)) + quantity
-            )
-            order_notional_by_symbol[symbol] = order_notional_by_symbol.get(
-                symbol,
-                Decimal(0),
-            ) + abs(quantity * price)
-            client_order_id = _client_order_id(open_order)
-            if client_order_id is not None:
-                open_client_order_ids.add(client_order_id)
+        (
+            order_qty_by_symbol_side,
+            order_notional_by_symbol,
+            open_client_order_ids,
+        ) = _equity_open_order_risk_maps(open_orders)
 
         self._remote_position_qty_by_symbol = position_qty_by_symbol
         self._remote_position_notional_by_symbol = position_notional_by_symbol
@@ -554,7 +607,7 @@ class AlpacaExecutionClient(LiveExecutionClient):
 
     async def _sync_open_cached_orders(self) -> None:
         for order in self._cache.orders_open(venue=ALPACA_VENUE, account_id=self.account_id):
-            remote = await self._order_by_client_order_id(order.client_order_id)
+            remote = await self._order_snapshot_for_cached_order(order)
             if remote is None:
                 continue
             self._emit_order_snapshot(order, remote)
@@ -583,6 +636,57 @@ class AlpacaExecutionClient(LiveExecutionClient):
             ),
             available_buying_power=self._last_buying_power,
         )
+
+    def _mleg_risk_denial_reason(self, orders: list[Order]) -> str | None:
+        if self._config.risk_kill_switch:
+            return "RISK_KILL_SWITCH"
+
+        duplicate_ids = [
+            str(order.client_order_id)
+            for order in orders
+            if order.client_order_id in self._remote_open_client_order_ids
+        ]
+        if duplicate_ids:
+            return f"RISK_DUPLICATE_CLIENT_ORDER_ID: {','.join(duplicate_ids)}"
+        return None
+
+    async def _order_snapshot_for_cached_order(self, order: Order) -> dict[str, Any] | None:
+        remote = await self._order_by_client_order_id(order.client_order_id)
+        if remote is not None:
+            return remote
+
+        parent_venue_order_id = self._mleg_parent_venue_order_id_by_client_order_id.get(
+            order.client_order_id,
+        )
+        if parent_venue_order_id is None:
+            return None
+
+        parent = await self._get_json(f"/v2/orders/{parent_venue_order_id}", {"nested": "true"})
+        if not isinstance(parent, dict):
+            return None
+        return _mleg_leg_snapshot_for_order(order, parent)
+
+    async def _order_snapshot_by_client_order_id(
+        self,
+        client_order_id: ClientOrderId,
+    ) -> dict[str, Any] | None:
+        remote = await self._order_by_client_order_id(client_order_id)
+        if remote is not None:
+            return remote
+
+        parent_venue_order_id = self._mleg_parent_venue_order_id_by_client_order_id.get(
+            client_order_id,
+        )
+        if parent_venue_order_id is None:
+            return None
+
+        parent = await self._get_json(f"/v2/orders/{parent_venue_order_id}", {"nested": "true"})
+        if not isinstance(parent, dict):
+            return None
+        for order in self._cache.orders_open(venue=ALPACA_VENUE, account_id=self.account_id):
+            if order.client_order_id == client_order_id:
+                return _mleg_leg_snapshot_for_order(order, parent)
+        return None
 
     def _current_total_notional(
         self,
@@ -735,6 +839,17 @@ class AlpacaExecutionClient(LiveExecutionClient):
             )
             self._terminal_venue_order_ids.add(venue_order_id)
 
+    def _emit_mleg_order_snapshots(self, orders: list[Order], parent: dict[str, Any]) -> None:
+        parent_venue_order_id = _venue_order_id(parent)
+        if parent_venue_order_id is not None:
+            for order in orders:
+                self._mleg_parent_venue_order_id_by_client_order_id[order.client_order_id] = (
+                    parent_venue_order_id
+                )
+
+        for order in orders:
+            self._emit_order_snapshot(order, _mleg_leg_snapshot_for_order(order, parent))
+
     def _emit_fill_delta(
         self,
         order: Order,
@@ -855,6 +970,8 @@ class AlpacaExecutionClient(LiveExecutionClient):
         )
         if instrument is not None:
             return instrument
+        if is_alpaca_option_symbol(symbol):
+            return make_alpaca_option(symbol, ts_init=self._clock.timestamp_ns())
         return make_alpaca_equity(symbol, ts_init=self._clock.timestamp_ns())
 
     async def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
@@ -900,6 +1017,8 @@ class AlpacaExecutionClient(LiveExecutionClient):
 def _validate_equity_limit_order(order: Order) -> str | None:
     if order.instrument_id.venue != ALPACA_VENUE:
         return f"UNSUPPORTED_VENUE: {order.instrument_id.venue}"
+    if is_alpaca_option_symbol(order.instrument_id.symbol.value):
+        return "UNSUPPORTED_SINGLE_OPTION_ORDER"
     if order.order_type != OrderType.LIMIT:
         return f"UNSUPPORTED_ORDER_TYPE: {order.order_type.name}"
     if order.time_in_force != TimeInForce.DAY:
@@ -1042,6 +1161,284 @@ def _equity_limit_payload_from_order(order: Order) -> dict[str, str]:
         "limit_price": str(order.price),
         "client_order_id": str(order.client_order_id),
     }
+
+
+def _validate_mleg_order_list(command: SubmitOrderList) -> str | None:
+    orders = list(command.order_list.orders)
+    if len(orders) < 2:
+        return "MLEG_REQUIRES_AT_LEAST_TWO_LEGS"
+    if len(orders) > 4:
+        return "MLEG_SUPPORTS_AT_MOST_FOUR_LEGS"
+
+    all_reduce_only = all(order.is_reduce_only for order in orders)
+    any_reduce_only = any(order.is_reduce_only for order in orders)
+    if any_reduce_only and not all_reduce_only:
+        return "MLEG_MIXED_OPEN_CLOSE_LEGS"
+
+    for order in orders:
+        error = _validate_mleg_leg_order(order)
+        if error is not None:
+            return error
+    return None
+
+
+def _validate_mleg_leg_order(order: Order) -> str | None:
+    if order.instrument_id.venue != ALPACA_VENUE:
+        return f"UNSUPPORTED_VENUE: {order.instrument_id.venue}"
+    if not is_alpaca_option_symbol(order.instrument_id.symbol.value):
+        return f"MLEG_LEG_REQUIRES_OPTION_SYMBOL: {order.instrument_id.symbol.value}"
+    if order.order_type != OrderType.LIMIT:
+        return f"UNSUPPORTED_ORDER_TYPE: {order.order_type.name}"
+    if order.time_in_force != TimeInForce.DAY:
+        return f"UNSUPPORTED_TIME_IN_FORCE: {order.time_in_force.name}"
+    if order.side not in (OrderSide.BUY, OrderSide.SELL):
+        return f"UNSUPPORTED_ORDER_SIDE: {order.side.name}"
+    if order.is_quote_quantity:
+        return "UNSUPPORTED_QUOTE_QUANTITY"
+    quantity = _order_qty(order)
+    if quantity <= 0 or quantity != quantity.to_integral_value():
+        return "MLEG_QUANTITY_MUST_BE_POSITIVE_INTEGER_CONTRACTS"
+    if order.price is None or Decimal(str(order.price)) <= 0:
+        return "INVALID_LIMIT_PRICE"
+    return None
+
+
+def _mleg_payload_from_order_list(command: SubmitOrderList) -> dict[str, Any]:
+    error = _validate_mleg_order_list(command)
+    if error is not None:
+        raise ValueError(error)
+
+    orders = list(command.order_list.orders)
+    quantities = [int(_order_qty(order)) for order in orders]
+    strategy_qty = math.gcd(*quantities)
+    if strategy_qty <= 0:
+        raise ValueError("MLEG_STRATEGY_QUANTITY_MUST_BE_POSITIVE")
+
+    trade_intent = "close" if all(order.is_reduce_only for order in orders) else "open"
+    net_credit = Decimal(0)
+    legs: list[dict[str, str]] = []
+    for order, leg_qty in zip(orders, quantities, strict=True):
+        ratio_qty = leg_qty // strategy_qty
+        price = Decimal(str(order.price))
+        net_credit += (price if order.side == OrderSide.SELL else -price) * Decimal(ratio_qty)
+        position_intent = _alpaca_position_intent(order.side, order.is_reduce_only)
+        legs.append(
+            {
+                "symbol": order.instrument_id.symbol.value,
+                "ratio_qty": str(ratio_qty),
+                "side": _alpaca_order_side(order.side),
+                "position_intent": position_intent,
+            },
+        )
+
+    if net_credit == 0:
+        raise ValueError("MLEG_SIGNED_NET_LIMIT_PRICE_MUST_BE_NON_ZERO")
+
+    if trade_intent == "open":
+        premium_kind = "credit" if net_credit > 0 else "debit"
+    else:
+        premium_kind = "credit" if net_credit < 0 else "debit"
+    signed_limit_price = _signed_net_limit_price(abs(net_credit), premium_kind, trade_intent)
+    return {
+        "order_class": "mleg",
+        "client_order_id": str(command.order_list.id),
+        "qty": str(strategy_qty),
+        "type": "limit",
+        "limit_price": _format_price_decimal(signed_limit_price),
+        "time_in_force": "day",
+        "legs": legs,
+    }
+
+
+def _alpaca_position_intent(side: OrderSide, reduce_only: bool) -> str:
+    if side == OrderSide.BUY and not reduce_only:
+        return "buy_to_open"
+    if side == OrderSide.SELL and not reduce_only:
+        return "sell_to_open"
+    if side == OrderSide.BUY and reduce_only:
+        return "buy_to_close"
+    if side == OrderSide.SELL and reduce_only:
+        return "sell_to_close"
+    raise ValueError(f"Unsupported Alpaca order side {side}")
+
+
+def _alpaca_order_side(side: OrderSide) -> str:
+    if side == OrderSide.BUY:
+        return "buy"
+    if side == OrderSide.SELL:
+        return "sell"
+    raise ValueError(f"Unsupported Alpaca order side {side}")
+
+
+def _signed_net_limit_price(
+    limit_price: Decimal,
+    premium_kind: str,
+    trade_intent: str,
+) -> Decimal:
+    normalized_limit = abs(limit_price)
+    if (premium_kind, trade_intent) in (("credit", "open"), ("debit", "close")):
+        return -normalized_limit
+    return normalized_limit
+
+
+def _format_price_decimal(value: Decimal) -> str:
+    return str(value.quantize(Decimal("0.01")))
+
+
+def _mleg_leg_snapshot_for_order(order: Order, parent: dict[str, Any]) -> dict[str, Any]:
+    leg = _matching_mleg_leg(order, _nested_order_legs(parent))
+    snapshot = _mleg_report_leg_snapshot(parent, leg or {})
+    parent_id = str(parent.get("id") or "UNKNOWN")
+    snapshot["id"] = str(snapshot.get("id") or f"{parent_id}:{order.client_order_id}")
+    snapshot["symbol"] = order.instrument_id.symbol.value
+    snapshot["qty"] = str(order.quantity)
+    snapshot["side"] = _alpaca_order_side(order.side)
+    snapshot["type"] = "limit"
+    snapshot["time_in_force"] = "day"
+    snapshot["limit_price"] = str(order.price)
+    snapshot["client_order_id"] = str(order.client_order_id)
+    snapshot.setdefault("filled_qty", "0")
+    return snapshot
+
+
+def _mleg_report_leg_snapshot(parent: dict[str, Any], leg: dict[str, Any]) -> dict[str, Any]:
+    snapshot = {
+        key: parent[key]
+        for key in (
+            "status",
+            "type",
+            "time_in_force",
+            "created_at",
+            "updated_at",
+            "submitted_at",
+            "canceled_at",
+            "expired_at",
+            "filled_at",
+        )
+        if key in parent
+    }
+    snapshot.update({key: value for key, value in leg.items() if value is not None})
+    parent_id = parent.get("id")
+    if not snapshot.get("id") and parent_id and snapshot.get("symbol"):
+        snapshot["id"] = f"{parent_id}:{snapshot['symbol']}:{snapshot.get('side', '')}"
+    snapshot.setdefault("type", "limit")
+    snapshot.setdefault("time_in_force", "day")
+    snapshot.setdefault("filled_qty", "0")
+    return snapshot
+
+
+def _nested_order_legs(data: dict[str, Any]) -> list[dict[str, Any]]:
+    legs = data.get("legs")
+    if not isinstance(legs, list):
+        return []
+    return [leg for leg in legs if isinstance(leg, dict)]
+
+
+def _matching_mleg_leg(order: Order, legs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for leg in legs:
+        if _mleg_leg_matches_order(order, leg):
+            return leg
+    return None
+
+
+def _mleg_leg_matches_order(order: Order, leg: dict[str, Any]) -> bool:
+    symbol = leg.get("symbol")
+    if symbol is None:
+        return False
+    if _normalize_symbol(str(symbol)) != _normalize_symbol(
+        order.instrument_id.symbol.value,
+    ):
+        return False
+    side = leg.get("side")
+    if side is not None and _order_side_from_alpaca(str(side)) != order.side:
+        return False
+    position_intent = leg.get("position_intent")
+    if position_intent is not None and str(position_intent).lower() != _alpaca_position_intent(
+        order.side,
+        order.is_reduce_only,
+    ):
+        return False
+    return symbol is not None or side is not None or position_intent is not None
+
+
+def _equity_open_order_rows(open_order: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = _nested_order_legs(open_order) or [open_order]
+    equity_rows: list[dict[str, Any]] = []
+    for row in rows:
+        symbol = row.get("symbol")
+        if not symbol:
+            continue
+        if is_alpaca_option_symbol(str(symbol)):
+            continue
+        equity_rows.append(row)
+    return equity_rows
+
+
+def _equity_position_risk_maps(
+    positions: list[Any],
+) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
+    qty_by_symbol: dict[str, Decimal] = {}
+    notional_by_symbol: dict[str, Decimal] = {}
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+        symbol = _normalize_symbol(_required_str(position, "symbol"))
+        if is_alpaca_option_symbol(symbol):
+            continue
+        quantity = _signed_position_qty_from_alpaca(position)
+        avg_entry_price = _decimal_from_optional(position.get("avg_entry_price")) or Decimal(0)
+        qty_by_symbol[symbol] = qty_by_symbol.get(symbol, Decimal(0)) + quantity
+        notional_by_symbol[symbol] = notional_by_symbol.get(symbol, Decimal(0)) + abs(
+            quantity * avg_entry_price,
+        )
+    return qty_by_symbol, notional_by_symbol
+
+
+def _equity_open_order_risk_maps(
+    open_orders: list[Any],
+) -> tuple[dict[tuple[str, OrderSide], Decimal], dict[str, Decimal], set[ClientOrderId]]:
+    qty_by_symbol_side: dict[tuple[str, OrderSide], Decimal] = {}
+    notional_by_symbol: dict[str, Decimal] = {}
+    client_order_ids: set[ClientOrderId] = set()
+    for open_order in open_orders:
+        if not isinstance(open_order, dict):
+            continue
+        client_order_id = _client_order_id(open_order)
+        if client_order_id is not None:
+            client_order_ids.add(client_order_id)
+        for order_row in _equity_open_order_rows(open_order):
+            _accumulate_equity_open_order_risk(
+                order_row,
+                qty_by_symbol_side,
+                notional_by_symbol,
+                client_order_ids,
+            )
+    return qty_by_symbol_side, notional_by_symbol, client_order_ids
+
+
+def _accumulate_equity_open_order_risk(
+    order_row: dict[str, Any],
+    qty_by_symbol_side: dict[tuple[str, OrderSide], Decimal],
+    notional_by_symbol: dict[str, Decimal],
+    client_order_ids: set[ClientOrderId],
+) -> None:
+    symbol = _normalize_symbol(_required_str(order_row, "symbol"))
+    side = _order_side_from_alpaca(_required_str(order_row, "side"))
+    quantity = _required_decimal(order_row, "qty")
+    price = (
+        _decimal_from_optional(order_row.get("limit_price"))
+        or _decimal_from_optional(order_row.get("stop_price"))
+        or Decimal(0)
+    )
+    qty_by_symbol_side[(symbol, side)] = (
+        qty_by_symbol_side.get((symbol, side), Decimal(0)) + quantity
+    )
+    notional_by_symbol[symbol] = notional_by_symbol.get(symbol, Decimal(0)) + abs(
+        quantity * price,
+    )
+    client_order_id = _client_order_id(order_row)
+    if client_order_id is not None:
+        client_order_ids.add(client_order_id)
 
 
 def _order_qty(order: Order) -> Decimal:
