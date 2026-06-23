@@ -14,6 +14,8 @@ use nautilus_alpaca::{
     },
     options_entry_strategy::{AlpacaOptionsEntryStrategy, AlpacaOptionsEntryStrategyConfig},
     options_runtime::OptionsEngineConfig,
+    state_persistence::{StrategyStatePersistenceHandle, start_runtime_lease_heartbeat},
+    storage::{RuntimeLeaseRequest, STATE_PERSISTENCE_MIGRATION_VERSION, acquire_runtime_lease},
 };
 use nautilus_common::enums::Environment;
 use nautilus_live::node::LiveNode;
@@ -23,10 +25,12 @@ use nautilus_model::{
     types::Price,
 };
 use nautilus_trading::strategy::StrategyConfig;
+use uuid::Uuid;
 
 const DEFAULT_SNAPSHOT_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_STRIKES_ABOVE: usize = 10;
 const DEFAULT_STRIKES_BELOW: usize = 10;
+const DEFAULT_RUNTIME_LEASE_TTL_SECS: u64 = 300;
 
 #[derive(Debug)]
 struct Args {
@@ -50,6 +54,14 @@ async fn main() -> anyhow::Result<()> {
 
     let runtime_config = OptionsEngineConfig::from_runtime_env()?;
     let args = Args::from_env(&runtime_config)?;
+    let live_submit_requested = runtime_config.submit_enabled && args.entry_submit_enabled;
+    let runtime_config = if live_submit_requested {
+        OptionsEngineConfig::from_runtime_env_with_storage()
+            .await
+            .context("live submit requires Alpaca Postgres storage readiness")?
+    } else {
+        runtime_config
+    };
     let series_id = OptionSeriesId::from_expiry(
         ALPACA_VENUE,
         &args.underlying,
@@ -71,15 +83,25 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to load Alpaca options strategy state")?;
     let strategy_state_entry_count = strategy_state.entries.len();
+    let state_persistence = if live_submit_requested {
+        Some(
+            prepare_state_persistence(&runtime_config, &args)
+                .await
+                .context("failed to prepare Alpaca state persistence readiness")?,
+        )
+    } else {
+        None
+    };
 
     log::info!(
-        "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategies={:?} runtime_submit_enabled={} node_entry_submit_enabled={} strategy_state_entries={}",
+        "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategies={:?} runtime_submit_enabled={} node_entry_submit_enabled={} storage_required={} strategy_state_entries={}",
         series_id,
         args.snapshot_interval_ms,
         args.max_runtime_secs,
         runtime_config.enabled_strategy_names(),
         runtime_config.submit_enabled,
         args.entry_submit_enabled,
+        live_submit_requested,
         strategy_state_entry_count,
     );
 
@@ -123,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
     entry_config.admission.submit_enabled =
         entry_config.admission.submit_enabled && args.entry_submit_enabled;
     entry_config.initial_state = strategy_state;
+    entry_config.state_persistence = state_persistence;
     let strategy = AlpacaOptionsEntryStrategy::new(entry_config);
     node.add_strategy(strategy)?;
 
@@ -137,6 +160,73 @@ async fn main() -> anyhow::Result<()> {
 
     node.run().await?;
     Ok(())
+}
+
+async fn prepare_state_persistence(
+    config: &OptionsEngineConfig,
+    args: &Args,
+) -> anyhow::Result<StrategyStatePersistenceHandle> {
+    let storage = config
+        .storage_repository
+        .as_ref()
+        .context("ALPACA_STORAGE_DATABASE_URL is required when live entry submit is enabled")?
+        .clone();
+    let migration_status = storage.migration_status().await?;
+    if let Some(dirty_version) = migration_status.dirty_version {
+        bail!("Alpaca storage migration is dirty at version {dirty_version}");
+    }
+    let latest_version = migration_status.latest_version.unwrap_or_default();
+    if latest_version < STATE_PERSISTENCE_MIGRATION_VERSION {
+        bail!(
+            "Alpaca storage migration {STATE_PERSISTENCE_MIGRATION_VERSION} is required; latest applied version is {latest_version}"
+        );
+    }
+
+    let account_id = config.storage_account_id().to_string();
+    let run_id = Uuid::new_v4();
+    let holder_id = format!("{}:{}", args.node_name, std::process::id());
+    let service_name = env::var("NAUTILUS_ALPACA_SERVICE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| args.node_name.clone());
+    let ttl = Duration::from_secs(
+        optional_u64_env(
+            "ALPACA_RUNTIME_LEASE_TTL_SECS",
+            Some(DEFAULT_RUNTIME_LEASE_TTL_SECS),
+        )?
+        .unwrap_or(DEFAULT_RUNTIME_LEASE_TTL_SECS),
+    );
+    let lease = acquire_runtime_lease(
+        &storage,
+        &account_id,
+        &RuntimeLeaseRequest {
+            holder_id: holder_id.clone(),
+            run_id,
+            service_name: Some(service_name),
+            mode: "live_submit".to_string(),
+            ttl,
+        },
+    )
+    .await?;
+    if !lease.acquired {
+        bail!(
+            "Alpaca runtime lease for account {} is held by {} until {}",
+            account_id,
+            lease.holder_id,
+            lease.expires_at
+        );
+    }
+    log::info!(
+        "Acquired Alpaca runtime lease: account_id={} holder_id={} run_id={} expires_at={}",
+        account_id,
+        holder_id,
+        lease.run_id,
+        lease.expires_at
+    );
+    start_runtime_lease_heartbeat(storage.clone(), account_id.clone(), run_id, ttl);
+    Ok(StrategyStatePersistenceHandle::spawn(
+        storage, account_id, holder_id, run_id,
+    ))
 }
 
 impl Args {

@@ -5,9 +5,13 @@ pub const STORAGE_SCHEMA_DEFAULT: &str = "alpaca";
 
 #[cfg(feature = "live")]
 pub const STORAGE_ACCOUNT_ID_DEFAULT: &str = "default";
+#[cfg(feature = "live")]
+pub const STATE_PERSISTENCE_MIGRATION_VERSION: i64 = 202606230002;
 
 #[cfg(feature = "live")]
 pub mod candidate_ledger;
+#[cfg(feature = "live")]
+pub mod lease;
 #[cfg(feature = "live")]
 pub mod market_cache;
 #[cfg(feature = "live")]
@@ -27,6 +31,11 @@ pub use candidate_ledger::append_candidate_ledger_record;
 pub use candidate_ledger::{
     CandidateLedgerSummaryFilters, read_candidate_ledger_records, summarize_candidate_ledger,
     summarize_candidate_ledger_records,
+};
+
+#[cfg(feature = "live")]
+pub use lease::{
+    RuntimeLeaseRequest, RuntimeLeaseStatus, acquire_runtime_lease, heartbeat_runtime_lease,
 };
 
 #[cfg(feature = "live")]

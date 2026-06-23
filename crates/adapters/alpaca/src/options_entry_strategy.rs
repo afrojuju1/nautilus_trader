@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use nautilus_common::{actor::DataActor, cache::CacheApi, factories::OrderFactory};
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
@@ -24,6 +24,7 @@ use nautilus_trading::{
     nautilus_strategy,
     strategy::{OrderApi, Strategy, StrategyConfig, StrategyCore},
 };
+use uuid::Uuid;
 
 use crate::{
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
@@ -37,7 +38,9 @@ use crate::{
         OptionsEngineConfig, OptionsOpportunitySet, OptionsScanOutcome, OptionsScanReport,
         SelectedOptionsEntry,
     },
-    runtime::StrategyState,
+    runtime::{StrategyState, StrategyStateEntryDraft},
+    state_persistence::StrategyStatePersistenceHandle,
+    storage::StrategyStateMutation,
 };
 
 /// Custom data type published by option-chain scanner actors for entry strategies.
@@ -152,6 +155,8 @@ pub struct AlpacaOptionsEntryStrategyConfig {
     pub admission: EntryAdmissionConfig,
     /// Initial persisted strategy state loaded before the node starts.
     pub initial_state: StrategyState,
+    /// Async state persistence boundary used when live submit is enabled.
+    pub state_persistence: Option<StrategyStatePersistenceHandle>,
 }
 
 impl AlpacaOptionsEntryStrategyConfig {
@@ -164,6 +169,7 @@ impl AlpacaOptionsEntryStrategyConfig {
             client_id: Some(ClientId::from(ALPACA_CLIENT_ID)),
             admission: EntryAdmissionConfig::default(),
             initial_state: StrategyState::default(),
+            state_persistence: None,
         }
     }
 
@@ -176,6 +182,7 @@ impl AlpacaOptionsEntryStrategyConfig {
             client_id: Some(ClientId::from(ALPACA_CLIENT_ID)),
             admission: EntryAdmissionConfig::from_engine_config(engine),
             initial_state: StrategyState::default(),
+            state_persistence: None,
         }
     }
 }
@@ -274,6 +281,16 @@ impl AlpacaOptionsEntryStrategy {
                 entry.strategy_name(),
                 entry.option_symbols().join(","),
                 entry.score()
+            );
+            return Ok(None);
+        }
+
+        if self.config.admission.submit_enabled && !self.state_persistence_ready() {
+            log::error!(
+                "Skipping Alpaca options entry: reason=state_persistence_unhealthy underlying={} strategy={} symbols={}",
+                entry.underlying(),
+                entry.strategy_name(),
+                entry.option_symbols().join(",")
             );
             return Ok(None);
         }
@@ -478,7 +495,9 @@ impl AlpacaOptionsEntryStrategy {
                 event.client_order_id,
                 event.venue_order_id
             );
+            let mutation = accepted_state_mutation(&event, &order_list_id, &draft);
             self.state.record_entry_submission(draft);
+            self.persist_strategy_state_mutation(mutation);
         }
 
         if should_remove {
@@ -486,7 +505,14 @@ impl AlpacaOptionsEntryStrategy {
         }
     }
 
-    fn handle_order_rejected(&mut self, client_order_id: ClientOrderId, reason: &str) {
+    fn handle_order_rejected(
+        &mut self,
+        client_order_id: ClientOrderId,
+        reason: &str,
+        event_id: UUID4,
+        ts_event: UnixNanos,
+        event_type: &'static str,
+    ) {
         let client_order_id = client_order_id.to_string();
         let Some(order_list_id) = self.pending_client_order_ids.get(&client_order_id).cloned()
         else {
@@ -529,11 +555,22 @@ impl AlpacaOptionsEntryStrategy {
                 client_order_id,
                 close_reason
             );
+            let mutation = rejected_state_mutation(
+                event_id,
+                ts_event,
+                event_type,
+                &order_list_id,
+                &client_order_id,
+                reason,
+                &draft,
+                &close_reason,
+            );
             self.state.record_entry_submission(draft);
             if let Some(entry) = self.state.entries.last_mut() {
                 entry.mark_canceled();
                 entry.close_reason = Some(close_reason);
             }
+            self.persist_strategy_state_mutation(mutation);
         }
 
         if should_remove {
@@ -623,6 +660,32 @@ impl AlpacaOptionsEntryStrategy {
             entry.option_symbols().join(",")
         );
     }
+
+    fn state_persistence_ready(&self) -> bool {
+        self.config
+            .state_persistence
+            .as_ref()
+            .is_some_and(StrategyStatePersistenceHandle::is_healthy)
+    }
+
+    fn persist_strategy_state_mutation(&self, mutation: anyhow::Result<StrategyStateMutation>) {
+        let Some(persistence) = &self.config.state_persistence else {
+            if self.config.admission.submit_enabled {
+                log::error!("Alpaca strategy-state persistence is not configured");
+            }
+            return;
+        };
+        let mutation = match mutation {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                log::error!("Failed to build Alpaca strategy-state mutation: {error:#}");
+                return;
+            }
+        };
+        if let Err(error) = persistence.persist(mutation, self.state.clone()) {
+            log::error!("Failed to enqueue Alpaca strategy-state mutation: {error:#}");
+        }
+    }
 }
 
 nautilus_strategy!(AlpacaOptionsEntryStrategy, {
@@ -631,11 +694,23 @@ nautilus_strategy!(AlpacaOptionsEntryStrategy, {
     }
 
     fn on_order_rejected(&mut self, event: OrderRejected) {
-        self.handle_order_rejected(event.client_order_id, event.reason.as_str());
+        self.handle_order_rejected(
+            event.client_order_id,
+            event.reason.as_str(),
+            event.event_id,
+            event.ts_event,
+            "entry_rejected",
+        );
     }
 
     fn on_order_denied(&mut self, event: OrderDenied) {
-        self.handle_order_rejected(event.client_order_id, event.reason.as_str());
+        self.handle_order_rejected(
+            event.client_order_id,
+            event.reason.as_str(),
+            event.event_id,
+            event.ts_event,
+            "entry_denied",
+        );
     }
 });
 
@@ -917,6 +992,91 @@ fn instrument_underlying_matches(
                 .as_str()
                 .eq_ignore_ascii_case(underlying)
         })
+}
+
+fn accepted_state_mutation(
+    event: &OrderAccepted,
+    order_list_id: &str,
+    draft: &StrategyStateEntryDraft,
+) -> anyhow::Result<StrategyStateMutation> {
+    let mut mutation = StrategyStateMutation::new(
+        uuid_from_nautilus(event.event_id)?,
+        "entry_accepted",
+        serde_json::json!({
+            "order_list_id": order_list_id,
+            "client_order_id": event.client_order_id.to_string(),
+            "venue_order_id": event.venue_order_id.to_string(),
+            "instrument_id": event.instrument_id.to_string(),
+            "account_id": event.account_id.to_string(),
+            "reconciliation": event.reconciliation,
+            "entry": state_entry_draft_payload(draft),
+        }),
+    );
+    mutation.strategy = Some(draft.strategy.clone());
+    mutation.underlying = Some(draft.underlying.clone());
+    mutation.trade_date = parse_trade_date(&draft.trade_date);
+    mutation.order_list_id = Some(order_list_id.to_string());
+    mutation.client_order_id = Some(event.client_order_id.to_string());
+    mutation.venue_order_id = Some(event.venue_order_id.to_string());
+    mutation.ts_event = Some(event.ts_event.to_datetime_utc());
+    Ok(mutation)
+}
+
+#[expect(clippy::too_many_arguments)]
+fn rejected_state_mutation(
+    event_id: UUID4,
+    ts_event: UnixNanos,
+    event_type: &str,
+    order_list_id: &str,
+    client_order_id: &str,
+    reason: &str,
+    draft: &StrategyStateEntryDraft,
+    close_reason: &str,
+) -> anyhow::Result<StrategyStateMutation> {
+    let mut mutation = StrategyStateMutation::new(
+        uuid_from_nautilus(event_id)?,
+        event_type,
+        serde_json::json!({
+            "order_list_id": order_list_id,
+            "client_order_id": client_order_id,
+            "reason": reason,
+            "close_reason": close_reason,
+            "entry": state_entry_draft_payload(draft),
+        }),
+    );
+    mutation.strategy = Some(draft.strategy.clone());
+    mutation.underlying = Some(draft.underlying.clone());
+    mutation.trade_date = parse_trade_date(&draft.trade_date);
+    mutation.order_list_id = Some(order_list_id.to_string());
+    mutation.client_order_id = Some(client_order_id.to_string());
+    mutation.ts_event = Some(ts_event.to_datetime_utc());
+    Ok(mutation)
+}
+
+fn uuid_from_nautilus(event_id: UUID4) -> anyhow::Result<Uuid> {
+    Ok(Uuid::parse_str(event_id.as_str())?)
+}
+
+fn parse_trade_date(value: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()
+}
+
+fn state_entry_draft_payload(draft: &StrategyStateEntryDraft) -> serde_json::Value {
+    serde_json::json!({
+        "trade_date": draft.trade_date,
+        "underlying": draft.underlying,
+        "strategy": draft.strategy,
+        "order_list_id": draft.order_list_id,
+        "short_symbol": draft.short_symbol,
+        "long_symbol": draft.long_symbol,
+        "short_call_symbol": draft.short_call_symbol,
+        "long_call_symbol": draft.long_call_symbol,
+        "quantity": draft.quantity,
+        "credit": draft.credit,
+        "debit": draft.debit,
+        "score": draft.score,
+        "parent_order_id": draft.parent_order_id,
+    })
 }
 
 fn scan_report_payload(report: &OptionsScanReport) -> serde_json::Value {

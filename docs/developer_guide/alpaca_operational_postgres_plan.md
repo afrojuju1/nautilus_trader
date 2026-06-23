@@ -339,20 +339,21 @@ version, load existing state rows, and persist one synthetic state event idempot
 
 ### Phase 2: Strategy-State Persistence Sink
 
-- Add a focused async sink for Alpaca strategy-state mutations.
-- Strategy callbacks keep updating memory immediately and enqueue mutations.
-- Sink serializes writes per account.
-- Sink exposes health to the live node and operator logs.
+- The live entry strategy has a focused async handle for Alpaca strategy-state mutations.
+- Accepted and terminal rejected order callbacks update memory immediately and enqueue mutations.
+- The handle serializes writes per account.
+- Sink failures mark the handle unhealthy and emit operator logs.
 
 Done when accepted/rejected strategy order events persist an event row and updated snapshot without
 blocking synchronous strategy callbacks.
 
 ### Phase 3: Submit Readiness Gate
 
-- Add storage readiness checks to the live node.
-- Require storage-backed state and healthy sink when `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED=true`.
-- Acquire or validate the runtime lease before live submission.
-- Emit a clear reason when submit remains disabled.
+- The option-chain live node checks storage readiness when live entry submit is requested.
+- Storage-backed state and a healthy persistence handle are required when
+  `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED=true` and runtime submit is enabled.
+- The node acquires a Postgres runtime lease before live submission and heartbeats it while running.
+- Strategy admission refuses live entries when persistence is missing or unhealthy.
 
 Done when paper submit cannot be enabled with missing storage, stale migrations, failed lease, or
 unhealthy sink.
