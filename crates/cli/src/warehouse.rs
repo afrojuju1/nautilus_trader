@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use nautilus_persistence::warehouse::clickhouse::{
-    ClickHouseConnectOptions, DEFAULT_MIGRATIONS_DIR, QuoteTickCatalogBackfill,
-    backfill_quote_ticks_from_catalog, check_health, run_migrations, run_quote_tick_smoke,
+    ClickHouseConnectOptions, DEFAULT_MIGRATIONS_DIR, MarketDataReadSource,
+    QuoteTickCatalogBackfill, QuoteTickReadRequest, backfill_quote_ticks_from_catalog,
+    check_health, run_migrations, run_quote_tick_smoke, validate_quote_ticks,
 };
 
 use crate::opt::{ClickHouseConfig, WarehouseCommand, WarehouseOpt};
@@ -78,6 +79,37 @@ pub(crate) async fn run_warehouse_command(opt: WarehouseOpt) -> anyhow::Result<(
                 report.catalog_rows,
                 report.written_rows,
                 report.warehouse_rows,
+                report.source,
+                report.catalog_uri
+            );
+            if !report.instrument_ids.is_empty() {
+                println!("instruments={}", report.instrument_ids.join(","));
+            }
+        }
+        WarehouseCommand::ValidateQuotes(config) => {
+            let connect_options = connect_options_from_config(&config.clickhouse);
+            let read_source = match config.read_source.as_deref() {
+                Some(value) => value.parse::<MarketDataReadSource>()?,
+                None => MarketDataReadSource::from_env()?,
+            };
+            let request = QuoteTickReadRequest::from_unix_nanos(
+                config.catalog_uri,
+                config.instrument_ids,
+                config.start_ns,
+                config.end_ns,
+                config.source,
+                read_source,
+            )?;
+            let report = validate_quote_ticks(&connect_options, &request).await?;
+            println!(
+                "ClickHouse QuoteTick validation complete: read_source={} catalog_rows={} clickhouse_rows={} selected_rows={} first_ts_init={:?} last_ts_init={:?} checksum={} source={} catalog_uri={}",
+                report.read_source,
+                report.catalog.rows,
+                report.clickhouse.rows,
+                report.selected.rows,
+                report.catalog.first_ts_init,
+                report.catalog.last_ts_init,
+                report.catalog.checksum,
                 report.source,
                 report.catalog_uri
             );

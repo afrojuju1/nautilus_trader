@@ -115,6 +115,8 @@ pub enum WarehouseCommand {
     QuoteSmoke(ClickHouseSmokeConfig),
     /// Backfills QuoteTick data from a Nautilus catalog into ClickHouse.
     BackfillQuotes(ClickHouseBackfillQuotesConfig),
+    /// Validates catalog QuoteTick data against ClickHouse rows.
+    ValidateQuotes(ClickHouseValidateQuotesConfig),
 }
 
 /// Configuration parameters for the warehouse QuoteTick smoke command.
@@ -150,6 +152,31 @@ pub struct ClickHouseBackfillQuotesConfig {
     /// Rows per ClickHouse insert batch.
     #[arg(long, default_value_t = 5000)]
     pub batch_size: usize,
+}
+
+/// Configuration parameters for catalog versus ClickHouse QuoteTick validation.
+#[derive(Parser, Debug, Clone)]
+pub struct ClickHouseValidateQuotesConfig {
+    #[clap(flatten)]
+    pub clickhouse: ClickHouseConfig,
+    /// Nautilus catalog path or URI to validate against.
+    #[arg(long)]
+    pub catalog_uri: String,
+    /// Instrument ID to validate. May be passed more than once.
+    #[arg(long = "instrument-id")]
+    pub instrument_ids: Vec<String>,
+    /// Inclusive start timestamp in Unix nanoseconds.
+    #[arg(long)]
+    pub start_ns: Option<u64>,
+    /// Inclusive end timestamp in Unix nanoseconds.
+    #[arg(long)]
+    pub end_ns: Option<u64>,
+    /// ClickHouse source label to validate.
+    #[arg(long, default_value = "catalog-backfill")]
+    pub source: String,
+    /// Effective market-data read source: catalog or clickhouse. Defaults to environment or catalog.
+    #[arg(long)]
+    pub read_source: Option<String>,
 }
 
 #[cfg(feature = "defi")]

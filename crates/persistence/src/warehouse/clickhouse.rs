@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     path::Path,
+    str::FromStr,
     time::Instant,
 };
 
@@ -13,7 +14,7 @@ use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::QuoteTick,
     identifiers::InstrumentId,
-    types::{Price, Quantity},
+    types::{Price, Quantity, price::PriceRaw, quantity::QuantityRaw},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -24,8 +25,62 @@ pub const DEFAULT_CLICKHOUSE_URL: &str = "http://localhost:8123";
 pub const DEFAULT_CLICKHOUSE_USERNAME: &str = "default";
 pub const DEFAULT_CLICKHOUSE_DATABASE: &str = "default";
 pub const DEFAULT_MIGRATIONS_DIR: &str = "schema/sql/clickhouse";
+pub const MARKET_DATA_READ_SOURCE_ENV: &str = "NAUTILUS_MARKET_DATA_READ_SOURCE";
 
 const WAREHOUSE_DATABASE: &str = "warehouse";
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum MarketDataReadSource {
+    #[default]
+    Catalog,
+    ClickHouse,
+}
+
+impl MarketDataReadSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Catalog => "catalog",
+            Self::ClickHouse => "clickhouse",
+        }
+    }
+
+    /// Returns the configured market-data read source, defaulting to `catalog`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `NAUTILUS_MARKET_DATA_READ_SOURCE` contains an unknown value.
+    pub fn from_env() -> anyhow::Result<Self> {
+        match env::var(MARKET_DATA_READ_SOURCE_ENV) {
+            Ok(value) => value.parse(),
+            Err(env::VarError::NotPresent) => Ok(Self::default()),
+            Err(err) => Err(anyhow!(
+                "failed to read {MARKET_DATA_READ_SOURCE_ENV}: {err}"
+            )),
+        }
+    }
+}
+
+impl FromStr for MarketDataReadSource {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "catalog" => Ok(Self::Catalog),
+            "clickhouse" => Ok(Self::ClickHouse),
+            other => Err(anyhow!(
+                "invalid market data read source '{other}', expected 'catalog' or 'clickhouse'"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for MarketDataReadSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ClickHouseConnectOptions {
     pub url: String,
@@ -232,6 +287,92 @@ pub struct QuoteTickBackfillReport {
     pub warehouse_rows: u64,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct QuoteTickReadRequest {
+    pub catalog_uri: String,
+    pub instrument_ids: Vec<String>,
+    pub start: Option<UnixNanos>,
+    pub end: Option<UnixNanos>,
+    pub source: String,
+    pub read_source: MarketDataReadSource,
+}
+
+impl QuoteTickReadRequest {
+    /// Creates a quote tick read request from Unix nanosecond bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ClickHouse source label is empty or the time bounds are reversed.
+    pub fn from_unix_nanos(
+        catalog_uri: String,
+        instrument_ids: Vec<String>,
+        start_ns: Option<u64>,
+        end_ns: Option<u64>,
+        source: String,
+        read_source: MarketDataReadSource,
+    ) -> anyhow::Result<Self> {
+        if source.trim().is_empty() {
+            return Err(anyhow!("quote tick read source label cannot be empty"));
+        }
+        if let (Some(start), Some(end)) = (start_ns, end_ns) {
+            if start > end {
+                return Err(anyhow!(
+                    "quote tick read start_ns ({start}) must be less than or equal to end_ns ({end})"
+                ));
+            }
+        }
+
+        Ok(Self {
+            catalog_uri,
+            instrument_ids,
+            start: start_ns.map(UnixNanos::from),
+            end: end_ns.map(UnixNanos::from),
+            source,
+            read_source,
+        })
+    }
+
+    fn catalog_identifiers(&self) -> Option<Vec<String>> {
+        if self.instrument_ids.is_empty() {
+            None
+        } else {
+            Some(self.instrument_ids.clone())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct QuoteTickValidationSummary {
+    pub rows: usize,
+    pub first_ts_init: Option<u64>,
+    pub last_ts_init: Option<u64>,
+    pub checksum: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct QuoteTickValidationReport {
+    pub catalog_uri: String,
+    pub instrument_ids: Vec<String>,
+    pub source: String,
+    pub read_source: MarketDataReadSource,
+    pub catalog: QuoteTickValidationSummary,
+    pub clickhouse: QuoteTickValidationSummary,
+    pub selected: QuoteTickValidationSummary,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct QuoteTickValidationRow {
+    instrument_id: String,
+    ts_event: u64,
+    ts_init: u64,
+    bid_price_raw: i128,
+    ask_price_raw: i128,
+    bid_size_raw: u128,
+    ask_size_raw: u128,
+    price_precision: u8,
+    size_precision: u8,
+}
+
 #[derive(Debug, Clone)]
 struct MigrationFile {
     version: u32,
@@ -303,6 +444,79 @@ pub async fn count_quote_ticks_for_run(
     Ok(row.count)
 }
 
+/// Reads `QuoteTick` rows from ClickHouse for a source and optional range.
+///
+/// # Errors
+///
+/// Returns an error if ClickHouse rejects the query.
+pub async fn read_quote_tick_rows(
+    client: &Client,
+    source: &str,
+    instrument_ids: &[String],
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+) -> anyhow::Result<Vec<ClickHouseQuoteTickRow>> {
+    let mut sql = String::from("SELECT ?fields FROM market.quote_ticks WHERE source = ?");
+    if start.is_some() {
+        sql.push_str(" AND ts_init >= ?");
+    }
+    if end.is_some() {
+        sql.push_str(" AND ts_init <= ?");
+    }
+    if !instrument_ids.is_empty() {
+        sql.push_str(" AND instrument_id IN ?");
+    }
+    sql.push_str(" ORDER BY instrument_id, ts_init, ts_event, ingest_run_id");
+
+    let mut query = client.query(&sql).bind(source);
+    if let Some(start) = start {
+        query = query.bind(start.as_u64());
+    }
+    if let Some(end) = end {
+        query = query.bind(end.as_u64());
+    }
+    if !instrument_ids.is_empty() {
+        query = query.bind(instrument_ids.to_vec());
+    }
+
+    Ok(query.fetch_all::<ClickHouseQuoteTickRow>().await?)
+}
+
+/// Reads `QuoteTick` data from the configured market-data source.
+///
+/// # Errors
+///
+/// Returns an error if the selected source cannot be read or ClickHouse rows cannot be converted
+/// back into Nautilus model values.
+pub async fn read_quote_ticks(
+    options: &ClickHouseConnectOptions,
+    request: &QuoteTickReadRequest,
+) -> anyhow::Result<Vec<QuoteTick>> {
+    match request.read_source {
+        MarketDataReadSource::Catalog => {
+            read_catalog_quote_ticks(
+                &request.catalog_uri,
+                request.catalog_identifiers(),
+                request.start,
+                request.end,
+            )
+            .await
+        }
+        MarketDataReadSource::ClickHouse => {
+            let client = options.client();
+            let rows = read_quote_tick_rows(
+                &client,
+                &request.source,
+                &request.instrument_ids,
+                request.start,
+                request.end,
+            )
+            .await?;
+            rows.iter().map(quote_tick_from_clickhouse_row).collect()
+        }
+    }
+}
+
 /// Writes a tiny synthetic `QuoteTick` batch and reads it back by ingest run.
 ///
 /// # Errors
@@ -326,6 +540,24 @@ pub async fn run_quote_tick_smoke(
     })
 }
 
+async fn read_catalog_quote_ticks(
+    catalog_uri: &str,
+    instrument_ids: Option<Vec<String>>,
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+) -> anyhow::Result<Vec<QuoteTick>> {
+    let catalog_uri = catalog_uri.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut catalog = ParquetDataCatalog::from_uri(&catalog_uri, None, None, None, None)
+            .with_context(|| format!("failed to open catalog {catalog_uri}"))?;
+        catalog
+            .quote_ticks(instrument_ids, start, end)
+            .with_context(|| format!("failed to query QuoteTick data from {catalog_uri}"))
+    })
+    .await
+    .context("catalog QuoteTick read task failed")?
+}
+
 /// Backfills quote ticks from a Nautilus `ParquetDataCatalog` into ClickHouse.
 ///
 /// # Errors
@@ -337,19 +569,13 @@ pub async fn backfill_quote_ticks_from_catalog(
 ) -> anyhow::Result<QuoteTickBackfillReport> {
     check_health(options).await?;
 
-    let catalog_uri = request.catalog_uri.clone();
-    let catalog_identifiers = request.catalog_identifiers();
-    let start = request.start;
-    let end = request.end;
-    let quotes = tokio::task::spawn_blocking(move || {
-        let mut catalog = ParquetDataCatalog::from_uri(&catalog_uri, None, None, None, None)
-            .with_context(|| format!("failed to open catalog {catalog_uri}"))?;
-        catalog
-            .quote_ticks(catalog_identifiers, start, end)
-            .with_context(|| format!("failed to query QuoteTick data from {catalog_uri}"))
-    })
-    .await
-    .context("catalog QuoteTick read task failed")??;
+    let quotes = read_catalog_quote_ticks(
+        &request.catalog_uri,
+        request.catalog_identifiers(),
+        request.start,
+        request.end,
+    )
+    .await?;
     if quotes.is_empty() {
         return Err(anyhow!(
             "catalog backfill found no QuoteTick rows for catalog_uri={} instruments={} start={:?} end={:?}",
@@ -397,6 +623,108 @@ pub async fn backfill_quote_ticks_from_catalog(
         written_rows,
         warehouse_rows,
     })
+}
+
+/// Validates catalog quote ticks against ClickHouse rows for the same source and range.
+///
+/// # Errors
+///
+/// Returns an error if either side cannot be read, the catalog range is empty, or validation
+/// summaries do not match.
+pub async fn validate_quote_ticks(
+    options: &ClickHouseConnectOptions,
+    request: &QuoteTickReadRequest,
+) -> anyhow::Result<QuoteTickValidationReport> {
+    check_health(options).await?;
+
+    let catalog_quotes = read_catalog_quote_ticks(
+        &request.catalog_uri,
+        request.catalog_identifiers(),
+        request.start,
+        request.end,
+    )
+    .await?;
+    if catalog_quotes.is_empty() {
+        return Err(anyhow!(
+            "catalog validation found no QuoteTick rows for catalog_uri={} instruments={} start={:?} end={:?}",
+            request.catalog_uri,
+            if request.instrument_ids.is_empty() {
+                "*".to_string()
+            } else {
+                request.instrument_ids.join(",")
+            },
+            request.start,
+            request.end
+        ));
+    }
+
+    let client = options.client();
+    let clickhouse_rows = read_quote_tick_rows(
+        &client,
+        &request.source,
+        &request.instrument_ids,
+        request.start,
+        request.end,
+    )
+    .await?;
+    let selected_quotes = read_quote_ticks(options, request).await?;
+
+    let report = QuoteTickValidationReport {
+        catalog_uri: request.catalog_uri.clone(),
+        instrument_ids: request.instrument_ids.clone(),
+        source: request.source.clone(),
+        read_source: request.read_source,
+        catalog: quote_tick_validation_summary(
+            catalog_quotes
+                .iter()
+                .map(QuoteTickValidationRow::from)
+                .collect(),
+        ),
+        clickhouse: quote_tick_validation_summary(
+            clickhouse_rows
+                .iter()
+                .map(QuoteTickValidationRow::from)
+                .collect(),
+        ),
+        selected: quote_tick_validation_summary(
+            selected_quotes
+                .iter()
+                .map(QuoteTickValidationRow::from)
+                .collect(),
+        ),
+    };
+
+    if report.catalog != report.clickhouse {
+        return Err(anyhow!(
+            "QuoteTick validation mismatch for source={} read_source={}: catalog_rows={} clickhouse_rows={} catalog_first_ts_init={:?} clickhouse_first_ts_init={:?} catalog_last_ts_init={:?} clickhouse_last_ts_init={:?} catalog_checksum={} clickhouse_checksum={}",
+            report.source,
+            report.read_source,
+            report.catalog.rows,
+            report.clickhouse.rows,
+            report.catalog.first_ts_init,
+            report.clickhouse.first_ts_init,
+            report.catalog.last_ts_init,
+            report.clickhouse.last_ts_init,
+            report.catalog.checksum,
+            report.clickhouse.checksum
+        ));
+    }
+    let expected_selected = match report.read_source {
+        MarketDataReadSource::Catalog => &report.catalog,
+        MarketDataReadSource::ClickHouse => &report.clickhouse,
+    };
+    if &report.selected != expected_selected {
+        return Err(anyhow!(
+            "QuoteTick selected read mismatch for read_source={}: selected_rows={} expected_rows={} selected_checksum={} expected_checksum={}",
+            report.read_source,
+            report.selected.rows,
+            expected_selected.rows,
+            report.selected.checksum,
+            expected_selected.checksum
+        ));
+    }
+
+    Ok(report)
 }
 
 /// Runs all pending ClickHouse warehouse migrations from the default migrations directory.
@@ -690,6 +1018,55 @@ fn elapsed_millis_u64(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+fn quote_tick_validation_summary(
+    mut rows: Vec<QuoteTickValidationRow>,
+) -> QuoteTickValidationSummary {
+    let first_ts_init = rows.iter().map(|row| row.ts_init).min();
+    let last_ts_init = rows.iter().map(|row| row.ts_init).max();
+    rows.sort();
+
+    let mut hasher = blake3::Hasher::new();
+    for row in &rows {
+        hasher.update(row.instrument_id.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&row.ts_event.to_le_bytes());
+        hasher.update(&row.ts_init.to_le_bytes());
+        hasher.update(&row.bid_price_raw.to_le_bytes());
+        hasher.update(&row.ask_price_raw.to_le_bytes());
+        hasher.update(&row.bid_size_raw.to_le_bytes());
+        hasher.update(&row.ask_size_raw.to_le_bytes());
+        hasher.update(&[row.price_precision, row.size_precision]);
+    }
+
+    QuoteTickValidationSummary {
+        rows: rows.len(),
+        first_ts_init,
+        last_ts_init,
+        checksum: hasher.finalize().to_hex().to_string(),
+    }
+}
+
+fn quote_tick_from_clickhouse_row(row: &ClickHouseQuoteTickRow) -> anyhow::Result<QuoteTick> {
+    let bid_price_raw = PriceRaw::try_from(row.bid_price_raw)
+        .with_context(|| format!("bid price raw overflowed PriceRaw: {}", row.bid_price_raw))?;
+    let ask_price_raw = PriceRaw::try_from(row.ask_price_raw)
+        .with_context(|| format!("ask price raw overflowed PriceRaw: {}", row.ask_price_raw))?;
+    let bid_size_raw = QuantityRaw::try_from(row.bid_size_raw)
+        .with_context(|| format!("bid size raw overflowed QuantityRaw: {}", row.bid_size_raw))?;
+    let ask_size_raw = QuantityRaw::try_from(row.ask_size_raw)
+        .with_context(|| format!("ask size raw overflowed QuantityRaw: {}", row.ask_size_raw))?;
+
+    Ok(QuoteTick::new(
+        InstrumentId::from(row.instrument_id.as_str()),
+        Price::from_raw(bid_price_raw, row.price_precision),
+        Price::from_raw(ask_price_raw, row.price_precision),
+        Quantity::from_raw(bid_size_raw, row.size_precision),
+        Quantity::from_raw(ask_size_raw, row.size_precision),
+        UnixNanos::from(row.ts_event),
+        UnixNanos::from(row.ts_init),
+    ))
+}
+
 fn synthetic_quote_tick() -> QuoteTick {
     QuoteTick::new(
         InstrumentId::from("AUDUSD.SIM"),
@@ -709,6 +1086,38 @@ impl MigrationFile {
             description: self.description.clone(),
             checksum: self.checksum.clone(),
             statements: self.statements.len(),
+        }
+    }
+}
+
+impl From<&QuoteTick> for QuoteTickValidationRow {
+    fn from(quote: &QuoteTick) -> Self {
+        Self {
+            instrument_id: quote.instrument_id.to_string(),
+            ts_event: quote.ts_event.as_u64(),
+            ts_init: quote.ts_init.as_u64(),
+            bid_price_raw: quote.bid_price.raw.into(),
+            ask_price_raw: quote.ask_price.raw.into(),
+            bid_size_raw: quote.bid_size.raw.into(),
+            ask_size_raw: quote.ask_size.raw.into(),
+            price_precision: quote.bid_price.precision,
+            size_precision: quote.bid_size.precision,
+        }
+    }
+}
+
+impl From<&ClickHouseQuoteTickRow> for QuoteTickValidationRow {
+    fn from(row: &ClickHouseQuoteTickRow) -> Self {
+        Self {
+            instrument_id: row.instrument_id.clone(),
+            ts_event: row.ts_event,
+            ts_init: row.ts_init,
+            bid_price_raw: row.bid_price_raw,
+            ask_price_raw: row.ask_price_raw,
+            bid_size_raw: row.bid_size_raw,
+            ask_size_raw: row.ask_size_raw,
+            price_precision: row.price_precision,
+            size_precision: row.size_precision,
         }
     }
 }
