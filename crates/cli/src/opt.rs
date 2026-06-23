@@ -113,6 +113,8 @@ pub enum WarehouseCommand {
     Health(ClickHouseConfig),
     /// Writes and reads back a tiny QuoteTick batch.
     QuoteSmoke(ClickHouseSmokeConfig),
+    /// Backfills QuoteTick data from a Nautilus catalog into ClickHouse.
+    BackfillQuotes(ClickHouseBackfillQuotesConfig),
 }
 
 /// Configuration parameters for the warehouse QuoteTick smoke command.
@@ -123,6 +125,31 @@ pub struct ClickHouseSmokeConfig {
     /// Source label recorded on the smoke row.
     #[arg(long, default_value = "smoke")]
     pub source: String,
+}
+
+/// Configuration parameters for catalog-backed QuoteTick warehouse backfills.
+#[derive(Parser, Debug, Clone)]
+pub struct ClickHouseBackfillQuotesConfig {
+    #[clap(flatten)]
+    pub clickhouse: ClickHouseConfig,
+    /// Nautilus catalog path or URI to read from.
+    #[arg(long)]
+    pub catalog_uri: String,
+    /// Instrument ID to backfill. May be passed more than once.
+    #[arg(long = "instrument-id")]
+    pub instrument_ids: Vec<String>,
+    /// Inclusive start timestamp in Unix nanoseconds.
+    #[arg(long)]
+    pub start_ns: Option<u64>,
+    /// Inclusive end timestamp in Unix nanoseconds.
+    #[arg(long)]
+    pub end_ns: Option<u64>,
+    /// Source label recorded on inserted rows.
+    #[arg(long, default_value = "catalog-backfill")]
+    pub source: String,
+    /// Rows per ClickHouse insert batch.
+    #[arg(long, default_value_t = 5000)]
+    pub batch_size: usize,
 }
 
 #[cfg(feature = "defi")]

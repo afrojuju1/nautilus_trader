@@ -18,6 +18,8 @@ use nautilus_model::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::backend::catalog::ParquetDataCatalog;
+
 pub const DEFAULT_CLICKHOUSE_URL: &str = "http://localhost:8123";
 pub const DEFAULT_CLICKHOUSE_USERNAME: &str = "default";
 pub const DEFAULT_CLICKHOUSE_DATABASE: &str = "default";
@@ -161,6 +163,75 @@ pub struct QuoteTickSmokeReport {
     pub count: u64,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct QuoteTickCatalogBackfill {
+    pub catalog_uri: String,
+    pub instrument_ids: Vec<String>,
+    pub start: Option<UnixNanos>,
+    pub end: Option<UnixNanos>,
+    pub source: String,
+    pub batch_size: usize,
+}
+
+impl QuoteTickCatalogBackfill {
+    /// Creates a catalog-backed quote tick backfill request from Unix nanosecond bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source label is empty, the batch size is zero, or the time bounds are
+    /// reversed.
+    pub fn from_unix_nanos(
+        catalog_uri: String,
+        instrument_ids: Vec<String>,
+        start_ns: Option<u64>,
+        end_ns: Option<u64>,
+        source: String,
+        batch_size: usize,
+    ) -> anyhow::Result<Self> {
+        if source.trim().is_empty() {
+            return Err(anyhow!("backfill source label cannot be empty"));
+        }
+        if batch_size == 0 {
+            return Err(anyhow!("backfill batch size must be greater than zero"));
+        }
+        if let (Some(start), Some(end)) = (start_ns, end_ns) {
+            if start > end {
+                return Err(anyhow!(
+                    "backfill start_ns ({start}) must be less than or equal to end_ns ({end})"
+                ));
+            }
+        }
+
+        Ok(Self {
+            catalog_uri,
+            instrument_ids,
+            start: start_ns.map(UnixNanos::from),
+            end: end_ns.map(UnixNanos::from),
+            source,
+            batch_size,
+        })
+    }
+
+    fn catalog_identifiers(&self) -> Option<Vec<String>> {
+        if self.instrument_ids.is_empty() {
+            None
+        } else {
+            Some(self.instrument_ids.clone())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct QuoteTickBackfillReport {
+    pub catalog_uri: String,
+    pub instrument_ids: Vec<String>,
+    pub source: String,
+    pub ingest_run_id: Uuid,
+    pub catalog_rows: usize,
+    pub written_rows: usize,
+    pub warehouse_rows: u64,
+}
+
 #[derive(Debug, Clone)]
 struct MigrationFile {
     version: u32,
@@ -252,6 +323,79 @@ pub async fn run_quote_tick_smoke(
         ingest_run_id,
         written: 1,
         count,
+    })
+}
+
+/// Backfills quote ticks from a Nautilus `ParquetDataCatalog` into ClickHouse.
+///
+/// # Errors
+///
+/// Returns an error if catalog reading, ClickHouse writing, or count validation fails.
+pub async fn backfill_quote_ticks_from_catalog(
+    options: &ClickHouseConnectOptions,
+    request: &QuoteTickCatalogBackfill,
+) -> anyhow::Result<QuoteTickBackfillReport> {
+    check_health(options).await?;
+
+    let catalog_uri = request.catalog_uri.clone();
+    let catalog_identifiers = request.catalog_identifiers();
+    let start = request.start;
+    let end = request.end;
+    let quotes = tokio::task::spawn_blocking(move || {
+        let mut catalog = ParquetDataCatalog::from_uri(&catalog_uri, None, None, None, None)
+            .with_context(|| format!("failed to open catalog {catalog_uri}"))?;
+        catalog
+            .quote_ticks(catalog_identifiers, start, end)
+            .with_context(|| format!("failed to query QuoteTick data from {catalog_uri}"))
+    })
+    .await
+    .context("catalog QuoteTick read task failed")??;
+    if quotes.is_empty() {
+        return Err(anyhow!(
+            "catalog backfill found no QuoteTick rows for catalog_uri={} instruments={} start={:?} end={:?}",
+            request.catalog_uri,
+            if request.instrument_ids.is_empty() {
+                "*".to_string()
+            } else {
+                request.instrument_ids.join(",")
+            },
+            request.start,
+            request.end
+        ));
+    }
+
+    let client = options.client();
+    let ingest_run_id = Uuid::new_v4();
+    let mut written_rows = 0usize;
+
+    for chunk in quotes.chunks(request.batch_size) {
+        let rows = chunk
+            .iter()
+            .map(|quote| {
+                ClickHouseQuoteTickRow::from_quote_tick(quote, &request.source, ingest_run_id)
+            })
+            .collect::<Vec<_>>();
+        write_quote_tick_rows(&client, &rows).await?;
+        written_rows += rows.len();
+    }
+
+    let warehouse_rows = count_quote_ticks_for_run(&client, ingest_run_id).await?;
+    let expected_rows = u64::try_from(quotes.len()).context("catalog row count overflowed u64")?;
+    if warehouse_rows != expected_rows {
+        return Err(anyhow!(
+            "ClickHouse backfill count mismatch for ingest_run_id={ingest_run_id}: catalog_rows={} warehouse_rows={warehouse_rows}",
+            quotes.len()
+        ));
+    }
+
+    Ok(QuoteTickBackfillReport {
+        catalog_uri: request.catalog_uri.clone(),
+        instrument_ids: request.instrument_ids.clone(),
+        source: request.source.clone(),
+        ingest_run_id,
+        catalog_rows: quotes.len(),
+        written_rows,
+        warehouse_rows,
     })
 }
 

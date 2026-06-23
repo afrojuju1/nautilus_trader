@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use nautilus_persistence::warehouse::clickhouse::{
-    ClickHouseConnectOptions, DEFAULT_MIGRATIONS_DIR, check_health, run_migrations,
-    run_quote_tick_smoke,
+    ClickHouseConnectOptions, DEFAULT_MIGRATIONS_DIR, QuoteTickCatalogBackfill,
+    backfill_quote_ticks_from_catalog, check_health, run_migrations, run_quote_tick_smoke,
 };
 
 use crate::opt::{ClickHouseConfig, WarehouseCommand, WarehouseOpt};
@@ -60,6 +60,30 @@ pub(crate) async fn run_warehouse_command(opt: WarehouseOpt) -> anyhow::Result<(
                 "ClickHouse QuoteTick smoke complete: ingest_run_id={} written={} count={}",
                 report.ingest_run_id, report.written, report.count
             );
+        }
+        WarehouseCommand::BackfillQuotes(config) => {
+            let connect_options = connect_options_from_config(&config.clickhouse);
+            let request = QuoteTickCatalogBackfill::from_unix_nanos(
+                config.catalog_uri,
+                config.instrument_ids,
+                config.start_ns,
+                config.end_ns,
+                config.source,
+                config.batch_size,
+            )?;
+            let report = backfill_quote_ticks_from_catalog(&connect_options, &request).await?;
+            println!(
+                "ClickHouse QuoteTick backfill complete: ingest_run_id={} catalog_rows={} written_rows={} warehouse_rows={} source={} catalog_uri={}",
+                report.ingest_run_id,
+                report.catalog_rows,
+                report.written_rows,
+                report.warehouse_rows,
+                report.source,
+                report.catalog_uri
+            );
+            if !report.instrument_ids.is_empty() {
+                println!("instruments={}", report.instrument_ids.join(","));
+            }
         }
     }
 
