@@ -30,6 +30,7 @@ use crate::{
         models::{AlpacaOrder, ListActivitiesRequest, ListOrdersRequest, OptionSnapshotsRequest},
     },
     management::{credit_spread_close_reason, days_to_expiration, recorded_age_secs},
+    options_entry_strategy::entry_order_list_id,
     options_runtime::{
         OptionsEngineConfig, OptionsOpportunitySet, SelectedOptionsEntry, active_sector_count,
         active_underlying_count, fleet_active_underlying_count, fleet_sector_limit_state,
@@ -863,7 +864,7 @@ async fn apply_selected_entry_decision(
 ) -> anyhow::Result<bool> {
     let order_list_id = mode
         .is_submit()
-        .then(|| order_list_id(trade_date, entry.underlying()));
+        .then(|| entry_order_list_id(trade_date, entry.underlying()));
     let (candidate_identity_key, mut candidate_alert_payload) = selected_entry_alert_payload(
         &entry,
         trade_date,
@@ -1596,13 +1597,6 @@ fn emit_management_snapshot(
             "hold_secs": recorded_age_secs(entry),
         }),
     );
-}
-
-fn order_list_id(trade_date: &str, underlying: &str) -> String {
-    format!(
-        "options-engine-entry-{trade_date}-{underlying}-{}",
-        UUID4::new()
-    )
 }
 
 fn close_order_list_id(entry: &StrategyStateEntry) -> String {

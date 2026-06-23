@@ -55,8 +55,8 @@ Commands:
   alerts performance-status      show post-market performance digest timer status
   check-config                   print resolved account config
   compare-scan [ARGS...]         compare REST scanner output with Nautilus option-chain output
-  option-chain-live [ARGS...]    run the read-only live Nautilus option-chain scan node
-  cutover-proof [ARGS...]        compare scan output, then run a bounded read-only live node
+  option-chain-live [ARGS...]    run the live Nautilus option-chain scan and entry-strategy node
+  cutover-proof [ARGS...]        compare scan output, then run a bounded live node proof
   validate                       run Alpaca formatting, shell, test, and check commands
   deploy                         build and install local Alpaca runtime files
   rollout                        validate, deploy, restart all services, then summarize health

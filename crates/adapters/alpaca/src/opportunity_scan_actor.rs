@@ -30,6 +30,7 @@ use crate::{
         SelectedDebitEntry, SelectedEntry, SelectedIronCondorEntry, SelectedNakedOptionEntry,
         SelectedOptionsEntry,
     },
+    options_entry_strategy::OptionsOpportunityData,
     options_runtime::{
         OptionsEngineConfig, OptionsOpportunitySet, OptionsScanOutcome, OptionsScanReport,
     },
@@ -261,6 +262,13 @@ impl DataActor for OptionChainOpportunityScanActor {
             "option_chain_opportunity_scan",
             opportunity_event_payload(slice, &opportunities),
         );
+        let data = OptionsOpportunityData::new(
+            opportunities.clone(),
+            slice.ts_event,
+            self.core.timestamp_ns(),
+        )
+        .into_custom_data();
+        self.publish_data(&data.data_type, &data);
         self.latest_opportunities = Some(opportunities);
         Ok(())
     }

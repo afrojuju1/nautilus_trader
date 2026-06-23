@@ -50,13 +50,18 @@ and strategies.
   - It loads one Alpaca REST option snapshot for the requested underlying/expiry, scans the same
     contracts through the legacy REST normalizer and the Nautilus `OptionChainSlice` normalizer,
     then emits JSON parity diagnostics without submitting orders.
-- [x] Add a read-only live Nautilus node for Alpaca option-chain candidate evidence.
+- [x] Add a live Nautilus node for Alpaca option-chain candidate evidence and entry strategy wiring.
   - Implemented as `alpaca-option-chain-scan-live-node`.
-  - The node registers only `AlpacaDataClientFactory`, requests Alpaca option instruments through
-    Nautilus `request_instruments`, subscribes to `OptionChainSlice` through the
-    `OptionChainOpportunityScanActor`, and never installs an execution client.
-- [ ] Decide whether read-only actor evidence should write to Postgres directly or publish events
-  for a separate persistence consumer.
+  - The node registers `AlpacaDataClientFactory`, `AlpacaExecutionClientFactory`,
+    `OptionChainOpportunityScanActor`, and `AlpacaOptionsEntryStrategy`.
+  - The scan actor publishes typed `AlpacaOptionsOpportunityData`; the strategy subscribes through
+    the Nautilus data bus and submits standard Nautilus orders only when the runtime submit/window
+    gates allow it.
+  - Until persisted strategy admission moves into the strategy path, entry submission also requires
+    `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED=true`; otherwise the strategy remains wired but
+    dry-runs selected entries.
+- [ ] Decide whether scanner evidence should write to Postgres directly or publish events for a
+  separate persistence consumer.
 - [x] Remove the adapter-local order-plan layer from options-engine submission.
   - Submission now builds standard Nautilus `OrderAny` values through `OrderFactory`, then derives
     `SubmitOrder` or `SubmitOrderList` commands for `AlpacaExecutionClient`.
@@ -69,6 +74,8 @@ and strategies.
     or `Strategy::submit_order_list`.
   - The account-engine compatibility path reuses the same entry-order construction while the full
     `LiveNode` execution cutover is still in progress.
+  - The account-engine compatibility path also reuses the strategy-owned entry order-list ID
+    helper, leaving only state/reconciliation/admission responsibilities in the old loop.
 
 ## Cutover Readiness
 
@@ -79,7 +86,7 @@ green during market hours for the configured paper profiles.
 - [x] REST-vs-option-chain scanner parity command exists.
   - Local: `deploy/alpaca/alpaca-control.sh compare-scan --pretty SPY 2026-07-02`
   - Docker: `ALPACA_COMPARE_UNDERLYING=SPY ALPACA_COMPARE_EXPIRY=2026-07-02 docker compose -f deploy/alpaca/compose.yml --profile cutover run --rm alpaca-compare-option-chain-scan`
-- [x] Read-only live Nautilus node exists.
+- [x] Live Nautilus node exists with scanner-to-strategy wiring.
   - Local bounded run:
     `ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS=90 deploy/alpaca/alpaca-control.sh option-chain-live SPY 2026-07-02`
   - Docker bounded run:
@@ -93,16 +100,21 @@ green during market hours for the configured paper profiles.
     non-zero cached instruments, and `option_chain_opportunity_scan` events.
   - For undefined-risk profiles, set `ALPACA_OPTION_CHAIN_OPTIONS_BUYING_POWER` or allow the live
     node to read paper-account buying power before scanning.
-- [ ] After side-by-side proof is green, move entry and exit order construction into a Nautilus
-  strategy boundary before retiring REST scanner loops.
+  - Do not set `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED=true` for cutover proof until the
+    persisted admission/state tasks below are complete.
+- [ ] Move persisted entry admission and state recording into the Nautilus strategy path before
+  retiring the account-engine entry loop.
 
 ## Next Loops To Retire
 
 - [ ] Entry loop
-  - Move entry selection and risk admission into `AlpacaOptionsEntryStrategy`.
-  - Feed the strategy from `OptionsOpportunitySet` or its successor, not Alpaca REST payloads.
-  - Wire the strategy into a live node with `AlpacaExecutionClientFactory` and retire direct
-    account-engine submission.
+  - Move persisted risk admission into `AlpacaOptionsEntryStrategy`: broker permission memory,
+    active-entry limits, daily submit limits, open-order limits, per-underlying/sector limits, and
+    broker account/position/open-order admission checks.
+  - Record accepted/rejected submission state from execution reports or reconciled order status so
+    restarts do not lose duplicate-entry protection.
+  - Retire direct account-engine entry submission after the strategy owns both admission and state
+    recording.
 
 - [ ] Management loop
   - Move close, flatten, stale-order, and reprice lifecycle into a dedicated strategy/component.

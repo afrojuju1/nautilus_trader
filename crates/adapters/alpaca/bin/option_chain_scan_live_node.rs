@@ -1,26 +1,28 @@
-//! Read-only live Nautilus option-chain scan node for Alpaca.
+//! Live Nautilus option-chain scan and entry node for Alpaca.
 
 use std::{env, time::Duration};
 
 use anyhow::{Context, bail};
 use nautilus_alpaca::{
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
-    config::AlpacaDataClientConfig,
-    factories::AlpacaDataClientFactory,
+    config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
+    factories::{AlpacaDataClientFactory, AlpacaExecutionClientFactory},
     http::{client::AlpacaHttpClient, models::AlpacaAccount},
     opportunity_scan_actor::{
         OptionChainOpportunityScanActor, OptionChainOpportunityScanActorConfig,
         option_chain_scan_config_from_engine,
     },
+    options_entry_strategy::{AlpacaOptionsEntryStrategy, AlpacaOptionsEntryStrategyConfig},
     options_runtime::OptionsEngineConfig,
 };
 use nautilus_common::enums::Environment;
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
     data::option_chain::StrikeRange,
-    identifiers::{ActorId, ClientId, OptionSeriesId, TraderId},
+    identifiers::{AccountId, ActorId, ClientId, OptionSeriesId, StrategyId, TraderId},
     types::Price,
 };
+use nautilus_trading::strategy::StrategyConfig;
 
 const DEFAULT_SNAPSHOT_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_STRIKES_ABOVE: usize = 10;
@@ -37,6 +39,7 @@ struct Args {
     strike_range: StrikeRange,
     snapshot_interval_ms: Option<u64>,
     snapshot_greeks_poll_secs: Option<u64>,
+    entry_submit_enabled: bool,
     max_runtime_secs: Option<u64>,
 }
 
@@ -65,19 +68,30 @@ async fn main() -> anyhow::Result<()> {
     let scan_config = option_chain_scan_config_from_engine(&runtime_config, options_buying_power);
 
     log::info!(
-        "Starting read-only Alpaca option-chain live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategies={:?}",
+        "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategies={:?} runtime_submit_enabled={} node_entry_submit_enabled={}",
         series_id,
         args.snapshot_interval_ms,
         args.max_runtime_secs,
         runtime_config.enabled_strategy_names(),
+        runtime_config.submit_enabled,
+        args.entry_submit_enabled,
     );
 
+    let account_id = account_id_from_env();
     let mut node = LiveNode::builder(args.trader_id, Environment::Live)?
         .with_name(args.node_name)
         .add_data_client(
             Some(ALPACA_CLIENT_ID.to_string()),
             Box::new(AlpacaDataClientFactory::new()),
             Box::new(data_config),
+        )?
+        .add_exec_client(
+            Some(ALPACA_CLIENT_ID.to_string()),
+            Box::new(AlpacaExecutionClientFactory::new(
+                args.trader_id,
+                account_id,
+            )),
+            Box::new(AlpacaExecClientConfig::default()),
         )?
         .with_delay_post_stop_secs(5)
         .build()?;
@@ -92,6 +106,17 @@ async fn main() -> anyhow::Result<()> {
         scan: scan_config,
     });
     node.add_actor(actor)?;
+
+    let strategy_config = StrategyConfig {
+        strategy_id: Some(StrategyId::from("ALPACA-OPTIONS-ENTRY")),
+        order_id_tag: Some("AOE".to_string()),
+        ..Default::default()
+    };
+    let mut entry_config =
+        AlpacaOptionsEntryStrategyConfig::from_engine_config(strategy_config, &runtime_config);
+    entry_config.submit_enabled = entry_config.submit_enabled && args.entry_submit_enabled;
+    let strategy = AlpacaOptionsEntryStrategy::new(entry_config);
+    node.add_strategy(strategy)?;
 
     if let Some(max_runtime_secs) = args.max_runtime_secs {
         let handle = node.handle();
@@ -153,12 +178,12 @@ impl Args {
             node_name: env::var("ALPACA_OPTION_CHAIN_NODE_NAME")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "ALPACA-OPTION-CHAIN-SCAN-LIVE".to_string()),
+                .unwrap_or_else(|| "ALPACA-OPTIONS-LIVE".to_string()),
             actor_id: ActorId::from(
                 env::var("ALPACA_OPTION_CHAIN_ACTOR_ID")
                     .ok()
                     .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "ALPACA-OPTION-CHAIN-SCAN-LIVE".to_string()),
+                    .unwrap_or_else(|| "ALPACA-OPTION-CHAIN-SCAN".to_string()),
             ),
             underlying: underlying.to_ascii_uppercase(),
             expiry,
@@ -172,9 +197,20 @@ impl Args {
                 "ALPACA_OPTION_CHAIN_SNAPSHOT_POLL_SECS",
                 None,
             )?,
+            entry_submit_enabled: bool_env("ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED", false)?,
             max_runtime_secs: optional_u64_env("ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS", None)?,
         })
     }
+}
+
+fn account_id_from_env() -> AccountId {
+    AccountId::from(
+        env::var("NAUTILUS_ALPACA_ACCOUNT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "ALPACA-001".to_string())
+            .as_str(),
+    )
 }
 
 fn strike_range_from_env() -> anyhow::Result<StrikeRange> {
@@ -228,6 +264,17 @@ fn optional_f64_env(name: &str) -> anyhow::Result<Option<f64>> {
         .parse::<f64>()
         .map(Some)
         .with_context(|| format!("invalid {name}={value:?}, expected number"))
+}
+
+fn bool_env(name: &str, default: bool) -> anyhow::Result<bool> {
+    let Some(value) = optional_raw_env(name) else {
+        return Ok(default);
+    };
+    match value.as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!("invalid {name}={value:?}, expected true or false"),
+    }
 }
 
 fn optional_raw_env(name: &str) -> Option<String> {
