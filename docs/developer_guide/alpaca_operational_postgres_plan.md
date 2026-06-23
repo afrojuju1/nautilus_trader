@@ -27,7 +27,8 @@ product database:
 
 ## Current State
 
-Existing tables are created inline by `StorageRepository::init_schema`:
+Existing tables are initialized by SQLx migrations under
+`crates/adapters/alpaca/migrations/`:
 
 - `strategy_state`: one JSONB snapshot per account.
 - `candidate_ledger`: append-only candidate, decision, alert, and submit-result records.
@@ -36,8 +37,8 @@ Existing tables are created inline by `StorageRepository::init_schema`:
 - `backtest_market_cache`: broad JSONB cache for backtest market payloads.
 
 This is acceptable for the current account-engine loop, but it is not enough for live strategy
-cutover because `strategy_state` is currently last-write-wins and there is no append-only state
-mutation record.
+cutover until runtime writes use the snapshot metadata, append-only state-event ledger, and runtime
+lease as part of a transactional persistence contract.
 
 ## Target Architecture
 
@@ -323,10 +324,10 @@ If any item fails, the node may continue scanning, but it must not submit entrie
 
 ### Phase 1: Migrations And Repository Contract
 
-- Enable `sqlx` migration support for the Alpaca operational Postgres store.
-- Move the existing inline DDL into versioned SQL migrations.
+- SQLx migration support is enabled for the Alpaca operational Postgres store.
+- The existing inline DDL lives in versioned SQL migrations.
 - Add state metadata columns, `strategy_state_events`, and `runtime_lease`.
-- Replace inline schema creation with the `sqlx` migrator in the startup/readiness path.
+- Inline schema creation has been replaced with the `sqlx` migrator in the storage startup path.
 - Add repository functions for transactional state event + snapshot writes.
 
 Done when a local Postgres can initialize through the `sqlx` migrator, report the applied migration
