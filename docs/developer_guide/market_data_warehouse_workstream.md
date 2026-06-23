@@ -67,7 +67,7 @@ ClickHouse is a fundamental database layer, so ownership must stay outside adapt
 | Concern | Owner | Notes |
 | --- | --- | --- |
 | ClickHouse client, row mapping, writers, readers | `nautilus-persistence` behind an optional feature such as `clickhouse` or `warehouse-clickhouse` | Accepts Nautilus model types and emits generic warehouse rows. |
-| ClickHouse schema and migrations | `schema/sql/clickhouse/` | Uses generic market namespaces such as `market.quote_ticks`, not adapter-owned schemas. |
+| ClickHouse schema and migrations | `schema/sql/clickhouse/` plus the warehouse operator `migrate` command | Uses generic market namespaces such as `market.quote_ticks`, not adapter-owned schemas. Applied migration metadata lives in `warehouse.schema_migrations`. |
 | Self-hosted ClickHouse deployment | `deploy/warehouse/` | Alpaca deployment can depend on it later, but should not own it. |
 | Warehouse operator CLI | Generic repo-level binary or existing CLI subcommand with `migrate`, `health`, `backfill`, and `validate` operations | Reads `ParquetDataCatalog`, writes ClickHouse, and validates selected datasets/ranges. |
 | Live warehouse sink | Repo-level data/persistence integration | Subscribes to standard Nautilus market-data flow and writes ClickHouse asynchronously. |
@@ -80,6 +80,9 @@ ClickHouse is a fundamental database layer, so ownership must stay outside adapt
   two real warehouse backends need the same interface.
 - Keep one durable warehouse operator surface for `health`, `migrate`, `backfill`, and `validate`.
   Do not add throwaway scripts or adapter-local commands for normal warehouse work.
+- Keep database tooling direct. Use `sqlx` migrations for Postgres only; use the official
+  ClickHouse Rust client for ClickHouse access. Do not introduce SeaORM, Diesel, or a generic ORM
+  layer for this workstream.
 - Keep runtime reads simple: `catalog` or `clickhouse`. Do not add hidden fallback reads, background
   comparison reads, or per-call switches unless a production consumer proves the need.
 - Keep scanners and strategies away from raw SQL. They should consume named query functions or the
@@ -91,6 +94,23 @@ ClickHouse is a fundamental database layer, so ownership must stay outside adapt
 - Keep `ParquetDataCatalog` the replay/backtest authority. ClickHouse can accelerate analytics and
   selected reads, but it should not become the only copy of replay-critical data.
 
+## ClickHouse Schema Management
+
+ClickHouse schema changes should use a small repo-owned migration path, not an adapter-local script
+and not a generic ORM stack. `sqlx` is the right migration manager for Postgres, but it does not
+manage ClickHouse. The initial warehouse migration path should be:
+
+- Store versioned ClickHouse SQL files under `schema/sql/clickhouse/`, starting with
+  `001_market_quote_ticks.sql`.
+- Apply those files through the warehouse operator `migrate` command using the official ClickHouse
+  Rust client.
+- Record applied version, description, checksum, and timestamp in `warehouse.schema_migrations`.
+  This is warehouse control metadata, not market data and not Alpaca-owned state.
+- Make migration files idempotent where ClickHouse DDL allows it, and fail closed on checksum drift
+  for an already-applied version.
+- Revisit an external schema tool such as Atlas only if ClickHouse schema complexity outgrows this
+  thin operator command. Do not add it in the first implementation pass.
+
 ## Clean Storage Boundary
 
 The target architecture keeps each store boring and narrow.
@@ -101,7 +121,7 @@ system.
 
 Keep in Postgres:
 
-- `schema_migrations`: operational schema versioning.
+- `sqlx` migration metadata: operational schema versioning for Postgres.
 - `strategy_state`: mutable runtime state and restart continuity.
 - `strategy_state_events`: append-only strategy-state mutation audit.
 - `candidate_ledger`: candidate decisions, blocks, submissions, and evidence keys.
@@ -544,8 +564,8 @@ For scanner features:
 | Phase | Outcome | Work | Done when |
 | --- | --- | --- | --- |
 | 1. ADR and contracts | Storage boundaries are durable. | Finalize repo-level ownership, table contracts, duplicate policy, retention policy, and feature consumers. | ADR/doc names ClickHouse as analytical warehouse owned outside adapters and keeps catalog/Postgres responsibilities intact. |
-| 2. Self-hosted ClickHouse dev stack | Reproducible warehouse sandbox. | Add `deploy/warehouse/` ClickHouse startup config, `schema/sql/clickhouse/` migrations, resource limits, and operator smoke commands. | A developer can create the schema and run a trivial insert/query locally without using Alpaca deployment files. |
-| 3. Generic ClickHouse persistence boundary | `nautilus-persistence` can write/read warehouse rows. | Add optional ClickHouse client feature, typed row mapping for `QuoteTick` first, migration runner or schema apply command, and health/smoke APIs. | A small Rust smoke writes and reads `QuoteTick` rows through `nautilus-persistence`. |
+| 2. Self-hosted ClickHouse dev stack | Reproducible warehouse sandbox. | Add `deploy/warehouse/` ClickHouse startup config, `schema/sql/clickhouse/` migrations, resource limits, and operator smoke commands. | The warehouse operator can apply migrations and run a trivial insert/query locally without using Alpaca deployment files. |
+| 3. Generic ClickHouse persistence boundary | `nautilus-persistence` can write/read warehouse rows. | Add optional ClickHouse client feature, typed row mapping for `QuoteTick` first, health/smoke APIs, and migration support used by the operator. | A small Rust smoke writes and reads `QuoteTick` rows through `nautilus-persistence`. |
 | 4. Catalog backfill proof | Warehouse data from existing catalog. | Build the generic warehouse `backfill` operation for quotes first, with row counts and run audit output. | A sampled catalog date/instrument range loads into ClickHouse and validates counts. Alpaca catalog data may be the first proof dataset. |
 | 5. Dual-write live sink | Both stores receive live market data. | Subscribe to standard Nautilus market-data flow, batch ClickHouse inserts, keep catalog writes in place, and record manifest parity. | Live ingestion writes catalog and ClickHouse, and ClickHouse outages surface as warehouse lag instead of trading failures. |
 | 6. Scanner query proof | Read-only scanner feature surface. | Add named queries for latest BBO, spread/liquidity windows, and coverage checks. | A scanner diagnostic can read warehouse features without touching live order flow. |
@@ -575,7 +595,8 @@ real volume, latency, or operational evidence contradicts them.
 | Trade-gating freshness | Do not use warehouse freshness as a trade gate before the flagged ClickHouse read path has passed explicit validation. If a strategy eventually depends on ClickHouse-derived features for entry, record feature timestamp and lag with the candidate decision. | Live order admission should rely on Nautilus cache/live data until the warehouse sink has proven reliability and latency. |
 | Duplicate handling | Start with plain `MergeTree` tables plus an ingest manifest, not `ReplacingMergeTree`. Treat `(dataset, source, instrument_id, start, end)` as an idempotent load range. | ClickHouse duplicate removal is eventual and can leak duplicates into normal queries. Job-level idempotency is easier to reason about for canonical market data. |
 | Backfill reloads | Prefer full-day partition loads. Load into staging, validate counts, then replace or promote the partition/range through the warehouse operator surface. | Partition-level replacement is cleaner than row-level mutations and avoids ad hoc development-only delete paths. |
-| Schema and migrations location | Put ClickHouse DDL under `schema/sql/clickhouse/`. Keep canonical tables generic. Add raw/source schemas only through explicit migrations after the canonical path proves insufficient. | Market-data warehouse schema is not adapter-owned. Source adapters can own extraction, while the warehouse owns normalized contracts. |
+| Schema and migrations location | Put ClickHouse DDL under `schema/sql/clickhouse/` and apply it with the warehouse operator `migrate` command. Keep canonical tables generic. Add raw/source schemas only through explicit migrations after the canonical path proves insufficient. | Market-data warehouse schema is not adapter-owned. Source adapters can own extraction, while the warehouse owns normalized contracts. |
+| Migration tooling | Use `sqlx` migrations for Postgres operational storage. Use the warehouse operator plus the official ClickHouse Rust client for ClickHouse migrations. Defer Atlas or any external schema manager until the thin operator path is clearly insufficient. | This avoids a custom Postgres migration system while also avoiding ORM/tooling bloat for ClickHouse. |
 | Postgres cleanup | Retire or narrow `backtest_market_cache` once ClickHouse and catalog writes cover those datasets. Add operational state events and migrations in Postgres before live submit cutover. Do not mirror ledgers to ClickHouse until a reporting consumer needs analytical copies. | This removes the broad JSONB market cache path and keeps a clean split between operational truth and analytical history. |
 | First runtime integration | Build the generic `nautilus-persistence` ClickHouse writer and warehouse `backfill` operation before turning on the live dual-write sink. | It validates contracts and scanner usefulness before introducing a new live-service dependency. |
 | Deployment owner | Self-host ClickHouse from `deploy/warehouse/`. Start with a local/dev stack, then prove the NUC only if storage, CPU, and memory headroom are acceptable. Move to a dedicated self-hosted analytics box if retention or ingest volume outgrows the NUC. | Quote-scale data can outgrow a small live-trading host quickly, and the warehouse must not starve trading processes. |
@@ -596,12 +617,13 @@ Start with the smallest repo-level path that proves ClickHouse is a real warehou
 1. Add `deploy/warehouse/compose.yml` for local/self-hosted ClickHouse with persistent data/log
    volumes, resource limits, local-only ports by default, and smoke commands.
 2. Add `schema/sql/clickhouse/001_market_quote_ticks.sql` for the initial canonical
-   `market.quote_ticks` table.
+   `market.quote_ticks` table plus warehouse migration metadata.
 3. Add optional ClickHouse support to `nautilus-persistence`, including config, connection health,
    and a typed `QuoteTick` row mapper.
 4. Add a durable warehouse operator surface with `health`, `migrate`, `backfill`, and `validate`
-   operations. The first smoke should write a tiny `QuoteTick` batch and read counts back through
-   the same surface.
+   operations. `migrate` applies `schema/sql/clickhouse/` files, records applied versions in
+   `warehouse.schema_migrations`, and fails on checksum drift. The first smoke should write a tiny
+   `QuoteTick` batch and read counts back through the same surface.
 5. Validate with a small catalog-backed proof window. Alpaca option-chain catalog data can be the
    first dataset, but no ClickHouse module, migration, command, or deployment file should carry an
    Alpaca-owned name.

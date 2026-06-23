@@ -57,7 +57,7 @@ flowchart LR
     end
 
     subgraph Postgres ["Operational Postgres"]
-        Migrations["schema_migrations"]
+        Migrations["sqlx migration metadata"]
         Snapshot["strategy_state snapshot"]
         Events["strategy_state_events"]
         CandidateLedger["candidate_ledger"]
@@ -102,7 +102,6 @@ write completion.
 
 | Table | Owner | Purpose | Shape |
 | --- | --- | --- | --- |
-| `schema_migrations` | Alpaca storage | Versioned schema contract for the operational store. | One row per applied migration with checksum. |
 | `strategy_state` | Alpaca runtime | Current restart/admission snapshot per account. | One row per account, JSONB state, version metadata. |
 | `strategy_state_events` | Alpaca runtime | Append-only state mutation audit and idempotency ledger. | One row per accepted/rejected/closed/reconciled state mutation. |
 | `candidate_ledger` | Scanner/strategy evidence | Candidate, block, decision, alert, and submit-result evidence. | Append-only JSONB records with typed columns for common filters. |
@@ -113,19 +112,25 @@ write completion.
 
 ## Proposed Schema Changes
 
-Use versioned SQL migrations instead of growing the inline `CREATE TABLE IF NOT EXISTS` block.
-The first migration can preserve the existing tables and add missing metadata.
+Use `sqlx` migrations instead of growing the inline `CREATE TABLE IF NOT EXISTS` block or adding a
+fork-owned migration manager. The first migration can preserve the existing tables and add missing
+metadata.
 
-### Schema Migrations
+### Postgres Migrations
 
-```sql
-CREATE TABLE IF NOT EXISTS "{schema}".schema_migrations (
-    version BIGINT PRIMARY KEY,
-    description TEXT NOT NULL,
-    checksum TEXT NOT NULL,
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-```
+Postgres schema evolution should use the existing Rust dependency path:
+
+- Enable the `sqlx` migration support needed by the crate that owns `StorageRepository`.
+- Store versioned SQL files under an Alpaca-owned migration directory such as
+  `crates/adapters/alpaca/migrations/`. If the operational store is later promoted out of Alpaca,
+  move the migrations to the new generic owner instead of keeping an adapter name.
+- Apply migrations with `sqlx::migrate!` / `Migrator` from the live node or operator readiness
+  path, and allow local operators to run the same files with `sqlx migrate run`.
+- Let `sqlx` own its metadata table, `_sqlx_migrations` by default. Do not add a custom
+  `schema_migrations` table to the Alpaca domain schema.
+
+The readiness check should report the applied migration version from `sqlx` metadata alongside
+normal storage health.
 
 ### Strategy State Snapshot
 
@@ -302,7 +307,7 @@ This can come after durable state, because durable state is the submit cutover b
 `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED=true` should require all of the following:
 
 - Postgres storage configured and reachable.
-- Required migrations applied.
+- Required `sqlx` migrations applied.
 - Strategy state loaded from Postgres.
 - Local JSON mirror updated from Postgres at startup.
 - Runtime lease acquired for the account.
@@ -316,14 +321,14 @@ If any item fails, the node may continue scanning, but it must not submit entrie
 
 ### Phase 1: Migrations And Repository Contract
 
-- Add versioned SQL migrations for the existing Alpaca schema.
-- Add `schema_migrations`, state metadata columns, `strategy_state_events`, and `runtime_lease`.
-- Keep inline schema creation only as a bootstrap that applies migrations, or replace it outright
-  with the migration runner.
+- Enable `sqlx` migration support for the Alpaca operational Postgres store.
+- Move the existing inline DDL into versioned SQL migrations.
+- Add state metadata columns, `strategy_state_events`, and `runtime_lease`.
+- Replace inline schema creation with the `sqlx` migrator in the startup/readiness path.
 - Add repository functions for transactional state event + snapshot writes.
 
-Done when a local Postgres can initialize, report migration version, load existing state rows, and
-persist one synthetic state event idempotently.
+Done when a local Postgres can initialize through the `sqlx` migrator, report the applied migration
+version, load existing state rows, and persist one synthetic state event idempotently.
 
 ### Phase 2: Strategy-State Persistence Sink
 
@@ -379,14 +384,16 @@ Done when Postgres contains operational state, evidence, reports, outcomes, and 
 - Do not build a generic storage framework before the Alpaca state sink proves the pattern.
 - Do not block synchronous Nautilus callbacks on async database writes.
 - Do not allow live submission with best-effort-only persistence.
+- Do not handroll a Postgres migration table or migration runner when `sqlx` already covers this
+  store.
 
 ## Recommended Next Step
 
 Implement Phase 1 first. It is the smallest safe step and gives later strategy work a durable
 contract:
 
-1. Add migration files.
-2. Add migration runner to `StorageRepository`.
+1. Add `sqlx` migration files for the existing Alpaca operational schema.
+2. Wire the `sqlx` migrator into startup/readiness.
 3. Add `strategy_state_events`.
 4. Add snapshot version metadata.
 5. Add a transactional repository method for one state event plus one snapshot update.

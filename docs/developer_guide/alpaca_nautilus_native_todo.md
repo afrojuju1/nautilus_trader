@@ -172,7 +172,8 @@ loop.
     exposure.
 - [ ] Add a real persistence boundary for strategy state.
   - Follow `docs/developer_guide/alpaca_operational_postgres_plan.md`.
-  - [ ] Add versioned Alpaca Postgres migrations.
+  - [ ] Enable `sqlx` Postgres migrations for Alpaca operational storage.
+  - [ ] Move inline `StorageRepository::init_schema` DDL into versioned SQL migration files.
   - [ ] Add `strategy_state_events` as the append-only state mutation ledger.
   - [ ] Add `version`, writer metadata, and last-event metadata to `strategy_state`.
   - [ ] Add a transactional repository method that inserts one state event and updates the

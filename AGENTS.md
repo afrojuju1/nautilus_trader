@@ -84,3 +84,16 @@ docker exec nautilus-alpaca-alpaca-options-1 alpaca-options-engine --check-confi
   result is reported. Compile checks and container health are build/runtime proof only.
 - Earnings-calendar input for Alpaca earnings strategies uses Alpha Vantage only through local secrets and cache. Keep `ALPHA_VANTAGE_API_KEY` in an untracked `.env` or external env file, never commit it. Refresh with `earnings-sync`; it caches raw Alpha Vantage `EARNINGS_CALENDAR` output for 23 hours by default, writes the full normalized feed to `$XDG_STATE_HOME/nautilus_trader/earnings/earnings_events.csv` or `$HOME/.local/state/nautilus_trader/earnings/earnings_events.csv`, and writes the stricter strategy-safe feed to `earnings_events_approved.csv` in the same directory.
 - Treat Alpha Vantage earnings timing quality as mixed: `pre-market` and `post-market` can be normalized to `before_open` and `after_close`, but blank timing becomes `unknown` and must remain blocked by default unless the user explicitly approves unknown-timing entries. The approved feed should also exclude weekend dates and non-common symbol shapes before any strategy consumes it.
+
+## Issue Tracking
+
+This repo uses `bd` (Beads) as the durable work ledger. Run `bd prime` for current workflow context
+and command help, but repo and user instructions override any generic Beads session-close protocol.
+
+- Use `bd ready` to find unblocked work.
+- Use `bd create`, `bd update <id> --claim`, and `bd close <id>` for substantial implementation
+  tasks and meaningful discoveries.
+- Keep Beads in sync when committing Beads-backed work, but do not commit or push repository changes
+  unless the user explicitly asks.
+- Do not replace short-lived implementation checklists with Beads unless the work should persist
+  beyond the current turn.
