@@ -57,9 +57,11 @@ and strategies.
   - The scan actor publishes typed `AlpacaOptionsOpportunityData`; the strategy subscribes through
     the Nautilus data bus and submits standard Nautilus orders only when the runtime submit/window
     gates allow it.
-  - Until persisted strategy admission moves into the strategy path, entry submission also requires
+  - Entry admission now runs in the strategy path, but live submission still requires
     `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED=true`; otherwise the strategy remains wired but
     dry-runs selected entries.
+  - Do not enable live entry submission until durable strategy-state persistence, startup
+    reconciliation, and remaining broker-account admission parity are complete.
 - [ ] Decide whether scanner evidence should write to Postgres directly or publish events for a
   separate persistence consumer.
 - [x] Remove the adapter-local order-plan layer from options-engine submission.
@@ -102,28 +104,133 @@ green during market hours for the configured paper profiles.
     node to read paper-account buying power before scanning.
   - Do not set `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED=true` for cutover proof until the
     persisted admission/state tasks below are complete.
-- [ ] Move persisted entry admission and state recording into the Nautilus strategy path before
-  retiring the account-engine entry loop.
+- [ ] Finish durable strategy-state recording and startup reconciliation in the Nautilus strategy
+  path before retiring the account-engine entry loop.
+
+## Remaining Work Breakdown
+
+### 1. Market-Hours Cutover Proof
+
+- [ ] Run `deploy/alpaca/alpaca-control.sh cutover-proof` during market hours for the configured
+  paper profiles and representative symbols/expiries.
+- [ ] Confirm REST-vs-option-chain selected candidates and scan diagnostics match, or document
+  mismatches caused by stricter Nautilus option-chain quote validity.
+- [ ] Confirm live-node logs show Alpaca instrument bootstrap, non-zero cached option instruments,
+  option-chain subscription, and `option_chain_opportunity_scan` events.
+- [ ] Keep `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED=false` until strategy admission, durable
+  state recording, and startup reconciliation are complete.
+
+### 2. Entry Admission Cutover
+
+Target: `AlpacaOptionsEntryStrategy` owns entry admission before any order is submitted. The old
+account-engine loop can temporarily call the same admission code while it still exists, but it
+must not remain the owner of risk decisions.
+
+- [x] Move the reusable admission model out of `options_engine.rs` into a strategy-owned module.
+  - [x] Move `SubmissionBlock`, admission-block reason classification, broker-permission memory, and
+    risk-gate decision conversion together.
+  - [x] Keep reason strings stable so operator events, alerts, and ledgers remain comparable during
+    cutover.
+- [ ] Feed admission with durable strategy state.
+  - [x] Load `StrategyState` for the live node before constructing `AlpacaOptionsEntryStrategy`.
+  - [ ] Require storage-backed state when `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED=true`; dry-run
+    cutover proof can keep the current no-storage live-node path.
+  - [x] Preserve same-day duplicate checks, active-entry limits, daily-submit limits, per-underlying
+    limits, per-sector limits, and fleet limits.
+- [ ] Feed admission with live broker state.
+  - [x] Prefer Nautilus cache/portfolio/order state where it exposes equivalent information.
+  - [ ] Keep Alpaca HTTP only for account flags or option-specific broker admission details not already
+    represented by Nautilus runtime state.
+  - [ ] Preserve the existing account/position/open-order option-spread admission checks before paper
+    submission is enabled.
+- [ ] Make the strategy emit the same selected/blocked/dry-run operator evidence as the old loop.
+  - [ ] Selected dry-runs must record `submission_disabled`.
+  - [x] Blocks must include reason, current, limit, and details where available.
+  - [ ] The cutover proof should show decision parity before the old entry loop is removed.
+- [ ] Done when `AlpacaOptionsEntryStrategy` refuses every entry the account engine would have
+  refused, using the same persisted state and live broker constraints.
+
+### 3. Entry State Recording
+
+Target: accepted and terminally rejected entry submissions are recorded from the Nautilus strategy
+path, so restarts and duplicate-entry protection do not depend on the old account-engine submit
+loop.
+
+- [ ] Add a strategy-owned pending submission record keyed by order-list ID.
+  - [x] Store selected entry, trade date, quantity, expected client order IDs, and order count.
+  - [ ] Store submit timestamps.
+  - [x] Keep this state in memory immediately after `submit_order` / `submit_order_list`.
+- [x] Record accepted submissions from Nautilus order events.
+  - [x] Use `Strategy::on_order_accepted`, `on_order_rejected`, and `on_order_denied`.
+  - [x] Record `entry.state_entry_draft(...)` once a submission has meaningful broker acceptance.
+  - [x] Preserve parent/venue order ID data when available from events or follow-up broker lookup.
+- [x] Preserve terminal rejection behavior.
+  - [x] Naked-option uncovered-permission rejections must still mark a canceled state entry with
+    `entry_rejected_uncovered_option_permission`.
+  - [x] Other terminal entry rejections should remain observable and should not create false active
+    exposure.
+- [ ] Add a real persistence boundary for strategy state.
+  - Strategy callbacks are synchronous, while the Postgres repository is async; do not hide DB
+    writes inside blocking callback code.
+  - Use an explicit state persistence actor/event sink or another Nautilus-native async boundary
+    for DB writes.
+  - Keep local/in-memory state updated before persistence completes so admission gates protect the
+    current process immediately.
+- [ ] Reconcile state on startup before enabling paper submission.
+  - [x] Load persisted entries.
+  - [ ] Reconcile broker orders/positions so pending or partially accepted entries are not double
+    submitted after restart.
+- [ ] Done when accepted/rejected strategy submissions update durable state without calling direct
+  account-engine submission code.
+
+### 4. Paper Submit Cutover
+
+- [ ] Enable `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED=true` only for a bounded paper run after
+  entry admission, durable state recording, and startup reconciliation are strategy-owned.
+- [ ] Confirm submitted orders flow through `AlpacaExecutionClientFactory`, standard Nautilus order
+  events, and durable strategy state.
+- [ ] Check broker account/orders after the run and cancel accepted smoke orders unless explicitly
+  leaving them open.
+
+### 5. Remove Old Entry Loop
+
+- [ ] Delete direct account-engine entry submission after the strategy path owns admission and
+  durable state.
+- [ ] Remove displaced entry-only helpers from `options_engine.rs`; keep only management/reconciliation
+  behavior that still has an explicit owner.
+- [ ] Remove `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED` once the Nautilus strategy path is the
+  official order-capable path, or replace it with the normal runtime `submit_enabled` gate only.
+
+### 6. Scanner Evidence Persistence
+
+- [ ] Decide whether scanner evidence is persisted by a dedicated consumer or a storage-aware actor.
+- [ ] Keep scan math and candidate ranking pure; persistence should consume scan results, not own
+  candidate selection.
+
+### 7. Management Loop Cutover
+
+- [ ] Move close, flatten, stale-order, and reprice lifecycle into a dedicated
+  strategy/component.
+- [ ] Keep broker reconciliation, close decisions, and operator events visible during cutover.
+- [ ] Remove direct management behavior from the account-engine loop once the new owner is proven.
+
+### 8. Diagnostic Cleanup
+
+- [ ] Retire long-running standalone scanner loops after actor/strategy paths provide equivalent
+  evidence.
+- [ ] Keep intentionally diagnostic commands such as scan comparison and bounded cutover proof.
 
 ## Next Loops To Retire
 
 - [ ] Entry loop
-  - Move persisted risk admission into `AlpacaOptionsEntryStrategy`: broker permission memory,
-    active-entry limits, daily submit limits, open-order limits, per-underlying/sector limits, and
-    broker account/position/open-order admission checks.
-  - Record accepted/rejected submission state from execution reports or reconciled order status so
-    restarts do not lose duplicate-entry protection.
-  - Retire direct account-engine entry submission after the strategy owns both admission and state
-    recording.
+  - Tracked in "2. Entry Admission Cutover", "3. Entry State Recording", and
+    "5. Remove Old Entry Loop" above.
 
 - [ ] Management loop
-  - Move close, flatten, stale-order, and reprice lifecycle into a dedicated strategy/component.
-  - Keep broker reconciliation and lifecycle decisions observable through operator events.
+  - Tracked in "7. Management Loop Cutover" above.
 
 - [ ] One-off scanner binaries
-  - Retire long-running standalone scanner loops after actor/strategy paths provide equivalent
-    evidence.
-  - Keep only intentionally diagnostic commands with clear no-order semantics.
+  - Tracked in "8. Diagnostic Cleanup" above.
 
 ## Guardrails
 

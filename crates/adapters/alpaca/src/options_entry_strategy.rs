@@ -1,16 +1,23 @@
 //! Nautilus-native entry strategy for Alpaca option candidates.
 
-use std::{any::Any, collections::BTreeSet, fmt::Debug, str::FromStr, sync::Arc};
+use std::{
+    any::Any,
+    collections::{BTreeMap, BTreeSet},
+    fmt::Debug,
+    str::FromStr,
+    sync::Arc,
+};
 
-use chrono::{NaiveTime, Utc};
-use chrono_tz::Tz;
-use nautilus_common::{actor::DataActor, factories::OrderFactory};
+use chrono::Utc;
+use nautilus_common::{actor::DataActor, cache::CacheApi, factories::OrderFactory};
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     data::{CustomData, CustomDataTrait, DataType, HasTsInit},
     enums::{OrderSide, TimeInForce},
+    events::{OrderAccepted, OrderDenied, OrderRejected},
     identifiers::{ClientId, ClientOrderId, InstrumentId, OrderListId},
-    orders::OrderAny,
+    instruments::Instrument,
+    orders::{Order, OrderAny},
     types::{Price, Quantity},
 };
 use nautilus_trading::{
@@ -20,10 +27,17 @@ use nautilus_trading::{
 
 use crate::{
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
+    options_entry_admission::{
+        EntryAdmissionConfig, EntryAdmissionSnapshot, EntryGateDecision, SubmissionBlock,
+        UNCOVERED_OPTION_PERMISSION_REJECTION_REASON, entry_gate_decision,
+        is_uncovered_option_permission_rejection, selected_submit_enabled,
+        submission_block_for_selected,
+    },
     options_runtime::{
         OptionsEngineConfig, OptionsOpportunitySet, OptionsScanOutcome, OptionsScanReport,
         SelectedOptionsEntry,
     },
+    runtime::StrategyState,
 };
 
 /// Custom data type published by option-chain scanner actors for entry strategies.
@@ -134,20 +148,10 @@ pub struct AlpacaOptionsEntryStrategyConfig {
     pub quantity: u64,
     /// Execution client ID to route orders to.
     pub client_id: Option<ClientId>,
-    /// Whether live submission is globally enabled.
-    pub submit_enabled: bool,
-    /// Strategy names that are intentionally scanned but not submitted.
-    pub dry_run_strategy_names: BTreeSet<String>,
-    /// Whether new entries are blocked.
-    pub kill_switch: bool,
-    /// Whether the entry window should be ignored.
-    pub ignore_entry_window: bool,
-    /// Entry window start.
-    pub entry_start: NaiveTime,
-    /// Entry window end.
-    pub entry_end: NaiveTime,
-    /// Entry window timezone.
-    pub entry_timezone: Tz,
+    /// Entry-admission gates owned by the strategy path.
+    pub admission: EntryAdmissionConfig,
+    /// Initial persisted strategy state loaded before the node starts.
+    pub initial_state: StrategyState,
 }
 
 impl AlpacaOptionsEntryStrategyConfig {
@@ -158,13 +162,8 @@ impl AlpacaOptionsEntryStrategyConfig {
             base,
             quantity,
             client_id: Some(ClientId::from(ALPACA_CLIENT_ID)),
-            submit_enabled: true,
-            dry_run_strategy_names: BTreeSet::new(),
-            kill_switch: false,
-            ignore_entry_window: true,
-            entry_start: NaiveTime::MIN,
-            entry_end: NaiveTime::from_hms_opt(23, 59, 59).expect("valid terminal day time"),
-            entry_timezone: chrono_tz::UTC,
+            admission: EntryAdmissionConfig::default(),
+            initial_state: StrategyState::default(),
         }
     }
 
@@ -175,17 +174,8 @@ impl AlpacaOptionsEntryStrategyConfig {
             base,
             quantity: engine.quantity,
             client_id: Some(ClientId::from(ALPACA_CLIENT_ID)),
-            submit_enabled: engine.submit_enabled,
-            dry_run_strategy_names: engine
-                .dry_run_strategy_names()
-                .into_iter()
-                .map(ToString::to_string)
-                .collect(),
-            kill_switch: engine.kill_switch,
-            ignore_entry_window: engine.ignore_entry_window,
-            entry_start: engine.entry_start,
-            entry_end: engine.entry_end,
-            entry_timezone: engine.entry_timezone,
+            admission: EntryAdmissionConfig::from_engine_config(engine),
+            initial_state: StrategyState::default(),
         }
     }
 }
@@ -201,11 +191,27 @@ pub struct AlpacaOptionsEntrySubmission {
     pub order_count: usize,
 }
 
+#[derive(Clone, Debug)]
+struct PendingEntrySubmission {
+    entry: SelectedOptionsEntry,
+    trade_date: String,
+    order_list_id: String,
+    quantity: u64,
+    order_count: usize,
+    accepted: usize,
+    rejected: usize,
+    recorded: bool,
+    rejection_reasons: Vec<String>,
+}
+
 /// Nautilus strategy responsible for converting selected option opportunities into orders.
 #[derive(Debug)]
 pub struct AlpacaOptionsEntryStrategy {
     core: StrategyCore,
     config: AlpacaOptionsEntryStrategyConfig,
+    state: StrategyState,
+    pending_submissions: BTreeMap<String, PendingEntrySubmission>,
+    pending_client_order_ids: BTreeMap<String, String>,
     submitted_underlying_keys: BTreeSet<String>,
 }
 
@@ -215,7 +221,10 @@ impl AlpacaOptionsEntryStrategy {
     pub fn new(config: AlpacaOptionsEntryStrategyConfig) -> Self {
         Self {
             core: StrategyCore::new(config.base.clone()),
+            state: config.initial_state.clone(),
             config,
+            pending_submissions: BTreeMap::new(),
+            pending_client_order_ids: BTreeMap::new(),
             submitted_underlying_keys: BTreeSet::new(),
         }
     }
@@ -238,16 +247,27 @@ impl AlpacaOptionsEntryStrategy {
             return Ok(None);
         };
 
-        if let Some(reason) = self.entry_block_reason() {
-            log::info!(
-                "Skipping Alpaca options entry: reason={} underlying={} strategy={}",
-                reason,
-                entry.underlying(),
-                entry.strategy_name()
-            );
-            return Ok(None);
+        match entry_gate_decision(&self.config.admission, Utc::now()) {
+            EntryGateDecision::Continue => {}
+            EntryGateDecision::KillSwitch => {
+                log::info!(
+                    "Skipping Alpaca options entry: reason=kill_switch_enabled underlying={} strategy={}",
+                    entry.underlying(),
+                    entry.strategy_name()
+                );
+                return Ok(None);
+            }
+            EntryGateDecision::OutsideEntryWindow => {
+                log::info!(
+                    "Skipping Alpaca options entry: reason=outside_entry_window underlying={} strategy={}",
+                    entry.underlying(),
+                    entry.strategy_name()
+                );
+                return Ok(None);
+            }
         }
-        if !self.selected_submit_enabled(&entry) {
+
+        if !selected_submit_enabled(&self.config.admission, &entry) {
             log::info!(
                 "Dry-run Alpaca options entry: underlying={} strategy={} symbols={} score={:.1}",
                 entry.underlying(),
@@ -255,6 +275,18 @@ impl AlpacaOptionsEntryStrategy {
                 entry.option_symbols().join(","),
                 entry.score()
             );
+            return Ok(None);
+        }
+
+        let snapshot = self.entry_admission_snapshot(&entry)?;
+        if let Some(block) = submission_block_for_selected(
+            &self.config.admission,
+            &self.state,
+            &entry,
+            &data.opportunities.trade_date,
+            &snapshot,
+        ) {
+            self.log_entry_block(&data.opportunities.trade_date, &entry, &block);
             return Ok(None);
         }
 
@@ -273,10 +305,15 @@ impl AlpacaOptionsEntryStrategy {
         }
 
         let order_list_id = entry_order_list_id(&data.opportunities.trade_date, entry.underlying());
-        match self.submit_selected_entry(entry, &order_list_id) {
+        match self.submit_selected_entry_with_trade_date(
+            entry,
+            &data.opportunities.trade_date,
+            &order_list_id,
+        ) {
             Ok(submission) => Ok(Some(submission)),
             Err(error) => {
                 self.submitted_underlying_keys.remove(&underlying_key);
+                self.remove_pending_submission(&order_list_id);
                 Err(error)
             }
         }
@@ -316,19 +353,40 @@ impl AlpacaOptionsEntryStrategy {
         entry: SelectedOptionsEntry,
         order_list_id: &str,
     ) -> anyhow::Result<AlpacaOptionsEntrySubmission> {
-        let mut order_api = self.order();
-        let mut orders = build_selected_entry_orders(
-            &mut order_api,
-            &entry,
-            order_list_id,
-            self.config.quantity,
-        )?;
+        let orders = self.build_entry_orders(&entry, order_list_id)?;
         let order_count = orders.len();
-        if order_count == 1 {
-            self.submit_order(orders.remove(0), None, self.config.client_id, None)?;
-        } else {
-            apply_order_list_id(&mut orders, order_list_id);
-            self.submit_order_list(orders, None, self.config.client_id, None)?;
+        self.submit_entry_orders(orders, order_list_id)?;
+
+        Ok(AlpacaOptionsEntrySubmission {
+            entry,
+            order_list_id: order_list_id.to_string(),
+            order_count,
+        })
+    }
+
+    fn submit_selected_entry_with_trade_date(
+        &mut self,
+        entry: SelectedOptionsEntry,
+        trade_date: &str,
+        order_list_id: &str,
+    ) -> anyhow::Result<AlpacaOptionsEntrySubmission> {
+        let orders = self.build_entry_orders(&entry, order_list_id)?;
+        let client_order_ids = orders
+            .iter()
+            .map(|order| order.client_order_id().to_string())
+            .collect::<Vec<_>>();
+        let order_count = orders.len();
+        self.record_pending_submission(
+            entry.clone(),
+            trade_date.to_string(),
+            order_list_id.to_string(),
+            order_count,
+            client_order_ids,
+        );
+
+        if let Err(error) = self.submit_entry_orders(orders, order_list_id) {
+            self.remove_pending_submission(order_list_id);
+            return Err(error);
         }
 
         Ok(AlpacaOptionsEntrySubmission {
@@ -338,31 +396,248 @@ impl AlpacaOptionsEntryStrategy {
         })
     }
 
-    fn selected_submit_enabled(&self, entry: &SelectedOptionsEntry) -> bool {
-        self.config.submit_enabled
-            && !self
-                .config
-                .dry_run_strategy_names
-                .contains(entry.strategy_name())
+    fn build_entry_orders(
+        &mut self,
+        entry: &SelectedOptionsEntry,
+        order_list_id: &str,
+    ) -> anyhow::Result<Vec<OrderAny>> {
+        let quantity = self.config.quantity;
+        let mut order_api = self.order();
+        build_selected_entry_orders(&mut order_api, entry, order_list_id, quantity)
     }
 
-    fn entry_block_reason(&self) -> Option<&'static str> {
-        if self.config.kill_switch {
-            return Some("kill_switch_enabled");
+    fn submit_entry_orders(
+        &mut self,
+        mut orders: Vec<OrderAny>,
+        order_list_id: &str,
+    ) -> anyhow::Result<()> {
+        if orders.len() == 1 {
+            self.submit_order(orders.remove(0), None, self.config.client_id, None)?;
+        } else {
+            apply_order_list_id(&mut orders, order_list_id);
+            self.submit_order_list(orders, None, self.config.client_id, None)?;
         }
-        if !self.config.ignore_entry_window && !self.inside_entry_window() {
-            return Some("outside_entry_window");
-        }
-        None
+        Ok(())
     }
 
-    fn inside_entry_window(&self) -> bool {
-        let now = Utc::now().with_timezone(&self.config.entry_timezone).time();
-        self.config.entry_start <= now && now <= self.config.entry_end
+    fn record_pending_submission(
+        &mut self,
+        entry: SelectedOptionsEntry,
+        trade_date: String,
+        order_list_id: String,
+        order_count: usize,
+        client_order_ids: Vec<String>,
+    ) {
+        for client_order_id in client_order_ids {
+            self.pending_client_order_ids
+                .insert(client_order_id, order_list_id.clone());
+        }
+        self.pending_submissions.insert(
+            order_list_id.clone(),
+            PendingEntrySubmission {
+                entry,
+                trade_date,
+                order_list_id,
+                quantity: self.config.quantity,
+                order_count,
+                accepted: 0,
+                rejected: 0,
+                recorded: false,
+                rejection_reasons: Vec::new(),
+            },
+        );
+    }
+
+    fn handle_order_accepted(&mut self, event: OrderAccepted) {
+        let client_order_id = event.client_order_id.to_string();
+        let Some(order_list_id) = self.pending_client_order_ids.get(&client_order_id).cloned()
+        else {
+            return;
+        };
+
+        let mut draft = None;
+        let mut should_remove = false;
+        if let Some(pending) = self.pending_submissions.get_mut(&order_list_id) {
+            pending.accepted = pending.accepted.saturating_add(1);
+            if !pending.recorded {
+                draft = Some(pending.entry.state_entry_draft(
+                    &pending.trade_date,
+                    &pending.order_list_id,
+                    pending.quantity,
+                    Some(event.venue_order_id.to_string()),
+                ));
+                pending.recorded = true;
+            }
+            should_remove = pending.accepted + pending.rejected >= pending.order_count;
+        }
+
+        if let Some(draft) = draft {
+            log::info!(
+                "Recording accepted Alpaca options entry: order_list_id={} client_order_id={} venue_order_id={}",
+                order_list_id,
+                event.client_order_id,
+                event.venue_order_id
+            );
+            self.state.record_entry_submission(draft);
+        }
+
+        if should_remove {
+            self.remove_pending_submission(&order_list_id);
+        }
+    }
+
+    fn handle_order_rejected(&mut self, client_order_id: ClientOrderId, reason: &str) {
+        let client_order_id = client_order_id.to_string();
+        let Some(order_list_id) = self.pending_client_order_ids.get(&client_order_id).cloned()
+        else {
+            return;
+        };
+
+        let mut rejected_state = None;
+        let mut should_remove = false;
+        if let Some(pending) = self.pending_submissions.get_mut(&order_list_id) {
+            pending.rejected = pending.rejected.saturating_add(1);
+            pending.rejection_reasons.push(reason.to_string());
+            if pending.entry.is_naked_option() && pending.accepted == 0 && !pending.recorded {
+                let close_reason = if pending
+                    .rejection_reasons
+                    .iter()
+                    .any(|reason| is_uncovered_option_permission_rejection(reason))
+                {
+                    UNCOVERED_OPTION_PERMISSION_REJECTION_REASON
+                } else {
+                    "entry_rejected"
+                };
+                rejected_state = Some((
+                    pending.entry.state_entry_draft(
+                        &pending.trade_date,
+                        &pending.order_list_id,
+                        pending.quantity,
+                        None,
+                    ),
+                    close_reason.to_string(),
+                ));
+                pending.recorded = true;
+            }
+            should_remove = pending.accepted + pending.rejected >= pending.order_count;
+        }
+
+        if let Some((draft, close_reason)) = rejected_state {
+            log::info!(
+                "Recording terminally rejected Alpaca options entry: order_list_id={} client_order_id={} reason={}",
+                order_list_id,
+                client_order_id,
+                close_reason
+            );
+            self.state.record_entry_submission(draft);
+            if let Some(entry) = self.state.entries.last_mut() {
+                entry.mark_canceled();
+                entry.close_reason = Some(close_reason);
+            }
+        }
+
+        if should_remove {
+            self.remove_pending_submission(&order_list_id);
+        }
+    }
+
+    fn remove_pending_submission(&mut self, order_list_id: &str) {
+        self.pending_submissions.remove(order_list_id);
+        self.pending_client_order_ids
+            .retain(|_, pending_order_list_id| pending_order_list_id != order_list_id);
+    }
+
+    fn entry_admission_snapshot(
+        &self,
+        entry: &SelectedOptionsEntry,
+    ) -> anyhow::Result<EntryAdmissionSnapshot> {
+        let cache = self.cache();
+        let open_order_count = cache.orders_open_count(None, None, None, None, None);
+        let mut broker_admission_reasons = Vec::new();
+        let symbols = entry.option_symbols();
+        let candidate_ids = symbols
+            .iter()
+            .map(|symbol| alpaca_instrument_id(symbol))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        for (symbol, instrument_id) in symbols.iter().zip(&candidate_ids) {
+            if cache.has_positions_open(None, Some(instrument_id), None, None, None) {
+                broker_admission_reasons
+                    .push(format!("existing open position on candidate leg {symbol}"));
+            }
+            if cache.has_orders_open(None, Some(instrument_id), None, None, None) {
+                broker_admission_reasons.push(format!(
+                    "working order already references candidate leg {symbol}"
+                ));
+            }
+        }
+
+        for position in cache.positions_open(None, None, None, None, None) {
+            if candidate_ids.contains(&position.instrument_id) {
+                continue;
+            }
+            if instrument_underlying_matches(&cache, &position.instrument_id, entry.underlying()) {
+                broker_admission_reasons.push(format!(
+                    "existing open option position on underlying {}: {}",
+                    entry.underlying(),
+                    position.instrument_id.symbol
+                ));
+            }
+        }
+
+        for order in cache.orders_open(None, None, None, None, None) {
+            let instrument_id = order.instrument_id();
+            if candidate_ids.contains(&instrument_id) {
+                continue;
+            }
+            if instrument_underlying_matches(&cache, &instrument_id, entry.underlying()) {
+                broker_admission_reasons.push(format!(
+                    "working order already references underlying {}: {}",
+                    entry.underlying(),
+                    instrument_id.symbol
+                ));
+            }
+        }
+
+        Ok(EntryAdmissionSnapshot {
+            open_order_count,
+            broker_admission_reasons,
+        })
+    }
+
+    fn log_entry_block(
+        &self,
+        trade_date: &str,
+        entry: &SelectedOptionsEntry,
+        block: &SubmissionBlock,
+    ) {
+        log::info!(
+            "Skipping Alpaca options entry: trade_date={} reason={} current={:?} limit={:?} details={:?} underlying={} strategy={} symbols={}",
+            trade_date,
+            block.reason,
+            block.current,
+            block.limit,
+            block.details,
+            entry.underlying(),
+            entry.strategy_name(),
+            entry.option_symbols().join(",")
+        );
     }
 }
 
-nautilus_strategy!(AlpacaOptionsEntryStrategy);
+nautilus_strategy!(AlpacaOptionsEntryStrategy, {
+    fn on_order_accepted(&mut self, event: OrderAccepted) {
+        self.handle_order_accepted(event);
+    }
+
+    fn on_order_rejected(&mut self, event: OrderRejected) {
+        self.handle_order_rejected(event.client_order_id, event.reason.as_str());
+    }
+
+    fn on_order_denied(&mut self, event: OrderDenied) {
+        self.handle_order_rejected(event.client_order_id, event.reason.as_str());
+    }
+});
 
 impl DataActor for AlpacaOptionsEntryStrategy {
     fn on_start(&mut self) -> anyhow::Result<()> {
@@ -627,6 +902,21 @@ fn submitted_underlying_key(trade_date: &str, entry: &SelectedOptionsEntry) -> S
         entry.strategy_name(),
         entry.underlying()
     )
+}
+
+fn instrument_underlying_matches(
+    cache: &CacheApi<'_>,
+    instrument_id: &InstrumentId,
+    underlying: &str,
+) -> bool {
+    cache
+        .instrument(instrument_id)
+        .and_then(|instrument| instrument.underlying())
+        .is_some_and(|instrument_underlying| {
+            instrument_underlying
+                .as_str()
+                .eq_ignore_ascii_case(underlying)
+        })
 }
 
 fn scan_report_payload(report: &OptionsScanReport) -> serde_json::Value {

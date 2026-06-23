@@ -67,10 +67,7 @@ use candidate_ledger::{
 use config::{
     account_options_buying_power, format_optional_pct, format_rejection_counts, no_candidate_reason,
 };
-pub(crate) use config::{
-    active_sector_count, active_underlying_count, fleet_active_underlying_count,
-    fleet_sector_limit_state,
-};
+pub(crate) use config::{active_sector_count, active_underlying_count};
 use config::{build_options_engine_config, load_runtime_config_file_from_env};
 
 const HIGH_SCORE_CANDIDATE_ALERT: &str = "high_score_candidate";

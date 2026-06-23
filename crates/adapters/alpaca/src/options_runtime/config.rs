@@ -877,45 +877,6 @@ pub(crate) fn active_sector_count(
         .count()
 }
 
-pub(crate) fn fleet_active_underlying_count(
-    config: &OptionsEngineConfig,
-    underlying: &str,
-) -> usize {
-    config
-        .fleet
-        .as_ref()
-        .map(|fleet| {
-            fleet
-                .exposure()
-                .active_entries_by_underlying
-                .get(&underlying.to_ascii_uppercase())
-                .copied()
-                .unwrap_or(0)
-        })
-        .unwrap_or(0)
-}
-
-pub(crate) fn fleet_sector_limit_state(
-    config: &OptionsEngineConfig,
-    underlying: &str,
-) -> Option<(String, usize, usize)> {
-    let fleet = config.fleet.as_ref()?;
-    let limit = fleet.config.fleet.max_active_entries_per_sector?;
-    let sector = fleet
-        .config
-        .fleet
-        .sectors
-        .get(&underlying.to_ascii_uppercase())?
-        .clone();
-    let current = fleet
-        .exposure()
-        .active_entries_by_sector
-        .get(&sector)
-        .copied()
-        .unwrap_or(0);
-    Some((sector, current, limit))
-}
-
 fn default_underlyings() -> Vec<String> {
     [
         "SPY", "QQQ", "IWM", "DIA", "GLD", "GDX", "SLV", "TLT", "XLE", "XLF", "XLK", "XLV", "XLY",

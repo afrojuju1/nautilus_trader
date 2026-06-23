@@ -65,6 +65,8 @@ pub mod options_engine;
 #[cfg(feature = "live")]
 pub mod options_entry;
 #[cfg(feature = "live")]
+pub mod options_entry_admission;
+#[cfg(feature = "live")]
 pub mod options_entry_strategy;
 #[cfg(feature = "live")]
 pub mod options_runtime;

@@ -66,15 +66,21 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to load options buying-power context")?;
     let scan_config = option_chain_scan_config_from_engine(&runtime_config, options_buying_power);
+    let strategy_state = runtime_config
+        .load_strategy_state()
+        .await
+        .context("failed to load Alpaca options strategy state")?;
+    let strategy_state_entry_count = strategy_state.entries.len();
 
     log::info!(
-        "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategies={:?} runtime_submit_enabled={} node_entry_submit_enabled={}",
+        "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategies={:?} runtime_submit_enabled={} node_entry_submit_enabled={} strategy_state_entries={}",
         series_id,
         args.snapshot_interval_ms,
         args.max_runtime_secs,
         runtime_config.enabled_strategy_names(),
         runtime_config.submit_enabled,
         args.entry_submit_enabled,
+        strategy_state_entry_count,
     );
 
     let account_id = account_id_from_env();
@@ -114,7 +120,9 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut entry_config =
         AlpacaOptionsEntryStrategyConfig::from_engine_config(strategy_config, &runtime_config);
-    entry_config.submit_enabled = entry_config.submit_enabled && args.entry_submit_enabled;
+    entry_config.admission.submit_enabled =
+        entry_config.admission.submit_enabled && args.entry_submit_enabled;
+    entry_config.initial_state = strategy_state;
     let strategy = AlpacaOptionsEntryStrategy::new(entry_config);
     node.add_strategy(strategy)?;
 

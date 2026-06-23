@@ -30,10 +30,15 @@ use crate::{
         models::{AlpacaOrder, ListActivitiesRequest, ListOrdersRequest, OptionSnapshotsRequest},
     },
     management::{credit_spread_close_reason, days_to_expiration, recorded_age_secs},
+    options_entry_admission::{
+        EntryAdmissionConfig, EntryAdmissionSnapshot, EntryGateDecision, EntryMode,
+        UNCOVERED_OPTION_PERMISSION_REJECTION_REASON, entry_gate_decision,
+        is_uncovered_option_permission_rejection, selected_entry_mode, selected_submit_enabled,
+        submission_block_for_selected as admission_block_for_selected,
+    },
     options_entry_strategy::entry_order_list_id,
     options_runtime::{
-        OptionsEngineConfig, OptionsOpportunitySet, SelectedOptionsEntry, active_sector_count,
-        active_underlying_count, fleet_active_underlying_count, fleet_sector_limit_state,
+        OptionsEngineConfig, OptionsOpportunitySet, SelectedOptionsEntry,
         scan_options_opportunities,
     },
     performance::{EntryOrderIds, collect_order_ids, entry_performance},
@@ -67,9 +72,6 @@ const DEFAULT_EVENT_TIMEOUT_SECS: u64 = 20;
 const STRATEGY_FAMILY: &str = "ALPACA-OPTIONS-ENGINE";
 const SELECTED_CANDIDATE_ALERT: &str = "selected_candidate";
 const CANDIDATE_SUBMIT_REJECTED_ALERT: &str = "candidate_submit_rejected";
-const UNCOVERED_OPTION_PERMISSION_REJECTION_REASON: &str =
-    "entry_rejected_uncovered_option_permission";
-
 #[derive(Clone, Debug)]
 struct SubmitOutcome {
     accepted: usize,
@@ -84,14 +86,6 @@ impl SubmitOutcome {
             .iter()
             .any(|reason| is_uncovered_option_permission_rejection(reason))
     }
-}
-
-#[derive(Clone, Debug)]
-struct SubmissionBlock {
-    reason: String,
-    current: Option<usize>,
-    limit: Option<usize>,
-    details: Vec<String>,
 }
 
 /// Strategy decision emitted into the Alpaca account engine.
@@ -133,28 +127,6 @@ pub enum StrategyDecision {
         /// Entry action mode.
         mode: EntryMode,
     },
-}
-
-/// Action mode for a selected entry candidate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EntryMode {
-    /// Submit the entry to the broker.
-    Submit,
-    /// Record the candidate without broker submission.
-    DryRun,
-}
-
-impl EntryMode {
-    fn action(self) -> &'static str {
-        match self {
-            Self::Submit => "submit",
-            Self::DryRun => "dry_run",
-        }
-    }
-
-    fn is_submit(self) -> bool {
-        self == Self::Submit
-    }
 }
 
 /// Account-engine context passed to hosted strategies for one iteration.
@@ -221,8 +193,10 @@ impl OptionsRuntimeStrategy {
         let Some(selected) = selected else {
             return Ok(StrategyDecision::NoEntry);
         };
-        if selected_submit_enabled(context.config, &selected)
-            && let Some(block) = submission_block_for_selected(context, &selected).await?
+        let admission_config = EntryAdmissionConfig::from_engine_config(context.config);
+        if selected_submit_enabled(&admission_config, &selected)
+            && let Some(block) =
+                submission_block_for_selected(context, &admission_config, &selected).await?
         {
             return Ok(StrategyDecision::SelectedBlocked {
                 entry: selected,
@@ -232,7 +206,7 @@ impl OptionsRuntimeStrategy {
                 details: block.details,
             });
         }
-        Ok(selected_strategy_decision(context.config, selected))
+        Ok(selected_strategy_decision(&admission_config, selected))
     }
 }
 
@@ -246,7 +220,8 @@ impl StrategyRuntime for OptionsRuntimeStrategy {
         context: AccountEngineContext<'a>,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<StrategyDecision>> + 'a>> {
         Box::pin(async move {
-            match entry_gate_decision(context.config, Utc::now()) {
+            let admission_config = EntryAdmissionConfig::from_engine_config(context.config);
+            match entry_gate_decision(&admission_config, Utc::now()) {
                 EntryGateDecision::KillSwitch => {
                     return Ok(StrategyDecision::Skip {
                         reason: "kill_switch_enabled",
@@ -272,40 +247,11 @@ impl StrategyRuntime for OptionsRuntimeStrategy {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EntryGateDecision {
-    Continue,
-    KillSwitch,
-    OutsideEntryWindow,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RiskGateDecision {
-    Continue,
-    MaxActiveEntries { current: usize, limit: usize },
-    MaxDailySubmits { current: usize, limit: usize },
-    MaxOpenOrders { current: usize, limit: usize },
-    FleetMaxActiveEntries { current: usize, limit: usize },
-}
-
-fn selected_submit_enabled(config: &OptionsEngineConfig, selected: &SelectedOptionsEntry) -> bool {
-    match selected {
-        SelectedOptionsEntry::Credit(entry) => config.credit_submit_enabled(entry.kind),
-        SelectedOptionsEntry::IronCondor(_) => config.iron_condor_submit_enabled(),
-        SelectedOptionsEntry::Debit(entry) => config.debit_submit_enabled(entry.kind),
-        SelectedOptionsEntry::NakedOption(entry) => config.naked_submit_enabled(entry.kind),
-    }
-}
-
 fn selected_strategy_decision(
-    config: &OptionsEngineConfig,
+    config: &EntryAdmissionConfig,
     selected: SelectedOptionsEntry,
 ) -> StrategyDecision {
-    let mode = if selected_submit_enabled(config, &selected) {
-        EntryMode::Submit
-    } else {
-        EntryMode::DryRun
-    };
+    let mode = selected_entry_mode(config, &selected);
     StrategyDecision::Selected {
         entry: selected,
         mode,
@@ -314,64 +260,9 @@ fn selected_strategy_decision(
 
 async fn submission_block_for_selected(
     context: &AccountEngineContext<'_>,
+    admission_config: &EntryAdmissionConfig,
     selected: &SelectedOptionsEntry,
-) -> anyhow::Result<Option<SubmissionBlock>> {
-    if let Some(block) = broker_permission_block_for_selected(context.state, selected) {
-        return Ok(Some(block));
-    }
-    if let Some(block) = risk_gate_decision(context).await?.into_submission_block() {
-        return Ok(Some(block));
-    }
-
-    let underlying = selected.underlying();
-    if let Some(limit) = context.config.max_active_entries_per_underlying {
-        let current = active_underlying_count(context.state, underlying);
-        if current >= limit {
-            return Ok(Some(SubmissionBlock {
-                reason: "risk_max_active_entries_per_underlying".to_string(),
-                current: Some(current),
-                limit: Some(limit),
-                details: Vec::new(),
-            }));
-        }
-    }
-    if let Some(limit) = context.config.max_active_entries_per_sector
-        && let Some(sector) = context.config.sector_for(underlying)
-    {
-        let current = active_sector_count(context.state, &context.config.sectors, sector);
-        if current >= limit {
-            return Ok(Some(SubmissionBlock {
-                reason: "risk_max_active_entries_per_sector".to_string(),
-                current: Some(current),
-                limit: Some(limit),
-                details: vec![format!("sector={sector}")],
-            }));
-        }
-    }
-    if let Some(block) = fleet_underlying_limit_block(context.config, underlying) {
-        return Ok(Some(block));
-    }
-    if let Some((sector, current, limit)) = fleet_sector_limit_state(context.config, underlying)
-        && current >= limit
-    {
-        return Ok(Some(SubmissionBlock {
-            reason: "fleet_max_active_entries_per_sector".to_string(),
-            current: Some(current),
-            limit: Some(limit),
-            details: vec![format!("sector={sector}")],
-        }));
-    }
-    if context
-        .state
-        .has_risk_counted_submitted_underlying_today(context.trade_date, underlying)
-    {
-        return Ok(Some(SubmissionBlock {
-            reason: "daily_duplicate_state".to_string(),
-            current: None,
-            limit: None,
-            details: vec!["scope=same_day_underlying_reentry".to_string()],
-        }));
-    }
+) -> anyhow::Result<Option<crate::options_entry_admission::SubmissionBlock>> {
     let account = context.client.account().await?;
     let positions = context.client.positions().await?;
     let open_orders = context
@@ -381,128 +272,21 @@ async fn submission_block_for_selected(
     let symbols = selected.option_symbols();
     let admission =
         check_option_spread_entry_admission(&account, &positions, &open_orders, &symbols);
-    if admission.allowed {
-        return Ok(None);
-    }
-    Ok(Some(SubmissionBlock {
-        reason: admission_block_reason(&admission.reasons).to_string(),
-        current: None,
-        limit: None,
-        details: admission.reasons,
-    }))
-}
-
-fn broker_permission_block_for_selected(
-    state: &StrategyState,
-    selected: &SelectedOptionsEntry,
-) -> Option<SubmissionBlock> {
-    if selected.is_naked_option()
-        && state.has_canceled_naked_entry_with_close_reason(
-            UNCOVERED_OPTION_PERMISSION_REJECTION_REASON,
-        )
-    {
-        Some(SubmissionBlock {
-            reason: "broker_uncovered_option_permission".to_string(),
-            current: None,
-            limit: None,
-            details: vec!["alpaca_http_40310000".to_string()],
-        })
-    } else {
-        None
-    }
-}
-
-fn fleet_underlying_limit_block(
-    config: &OptionsEngineConfig,
-    underlying: &str,
-) -> Option<SubmissionBlock> {
-    let limit = config
-        .fleet
-        .as_ref()
-        .and_then(|fleet| fleet.config.fleet.max_active_entries_per_underlying)?;
-    let current = fleet_active_underlying_count(config, underlying);
-    if current >= limit {
-        Some(SubmissionBlock {
-            reason: "fleet_max_active_entries_per_underlying".to_string(),
-            current: Some(current),
-            limit: Some(limit),
-            details: Vec::new(),
-        })
-    } else {
-        None
-    }
-}
-
-fn admission_block_reason(reasons: &[String]) -> &'static str {
-    if reasons.iter().any(|reason| {
-        matches!(
-            reason.as_str(),
-            "account trading_blocked is true"
-                | "account_blocked is true"
-                | "trade_suspended_by_user is true"
-        ) || reason.starts_with("account status is ")
-    }) {
-        "account_not_tradable"
-    } else if reasons
-        .iter()
-        .any(|reason| reason == "candidate option symbols must resolve to one underlying")
-    {
-        "invalid_candidate_symbols"
-    } else if reasons
-        .iter()
-        .any(|reason| reason.starts_with("existing open position on candidate leg "))
-    {
-        "existing_candidate_leg_position"
-    } else if reasons
-        .iter()
-        .any(|reason| reason.starts_with("existing open option position on underlying "))
-    {
-        "existing_underlying_position"
-    } else if reasons
-        .iter()
-        .any(|reason| reason.starts_with("working order already references candidate leg "))
-    {
-        "working_candidate_leg_order"
-    } else if reasons
-        .iter()
-        .any(|reason| reason.starts_with("working order already references underlying "))
-    {
-        "working_underlying_order"
-    } else {
-        "broker_admission_rejected"
-    }
-}
-
-impl RiskGateDecision {
-    fn into_submission_block(self) -> Option<SubmissionBlock> {
-        match self {
-            Self::Continue => None,
-            Self::MaxActiveEntries { current, limit } => Some(SubmissionBlock {
-                reason: "risk_max_active_entries".to_string(),
-                current: Some(current),
-                limit: Some(limit),
-                details: Vec::new(),
-            }),
-            Self::MaxDailySubmits { current, limit } => Some(SubmissionBlock {
-                reason: "risk_max_daily_submits".to_string(),
-                current: Some(current),
-                limit: Some(limit),
-                details: Vec::new(),
-            }),
-            Self::MaxOpenOrders { current, limit } => Some(SubmissionBlock {
-                reason: "risk_max_open_orders".to_string(),
-                current: Some(current),
-                limit: Some(limit),
-                details: Vec::new(),
-            }),
-            Self::FleetMaxActiveEntries { current, limit } => Some(SubmissionBlock {
-                reason: "fleet_max_active_entries".to_string(),
-                current: Some(current),
-                limit: Some(limit),
-                details: Vec::new(),
-            }),
-        }
-    }
+    let snapshot = EntryAdmissionSnapshot {
+        open_order_count: open_orders.len(),
+        broker_admission_reasons: if admission.allowed {
+            Vec::new()
+        } else {
+            admission.reasons
+        },
+    };
+    Ok(admission_block_for_selected(
+        admission_config,
+        context.state,
+        selected,
+        context.trade_date,
+        &snapshot,
+    ))
 }
 
 /// Runs the Alpaca options-engine account engine until configured shutdown.
@@ -571,7 +355,7 @@ pub async fn run_options_engine() -> anyhow::Result<()> {
 
     let mut iteration = 1_u64;
     loop {
-        let trade_date = market_trade_date(&config);
+        let trade_date = EntryAdmissionConfig::from_engine_config(&config).market_trade_date();
         println!("strategy_iteration={iteration} trade_date={trade_date}");
         emit_operator_event(
             "strategy_iteration",
@@ -978,57 +762,6 @@ async fn apply_selected_entry_decision(
         .await;
     }
     Ok(outcome.accepted > 0 || terminal_rejection)
-}
-
-fn is_uncovered_option_permission_rejection(reason: &str) -> bool {
-    let reason = reason.to_ascii_lowercase();
-    reason.contains("40310000")
-        && reason.contains("not eligible to trade uncovered option contracts")
-}
-
-async fn risk_gate_decision(
-    context: &AccountEngineContext<'_>,
-) -> anyhow::Result<RiskGateDecision> {
-    if let Some(limit) = context.config.max_active_entries {
-        let current = context
-            .state
-            .entries
-            .iter()
-            .filter(|entry| entry.is_active())
-            .count();
-        if current >= limit {
-            return Ok(RiskGateDecision::MaxActiveEntries { current, limit });
-        }
-    }
-
-    if let Some(limit) = context.config.max_daily_submits {
-        let current = context.state.risk_counted_daily_submits(context.trade_date);
-        if current >= limit {
-            return Ok(RiskGateDecision::MaxDailySubmits { current, limit });
-        }
-    }
-
-    if let Some(limit) = context.config.max_open_orders {
-        let current = context
-            .client
-            .orders(&ListOrdersRequest::open_nested())
-            .await?
-            .len();
-        if current >= limit {
-            return Ok(RiskGateDecision::MaxOpenOrders { current, limit });
-        }
-    }
-
-    if let Some(fleet) = context.config.fleet.as_ref()
-        && let Some(limit) = fleet.config.fleet.max_active_entries
-    {
-        let current = fleet.exposure().active_entries;
-        if current >= limit {
-            return Ok(RiskGateDecision::FleetMaxActiveEntries { current, limit });
-        }
-    }
-
-    Ok(RiskGateDecision::Continue)
 }
 
 async fn manage_existing_entries(
@@ -1632,11 +1365,6 @@ fn age_secs_from_rfc3339(value: &str) -> Option<u64> {
         .map(|duration| duration.as_secs())
 }
 
-fn inside_entry_window_at(config: &OptionsEngineConfig, now: DateTime<Utc>) -> bool {
-    let now = now.with_timezone(&config.entry_timezone).time();
-    config.entry_start <= now && now <= config.entry_end
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CloseSubmissionGateDecision {
     Continue,
@@ -1683,23 +1411,6 @@ fn close_reprice_cooldown_remaining_secs(
     (age < config.close_reprice_cooldown_secs).then_some(config.close_reprice_cooldown_secs - age)
 }
 
-fn entry_gate_decision(config: &OptionsEngineConfig, now: DateTime<Utc>) -> EntryGateDecision {
-    if config.kill_switch {
-        EntryGateDecision::KillSwitch
-    } else if !config.ignore_entry_window && !inside_entry_window_at(config, now) {
-        EntryGateDecision::OutsideEntryWindow
-    } else {
-        EntryGateDecision::Continue
-    }
-}
-
-fn market_trade_date(config: &OptionsEngineConfig) -> String {
-    Utc::now()
-        .with_timezone(&config.entry_timezone)
-        .date_naive()
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, path::PathBuf};
@@ -1720,6 +1431,7 @@ mod tests {
         },
         common::consts::ALPACA_CLIENT_ID,
         fleet::{AccountConfig, FleetConfig, FleetSection, ResolvedFleetConfig},
+        options_entry_admission::admission_block_reason,
         options_runtime::SelectedNakedOptionEntry,
         runtime::{
             debit_spread_strategy_name, naked_option_strategy_name, save_strategy_state_atomic,
@@ -1793,9 +1505,10 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-05-04T14:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
+        let admission_config = EntryAdmissionConfig::from_engine_config(&config);
 
         assert_eq!(
-            entry_gate_decision(&config, now),
+            entry_gate_decision(&admission_config, now),
             EntryGateDecision::Continue
         );
     }
@@ -1806,9 +1519,10 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-05-04T21:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
+        let admission_config = EntryAdmissionConfig::from_engine_config(&config);
 
         assert_eq!(
-            entry_gate_decision(&config, now),
+            entry_gate_decision(&admission_config, now),
             EntryGateDecision::OutsideEntryWindow
         );
     }
@@ -1820,9 +1534,10 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-05-04T21:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
+        let admission_config = EntryAdmissionConfig::from_engine_config(&config);
 
         assert_eq!(
-            entry_gate_decision(&config, now),
+            entry_gate_decision(&admission_config, now),
             EntryGateDecision::KillSwitch
         );
     }
@@ -1952,8 +1667,23 @@ mod tests {
     #[test]
     fn fleet_underlying_limit_allows_same_underlying_below_limit() {
         let (config, dir) = config_with_fleet_underlying_limit(2);
+        let selected = SelectedOptionsEntry::NakedOption(SelectedNakedOptionEntry {
+            underlying: "SPY".to_string(),
+            kind: NakedOptionKind::Call,
+            candidate: naked_option_candidate(),
+        });
+        let admission_config = EntryAdmissionConfig::from_engine_config(&config);
 
-        assert!(fleet_underlying_limit_block(&config, "SPY").is_none());
+        assert!(
+            admission_block_for_selected(
+                &admission_config,
+                &StrategyState::default(),
+                &selected,
+                "2026-05-04",
+                &EntryAdmissionSnapshot::default(),
+            )
+            .is_none()
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1961,8 +1691,21 @@ mod tests {
     #[test]
     fn fleet_underlying_limit_blocks_at_configured_limit() {
         let (config, dir) = config_with_fleet_underlying_limit(1);
+        let selected = SelectedOptionsEntry::NakedOption(SelectedNakedOptionEntry {
+            underlying: "SPY".to_string(),
+            kind: NakedOptionKind::Call,
+            candidate: naked_option_candidate(),
+        });
+        let admission_config = EntryAdmissionConfig::from_engine_config(&config);
 
-        let block = fleet_underlying_limit_block(&config, "SPY").unwrap();
+        let block = admission_block_for_selected(
+            &admission_config,
+            &StrategyState::default(),
+            &selected,
+            "2026-05-04",
+            &EntryAdmissionSnapshot::default(),
+        )
+        .unwrap();
 
         assert_eq!(block.reason, "fleet_max_active_entries_per_underlying");
         assert_eq!(block.current, Some(1));
@@ -2030,7 +1773,15 @@ mod tests {
             candidate: naked_option_candidate(),
         });
 
-        let block = broker_permission_block_for_selected(&state, &selected).unwrap();
+        let admission_config = EntryAdmissionConfig::from_engine_config(&config_for_gate_tests());
+        let block = admission_block_for_selected(
+            &admission_config,
+            &state,
+            &selected,
+            "2026-05-04",
+            &EntryAdmissionSnapshot::default(),
+        )
+        .unwrap();
 
         assert_eq!(block.reason, "broker_uncovered_option_permission");
         assert_eq!(block.details, vec!["alpaca_http_40310000"]);
