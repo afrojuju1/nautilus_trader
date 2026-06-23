@@ -170,15 +170,15 @@ loop.
     `entry_rejected_uncovered_option_permission`.
   - [x] Other terminal entry rejections should remain observable and should not create false active
     exposure.
-- [ ] Add a real persistence boundary for strategy state.
+- [x] Add a real persistence boundary for strategy state.
   - Follow `docs/developer_guide/alpaca_operational_postgres_plan.md`.
-  - [ ] Enable `sqlx` Postgres migrations for Alpaca operational storage.
-  - [ ] Move inline `StorageRepository::init_schema` DDL into versioned SQL migration files.
-  - [ ] Add `strategy_state_events` as the append-only state mutation ledger.
-  - [ ] Add `version`, writer metadata, and last-event metadata to `strategy_state`.
-  - [ ] Add a transactional repository method that inserts one state event and updates the
+  - [x] Enable `sqlx` Postgres migrations for Alpaca operational storage.
+  - [x] Move inline `StorageRepository::init_schema` DDL into versioned SQL migration files.
+  - [x] Add `strategy_state_events` as the append-only state mutation ledger.
+  - [x] Add `version`, writer metadata, and last-event metadata to `strategy_state`.
+  - [x] Add a transactional repository method that inserts one state event and updates the
     snapshot idempotently.
-  - [ ] Add a live-submit runtime lease or equivalent DB-visible exclusive writer guard.
+  - [x] Add a live-submit runtime lease or equivalent DB-visible exclusive writer guard.
   - Strategy callbacks are synchronous, while the Postgres repository is async; do not hide DB
     writes inside blocking callback code.
   - Use an explicit state persistence actor/event sink or another Nautilus-native async boundary

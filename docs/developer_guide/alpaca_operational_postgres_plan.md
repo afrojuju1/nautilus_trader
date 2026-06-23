@@ -23,7 +23,8 @@ product database:
 - Write state mutations through an async persistence sink, not directly from synchronous strategy
   callbacks.
 - Add schema migrations and storage readiness gates before paper submission is enabled.
-- Retire or narrow `backtest_market_cache` once catalog and ClickHouse cover market-data use cases.
+- Keep market-data-shaped caches out of Postgres now that catalog and ClickHouse cover that
+  responsibility.
 
 ## Current State
 
@@ -34,7 +35,7 @@ Existing tables are initialized by SQLx migrations under
 - `candidate_ledger`: append-only candidate, decision, alert, and submit-result records.
 - `performance_ledger`: upserted realized performance records.
 - `candidate_outcome`: upserted candidate outcome records.
-- `backtest_market_cache`: broad JSONB cache for backtest market payloads.
+- `runtime_lease`: DB-visible live-submit writer guard.
 
 This is acceptable for the current account-engine loop, but it is not enough for live strategy
 cutover until runtime writes use the snapshot metadata, append-only state-event ledger, and runtime
@@ -378,9 +379,9 @@ direct SQL in strategy callbacks.
 
 ### Phase 6: Postgres Slimming
 
-- Stop adding new use cases to `backtest_market_cache`.
-- Move market-data-shaped caches to catalog/ClickHouse.
-- Rename or replace any remaining tiny operational checkpoint use case.
+- `backtest_market_cache` has been retired with a forward SQLx migration.
+- Alpaca backtests no longer require Postgres storage for market-data-shaped cache payloads.
+- Market-data-shaped caches belong in catalog/ClickHouse.
 - Keep optional ClickHouse mirrors of ledgers analytical only; Postgres remains source of truth.
 
 Done when Postgres contains operational state, evidence, reports, outcomes, and manifests only.

@@ -146,10 +146,9 @@ Preferred replacements:
 - Do not mirror candidate/performance ledgers into ClickHouse initially. Add analytical mirrors only
   when a reporting consumer needs them; Postgres remains the source of truth for those records.
 
-Deletion proposal after ClickHouse is live: retire or heavily narrow Postgres
-`backtest_market_cache`. If a cache entry is really market data, write it through the catalog and
-ClickHouse. If it is a tiny operational checkpoint, rename it to match that responsibility instead
-of keeping a broad market-cache table.
+Postgres cleanup after ClickHouse proof: `backtest_market_cache` is retired. Market-data-shaped
+cache entries now belong in the catalog and ClickHouse; tiny operational checkpoints should use a
+name that describes the operational responsibility instead of reviving a broad market-cache table.
 
 The detailed operational Postgres plan lives in
 `alpaca_operational_postgres_plan.md`. That plan owns strategy-state snapshots, state-event
@@ -577,7 +576,7 @@ For scanner features:
 | 7. Read validation command | Cutover proof without a runtime comparison mode. | Add an explicit operator command that compares catalog and ClickHouse for requested dataset/range and reports counts, timestamp range, checksum, and freshness. | Operators can prove a supported read range before changing runtime config. |
 | 8. Flagged ClickHouse read cutover | Controlled read switch. | Promote supported datasets to `clickhouse` mode with explicit rollback to `catalog`. | Operators can switch reads to ClickHouse and back to catalog by configuration. |
 | 9. Dataset expansion | More generic market data coverage. | Add trades, bars, option Greeks, and option-chain liquidity features after quote ticks prove the path. | Research can query generic market datasets by instrument/source/time and option features by underlying, expiration, strike, and time. |
-| 10. Postgres slimming | Operational store is narrow. | Follow `alpaca_operational_postgres_plan.md`; move market-data cache payloads and scanner feature time series to catalog/ClickHouse; keep Postgres for state, events, ledgers, outcomes, leases, and ingest manifests. | `backtest_market_cache` is retired or narrowed to non-market operational checkpoints. |
+| 10. Postgres slimming | Operational store is narrow. | Follow `alpaca_operational_postgres_plan.md`; keep market-data cache payloads and scanner feature time series in catalog/ClickHouse; keep Postgres for state, events, ledgers, outcomes, leases, and ingest manifests. | `backtest_market_cache` is retired and no active code writes market-data payloads to Postgres. |
 | 11. Export to catalog | Replay-compatible bridge. | Export warehouse-selected ranges back into `ParquetDataCatalog` format when needed. | Backtests still consume catalog data, even if ClickHouse selected or prepared the range. |
 
 ## Provisional Answers
@@ -602,7 +601,7 @@ real volume, latency, or operational evidence contradicts them.
 | Backfill reloads | Prefer full-day partition loads. Load into staging, validate counts, then replace or promote the partition/range through the warehouse operator surface. | Partition-level replacement is cleaner than row-level mutations and avoids ad hoc development-only delete paths. |
 | Schema and migrations location | Put ClickHouse DDL under `schema/sql/clickhouse/` and apply it with the warehouse operator `migrate` command. Keep canonical tables generic. Add raw/source schemas only through explicit migrations after the canonical path proves insufficient. | Market-data warehouse schema is not adapter-owned. Source adapters can own extraction, while the warehouse owns normalized contracts. |
 | Migration tooling | Use `sqlx` migrations for Postgres operational storage. Use the warehouse operator plus the official ClickHouse Rust client for ClickHouse migrations. Defer Atlas or any external schema manager until the thin operator path is clearly insufficient. | This avoids a custom Postgres migration system while also avoiding ORM/tooling bloat for ClickHouse. |
-| Postgres cleanup | Retire or narrow `backtest_market_cache` once ClickHouse and catalog writes cover those datasets. Add operational state events and migrations in Postgres before live submit cutover. Do not mirror ledgers to ClickHouse until a reporting consumer needs analytical copies. | This removes the broad JSONB market cache path and keeps a clean split between operational truth and analytical history. |
+| Postgres cleanup | `backtest_market_cache` is retired once ClickHouse and catalog writes cover those datasets. Add operational state events and migrations in Postgres before live submit cutover. Do not mirror ledgers to ClickHouse until a reporting consumer needs analytical copies. | This removes the broad JSONB market cache path and keeps a clean split between operational truth and analytical history. |
 | First runtime integration | Build the generic `nautilus-persistence` ClickHouse writer and warehouse `backfill` operation before turning on the live dual-write sink. | It validates contracts and scanner usefulness before introducing a new live-service dependency. |
 | Deployment owner | Self-host ClickHouse from `deploy/warehouse/`. Start with a local/dev stack, then prove the NUC only if storage, CPU, and memory headroom are acceptable. Move to a dedicated self-hosted analytics box if retention or ingest volume outgrows the NUC. | Quote-scale data can outgrow a small live-trading host quickly, and the warehouse must not starve trading processes. |
 

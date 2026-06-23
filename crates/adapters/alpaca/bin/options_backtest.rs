@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, File},
-    hash::{DefaultHasher, Hash, Hasher},
     io::Write,
 };
 
@@ -26,17 +25,13 @@ use nautilus_alpaca::{
         SelectedNakedOptionEntry, SelectedOptionsEntry,
     },
     runtime_env::load_options_env_file,
-    storage::{
-        STORAGE_ACCOUNT_ID_DEFAULT, StorageRepository, read_backtest_market_cache,
-        write_backtest_market_cache,
-    },
     strategy::{
         scan_credit_spread_snapshot_at, scan_debit_spread_snapshot_at,
         scan_iron_condor_snapshots_at, scan_naked_option_snapshot_at,
     },
 };
 use nautilus_model::data::greeks::black_scholes_greeks;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use tokio::time::{Duration as TokioDuration, sleep};
 
 const DAYS_PER_YEAR: f64 = 365.25;
@@ -463,14 +458,10 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<BacktestReport> {
     args.synthetic_spread_pct = variant.synthetic_spread_pct;
-    let mut config = OptionsEngineConfig::from_runtime_env_with_storage().await?;
+    let mut config = OptionsEngineConfig::from_runtime_env()?;
     apply_backtest_overrides(&mut config, &args)?;
     apply_sweep_variant(&mut config, &variant);
     apply_historical_scanner_overrides(&mut config, &args);
-    let account_id = config
-        .storage_account_id
-        .clone()
-        .unwrap_or_else(|| STORAGE_ACCOUNT_ID_DEFAULT.to_string());
 
     let mut data_config = AlpacaDataClientConfig::default();
     data_config.trading_base_url = env::var("ALPACA_TRADING_BASE_URL").ok();
@@ -533,8 +524,6 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
                 args.missing_open_interest,
                 args.min_exit_leg_bars,
                 args.require_exit_common_timestamp,
-                config.storage_repository.as_deref(),
-                &account_id,
             )
             .await?;
             days.push(result);
@@ -591,8 +580,6 @@ async fn backtest_underlying_day(
     missing_open_interest: u64,
     min_exit_leg_bars: usize,
     require_exit_common_timestamp: bool,
-    storage: Option<&StorageRepository>,
-    account_id: &str,
 ) -> anyhow::Result<BacktestDay> {
     let entry_timestamp = timestamp_for(config, trade_date, entry_time)?;
     let exit_timestamp = timestamp_for(config, trade_date, exit_time)?;
@@ -603,10 +590,7 @@ async fn backtest_underlying_day(
     let exit_end = timestamp_plus_minutes(config, trade_date, exit_time, 1)?;
     let (min_dte, max_dte) = scanner_dte_window(config);
 
-    let mut contracts = load_contracts(
-        client, storage, account_id, underlying, trade_date, min_dte, max_dte,
-    )
-    .await?;
+    let mut contracts = load_contracts(client, underlying, trade_date, min_dte, max_dte).await?;
     normalize_historical_open_interest(&mut contracts, missing_open_interest);
     let symbols = contracts
         .iter()
@@ -616,8 +600,6 @@ async fn backtest_underlying_day(
 
     let underlying_price = load_underlying_price_at(
         client,
-        storage,
-        account_id,
         underlying,
         timeframe,
         stock_feed,
@@ -632,8 +614,6 @@ async fn backtest_underlying_day(
     } else {
         load_option_bars(
             client,
-            storage,
-            account_id,
             symbols.clone(),
             timeframe,
             option_feed,
@@ -645,15 +625,7 @@ async fn backtest_underlying_day(
     let option_trades = if symbols.is_empty() {
         BTreeMap::new()
     } else {
-        load_option_trades(
-            client,
-            storage,
-            account_id,
-            symbols.clone(),
-            &entry_start,
-            &entry_end,
-        )
-        .await?
+        load_option_trades(client, symbols.clone(), &entry_start, &entry_end).await?
     };
     let snapshots = build_snapshot_map(
         &contracts,
@@ -691,8 +663,6 @@ async fn backtest_underlying_day(
                 option_feed,
                 &option_bars,
                 &option_trades,
-                storage,
-                account_id,
             )
             .await?;
             if let Some(reason) =
@@ -911,8 +881,6 @@ async fn simulate_selected_entry(
     option_feed: &str,
     entry_bars: &BTreeMap<String, Vec<AlpacaOptionBar>>,
     entry_trades: &BTreeMap<String, Vec<AlpacaOptionTrade>>,
-    storage: Option<&StorageRepository>,
-    account_id: &str,
 ) -> anyhow::Result<TradeBacktest> {
     let descriptor = entry.descriptor();
     let mut legs = selected_legs(&entry);
@@ -931,8 +899,6 @@ async fn simulate_selected_entry(
         .collect::<Vec<_>>();
     let path_bars = load_option_bars(
         client,
-        storage,
-        account_id,
         symbols,
         timeframe,
         option_feed,
@@ -942,8 +908,6 @@ async fn simulate_selected_entry(
     .await?;
     let path_trades = load_option_trades(
         client,
-        storage,
-        account_id,
         legs.iter().map(|leg| leg.symbol.clone()).collect(),
         entry_timestamp,
         exit_end,
@@ -1393,18 +1357,11 @@ fn timestamp_age_secs(entry_timestamp: &str, timestamp: &str) -> Option<i64> {
 
 async fn load_contracts(
     client: &AlpacaHttpClient,
-    storage: Option<&StorageRepository>,
-    account_id: &str,
     underlying: &str,
     scan_date: NaiveDate,
     min_dte: i64,
     max_dte: i64,
 ) -> anyhow::Result<Vec<AlpacaOptionContract>> {
-    let cache_key = format!("{underlying}|{scan_date}|{min_dte}|{max_dte}");
-    if let Some(cached) = read_cache(storage, account_id, "option_contracts", &cache_key).await? {
-        return Ok(cached);
-    }
-
     let min_expiration = (scan_date + Duration::days(min_dte)).to_string();
     let max_expiration = (scan_date + Duration::days(max_dte)).to_string();
     let mut contracts = Vec::new();
@@ -1421,14 +1378,6 @@ async fn load_contracts(
 
     contracts.sort_by(|left, right| left.symbol.cmp(&right.symbol));
     contracts.dedup_by(|left, right| left.symbol == right.symbol);
-    write_cache(
-        storage,
-        account_id,
-        "option_contracts",
-        &cache_key,
-        &contracts,
-    )
-    .await?;
     Ok(contracts)
 }
 
@@ -1523,8 +1472,6 @@ fn is_standard_alpaca_option_symbol(symbol: &str) -> bool {
 
 async fn load_option_bars(
     client: &AlpacaHttpClient,
-    storage: Option<&StorageRepository>,
-    account_id: &str,
     symbols: Vec<String>,
     timeframe: &str,
     _feed: &str,
@@ -1534,22 +1481,14 @@ async fn load_option_bars(
     if symbols.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let cache_key = market_data_cache_key(&symbols, &["standard-v2", timeframe, start, end]);
-    if let Some(cached) = read_cache(storage, account_id, "option_bars", &cache_key).await? {
-        return Ok(cached);
-    }
     let mut request =
         OptionBarsRequest::for_symbols(symbols, timeframe.to_string(), start.to_string());
     request.end = Some(end.to_string());
-    let bars = client.option_bars(&request).await?.bars;
-    write_cache(storage, account_id, "option_bars", &cache_key, &bars).await?;
-    Ok(bars)
+    Ok(client.option_bars(&request).await?.bars)
 }
 
 async fn load_option_trades(
     client: &AlpacaHttpClient,
-    storage: Option<&StorageRepository>,
-    account_id: &str,
     symbols: Vec<String>,
     start: &str,
     end: &str,
@@ -1557,21 +1496,13 @@ async fn load_option_trades(
     if symbols.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let cache_key = market_data_cache_key(&symbols, &["standard-v2", start, end]);
-    if let Some(cached) = read_cache(storage, account_id, "option_trades", &cache_key).await? {
-        return Ok(cached);
-    }
     let mut request = OptionTradesRequest::for_symbols(symbols, start.to_string());
     request.end = Some(end.to_string());
-    let trades = client.option_trades(&request).await?.trades;
-    write_cache(storage, account_id, "option_trades", &cache_key, &trades).await?;
-    Ok(trades)
+    Ok(client.option_trades(&request).await?.trades)
 }
 
 async fn load_underlying_price_at(
     client: &AlpacaHttpClient,
-    storage: Option<&StorageRepository>,
-    account_id: &str,
     symbol: &str,
     timeframe: &str,
     feed: &str,
@@ -1579,20 +1510,6 @@ async fn load_underlying_price_at(
     end: &str,
     target_timestamp: &str,
 ) -> anyhow::Result<Option<f64>> {
-    let symbols = [symbol.to_string()];
-    let cache_key = market_data_cache_key(&symbols, &[timeframe, feed, start, end]);
-    if let Some(cached) = read_cache::<BTreeMap<String, Vec<AlpacaStockBar>>>(
-        storage,
-        account_id,
-        "stock_bars",
-        &cache_key,
-    )
-    .await?
-    {
-        return Ok(cached
-            .get(symbol)
-            .and_then(|bars| stock_bar_close_near(bars, target_timestamp)));
-    }
     let mut request = StockBarsRequest::for_symbols(
         [symbol.to_string()],
         timeframe.to_string(),
@@ -1601,59 +1518,10 @@ async fn load_underlying_price_at(
     request.end = Some(end.to_string());
     request.feed = Some(feed.to_string());
     let response = client.stock_bars(&request).await?;
-    write_cache(
-        storage,
-        account_id,
-        "stock_bars",
-        &cache_key,
-        &response.bars,
-    )
-    .await?;
     Ok(response
         .bars
         .get(symbol)
         .and_then(|bars| stock_bar_close_near(bars, target_timestamp)))
-}
-
-async fn read_cache<T>(
-    storage: Option<&StorageRepository>,
-    account_id: &str,
-    cache_kind: &str,
-    cache_key: &str,
-) -> anyhow::Result<Option<T>>
-where
-    T: DeserializeOwned,
-{
-    let Some(storage) = storage else {
-        return Ok(None);
-    };
-    read_backtest_market_cache(storage, account_id, cache_kind, cache_key).await
-}
-
-async fn write_cache<T>(
-    storage: Option<&StorageRepository>,
-    account_id: &str,
-    cache_kind: &str,
-    cache_key: &str,
-    payload: &T,
-) -> anyhow::Result<()>
-where
-    T: Serialize,
-{
-    let Some(storage) = storage else {
-        return Ok(());
-    };
-    write_backtest_market_cache(storage, account_id, cache_kind, cache_key, payload).await
-}
-
-fn market_data_cache_key(symbols: &[String], parts: &[&str]) -> String {
-    let mut symbols = symbols.to_vec();
-    symbols.sort();
-    symbols.dedup();
-    let raw = format!("{}|{}", parts.join("|"), symbols.join(","));
-    let mut hasher = DefaultHasher::new();
-    raw.hash(&mut hasher);
-    format!("{}|{:016x}", parts.join("|"), hasher.finish())
 }
 
 fn build_snapshot_map(
