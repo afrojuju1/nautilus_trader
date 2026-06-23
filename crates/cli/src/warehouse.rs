@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
 use nautilus_persistence::warehouse::clickhouse::{
-    ClickHouseConnectOptions, DEFAULT_MIGRATIONS_DIR, run_migrations,
+    ClickHouseConnectOptions, DEFAULT_MIGRATIONS_DIR, check_health, run_migrations,
+    run_quote_tick_smoke,
 };
 
-use crate::opt::{WarehouseCommand, WarehouseOpt};
+use crate::opt::{ClickHouseConfig, WarehouseCommand, WarehouseOpt};
 
 /// Executes market-data warehouse commands.
 ///
@@ -14,12 +15,7 @@ use crate::opt::{WarehouseCommand, WarehouseOpt};
 pub(crate) async fn run_warehouse_command(opt: WarehouseOpt) -> anyhow::Result<()> {
     match opt.command {
         WarehouseCommand::Migrate(config) => {
-            let connect_options = ClickHouseConnectOptions::from_env_with_overrides(
-                config.url,
-                config.username,
-                config.password,
-                config.database,
-            );
+            let connect_options = connect_options_from_config(&config);
             log::info!(
                 "Connecting to ClickHouse at {}",
                 connect_options.connection_string_masked()
@@ -52,7 +48,29 @@ pub(crate) async fn run_warehouse_command(opt: WarehouseOpt) -> anyhow::Result<(
                 );
             }
         }
+        WarehouseCommand::Health(config) => {
+            let connect_options = connect_options_from_config(&config);
+            check_health(&connect_options).await?;
+            println!("ClickHouse warehouse health ok");
+        }
+        WarehouseCommand::QuoteSmoke(config) => {
+            let connect_options = connect_options_from_config(&config.clickhouse);
+            let report = run_quote_tick_smoke(&connect_options, &config.source).await?;
+            println!(
+                "ClickHouse QuoteTick smoke complete: ingest_run_id={} written={} count={}",
+                report.ingest_run_id, report.written, report.count
+            );
+        }
     }
 
     Ok(())
+}
+
+fn connect_options_from_config(config: &ClickHouseConfig) -> ClickHouseConnectOptions {
+    ClickHouseConnectOptions::from_env_with_overrides(
+        config.url.clone(),
+        config.username.clone(),
+        config.password.clone(),
+        config.database.clone(),
+    )
 }

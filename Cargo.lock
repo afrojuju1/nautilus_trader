@@ -6666,6 +6666,7 @@ dependencies = [
  "tokio",
  "unbounded-interval-tree",
  "url",
+ "uuid",
 ]
 
 [[package]]

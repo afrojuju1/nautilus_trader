@@ -109,6 +109,20 @@ pub struct ClickHouseConfig {
 pub enum WarehouseCommand {
     /// Applies pending ClickHouse warehouse migrations.
     Migrate(ClickHouseConfig),
+    /// Checks ClickHouse warehouse connectivity.
+    Health(ClickHouseConfig),
+    /// Writes and reads back a tiny QuoteTick batch.
+    QuoteSmoke(ClickHouseSmokeConfig),
+}
+
+/// Configuration parameters for the warehouse QuoteTick smoke command.
+#[derive(Parser, Debug, Clone)]
+pub struct ClickHouseSmokeConfig {
+    #[clap(flatten)]
+    pub clickhouse: ClickHouseConfig,
+    /// Source label recorded on the smoke row.
+    #[arg(long, default_value = "smoke")]
+    pub source: String,
 }
 
 #[cfg(feature = "defi")]

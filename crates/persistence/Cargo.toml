@@ -29,7 +29,7 @@ cloud = [
   "object_store/gcp",
   "object_store/http",
 ]
-clickhouse = ["dep:blake3", "dep:clickhouse"]
+clickhouse = ["dep:blake3", "dep:clickhouse", "dep:uuid"]
 extension-module = [
   "nautilus-core/extension-module",
   "nautilus-model/extension-module",
@@ -85,6 +85,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 unbounded-interval-tree = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true, optional = true }
 
 pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }

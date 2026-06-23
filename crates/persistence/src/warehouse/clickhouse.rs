@@ -9,7 +9,14 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use clickhouse::{Client, Row};
-use serde::Deserialize;
+use nautilus_core::UnixNanos;
+use nautilus_model::{
+    data::QuoteTick,
+    identifiers::InstrumentId,
+    types::{Price, Quantity},
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 pub const DEFAULT_CLICKHOUSE_URL: &str = "http://localhost:8123";
 pub const DEFAULT_CLICKHOUSE_USERNAME: &str = "default";
@@ -110,6 +117,50 @@ pub struct ClickHouseMigrationOutcome {
     pub statements: usize,
 }
 
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+pub struct ClickHouseQuoteTickRow {
+    pub ts_event: u64,
+    pub ts_init: u64,
+    pub instrument_id: String,
+    pub venue: String,
+    pub source: String,
+    pub bid_price_raw: i128,
+    pub ask_price_raw: i128,
+    pub bid_size_raw: u128,
+    pub ask_size_raw: u128,
+    pub price_precision: u8,
+    pub size_precision: u8,
+    #[serde(with = "clickhouse::serde::uuid")]
+    pub ingest_run_id: Uuid,
+}
+
+impl ClickHouseQuoteTickRow {
+    #[must_use]
+    pub fn from_quote_tick(quote: &QuoteTick, source: &str, ingest_run_id: Uuid) -> Self {
+        Self {
+            ts_event: quote.ts_event.as_u64(),
+            ts_init: quote.ts_init.as_u64(),
+            instrument_id: quote.instrument_id.to_string(),
+            venue: quote.instrument_id.venue.to_string(),
+            source: source.to_string(),
+            bid_price_raw: quote.bid_price.raw.into(),
+            ask_price_raw: quote.ask_price.raw.into(),
+            bid_size_raw: quote.bid_size.raw.into(),
+            ask_size_raw: quote.ask_size.raw.into(),
+            price_precision: quote.bid_price.precision,
+            size_precision: quote.bid_size.precision,
+            ingest_run_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct QuoteTickSmokeReport {
+    pub ingest_run_id: Uuid,
+    pub written: usize,
+    pub count: u64,
+}
+
 #[derive(Debug, Clone)]
 struct MigrationFile {
     version: u32,
@@ -123,6 +174,85 @@ struct AppliedMigrationRow {
     version: u32,
     checksum: String,
     success: u8,
+}
+
+#[derive(Debug, Clone, Row, Deserialize)]
+struct CountRow {
+    count: u64,
+}
+
+/// Checks that the ClickHouse warehouse endpoint accepts queries.
+///
+/// # Errors
+///
+/// Returns an error if the ClickHouse query fails.
+pub async fn check_health(options: &ClickHouseConnectOptions) -> anyhow::Result<()> {
+    options.client().query("SELECT 1").execute().await?;
+    Ok(())
+}
+
+/// Writes `QuoteTick` rows to `market.quote_ticks`.
+///
+/// # Errors
+///
+/// Returns an error if ClickHouse rejects the insert.
+pub async fn write_quote_tick_rows(
+    client: &Client,
+    rows: &[ClickHouseQuoteTickRow],
+) -> anyhow::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let market_client = client.clone().with_database("market");
+    let mut insert = market_client
+        .insert::<ClickHouseQuoteTickRow>("quote_ticks")
+        .await?;
+    for row in rows {
+        insert.write(row).await?;
+    }
+    insert.end().await?;
+    Ok(())
+}
+
+/// Counts `market.quote_ticks` rows for an ingest run.
+///
+/// # Errors
+///
+/// Returns an error if ClickHouse rejects the count query.
+pub async fn count_quote_ticks_for_run(
+    client: &Client,
+    ingest_run_id: Uuid,
+) -> anyhow::Result<u64> {
+    let row = client
+        .query("SELECT count() AS count FROM market.quote_ticks WHERE ingest_run_id = toUUID(?)")
+        .bind(ingest_run_id.to_string())
+        .fetch_one::<CountRow>()
+        .await?;
+    Ok(row.count)
+}
+
+/// Writes a tiny synthetic `QuoteTick` batch and reads it back by ingest run.
+///
+/// # Errors
+///
+/// Returns an error if ClickHouse health, insert, or readback fails.
+pub async fn run_quote_tick_smoke(
+    options: &ClickHouseConnectOptions,
+    source: &str,
+) -> anyhow::Result<QuoteTickSmokeReport> {
+    check_health(options).await?;
+    let client = options.client();
+    let ingest_run_id = Uuid::new_v4();
+    let quote = synthetic_quote_tick();
+    let row = ClickHouseQuoteTickRow::from_quote_tick(&quote, source, ingest_run_id);
+    write_quote_tick_rows(&client, &[row]).await?;
+    let count = count_quote_ticks_for_run(&client, ingest_run_id).await?;
+    Ok(QuoteTickSmokeReport {
+        ingest_run_id,
+        written: 1,
+        count,
+    })
 }
 
 /// Runs all pending ClickHouse warehouse migrations from the default migrations directory.
@@ -414,6 +544,18 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
 
 fn elapsed_millis_u64(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn synthetic_quote_tick() -> QuoteTick {
+    QuoteTick::new(
+        InstrumentId::from("AUDUSD.SIM"),
+        Price::from("1.00000"),
+        Price::from("1.00010"),
+        Quantity::from("100000"),
+        Quantity::from("100000"),
+        UnixNanos::from(1_700_000_000_000_000_000),
+        UnixNanos::from(1_700_000_000_000_000_001),
+    )
 }
 
 impl MigrationFile {
