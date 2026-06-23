@@ -64,10 +64,13 @@ system.
 
 Keep in Postgres:
 
+- `schema_migrations`: operational schema versioning.
 - `strategy_state`: mutable runtime state and restart continuity.
+- `strategy_state_events`: append-only strategy-state mutation audit.
 - `candidate_ledger`: candidate decisions, blocks, submissions, and evidence keys.
 - `performance_ledger`: performance records and report inputs.
 - `candidate_outcome`: observed outcomes tied back to candidates.
+- `runtime_lease`: DB-visible live-submit writer guard.
 - `ingest_manifest`: small dual-write/backfill control records, if implemented as a relational
   table.
 
@@ -89,6 +92,11 @@ Deletion proposal after ClickHouse is live: retire or heavily narrow Postgres
 `backtest_market_cache`. If a cache entry is really market data, write it through the catalog and
 ClickHouse. If it is a tiny operational checkpoint, rename it to match that responsibility instead
 of keeping a broad market-cache table.
+
+The detailed operational Postgres plan lives in
+`alpaca_operational_postgres_plan.md`. That plan owns strategy-state snapshots, state-event
+durability, runtime leases, migrations, and live-submit readiness. This warehouse workstream owns
+catalog/ClickHouse market-data persistence and uses Postgres only for small ingest manifests.
 
 ## Recommended Architecture
 
@@ -522,7 +530,7 @@ For scanner features:
 | 6. Shadow compare read path | Cutover rehearsal. | Add a read-source flag with `catalog`, `shadow_compare`, and `clickhouse` modes; implement parity reporting. | `shadow_compare` uses catalog for decisions and reports ClickHouse differences for sampled datasets. |
 | 7. Flagged ClickHouse read cutover | Controlled read switch. | Promote supported datasets to `clickhouse` mode with explicit fallback and rollback. | Operators can switch reads to ClickHouse and back to catalog by configuration. |
 | 8. Option data expansion | Option-specific tables and features. | Add bars, option Greeks, and option-chain liquidity features. | Candidate research can query option chain features by underlying, expiration, strike, and time. |
-| 9. Postgres slimming | Operational store is narrow. | Move market-data cache payloads and scanner feature time series to catalog/ClickHouse; keep Postgres for state, ledgers, outcomes, and ingest manifests. | `backtest_market_cache` is retired or narrowed to non-market operational checkpoints. |
+| 9. Postgres slimming | Operational store is narrow. | Follow `alpaca_operational_postgres_plan.md`; move market-data cache payloads and scanner feature time series to catalog/ClickHouse; keep Postgres for state, events, ledgers, outcomes, leases, and ingest manifests. | `backtest_market_cache` is retired or narrowed to non-market operational checkpoints. |
 | 10. Export to catalog | Replay-compatible bridge. | Export warehouse-selected ranges back into `ParquetDataCatalog` format when needed. | Backtests still consume catalog data, even if ClickHouse selected or prepared the range. |
 
 ## Provisional Answers
@@ -533,17 +541,19 @@ real volume, latency, or operational evidence contradicts them.
 | Question | Provisional answer | Reason |
 | --- | --- | --- |
 | Write model | Write market data to both `ParquetDataCatalog` and ClickHouse. Catalog remains the primary engine-compatible store during the initial rollout. | This gives ClickHouse analytical coverage while preserving Nautilus replay/backtest continuity. |
-| Postgres role | Keep Postgres as the operational control plane: strategy state, decision/evidence ledgers, outcomes, and ingest manifests. Do not use it for bulk market data. | Postgres gives clean transactional semantics for small mutable records; ClickHouse and the catalog are better homes for high-volume market data. |
+| Postgres role | Keep Postgres as the operational control plane: strategy state snapshots, state events, decision/evidence ledgers, outcomes, runtime leases, and ingest manifests. Do not use it for bulk market data. | Postgres gives clean transactional semantics for small mutable records; ClickHouse and the catalog are better homes for high-volume market data. |
 | First production source | Use existing `ParquetDataCatalog` files for historical backfill first. Use Alpaca historical REST only to fill catalog gaps, then write those filled ranges to both stores. | This preserves Nautilus schemas and avoids two independent historical loaders with subtly different semantics. |
 | Option and underlying quotes | Store all normalized `QuoteTick`-shaped BBO data in one `market.quote_ticks` table. Add instrument metadata or views for option-specific filtering. | Underlying and option BBO rows have the same core query shape: instrument, event time, bid, ask, sizes. One table simplifies joins, coverage checks, and scanner queries. |
 | Vendor-specific option quote payloads | Put fields that do not belong to Nautilus `QuoteTick` in a separate raw/source table such as `market.alpaca_option_quote_snapshots_raw`. | The canonical warehouse tables should mirror Nautilus semantics; raw vendor tables are useful for audits and adapter debugging. |
+| Initial dataset scope | Prove quote ticks first for the configured scanner universe and option contracts the scanner actually scores. Add trades, bars, Greeks, and wider history after quote coverage and query shape are boring. | Quotes are the first analytical need for spread/liquidity windows, and starting from scored contracts keeps the first ClickHouse pass measurable. |
 | Initial freshness target | For backfill and scanner research, end-of-run consistency is enough. For the live dual-write sink, target data visible within one scan interval, with an initial practical SLO of p95 under 60 seconds and p99 under 5 minutes. | This keeps the warehouse useful for scanner features without turning it into a hard real-time trading dependency. |
 | Read cutover | Start in `catalog` mode, rehearse with `shadow_compare`, then promote supported datasets to `clickhouse` mode by flag. | A flag keeps cutover reversible and prevents scattered call-site-specific behavior. |
+| Read flag config surface | Start with one coarse market-data read-source flag with `catalog`, `shadow_compare`, and `clickhouse` modes. Split by dataset or consumer only after the first cutover proves a real need. | A single flag is easier to operate and avoids call-site-specific switches during the first migration. |
 | Trade-gating freshness | Do not use warehouse freshness as a trade gate before the flagged ClickHouse read path has passed shadow comparison. If a strategy eventually depends on ClickHouse-derived features for entry, record feature timestamp and lag with the candidate decision. | Live order admission should rely on Nautilus cache/live data until the warehouse sink has proven reliability and latency. |
 | Duplicate handling | Start with plain `MergeTree` tables plus an ingest manifest, not `ReplacingMergeTree`. Treat `(dataset, source, instrument_id, start, end)` as an idempotent load range. | ClickHouse duplicate removal is eventual and can leak duplicates into normal queries. Job-level idempotency is easier to reason about for canonical market data. |
 | Backfill reloads | Prefer full-day partition loads for production backfills. Load into staging, validate counts, then replace or promote the partition. For small development reloads, explicit delete-and-reload is acceptable. | Partition-level replacement is cleaner than row-level mutations once volume grows. Development needs a simpler escape hatch. |
 | Schema and migrations location | Put ClickHouse DDL under a repo-level warehouse area such as `schema/sql/clickhouse/`. Keep Alpaca-specific loaders near the Alpaca adapter until they become generic. | Market-data warehouse schema is not Alpaca-owned long term. The adapter can own source-specific extraction while the warehouse owns normalized contracts. |
-| Postgres cleanup | Retire or narrow `backtest_market_cache` once ClickHouse and catalog writes cover those datasets. Mirror ledgers to ClickHouse only for analytics, not as the source of truth. | This removes the broad JSONB market cache path and keeps a clean split between operational truth and analytical history. |
+| Postgres cleanup | Retire or narrow `backtest_market_cache` once ClickHouse and catalog writes cover those datasets. Add operational state events and migrations in Postgres before live submit cutover. Mirror ledgers to ClickHouse only for analytics, not as the source of truth. | This removes the broad JSONB market cache path and keeps a clean split between operational truth and analytical history. |
 | First runtime integration | Build a catalog backfill command before turning on the live dual-write sink. | It validates contracts and scanner usefulness before introducing a new live-service dependency. |
 | Deployment owner | Self-host ClickHouse. Start with a local/dev stack, then prove the NUC only if storage, CPU, and memory headroom are acceptable. Move to a dedicated self-hosted analytics box if retention or ingest volume outgrows the NUC. | Quote-scale data can outgrow a small live-trading host quickly, and the warehouse must not starve trading processes. |
 
@@ -551,12 +561,10 @@ real volume, latency, or operational evidence contradicts them.
 
 - Exact self-host target and retention budget: local NUC or dedicated analytics host should be
   decided after sizing expected quote/trade volume and disk retention.
-- Exact live freshness SLO: keep the initial p95 under 60 seconds target unless scanner features
-  become trade-gating. Trade-gating features need a tighter SLO and a fail-open/fail-closed policy.
-- First dataset scope: choose the first instrument universe and date range before implementation so
-  row counts, storage size, and backfill runtime are measurable.
-- Exact config surface for the read flag: start with a coarse runtime flag, then split by dataset or
-  consumer if the first cutover needs finer control.
+- First proof window: choose the initial instrument list and date range before implementation so row
+  counts, storage size, and backfill runtime are measurable.
+- Trade-gating warehouse reads: if ClickHouse-derived features later gate live orders, define a
+  tighter freshness SLO and an explicit fail-open/fail-closed policy for partial or stale reads.
 
 ## Design Preference
 

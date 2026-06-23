@@ -62,8 +62,9 @@ and strategies.
     dry-runs selected entries.
   - Do not enable live entry submission until durable strategy-state persistence, startup
     reconciliation, and remaining broker-account admission parity are complete.
-- [ ] Decide whether scanner evidence should write to Postgres directly or publish events for a
-  separate persistence consumer.
+- [ ] Wire scanner and strategy evidence through a persistence sink/consumer after durable
+  strategy-state writes are in place; do not write Postgres directly from synchronous strategy
+  callbacks.
 - [x] Remove the adapter-local order-plan layer from options-engine submission.
   - Submission now builds standard Nautilus `OrderAny` values through `OrderFactory`, then derives
     `SubmitOrder` or `SubmitOrderList` commands for `AlpacaExecutionClient`.
@@ -170,14 +171,25 @@ loop.
   - [x] Other terminal entry rejections should remain observable and should not create false active
     exposure.
 - [ ] Add a real persistence boundary for strategy state.
+  - Follow `docs/developer_guide/alpaca_operational_postgres_plan.md`.
+  - [ ] Add versioned Alpaca Postgres migrations.
+  - [ ] Add `strategy_state_events` as the append-only state mutation ledger.
+  - [ ] Add `version`, writer metadata, and last-event metadata to `strategy_state`.
+  - [ ] Add a transactional repository method that inserts one state event and updates the
+    snapshot idempotently.
+  - [ ] Add a live-submit runtime lease or equivalent DB-visible exclusive writer guard.
   - Strategy callbacks are synchronous, while the Postgres repository is async; do not hide DB
     writes inside blocking callback code.
   - Use an explicit state persistence actor/event sink or another Nautilus-native async boundary
     for DB writes.
   - Keep local/in-memory state updated before persistence completes so admission gates protect the
     current process immediately.
+  - [ ] Mark the sink unhealthy, deny new entries, and emit operator evidence when persistence
+    fails.
 - [ ] Reconcile state on startup before enabling paper submission.
   - [x] Load persisted entries.
+  - [ ] Require migrations, storage readiness, healthy sink, and an active account writer lease
+    when `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED=true`.
   - [ ] Reconcile broker orders/positions so pending or partially accepted entries are not double
     submitted after restart.
 - [ ] Done when accepted/rejected strategy submissions update durable state without calling direct
