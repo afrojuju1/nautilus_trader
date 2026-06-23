@@ -113,8 +113,9 @@ write completion.
 ## Proposed Schema Changes
 
 Use `sqlx` migrations instead of growing the inline `CREATE TABLE IF NOT EXISTS` block or adding a
-fork-owned migration manager. The first migration can preserve the existing tables and add missing
-metadata.
+fork-owned migration manager. The generic Postgres migration runner belongs in
+`nautilus-infrastructure`; Alpaca should only own the operational migration files and readiness
+calls. The first migration can preserve the existing tables and add missing metadata.
 
 ### Postgres Migrations
 
@@ -124,8 +125,9 @@ Postgres schema evolution should use the existing Rust dependency path:
 - Store versioned SQL files under an Alpaca-owned migration directory such as
   `crates/adapters/alpaca/migrations/`. If the operational store is later promoted out of Alpaca,
   move the migrations to the new generic owner instead of keeping an adapter name.
-- Apply migrations with `sqlx::migrate!` / `Migrator` from the live node or operator readiness
-  path, and allow local operators to run the same files with `sqlx migrate run`.
+- Apply migrations with `sqlx::migrate!` / `Migrator` through the shared
+  `nautilus-infrastructure` Postgres helper from the live node or operator readiness path, and
+  allow local operators to run the same files with `sqlx migrate run`.
 - Let `sqlx` own its metadata table, `_sqlx_migrations` by default. Do not add a custom
   `schema_migrations` table to the Alpaca domain schema.
 

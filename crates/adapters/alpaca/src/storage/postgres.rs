@@ -1,14 +1,22 @@
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
+use nautilus_infrastructure::sql::pg::{
+    PostgresMigrationStatus, postgres_migration_status, run_schema_migrations,
+    validate_postgres_identifier,
+};
 use sqlx::{AssertSqlSafe, PgPool, postgres::PgPoolOptions};
 
 use crate::storage::STORAGE_SCHEMA_DEFAULT;
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Debug, Clone)]
 pub struct StorageRepository {
     pool: PgPool,
     schema: String,
 }
+
+pub type StorageMigrationStatus = PostgresMigrationStatus;
 
 #[derive(Debug, thiserror::Error)]
 #[error("invalid storage schema: {schema}")]
@@ -34,6 +42,7 @@ impl StorageRepository {
             .connect(database_url)
             .await?;
         let repository = Self { pool, schema };
+        repository.apply_migrations().await?;
         repository.init_schema().await?;
         Ok(repository)
     }
@@ -44,6 +53,14 @@ impl StorageRepository {
 
     pub fn schema(&self) -> &str {
         &self.schema
+    }
+
+    pub async fn migration_status(&self) -> anyhow::Result<StorageMigrationStatus> {
+        postgres_migration_status(&self.pool, &self.schema).await
+    }
+
+    async fn apply_migrations(&self) -> anyhow::Result<StorageMigrationStatus> {
+        run_schema_migrations(&self.pool, &self.schema, &MIGRATOR).await
     }
 
     async fn init_schema(&self) -> anyhow::Result<()> {
@@ -140,29 +157,25 @@ CREATE INDEX IF NOT EXISTS "ix_backtest_market_cache_account_kind"
 }
 
 fn validate_schema(schema: &str) -> anyhow::Result<()> {
-    if !is_valid_identifier(schema) {
-        return Err(StorageInitError {
-            schema: schema.to_string(),
-        }
-        .into());
-    }
+    validate_postgres_identifier(schema, "storage schema").map_err(|_| StorageInitError {
+        schema: schema.to_string(),
+    })?;
     Ok(())
-}
-
-fn is_valid_identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value.chars().all(|value| {
-            value.is_ascii_alphanumeric() || value == '_' || value == '.' || value == '-'
-        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn is_valid_identifier(value: &str) -> bool {
+        validate_postgres_identifier(value, "storage schema").is_ok()
+    }
+
     #[test]
     fn rejects_invalid_identifier_chars() {
         assert!(is_valid_identifier("alpaca_trader"));
+        assert!(!is_valid_identifier("alpaca-trader"));
+        assert!(!is_valid_identifier("alpaca.trader"));
         assert!(!is_valid_identifier("alpaca trader"));
     }
 }

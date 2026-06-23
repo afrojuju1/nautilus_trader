@@ -16,9 +16,15 @@
 use derive_builder::Builder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sqlx::{AssertSqlSafe, ConnectOptions, PgPool, postgres::PgConnectOptions};
+use sqlx::{AssertSqlSafe, ConnectOptions, PgPool, Row, postgres::PgConnectOptions};
 
-fn validate_sql_identifier(value: &str, label: &str) -> anyhow::Result<()> {
+/// Validates a Postgres identifier used in generated DDL.
+///
+/// # Errors
+///
+/// Returns an error if `value` is empty or contains anything except ASCII alphanumeric characters
+/// and underscores.
+pub fn validate_postgres_identifier(value: &str, label: &str) -> anyhow::Result<()> {
     if value.is_empty() {
         anyhow::bail!("{label} must not be empty");
     }
@@ -31,8 +37,93 @@ fn validate_sql_identifier(value: &str, label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn quote_postgres_identifier(value: &str, label: &str) -> anyhow::Result<String> {
+    validate_postgres_identifier(value, label)?;
+    Ok(format!("\"{value}\""))
+}
+
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+/// Status for SQLx migrations in a Postgres schema.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PostgresMigrationStatus {
+    pub applied_count: i64,
+    pub latest_version: Option<i64>,
+    pub dirty_version: Option<i64>,
+}
+
+/// Runs SQLx migrations in a schema-specific search path and returns migration status.
+///
+/// # Errors
+///
+/// Returns an error if schema validation, schema creation, migration execution, search path reset,
+/// or migration status query fails.
+pub async fn run_schema_migrations(
+    pg: &PgPool,
+    schema: &str,
+    migrator: &sqlx::migrate::Migrator,
+) -> anyhow::Result<PostgresMigrationStatus> {
+    let schema_identifier = quote_postgres_identifier(schema, "schema")?;
+    let mut connection = pg.acquire().await?;
+    let schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {schema_identifier};");
+    sqlx::query(AssertSqlSafe(schema_sql))
+        .execute(&mut *connection)
+        .await?;
+
+    let search_path_sql = format!("SET search_path TO {schema_identifier}, public;");
+    sqlx::query(AssertSqlSafe(search_path_sql))
+        .execute(&mut *connection)
+        .await?;
+
+    let migration_result = migrator.run(&mut *connection).await;
+    let reset_result = sqlx::query("RESET search_path")
+        .execute(&mut *connection)
+        .await;
+
+    migration_result?;
+    reset_result?;
+
+    postgres_migration_status(pg, schema).await
+}
+
+/// Returns SQLx migration status for the given Postgres schema.
+///
+/// # Errors
+///
+/// Returns an error if schema validation or the migration metadata query fails for reasons other
+/// than the metadata table not existing yet.
+pub async fn postgres_migration_status(
+    pg: &PgPool,
+    schema: &str,
+) -> anyhow::Result<PostgresMigrationStatus> {
+    let schema_identifier = quote_postgres_identifier(schema, "schema")?;
+    let query = format!(
+        r#"
+SELECT
+    COUNT(*)::BIGINT AS applied_count,
+    MAX(version) AS latest_version,
+    MIN(version) FILTER (WHERE success = false) AS dirty_version
+FROM {schema_identifier}._sqlx_migrations;
+"#
+    );
+
+    match sqlx::query(AssertSqlSafe(query)).fetch_one(pg).await {
+        Ok(row) => Ok(PostgresMigrationStatus {
+            applied_count: row.try_get("applied_count")?,
+            latest_version: row.try_get("latest_version")?,
+            dirty_version: row.try_get("dirty_version")?,
+        }),
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42P01") => {
+            Ok(PostgresMigrationStatus {
+                applied_count: 0,
+                latest_version: None,
+                dirty_version: None,
+            })
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
@@ -232,7 +323,7 @@ pub async fn init_postgres(
 ) -> anyhow::Result<()> {
     log::info!("Initializing Postgres database with target permissions and schema");
 
-    validate_sql_identifier(&database, "database")?;
+    validate_postgres_identifier(&database, "database")?;
 
     // Create public schema
     match sqlx::query("CREATE SCHEMA IF NOT EXISTS public;")
@@ -412,7 +503,7 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
 ///
 /// Returns an error if the DROP DATABASE command fails.
 pub async fn drop_postgres(pg: &PgPool, database: String) -> anyhow::Result<()> {
-    validate_sql_identifier(&database, "database")?;
+    validate_postgres_identifier(&database, "database")?;
 
     // Execute drop owned
     match sqlx::query(AssertSqlSafe(format!("DROP OWNED BY {database}")))

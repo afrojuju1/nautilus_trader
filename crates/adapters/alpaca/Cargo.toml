@@ -39,6 +39,7 @@ live = [
   "dep:dotenvy",
   "dep:log",
   "dep:nautilus-common",
+  "dep:nautilus-infrastructure",
   "dep:nautilus-live",
   "nautilus-live/node",
   "dep:nautilus-network",
@@ -68,6 +69,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 nautilus-common = { workspace = true, features = ["live"], optional = true }
 nautilus-backtest = { workspace = true, features = ["streaming"], optional = true }
 nautilus-core = { workspace = true }
+nautilus-infrastructure = { workspace = true, features = [
+  "postgres",
+], optional = true }
 nautilus-live = { workspace = true, optional = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true, optional = true }

@@ -57,7 +57,7 @@ struct OperatorConfig {
     sectors: BTreeMap<String, String>,
     fleet_account_id: Option<String>,
     fleet_policy_blocks: Vec<String>,
-    storage_enabled: bool,
+    storage: StorageStatus,
     json_output: bool,
 }
 
@@ -73,6 +73,7 @@ struct OperatorStatus {
     checked_at_utc: String,
     engine_state: EngineState,
     service: ServiceStatus,
+    storage: StorageStatus,
     account: AccountStatus,
     orders: OrdersStatus,
     positions: PositionsStatus,
@@ -112,6 +113,15 @@ struct ServiceStatus {
     manage_enabled: bool,
     close_enabled: bool,
     dry_run_strategies: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StorageStatus {
+    enabled: bool,
+    schema: String,
+    applied_migrations: Option<i64>,
+    latest_migration_version: Option<i64>,
+    dirty_migration_version: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -284,6 +294,25 @@ impl OperatorConfig {
             .map(ToString::to_string)
             .collect();
 
+        let storage = if let Some(repository) = &strategy_config.storage_repository {
+            let status = repository.migration_status().await?;
+            StorageStatus {
+                enabled: true,
+                schema: repository.schema().to_string(),
+                applied_migrations: Some(status.applied_count),
+                latest_migration_version: status.latest_version,
+                dirty_migration_version: status.dirty_version,
+            }
+        } else {
+            StorageStatus {
+                enabled: false,
+                schema: strategy_config.storage_schema.clone(),
+                applied_migrations: None,
+                latest_migration_version: None,
+                dirty_migration_version: None,
+            }
+        };
+
         Ok(Self {
             service_name: env::var("NAUTILUS_ALPACA_SERVICE")
                 .ok()
@@ -315,7 +344,7 @@ impl OperatorConfig {
             sectors: strategy_config.sectors,
             fleet_account_id: strategy_config.fleet_account_id,
             fleet_policy_blocks: strategy_config.fleet_policy_blocks,
-            storage_enabled: strategy_config.storage_repository.is_some(),
+            storage,
             json_output: env::args().any(|arg| arg == "--json"),
         })
     }
@@ -429,7 +458,7 @@ fn build_status(
 
     let strategy_state = StrategyStateStatus {
         path: config.state_path.display().to_string(),
-        exists: config.storage_enabled || config.state_path.exists(),
+        exists: config.storage.enabled || config.state_path.exists(),
         entries: state.entries.len(),
         active_entries: state
             .entries
@@ -514,6 +543,7 @@ fn build_status(
         checked_at_utc: now.to_rfc3339(),
         engine_state,
         service,
+        storage: config.storage.clone(),
         account: account_status,
         orders: orders_status,
         positions: positions_status,
@@ -824,6 +854,23 @@ fn print_human_status(status: &OperatorStatus) {
         status.service.dry_run_strategies.join(","),
         status.service.lock_file,
         status.service.log_file,
+    );
+    println!(
+        "storage: enabled={} schema={} applied_migrations={} latest_migration_version={} dirty_migration_version={}",
+        status.storage.enabled,
+        status.storage.schema,
+        status
+            .storage
+            .applied_migrations
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        status
+            .storage
+            .latest_migration_version
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        status
+            .storage
+            .dirty_migration_version
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
     );
     println!(
         "account: status={} trading_blocked={} account_blocked={} suspended={} buying_power={} options_buying_power={} portfolio_value={} cash={}",

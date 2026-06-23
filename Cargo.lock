@@ -5360,6 +5360,7 @@ dependencies = [
  "nautilus-backtest",
  "nautilus-common",
  "nautilus-core",
+ "nautilus-infrastructure",
  "nautilus-live",
  "nautilus-model",
  "nautilus-network",
@@ -9456,6 +9457,7 @@ dependencies = [
  "sqlx-postgres",
  "sqlx-sqlite",
  "syn 2.0.118",
+ "thiserror 2.0.18",
  "tokio",
  "url",
 ]

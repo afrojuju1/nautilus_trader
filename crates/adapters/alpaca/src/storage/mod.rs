@@ -19,7 +19,7 @@ pub mod state;
 mod postgres;
 
 #[cfg(feature = "live")]
-pub use postgres::{StorageInitError, StorageRepository};
+pub use postgres::{StorageInitError, StorageMigrationStatus, StorageRepository};
 
 #[cfg(feature = "live")]
 pub use candidate_ledger::append_candidate_ledger_record;

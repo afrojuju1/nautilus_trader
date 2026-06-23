@@ -223,6 +223,11 @@ ClickHouse is self-hosted for this workstream. The repo-level deployment home sh
 the remaining deployment decision is whether the first production instance lives on the NUC with
 strict resource limits or on a dedicated self-hosted analytics box.
 
+The first deployment slice is intentionally only the generic ClickHouse service, persistent volumes,
+local-only ports, and smoke command under `deploy/warehouse/`. Schema migrations, data writers, and
+reader cutover stay in later warehouse tasks so the deploy baseline does not become an adapter-local
+proof script.
+
 ## Database Decision
 
 Use ClickHouse as the repo-level analytical market-data warehouse. Its `MergeTree` family stores
