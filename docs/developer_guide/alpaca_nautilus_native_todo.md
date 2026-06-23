@@ -63,6 +63,12 @@ and strategies.
   - Alpaca-specific code remains at symbol normalization and execution-client payload translation;
     the account engine still owns broker session lifecycle and submit gates until entry admission
     moves behind a real strategy boundary.
+- [x] Add a Nautilus-native entry strategy boundary.
+  - `AlpacaOptionsEntryStrategy` owns conversion from `OptionsOpportunitySet` /
+    `SelectedOptionsEntry` into standard Nautilus orders and submits through `Strategy::submit_order`
+    or `Strategy::submit_order_list`.
+  - The account-engine compatibility path reuses the same entry-order construction while the full
+    `LiveNode` execution cutover is still in progress.
 
 ## Cutover Readiness
 
@@ -93,10 +99,10 @@ green during market hours for the configured paper profiles.
 ## Next Loops To Retire
 
 - [ ] Entry loop
-  - Move entry selection and risk admission into a Nautilus `Strategy`.
-  - Build accepted entries as standard Nautilus orders with `OrderFactory` or `OrderApi`.
-  - Keep the strategy fed by `OptionsOpportunitySet` or its successor, not Alpaca REST payloads.
-  - Submit through standard Nautilus `submit_order` or `submit_order_list` flow only.
+  - Move entry selection and risk admission into `AlpacaOptionsEntryStrategy`.
+  - Feed the strategy from `OptionsOpportunitySet` or its successor, not Alpaca REST payloads.
+  - Wire the strategy into a live node with `AlpacaExecutionClientFactory` and retire direct
+    account-engine submission.
 
 - [ ] Management loop
   - Move close, flatten, stale-order, and reprice lifecycle into a dedicated strategy/component.

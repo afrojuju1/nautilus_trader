@@ -17,9 +17,7 @@ use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     enums::{AccountType, OmsType, OrderSide, TimeInForce},
     events::{OrderEventAny, OrderInitialized},
-    identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TraderId, Venue,
-    },
+    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue},
     orders::{OrderAny, OrderList},
     types::{Price, Quantity},
 };
@@ -33,6 +31,7 @@ use crate::{
     config::AlpacaExecClientConfig,
     execution::AlpacaExecutionClient,
     http::{client::AlpacaHttpClient, error::Error, models::AlpacaOrder},
+    options_entry_strategy::{apply_order_list_id, build_selected_entry_orders},
     options_runtime::{OptionsEngineConfig, SelectedOptionsEntry},
     runtime::StrategyStateEntry,
 };
@@ -49,8 +48,8 @@ pub(super) async fn submit_selected_entry(
         order_list_id,
         config.cancel_after_accept,
         |client, trader_id, client_id, strategy_id| {
-            let orders =
-                selected_entry_orders(entry, order_list_id, quantity, trader_id, strategy_id)?;
+            let mut factory = option_order_factory(trader_id, strategy_id);
+            let orders = build_selected_entry_orders(&mut factory, entry, order_list_id, quantity)?;
             submit_orders(
                 client,
                 order_list_id,
@@ -198,10 +197,7 @@ fn submit_order_list_from_orders(
         anyhow::bail!("cannot build empty order list");
     }
 
-    let order_list_id = OrderListId::from(order_list_id);
-    for order in orders.iter_mut() {
-        order.set_order_list_id(order_list_id);
-    }
+    apply_order_list_id(orders, order_list_id);
 
     let ts_init = get_atomic_clock_realtime().get_time_ns();
     let order_list = OrderList::from_orders(orders, ts_init);
@@ -224,109 +220,6 @@ fn submit_order_list_from_orders(
         ts_init,
         None,
     ))
-}
-
-fn selected_entry_orders(
-    entry: &SelectedOptionsEntry,
-    order_list_id: &str,
-    quantity: u64,
-    trader_id: TraderId,
-    strategy_id: StrategyId,
-) -> anyhow::Result<Vec<OrderAny>> {
-    if quantity == 0 {
-        anyhow::bail!("quantity must be positive");
-    }
-
-    let mut factory = option_order_factory(trader_id, strategy_id);
-    Ok(match entry {
-        SelectedOptionsEntry::Credit(entry) => vec![
-            limit_option_order(
-                &mut factory,
-                labeled_client_order_id(order_list_id, "short"),
-                &entry.candidate.short.symbol,
-                OrderSide::Sell,
-                quantity,
-                entry.candidate.short.bid,
-                false,
-            )?,
-            limit_option_order(
-                &mut factory,
-                labeled_client_order_id(order_list_id, "long"),
-                &entry.candidate.long.symbol,
-                OrderSide::Buy,
-                quantity,
-                entry.candidate.long.ask,
-                false,
-            )?,
-        ],
-        SelectedOptionsEntry::IronCondor(entry) => vec![
-            limit_option_order(
-                &mut factory,
-                labeled_client_order_id(order_list_id, "short-put"),
-                &entry.candidate.put.short.symbol,
-                OrderSide::Sell,
-                quantity,
-                entry.candidate.put.short.bid,
-                false,
-            )?,
-            limit_option_order(
-                &mut factory,
-                labeled_client_order_id(order_list_id, "long-put"),
-                &entry.candidate.put.long.symbol,
-                OrderSide::Buy,
-                quantity,
-                entry.candidate.put.long.ask,
-                false,
-            )?,
-            limit_option_order(
-                &mut factory,
-                labeled_client_order_id(order_list_id, "short-call"),
-                &entry.candidate.call.short.symbol,
-                OrderSide::Sell,
-                quantity,
-                entry.candidate.call.short.bid,
-                false,
-            )?,
-            limit_option_order(
-                &mut factory,
-                labeled_client_order_id(order_list_id, "long-call"),
-                &entry.candidate.call.long.symbol,
-                OrderSide::Buy,
-                quantity,
-                entry.candidate.call.long.ask,
-                false,
-            )?,
-        ],
-        SelectedOptionsEntry::Debit(entry) => vec![
-            limit_option_order(
-                &mut factory,
-                labeled_client_order_id(order_list_id, "long"),
-                &entry.candidate.long.symbol,
-                OrderSide::Buy,
-                quantity,
-                entry.candidate.long.ask,
-                false,
-            )?,
-            limit_option_order(
-                &mut factory,
-                labeled_client_order_id(order_list_id, "short"),
-                &entry.candidate.short.symbol,
-                OrderSide::Sell,
-                quantity,
-                entry.candidate.short.bid,
-                false,
-            )?,
-        ],
-        SelectedOptionsEntry::NakedOption(entry) => vec![limit_option_order(
-            &mut factory,
-            ClientOrderId::from(order_list_id),
-            &entry.candidate.short.symbol,
-            OrderSide::Sell,
-            quantity,
-            entry.candidate.short.bid,
-            false,
-        )?],
-    })
 }
 
 fn close_entry_orders(
@@ -589,8 +482,9 @@ pub(crate) mod tests_support {
         client_id: Option<ClientId>,
         strategy_id: StrategyId,
     ) -> anyhow::Result<SubmitOrder> {
+        let mut factory = option_order_factory(trader_id, strategy_id);
         let mut orders =
-            selected_entry_orders(entry, client_order_id, quantity, trader_id, strategy_id)?;
+            build_selected_entry_orders(&mut factory, entry, client_order_id, quantity)?;
         let order = single_order(&mut orders, "open")?;
         Ok(submit_order_from_order(order, trader_id, client_id))
     }

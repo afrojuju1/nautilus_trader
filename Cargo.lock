@@ -5364,6 +5364,7 @@ dependencies = [
  "nautilus-model",
  "nautilus-network",
  "nautilus-persistence",
+ "nautilus-trading",
  "pyo3",
  "pyo3-stub-gen",
  "reqwest 0.13.4",
