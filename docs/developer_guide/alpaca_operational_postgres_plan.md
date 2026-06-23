@@ -283,6 +283,10 @@ schema because it is small control state.
 The transaction must be idempotent. Replaying the same `event_id` should not duplicate
 `strategy_state_events`, and it should leave the snapshot consistent.
 
+`persist_strategy_state_mutation` is the repository boundary for this contract. It inserts the
+event first, locks and versions the snapshot when the event is new, and treats duplicate event IDs
+as an idempotent success without rewriting the snapshot.
+
 ### Candidate Evidence
 
 Candidate evidence can stay in `candidate_ledger`, but scanner/strategy code should not own direct
@@ -328,7 +332,7 @@ If any item fails, the node may continue scanning, but it must not submit entrie
 - The existing inline DDL lives in versioned SQL migrations.
 - Add state metadata columns, `strategy_state_events`, and `runtime_lease`.
 - Inline schema creation has been replaced with the `sqlx` migrator in the storage startup path.
-- Add repository functions for transactional state event + snapshot writes.
+- The repository has a transactional state event + snapshot write contract.
 
 Done when a local Postgres can initialize through the `sqlx` migrator, report the applied migration
 version, load existing state rows, and persist one synthetic state event idempotently.

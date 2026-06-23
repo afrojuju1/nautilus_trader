@@ -48,6 +48,7 @@ live = [
   "dep:rust_decimal",
   "dep:toml",
   "dep:tokio-tungstenite",
+  "dep:uuid",
   "tokio",
 ]
 python = [
@@ -98,6 +99,7 @@ tokio-tungstenite = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }
 url = { workspace = true }
 ustr = { workspace = true }
+uuid = { workspace = true, optional = true }
 
 [[bin]]
 name = "alpaca-load-option-contracts"
