@@ -51,6 +51,8 @@ pub mod backend;
 pub mod config;
 pub mod parquet;
 pub mod test_data;
+#[cfg(feature = "clickhouse")]
+pub mod warehouse;
 
 #[cfg(feature = "python")]
 pub mod python;

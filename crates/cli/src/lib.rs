@@ -53,12 +53,14 @@
 mod blockchain;
 mod database;
 pub mod opt;
+mod warehouse;
 
 #[cfg(feature = "defi")]
 use crate::blockchain::run_blockchain_command;
 use crate::{
     database::postgres::run_database_command,
     opt::{Commands, NautilusCli},
+    warehouse::run_warehouse_command,
 };
 
 /// Runs the Nautilus CLI based on the provided options.
@@ -69,6 +71,7 @@ use crate::{
 pub async fn run(opt: NautilusCli) -> anyhow::Result<()> {
     match opt.command {
         Commands::Database(database_opt) => run_database_command(database_opt).await?,
+        Commands::Warehouse(warehouse_opt) => run_warehouse_command(warehouse_opt).await?,
         #[cfg(feature = "defi")]
         Commands::Blockchain(blockchain_opt) => {
             Box::pin(run_blockchain_command(blockchain_opt)).await?;

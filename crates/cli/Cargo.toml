@@ -29,6 +29,7 @@ nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
 nautilus-infrastructure = { workspace = true, features = ["postgres"] }
 nautilus-model = { workspace = true }
+nautilus-persistence = { workspace = true, features = ["clickhouse"] }
 
 nautilus-blockchain = { workspace = true, features = [
   "hypersync",

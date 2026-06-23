@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::path::PathBuf;
+
 use clap::Parser;
 
 /// Command-line interface for NautilusTrader.
@@ -27,6 +29,7 @@ pub struct NautilusCli {
 #[derive(Parser, Debug)]
 pub enum Commands {
     Database(DatabaseOpt),
+    Warehouse(WarehouseOpt),
     #[cfg(feature = "defi")]
     Blockchain(BlockchainOpt),
 }
@@ -70,6 +73,42 @@ pub enum DatabaseCommand {
     Init(DatabaseConfig),
     /// Drops roles, privileges and deletes all data from the database.
     Drop(DatabaseConfig),
+}
+
+/// Market-data warehouse options and subcommands.
+#[derive(Parser, Debug)]
+#[command(about = "Market-data warehouse operations", long_about = None)]
+pub struct WarehouseOpt {
+    #[clap(subcommand)]
+    pub command: WarehouseCommand,
+}
+
+/// Configuration parameters for ClickHouse warehouse operations.
+#[derive(Parser, Debug, Clone)]
+pub struct ClickHouseConfig {
+    /// ClickHouse HTTP URL, including protocol and port.
+    #[arg(long)]
+    pub url: Option<String>,
+    /// Username for connecting to ClickHouse.
+    #[arg(long)]
+    pub username: Option<String>,
+    /// Password for connecting to ClickHouse.
+    #[arg(long)]
+    pub password: Option<String>,
+    /// Default ClickHouse database for the client connection.
+    #[arg(long)]
+    pub database: Option<String>,
+    /// Directory path to ClickHouse migration SQL files.
+    #[arg(long)]
+    pub migrations_dir: Option<PathBuf>,
+}
+
+/// Available warehouse management commands.
+#[derive(Parser, Debug, Clone)]
+#[command(about = "Market-data warehouse operations", long_about = None)]
+pub enum WarehouseCommand {
+    /// Applies pending ClickHouse warehouse migrations.
+    Migrate(ClickHouseConfig),
 }
 
 #[cfg(feature = "defi")]

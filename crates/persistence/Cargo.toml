@@ -29,6 +29,7 @@ cloud = [
   "object_store/gcp",
   "object_store/http",
 ]
+clickhouse = ["dep:blake3", "dep:clickhouse"]
 extension-module = [
   "nautilus-core/extension-module",
   "nautilus-model/extension-module",
@@ -69,8 +70,10 @@ ahash = { workspace = true }
 anyhow = { workspace = true }
 arrow = { workspace = true }
 arrow-row = { workspace = true }
+blake3 = { workspace = true, optional = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+clickhouse = { workspace = true, optional = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
