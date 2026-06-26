@@ -773,8 +773,8 @@ pub fn order_status_from_alpaca(status: Option<&str>) -> Result<OrderStatus> {
 
 fn order_side_from_alpaca(side: Option<&str>) -> Result<OrderSide> {
     match side.map(normalize).as_deref() {
-        Some("buy") => Ok(OrderSide::Buy),
-        Some("sell") => Ok(OrderSide::Sell),
+        Some("buy" | "buy_to_cover" | "buy_to_open" | "buy_to_close") => Ok(OrderSide::Buy),
+        Some("sell" | "sell_short" | "sell_to_open" | "sell_to_close") => Ok(OrderSide::Sell),
         Some(value) => Err(Error::Parse(format!(
             "unsupported Alpaca order side: {value}"
         ))),
