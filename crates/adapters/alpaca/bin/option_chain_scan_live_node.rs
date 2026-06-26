@@ -4,7 +4,7 @@ use std::{env, time::Duration};
 
 use anyhow::{Context, bail};
 use nautilus_alpaca::{
-    common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
+    common::consts::ALPACA_CLIENT_ID,
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
     factories::{AlpacaDataClientFactory, AlpacaExecutionClientFactory},
     http::{client::AlpacaHttpClient, models::AlpacaAccount},
@@ -14,6 +14,7 @@ use nautilus_alpaca::{
     },
     options_entry_strategy::{AlpacaOptionsEntryStrategy, AlpacaOptionsEntryStrategyConfig},
     options_runtime::OptionsEngineConfig,
+    parse::parse_option_series_id,
     state_persistence::{StrategyStatePersistenceHandle, start_runtime_lease_heartbeat},
     storage::{RuntimeLeaseRequest, STATE_PERSISTENCE_MIGRATION_VERSION, acquire_runtime_lease},
 };
@@ -21,7 +22,7 @@ use nautilus_common::enums::Environment;
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
     data::option_chain::StrikeRange,
-    identifiers::{AccountId, ActorId, ClientId, OptionSeriesId, StrategyId, TraderId},
+    identifiers::{AccountId, ActorId, ClientId, StrategyId, TraderId},
     types::Price,
 };
 use nautilus_trading::strategy::StrategyConfig;
@@ -62,13 +63,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         runtime_config
     };
-    let series_id = OptionSeriesId::from_expiry(
-        ALPACA_VENUE,
-        &args.underlying,
-        &args.settlement,
-        &args.expiry,
-    )
-    .map_err(|e| anyhow::anyhow!("invalid Alpaca option series: {e}"))?;
+    let series_id = parse_option_series_id(&args.underlying, &args.settlement, &args.expiry)
+        .map_err(|e| anyhow::anyhow!("invalid Alpaca option series: {e}"))?;
     let client_id = ClientId::from(ALPACA_CLIENT_ID);
     let data_config = AlpacaDataClientConfig {
         snapshot_greeks_poll_secs: args.snapshot_greeks_poll_secs,

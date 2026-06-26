@@ -9,7 +9,6 @@ use anyhow::{Context, bail};
 use chrono::{NaiveDate, Utc};
 use nautilus_alpaca::{
     candidate_engine::{CreditSpreadKind, NakedOptionCapitalContext, NakedOptionKind},
-    common::consts::ALPACA_VENUE,
     config::AlpacaDataClientConfig,
     http::{
         client::AlpacaHttpClient,
@@ -26,7 +25,7 @@ use nautilus_alpaca::{
         SelectedDebitEntry, SelectedEntry, SelectedIronCondorEntry, SelectedNakedOptionEntry,
         SelectedOptionsEntry,
     },
-    parse::parse_option_contract,
+    parse::{parse_option_contract, parse_option_series_id},
     providers::AlpacaOptionContractProvider,
     runtime::{
         credit_spread_strategy_name, debit_spread_strategy_name, naked_option_strategy_name,
@@ -44,7 +43,6 @@ use nautilus_model::{
         option_chain::{OptionChainSlice, OptionGreeks, OptionStrikeData},
     },
     enums::{GreeksConvention, OptionKind},
-    identifiers::OptionSeriesId,
     instruments::OptionContract,
     types::{Price, Quantity},
 };
@@ -493,9 +491,8 @@ fn option_chain_slice_from_rest(
     underlying_price: f64,
     ts: UnixNanos,
 ) -> anyhow::Result<OptionChainSlice> {
-    let series_id =
-        OptionSeriesId::from_expiry(ALPACA_VENUE, underlying, "USD", &expiry.to_string())
-            .map_err(|e| anyhow::anyhow!("invalid option series for {underlying} {expiry}: {e}"))?;
+    let series_id = parse_option_series_id(underlying, "USD", &expiry.to_string())
+        .map_err(|e| anyhow::anyhow!("invalid option series for {underlying} {expiry}: {e}"))?;
     let mut slice = OptionChainSlice {
         series_id,
         atm_strike: None,
