@@ -51,7 +51,14 @@ pub mod backend;
 pub mod config;
 pub mod parquet;
 pub mod test_data;
-#[cfg(feature = "clickhouse")]
+#[cfg(any(
+    feature = "clickhouse",
+    feature = "clickhouse-write",
+    feature = "clickhouse-read",
+    feature = "clickhouse-catalog",
+    feature = "clickhouse-migrations",
+    feature = "live-dual-write",
+))]
 pub mod warehouse;
 
 #[cfg(feature = "python")]

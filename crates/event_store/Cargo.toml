@@ -24,7 +24,7 @@ crate-type = ["rlib"]
 default = []
 defi = ["nautilus-common/defi", "nautilus-model/defi", "nautilus-system/defi"]
 live = ["nautilus-common/live"]
-persistence = ["dep:nautilus-persistence"]
+persistence = ["dep:nautilus-persistence", "nautilus-persistence/catalog-query"]
 
 [package.metadata.docs.rs]
 all-features = true

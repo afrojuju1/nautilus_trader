@@ -31,7 +31,7 @@ python = [
   "pyo3",
   "streaming",
 ]
-streaming = ["nautilus-persistence"]
+streaming = ["nautilus-persistence/catalog-query"]
 tracing-bridge = ["nautilus-common/tracing-bridge"]
 
 [package.metadata.cargo-machete]

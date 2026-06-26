@@ -22,8 +22,8 @@ crate-type = ["rlib"]
 
 [features]
 default = []
-streaming = ["nautilus-persistence"]
-warehouse-clickhouse = ["streaming", "nautilus-persistence/clickhouse"]
+streaming = ["nautilus-persistence/catalog-query"]
+warehouse-clickhouse = ["nautilus-persistence/live-dual-write"]
 ffi = [
   "nautilus-common/ffi",
   "nautilus-core/ffi",

@@ -23,13 +23,20 @@ crate-type = ["rlib", "staticlib"]
 [features]
 default = []
 defi = ["nautilus-model/defi"]
+catalog-write = []
+catalog-query = ["catalog-write", "dep:datafusion"]
 cloud = [
   "object_store/aws",
   "object_store/azure",
   "object_store/gcp",
   "object_store/http",
 ]
-clickhouse = ["dep:blake3", "dep:clickhouse", "dep:uuid"]
+clickhouse-write = ["dep:clickhouse", "dep:uuid"]
+clickhouse-read = ["clickhouse-write"]
+clickhouse-catalog = ["catalog-query", "clickhouse-read", "dep:blake3"]
+clickhouse-migrations = ["clickhouse-write", "dep:blake3"]
+clickhouse = ["clickhouse-catalog", "clickhouse-migrations"]
+live-dual-write = ["catalog-write", "clickhouse-write"]
 extension-module = [
   "nautilus-core/extension-module",
   "nautilus-model/extension-module",
@@ -45,6 +52,7 @@ python = [
   "nautilus-model/ffi",
   "nautilus-model/python",
   "nautilus-serialization/python",
+  "catalog-query",
   "pyo3",
   "pyo3-stub-gen",
   "cloud",
@@ -74,7 +82,7 @@ blake3 = { workspace = true, optional = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 clickhouse = { workspace = true, optional = true }
-datafusion = { workspace = true }
+datafusion = { workspace = true, optional = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
 log = { workspace = true }

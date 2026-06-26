@@ -21,7 +21,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use datafusion::arrow::{
+use arrow::{
     array::{Array, StringArray},
     datatypes::{DataType as ArrowDataType, Field, Schema},
     record_batch::RecordBatch,

@@ -15,11 +15,17 @@
 
 //! Provides an Apache Parquet backend powered by [DataFusion](https://arrow.apache.org/datafusion).
 
+#[cfg(feature = "catalog-query")]
 pub mod binary_heap;
 pub mod catalog;
+#[cfg(feature = "catalog-query")]
 pub mod catalog_operations;
+#[cfg(feature = "catalog-query")]
 pub mod compare;
 pub mod custom;
+#[cfg(feature = "catalog-query")]
 pub mod feather;
+#[cfg(feature = "catalog-query")]
 pub mod kmerge_batch;
+#[cfg(feature = "catalog-query")]
 pub mod session;

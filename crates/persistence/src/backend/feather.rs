@@ -22,10 +22,10 @@ use std::{
 };
 
 use ahash::AHashMap;
-use chrono_tz::Tz;
-use datafusion::arrow::{
+use arrow::{
     datatypes::Schema, error::ArrowError, ipc::writer::StreamWriter, record_batch::RecordBatch,
 };
+use chrono_tz::Tz;
 use nautilus_common::{
     cache::fifo::FifoCache,
     clock::Clock,
@@ -968,7 +968,7 @@ impl FeatherWriter {
 mod tests {
     use std::{io::Cursor, sync::Arc};
 
-    use datafusion::arrow::ipc::reader::StreamReader;
+    use arrow::ipc::reader::StreamReader;
     use nautilus_common::clock::TestClock;
     use nautilus_model::{
         data::{Data, OrderBookDeltas_API, QuoteTick, TradeTick},

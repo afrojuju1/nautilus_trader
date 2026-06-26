@@ -1,40 +1,60 @@
 //! ClickHouse-backed market-data warehouse utilities.
 
+use std::env;
+#[cfg(feature = "clickhouse-read")]
+use std::str::FromStr;
+#[cfg(feature = "clickhouse-migrations")]
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    fs,
     path::Path,
-    str::FromStr,
     time::Instant,
 };
 
-use anyhow::{Context, anyhow};
+#[cfg(any(feature = "clickhouse-catalog", feature = "clickhouse-migrations"))]
+use anyhow::Context;
+#[cfg(any(
+    feature = "clickhouse-read",
+    feature = "clickhouse-catalog",
+    feature = "clickhouse-migrations"
+))]
+use anyhow::anyhow;
+#[cfg(feature = "clickhouse-read")]
 use chrono::{DateTime, Utc};
 use clickhouse::{Client, Row};
 use nautilus_core::UnixNanos;
+#[cfg(feature = "clickhouse-catalog")]
+use nautilus_model::types::{price::PriceRaw, quantity::QuantityRaw};
 use nautilus_model::{
     data::QuoteTick,
     identifiers::InstrumentId,
-    types::{Price, Quantity, price::PriceRaw, quantity::QuantityRaw},
+    types::{Price, Quantity},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(feature = "clickhouse-catalog")]
 use crate::backend::catalog::ParquetDataCatalog;
 
 pub const DEFAULT_CLICKHOUSE_URL: &str = "http://localhost:8123";
 pub const DEFAULT_CLICKHOUSE_USERNAME: &str = "default";
 pub const DEFAULT_CLICKHOUSE_DATABASE: &str = MARKET_DATA_DATABASE;
+#[cfg(feature = "clickhouse-migrations")]
 pub const DEFAULT_MIGRATIONS_DIR: &str = "schema/sql/clickhouse";
+#[cfg(feature = "clickhouse-read")]
 pub const MARKET_DATA_READ_SOURCE_ENV: &str = "NAUTILUS_MARKET_DATA_READ_SOURCE";
 
+#[cfg(feature = "clickhouse-migrations")]
 const CLICKHOUSE_BOOTSTRAP_DATABASE: &str = "default";
 const MARKET_DATA_DATABASE: &str = "market";
 const QUOTE_TICKS_TABLE: &str = "quote_ticks";
 const QUOTE_TICKS_QUALIFIED_TABLE: &str = "market.quote_ticks";
+#[cfg(feature = "clickhouse-migrations")]
 const WAREHOUSE_METADATA_DATABASE: &str = "warehouse";
+#[cfg(feature = "clickhouse-migrations")]
 const SCHEMA_MIGRATIONS_QUALIFIED_TABLE: &str = "warehouse.schema_migrations";
 
+#[cfg(feature = "clickhouse-read")]
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum MarketDataReadSource {
     #[default]
@@ -42,6 +62,7 @@ pub enum MarketDataReadSource {
     ClickHouse,
 }
 
+#[cfg(feature = "clickhouse-read")]
 impl MarketDataReadSource {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -67,6 +88,7 @@ impl MarketDataReadSource {
     }
 }
 
+#[cfg(feature = "clickhouse-read")]
 impl FromStr for MarketDataReadSource {
     type Err = anyhow::Error;
 
@@ -81,6 +103,7 @@ impl FromStr for MarketDataReadSource {
     }
 }
 
+#[cfg(feature = "clickhouse-read")]
 impl std::fmt::Display for MarketDataReadSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -159,12 +182,14 @@ impl ClickHouseConnectOptions {
     }
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ClickHouseMigrationReport {
     pub applied: Vec<ClickHouseMigrationOutcome>,
     pub skipped: Vec<ClickHouseMigrationOutcome>,
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 impl ClickHouseMigrationReport {
     #[must_use]
     pub fn applied_count(&self) -> usize {
@@ -177,6 +202,7 @@ impl ClickHouseMigrationReport {
     }
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ClickHouseMigrationOutcome {
     pub version: u32,
@@ -229,6 +255,7 @@ pub struct QuoteTickSmokeReport {
     pub count: u64,
 }
 
+#[cfg(feature = "clickhouse-catalog")]
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct QuoteTickCatalogBackfill {
     pub catalog_uri: String,
@@ -239,6 +266,7 @@ pub struct QuoteTickCatalogBackfill {
     pub batch_size: usize,
 }
 
+#[cfg(feature = "clickhouse-catalog")]
 impl QuoteTickCatalogBackfill {
     /// Creates a catalog-backed quote tick backfill request from Unix nanosecond bounds.
     ///
@@ -287,6 +315,7 @@ impl QuoteTickCatalogBackfill {
     }
 }
 
+#[cfg(feature = "clickhouse-catalog")]
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct QuoteTickBackfillReport {
     pub catalog_uri: String,
@@ -298,6 +327,7 @@ pub struct QuoteTickBackfillReport {
     pub warehouse_rows: u64,
 }
 
+#[cfg(feature = "clickhouse-catalog")]
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct QuoteTickReadRequest {
     pub catalog_uri: String,
@@ -308,6 +338,7 @@ pub struct QuoteTickReadRequest {
     pub read_source: MarketDataReadSource,
 }
 
+#[cfg(feature = "clickhouse-catalog")]
 impl QuoteTickReadRequest {
     /// Creates a quote tick read request from Unix nanosecond bounds.
     ///
@@ -357,6 +388,7 @@ impl QuoteTickReadRequest {
     }
 }
 
+#[cfg(feature = "clickhouse-catalog")]
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct QuoteTickValidationSummary {
     pub rows: usize,
@@ -365,6 +397,7 @@ pub struct QuoteTickValidationSummary {
     pub checksum: String,
 }
 
+#[cfg(feature = "clickhouse-catalog")]
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct QuoteTickValidationReport {
     pub catalog_uri: String,
@@ -376,6 +409,7 @@ pub struct QuoteTickValidationReport {
     pub selected: QuoteTickValidationSummary,
 }
 
+#[cfg(feature = "clickhouse-catalog")]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct QuoteTickValidationRow {
     instrument_id: String,
@@ -389,6 +423,7 @@ struct QuoteTickValidationRow {
     size_precision: u8,
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 #[derive(Debug, Clone)]
 struct MigrationFile {
     version: u32,
@@ -397,6 +432,7 @@ struct MigrationFile {
     statements: Vec<String>,
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 #[derive(Debug, Clone, Row, Deserialize)]
 struct AppliedMigrationRow {
     version: u32,
@@ -467,6 +503,7 @@ pub async fn count_quote_ticks_for_run(
 /// # Errors
 ///
 /// Returns an error if ClickHouse rejects the query.
+#[cfg(feature = "clickhouse-read")]
 pub async fn read_quote_tick_rows(
     client: &Client,
     source: &str,
@@ -507,6 +544,7 @@ pub async fn read_quote_tick_rows(
     Ok(query.fetch_all::<ClickHouseQuoteTickRow>().await?)
 }
 
+#[cfg(feature = "clickhouse-read")]
 fn ensure_bounded_quote_tick_range(
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
@@ -519,6 +557,7 @@ fn ensure_bounded_quote_tick_range(
     Ok(())
 }
 
+#[cfg(feature = "clickhouse-read")]
 fn unix_nanos_utc_date(value: UnixNanos) -> anyhow::Result<String> {
     let value = value.as_u64();
     let secs = value / 1_000_000_000;
@@ -536,6 +575,7 @@ fn unix_nanos_utc_date(value: UnixNanos) -> anyhow::Result<String> {
 ///
 /// Returns an error if the selected source cannot be read or ClickHouse rows cannot be converted
 /// back into Nautilus model values.
+#[cfg(feature = "clickhouse-catalog")]
 pub async fn read_quote_ticks(
     options: &ClickHouseConnectOptions,
     request: &QuoteTickReadRequest,
@@ -589,6 +629,7 @@ pub async fn run_quote_tick_smoke(
     })
 }
 
+#[cfg(feature = "clickhouse-catalog")]
 async fn read_catalog_quote_ticks(
     catalog_uri: &str,
     instrument_ids: Option<Vec<String>>,
@@ -612,6 +653,7 @@ async fn read_catalog_quote_ticks(
 /// # Errors
 ///
 /// Returns an error if catalog reading, ClickHouse writing, or count validation fails.
+#[cfg(feature = "clickhouse-catalog")]
 pub async fn backfill_quote_ticks_from_catalog(
     options: &ClickHouseConnectOptions,
     request: &QuoteTickCatalogBackfill,
@@ -680,6 +722,7 @@ pub async fn backfill_quote_ticks_from_catalog(
 ///
 /// Returns an error if either side cannot be read, the catalog range is empty, or validation
 /// summaries do not match.
+#[cfg(feature = "clickhouse-catalog")]
 pub async fn validate_quote_ticks(
     options: &ClickHouseConnectOptions,
     request: &QuoteTickReadRequest,
@@ -783,6 +826,7 @@ pub async fn validate_quote_ticks(
 ///
 /// Returns an error if the ClickHouse connection, migration discovery, checksum validation, DDL
 /// execution, or migration metadata update fails.
+#[cfg(feature = "clickhouse-migrations")]
 pub async fn run_default_migrations(
     options: &ClickHouseConnectOptions,
 ) -> anyhow::Result<ClickHouseMigrationReport> {
@@ -795,6 +839,7 @@ pub async fn run_default_migrations(
 ///
 /// Returns an error if the ClickHouse connection, migration discovery, checksum validation, DDL
 /// execution, or migration metadata update fails.
+#[cfg(feature = "clickhouse-migrations")]
 pub async fn run_migrations(
     options: &ClickHouseConnectOptions,
     migrations_dir: &Path,
@@ -810,6 +855,7 @@ pub async fn run_migrations(
     apply_migration_files(&client, &applied, migrations).await
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 async fn ensure_database(client: &Client, database: &str) -> anyhow::Result<()> {
     client
         .query(&format!("CREATE DATABASE IF NOT EXISTS {database}"))
@@ -818,6 +864,7 @@ async fn ensure_database(client: &Client, database: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 async fn ensure_migration_metadata(client: &Client) -> anyhow::Result<()> {
     client
         .query(&format!(
@@ -840,6 +887,7 @@ ORDER BY (version, applied_at)
     Ok(())
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 async fn load_applied_migrations(
     client: &Client,
 ) -> anyhow::Result<BTreeMap<u32, AppliedMigrationRow>> {
@@ -861,6 +909,7 @@ ORDER BY version
     Ok(rows.into_iter().map(|row| (row.version, row)).collect())
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 async fn apply_migration_files(
     client: &Client,
     applied: &BTreeMap<u32, AppliedMigrationRow>,
@@ -898,6 +947,7 @@ async fn apply_migration_files(
     Ok(report)
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 async fn apply_one_migration(client: &Client, migration: &MigrationFile) -> anyhow::Result<()> {
     let start = Instant::now();
     let execution_result = execute_migration_statements(client, migration).await;
@@ -917,6 +967,7 @@ async fn apply_one_migration(client: &Client, migration: &MigrationFile) -> anyh
     execution_result
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 async fn execute_migration_statements(
     client: &Client,
     migration: &MigrationFile,
@@ -937,6 +988,7 @@ async fn execute_migration_statements(
     Ok(())
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 async fn record_migration(
     client: &Client,
     migration: &MigrationFile,
@@ -961,6 +1013,7 @@ VALUES (?, ?, ?, ?, ?)
     Ok(())
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 fn load_migration_files(migrations_dir: &Path) -> anyhow::Result<Vec<MigrationFile>> {
     let entries = fs::read_dir(migrations_dir).with_context(|| {
         format!(
@@ -1007,6 +1060,7 @@ fn load_migration_files(migrations_dir: &Path) -> anyhow::Result<Vec<MigrationFi
     Ok(migrations)
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 fn parse_migration_filename(path: &Path) -> anyhow::Result<(u32, String)> {
     let file_name = path
         .file_name()
@@ -1030,6 +1084,7 @@ fn parse_migration_filename(path: &Path) -> anyhow::Result<(u32, String)> {
     Ok((version, description.to_string()))
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
@@ -1069,10 +1124,12 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
     statements
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 fn elapsed_millis_u64(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+#[cfg(feature = "clickhouse-catalog")]
 fn quote_tick_validation_summary(
     mut rows: Vec<QuoteTickValidationRow>,
 ) -> QuoteTickValidationSummary {
@@ -1101,6 +1158,7 @@ fn quote_tick_validation_summary(
     }
 }
 
+#[cfg(feature = "clickhouse-catalog")]
 fn quote_tick_from_clickhouse_row(row: &ClickHouseQuoteTickRow) -> anyhow::Result<QuoteTick> {
     let bid_price_raw = PriceRaw::try_from(row.bid_price_raw)
         .with_context(|| format!("bid price raw overflowed PriceRaw: {}", row.bid_price_raw))?;
@@ -1134,6 +1192,7 @@ fn synthetic_quote_tick() -> QuoteTick {
     )
 }
 
+#[cfg(feature = "clickhouse-migrations")]
 impl MigrationFile {
     fn outcome(&self) -> ClickHouseMigrationOutcome {
         ClickHouseMigrationOutcome {
@@ -1145,6 +1204,7 @@ impl MigrationFile {
     }
 }
 
+#[cfg(feature = "clickhouse-catalog")]
 impl From<&QuoteTick> for QuoteTickValidationRow {
     fn from(quote: &QuoteTick) -> Self {
         Self {
@@ -1161,6 +1221,7 @@ impl From<&QuoteTick> for QuoteTickValidationRow {
     }
 }
 
+#[cfg(feature = "clickhouse-catalog")]
 impl From<&ClickHouseQuoteTickRow> for QuoteTickValidationRow {
     fn from(row: &ClickHouseQuoteTickRow) -> Self {
         Self {

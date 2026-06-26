@@ -32,7 +32,11 @@ extension-module = [
   "pyo3/extension-module",
 ]
 high-precision = ["nautilus-model/high-precision"]
-backtest-node = ["dep:nautilus-backtest", "dep:nautilus-persistence"]
+backtest-node = [
+  "dep:nautilus-backtest",
+  "dep:nautilus-persistence",
+  "nautilus-persistence/catalog-query",
+]
 warehouse-clickhouse = ["nautilus-live/warehouse-clickhouse"]
 live = [
   "dep:anyhow",

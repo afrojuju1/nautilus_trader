@@ -56,6 +56,7 @@ pub(crate) fn remote_full_uri(uri: &str, object_path: &str) -> anyhow::Result<St
     }
 }
 
+#[allow(dead_code)]
 pub(crate) enum ObjectStoreLocationKind {
     Local,
     Remote { store_root_url: Url },
@@ -65,10 +66,12 @@ pub(crate) struct ObjectStoreLocation {
     pub object_store: Arc<dyn ObjectStore>,
     pub base_path: String,
     pub original_uri: String,
+    #[allow(dead_code)]
     pub kind: ObjectStoreLocationKind,
 }
 
 impl ObjectStoreLocation {
+    #[allow(dead_code)]
     pub(crate) fn store_root_url(&self) -> Option<&Url> {
         match &self.kind {
             ObjectStoreLocationKind::Local => None,
@@ -680,6 +683,7 @@ pub(crate) fn file_uri_to_native_path(uri: &str) -> String {
 /// DataFusion percent-decodes the `ListingTableUrl` it is given, so the segments are encoded
 /// here for that decode to recover the literal on-disk name. Falls back to a plain join when
 /// `base_uri` does not parse.
+#[cfg(feature = "catalog-query")]
 pub(crate) fn append_path_to_file_uri(base_uri: &str, path: &str) -> String {
     if let Ok(mut url) = Url::parse(base_uri) {
         if let Ok(mut segments) = url.path_segments_mut() {

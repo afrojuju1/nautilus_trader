@@ -64,7 +64,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     fmt::Debug,
     io::Cursor,
     ops::Bound as RangeBound,
@@ -73,12 +73,13 @@ use std::{
 };
 
 use ahash::AHashMap;
-use datafusion::arrow::{
+use arrow::{
     array::{Array, UInt64Array},
     compute::{SortOptions, concat_batches, sort_to_indices, take_record_batch},
     record_batch::RecordBatch,
 };
 use futures::StreamExt;
+#[cfg(feature = "catalog-query")]
 use indexmap::IndexSet;
 use nautilus_common::live::get_runtime;
 use nautilus_core::{
@@ -86,11 +87,13 @@ use nautilus_core::{
     datetime::{iso8601_to_unix_nanos, unix_nanos_to_iso8601},
     string::{conversions::to_snake_case, urlencoding},
 };
+#[cfg(feature = "catalog-query")]
+use nautilus_model::data::is_monotonically_increasing_by_init;
 use nautilus_model::{
     data::{
         Bar, CustomData, Data, FundingRateUpdate, HasTsInit, IndexPriceUpdate, InstrumentStatus,
         MarkPriceUpdate, OptionGreeks, OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick,
-        close::InstrumentClose, is_monotonically_increasing_by_init, to_variant,
+        close::InstrumentClose, to_variant,
     },
     events::{
         AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
@@ -102,26 +105,25 @@ use nautilus_model::{
     instruments::InstrumentAny,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
 };
-use nautilus_serialization::arrow::{
-    ArrowSchemaProvider, DecodeDataFromRecordBatch, DecodeTypedFromRecordBatch,
-    EncodeToRecordBatch, custom::CustomDataDecoder,
-};
+#[cfg(feature = "catalog-query")]
+use nautilus_serialization::arrow::DecodeTypedFromRecordBatch;
+#[cfg(feature = "catalog-query")]
+use nautilus_serialization::arrow::{ArrowSchemaProvider, custom::CustomDataDecoder};
+use nautilus_serialization::arrow::{DecodeDataFromRecordBatch, EncodeToRecordBatch};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use serde::Serialize;
 use unbounded_interval_tree::interval_tree::IntervalTree;
 
-use super::{
-    custom::{
-        custom_data_path_components, decode_batch_to_data as orchestration_decode_batch_to_data,
-        decode_custom_batches_to_data as orchestration_decode_custom_batches_to_data,
-        prepare_custom_data_batch,
-    },
-    session::{self, DataBackendSession, QueryResult, build_query},
+use super::custom::{
+    custom_data_path_components, decode_batch_to_data as orchestration_decode_batch_to_data,
+    decode_custom_batches_to_data as orchestration_decode_custom_batches_to_data,
+    prepare_custom_data_batch,
 };
+#[cfg(feature = "catalog-query")]
+use super::session::{self, DataBackendSession, QueryResult, build_query};
 use crate::parquet::{
-    append_path_to_file_uri, decode_object_store_segment, is_remote_uri_scheme,
-    read_parquet_from_object_store, remote_full_uri, remote_store_root_url,
-    write_batches_to_object_store,
+    decode_object_store_segment, is_remote_uri_scheme, read_parquet_from_object_store,
+    remote_full_uri, remote_store_root_url, write_batches_to_object_store,
 };
 
 /// A high-performance data catalog for storing and retrieving financial market data using Apache Parquet format.
@@ -160,6 +162,7 @@ pub struct ParquetDataCatalog {
     /// The object store backend for data persistence.
     pub object_store: Arc<dyn ObjectStore>,
     /// The DataFusion session for query execution.
+    #[cfg(feature = "catalog-query")]
     pub session: DataBackendSession,
     /// The number of records to process in each batch.
     pub batch_size: usize,
@@ -321,6 +324,7 @@ impl ParquetDataCatalog {
             base_path: location.base_path,
             original_uri: location.original_uri,
             object_store: location.object_store,
+            #[cfg(feature = "catalog-query")]
             session: session::DataBackendSession::new(batch_size),
             batch_size,
             compression,
@@ -338,6 +342,7 @@ impl ParquetDataCatalog {
     ///
     /// This is useful during catalog operations when files are being modified
     /// and we need to ensure fresh data is loaded.
+    #[cfg(feature = "catalog-query")]
     pub fn reset_session(&mut self) {
         self.session.clear_registered_tables();
     }
@@ -1446,6 +1451,7 @@ impl ParquetDataCatalog {
     /// Returns the path as-is if it is already a full URI or absolute; otherwise builds
     /// file:// base + path for local catalogs or `reconstruct_full_uri` for remote.
     #[must_use]
+    #[cfg(feature = "catalog-query")]
     fn resolve_path_for_datafusion(&self, path: &str) -> String {
         if path.contains("://") {
             return path.to_string();
@@ -1456,13 +1462,14 @@ impl ParquetDataCatalog {
         }
 
         if self.original_uri.starts_with("file://") {
-            return append_path_to_file_uri(&self.original_uri, path);
+            return crate::parquet::append_path_to_file_uri(&self.original_uri, path);
         }
         self.reconstruct_full_uri(path)
     }
 
     /// Like `resolve_path_for_datafusion` but ensures the result ends with a trailing slash.
     #[must_use]
+    #[cfg(feature = "catalog-query")]
     fn resolve_directory_for_datafusion(&self, directory: &str) -> String {
         let mut resolved = self.resolve_path_for_datafusion(directory);
         if !resolved.ends_with('/') {
@@ -1581,6 +1588,7 @@ impl ParquetDataCatalog {
     /// )?;
     /// # Ok::<(), anyhow::Error>(())
     /// ```
+    #[cfg(feature = "catalog-query")]
     pub fn query<T>(
         &mut self,
         identifiers: Option<Vec<String>>,
@@ -1764,6 +1772,7 @@ impl ParquetDataCatalog {
     /// )?;
     /// # Ok::<(), anyhow::Error>(())
     /// ```
+    #[cfg(feature = "catalog-query")]
     pub fn query_typed_data<T>(
         &mut self,
         identifiers: Option<Vec<String>>,
@@ -1799,6 +1808,7 @@ impl ParquetDataCatalog {
     ///
     /// Returns an error if object store registration, file discovery, query execution,
     /// or record decoding fails.
+    #[cfg(feature = "catalog-query")]
     pub fn query_typed<T>(
         &mut self,
         identifiers: Option<Vec<String>>,
@@ -1907,6 +1917,7 @@ impl ParquetDataCatalog {
     /// - File discovery fails.
     /// - Data decoding fails.
     /// - Query execution fails.
+    #[cfg(feature = "catalog-query")]
     #[expect(clippy::too_many_arguments)]
     pub fn query_custom_data_dynamic(
         &mut self,
@@ -1939,7 +1950,7 @@ impl ParquetDataCatalog {
         // Use CustomDataDecoder for all custom data. Pass type_name so decode can look up
         // the type when Parquet/DataFusion does not preserve schema metadata. Callers must
         // ensure Rust custom types are registered via ensure_custom_data_registered::<T>().
-        let mut lookup_metadata = HashMap::new();
+        let mut lookup_metadata = std::collections::HashMap::new();
         lookup_metadata.insert("type_name".to_string(), type_name.to_string());
         let registered_schema = CustomDataDecoder::get_schema(Some(lookup_metadata));
         registered_schema.field_with_name("ts_init").map_err(|_| {
@@ -2121,6 +2132,7 @@ impl ParquetDataCatalog {
     /// # Errors
     ///
     /// Returns an error if file discovery, query execution, or decoding fails.
+    #[cfg(feature = "catalog-query")]
     pub fn quote_ticks(
         &mut self,
         instrument_ids: Option<Vec<String>>,
@@ -2135,6 +2147,7 @@ impl ParquetDataCatalog {
     /// # Errors
     ///
     /// Returns an error if file discovery, query execution, or decoding fails.
+    #[cfg(feature = "catalog-query")]
     pub fn trade_ticks(
         &mut self,
         instrument_ids: Option<Vec<String>>,
@@ -2149,6 +2162,7 @@ impl ParquetDataCatalog {
     /// # Errors
     ///
     /// Returns an error if file discovery, query execution, or decoding fails.
+    #[cfg(feature = "catalog-query")]
     pub fn bars(
         &mut self,
         instrument_ids: Option<Vec<String>>,
@@ -2163,6 +2177,7 @@ impl ParquetDataCatalog {
     /// # Errors
     ///
     /// Returns an error if file discovery, query execution, or decoding fails.
+    #[cfg(feature = "catalog-query")]
     pub fn order_book_deltas(
         &mut self,
         instrument_ids: Option<Vec<String>>,
@@ -2177,6 +2192,7 @@ impl ParquetDataCatalog {
     /// # Errors
     ///
     /// Returns an error if file discovery, query execution, or decoding fails.
+    #[cfg(feature = "catalog-query")]
     pub fn order_book_depth10(
         &mut self,
         instrument_ids: Option<Vec<String>>,
@@ -2191,6 +2207,7 @@ impl ParquetDataCatalog {
     /// # Errors
     ///
     /// Returns an error if file discovery, query execution, or decoding fails.
+    #[cfg(feature = "catalog-query")]
     pub fn funding_rates(
         &mut self,
         instrument_ids: Option<Vec<String>>,
@@ -2205,6 +2222,7 @@ impl ParquetDataCatalog {
     /// # Errors
     ///
     /// Returns an error if file discovery, query execution, or decoding fails.
+    #[cfg(feature = "catalog-query")]
     pub fn instrument_closes(
         &mut self,
         instrument_ids: Option<Vec<String>>,
@@ -2219,6 +2237,7 @@ impl ParquetDataCatalog {
     /// # Errors
     ///
     /// Returns an error if file discovery, query execution, or decoding fails.
+    #[cfg(feature = "catalog-query")]
     pub fn option_greeks(
         &mut self,
         instrument_ids: Option<Vec<String>>,
@@ -2941,6 +2960,7 @@ impl ParquetDataCatalog {
         Ok(ObjectPath::from(self.object_store_path(path)?))
     }
 
+    #[cfg(feature = "catalog-query")]
     fn register_remote_object_store(&mut self) -> anyhow::Result<()> {
         if self.is_remote_uri() {
             let base_url = remote_store_root_url(&self.original_uri)?;
@@ -3742,7 +3762,7 @@ impl ParquetDataCatalog {
     /// This function reads an Arrow IPC stream file from the object store
     /// and returns all `RecordBatches` contained within it.
     fn read_feather_file(&self, file_path: &str) -> anyhow::Result<Vec<RecordBatch>> {
-        use datafusion::arrow::ipc::reader::StreamReader;
+        use arrow::ipc::reader::StreamReader;
 
         let bytes = self.execute_async(async {
             let path = ObjectPath::from(file_path);
@@ -3845,6 +3865,7 @@ impl ParquetDataCatalog {
     }
 
     /// Converts `RecordBatches` directly to strongly typed values.
+    #[cfg(feature = "catalog-query")]
     fn convert_record_batches_to_typed<T>(batches: Vec<RecordBatch>) -> anyhow::Result<Vec<T>>
     where
         T: DecodeTypedFromRecordBatch,
