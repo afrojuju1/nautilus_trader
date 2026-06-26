@@ -95,7 +95,7 @@ pub struct ClickHouseConfig {
     /// Password for connecting to ClickHouse.
     #[arg(long)]
     pub password: Option<String>,
-    /// Default ClickHouse database for the client connection.
+    /// ClickHouse database selected for market-data warehouse operations.
     #[arg(long)]
     pub database: Option<String>,
     /// Directory path to ClickHouse migration SQL files.
@@ -165,10 +165,10 @@ pub struct ClickHouseValidateQuotesConfig {
     /// Instrument ID to validate. May be passed more than once.
     #[arg(long = "instrument-id")]
     pub instrument_ids: Vec<String>,
-    /// Inclusive start timestamp in Unix nanoseconds.
+    /// Inclusive start timestamp in Unix nanoseconds. Required for ClickHouse validation.
     #[arg(long)]
     pub start_ns: Option<u64>,
-    /// Inclusive end timestamp in Unix nanoseconds.
+    /// Inclusive end timestamp in Unix nanoseconds. Required for ClickHouse validation.
     #[arg(long)]
     pub end_ns: Option<u64>,
     /// ClickHouse source label to validate.

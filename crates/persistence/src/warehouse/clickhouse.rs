@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
+use chrono::{DateTime, Utc};
 use clickhouse::{Client, Row};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
@@ -23,11 +24,16 @@ use crate::backend::catalog::ParquetDataCatalog;
 
 pub const DEFAULT_CLICKHOUSE_URL: &str = "http://localhost:8123";
 pub const DEFAULT_CLICKHOUSE_USERNAME: &str = "default";
-pub const DEFAULT_CLICKHOUSE_DATABASE: &str = "default";
+pub const DEFAULT_CLICKHOUSE_DATABASE: &str = MARKET_DATA_DATABASE;
 pub const DEFAULT_MIGRATIONS_DIR: &str = "schema/sql/clickhouse";
 pub const MARKET_DATA_READ_SOURCE_ENV: &str = "NAUTILUS_MARKET_DATA_READ_SOURCE";
 
-const WAREHOUSE_DATABASE: &str = "warehouse";
+const CLICKHOUSE_BOOTSTRAP_DATABASE: &str = "default";
+const MARKET_DATA_DATABASE: &str = "market";
+const QUOTE_TICKS_TABLE: &str = "quote_ticks";
+const QUOTE_TICKS_QUALIFIED_TABLE: &str = "market.quote_ticks";
+const WAREHOUSE_METADATA_DATABASE: &str = "warehouse";
+const SCHEMA_MIGRATIONS_QUALIFIED_TABLE: &str = "warehouse.schema_migrations";
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum MarketDataReadSource {
@@ -130,11 +136,16 @@ impl ClickHouseConnectOptions {
 
     #[must_use]
     pub fn client(&self) -> Client {
+        self.client_for_database(&self.database)
+    }
+
+    #[must_use]
+    pub fn client_for_database(&self, database: &str) -> Client {
         Client::default()
             .with_url(&self.url)
             .with_user(&self.username)
             .with_password(&self.password)
-            .with_database(&self.database)
+            .with_database(database)
     }
 
     #[must_use]
@@ -303,6 +314,7 @@ impl QuoteTickReadRequest {
     /// # Errors
     ///
     /// Returns an error if the ClickHouse source label is empty or the time bounds are reversed.
+    /// ClickHouse-backed reads additionally require both bounds when executed.
     pub fn from_unix_nanos(
         catalog_uri: String,
         instrument_ids: Vec<String>,
@@ -338,6 +350,10 @@ impl QuoteTickReadRequest {
         } else {
             Some(self.instrument_ids.clone())
         }
+    }
+
+    fn ensure_bounded_clickhouse_read(&self) -> anyhow::Result<()> {
+        ensure_bounded_quote_tick_range(self.start, self.end)
     }
 }
 
@@ -403,7 +419,7 @@ pub async fn check_health(options: &ClickHouseConnectOptions) -> anyhow::Result<
     Ok(())
 }
 
-/// Writes `QuoteTick` rows to `market.quote_ticks`.
+/// Writes `QuoteTick` rows to the canonical market-data quote table.
 ///
 /// # Errors
 ///
@@ -416,9 +432,9 @@ pub async fn write_quote_tick_rows(
         return Ok(());
     }
 
-    let market_client = client.clone().with_database("market");
+    let market_client = client.clone().with_database(MARKET_DATA_DATABASE);
     let mut insert = market_client
-        .insert::<ClickHouseQuoteTickRow>("quote_ticks")
+        .insert::<ClickHouseQuoteTickRow>(QUOTE_TICKS_TABLE)
         .await?;
     for row in rows {
         insert.write(row).await?;
@@ -427,7 +443,7 @@ pub async fn write_quote_tick_rows(
     Ok(())
 }
 
-/// Counts `market.quote_ticks` rows for an ingest run.
+/// Counts quote rows for an ingest run.
 ///
 /// # Errors
 ///
@@ -437,7 +453,9 @@ pub async fn count_quote_ticks_for_run(
     ingest_run_id: Uuid,
 ) -> anyhow::Result<u64> {
     let row = client
-        .query("SELECT count() AS count FROM market.quote_ticks WHERE ingest_run_id = toUUID(?)")
+        .query(&format!(
+            "SELECT count() AS count FROM {QUOTE_TICKS_QUALIFIED_TABLE} WHERE ingest_run_id = toUUID(?)"
+        ))
         .bind(ingest_run_id.to_string())
         .fetch_one::<CountRow>()
         .await?;
@@ -456,12 +474,17 @@ pub async fn read_quote_tick_rows(
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
 ) -> anyhow::Result<Vec<ClickHouseQuoteTickRow>> {
-    let mut sql = String::from("SELECT ?fields FROM market.quote_ticks WHERE source = ?");
+    ensure_bounded_quote_tick_range(start, end)?;
+
+    let start_event_date = start.map(unix_nanos_utc_date).transpose()?;
+    let end_event_date = end.map(unix_nanos_utc_date).transpose()?;
+
+    let mut sql = format!("SELECT ?fields FROM {QUOTE_TICKS_QUALIFIED_TABLE} WHERE source = ?");
     if start.is_some() {
-        sql.push_str(" AND ts_init >= ?");
+        sql.push_str(" AND event_date >= toDate(?) AND ts_init >= ?");
     }
     if end.is_some() {
-        sql.push_str(" AND ts_init <= ?");
+        sql.push_str(" AND event_date <= toDate(?) AND ts_init <= ?");
     }
     if !instrument_ids.is_empty() {
         sql.push_str(" AND instrument_id IN ?");
@@ -469,10 +492,12 @@ pub async fn read_quote_tick_rows(
     sql.push_str(" ORDER BY instrument_id, ts_init, ts_event, ingest_run_id");
 
     let mut query = client.query(&sql).bind(source);
-    if let Some(start) = start {
+    if let (Some(event_date), Some(start)) = (start_event_date, start) {
+        query = query.bind(event_date);
         query = query.bind(start.as_u64());
     }
-    if let Some(end) = end {
+    if let (Some(event_date), Some(end)) = (end_event_date, end) {
+        query = query.bind(event_date);
         query = query.bind(end.as_u64());
     }
     if !instrument_ids.is_empty() {
@@ -480,6 +505,29 @@ pub async fn read_quote_tick_rows(
     }
 
     Ok(query.fetch_all::<ClickHouseQuoteTickRow>().await?)
+}
+
+fn ensure_bounded_quote_tick_range(
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+) -> anyhow::Result<()> {
+    if start.is_none() || end.is_none() {
+        return Err(anyhow!(
+            "ClickHouse QuoteTick reads require both start_ns and end_ns bounds to avoid unbounded warehouse scans"
+        ));
+    }
+    Ok(())
+}
+
+fn unix_nanos_utc_date(value: UnixNanos) -> anyhow::Result<String> {
+    let value = value.as_u64();
+    let secs = value / 1_000_000_000;
+    let nanos = (value % 1_000_000_000) as u32;
+    let secs = i64::try_from(secs)
+        .map_err(|err| anyhow!("Unix nanosecond timestamp is outside i64 range: {err}"))?;
+    let datetime = DateTime::<Utc>::from_timestamp(secs, nanos)
+        .ok_or_else(|| anyhow!("Unix nanosecond timestamp is outside UTC datetime range"))?;
+    Ok(datetime.date_naive().format("%Y-%m-%d").to_string())
 }
 
 /// Reads `QuoteTick` data from the configured market-data source.
@@ -503,6 +551,7 @@ pub async fn read_quote_ticks(
             .await
         }
         MarketDataReadSource::ClickHouse => {
+            request.ensure_bounded_clickhouse_read()?;
             let client = options.client();
             let rows = read_quote_tick_rows(
                 &client,
@@ -635,6 +684,7 @@ pub async fn validate_quote_ticks(
     options: &ClickHouseConnectOptions,
     request: &QuoteTickReadRequest,
 ) -> anyhow::Result<QuoteTickValidationReport> {
+    request.ensure_bounded_clickhouse_read()?;
     check_health(options).await?;
 
     let catalog_quotes = read_catalog_quote_ticks(
@@ -749,25 +799,30 @@ pub async fn run_migrations(
     options: &ClickHouseConnectOptions,
     migrations_dir: &Path,
 ) -> anyhow::Result<ClickHouseMigrationReport> {
-    let client = options.client();
-    ensure_migration_metadata(&client).await?;
+    let bootstrap_client = options.client_for_database(CLICKHOUSE_BOOTSTRAP_DATABASE);
+    ensure_database(&bootstrap_client, MARKET_DATA_DATABASE).await?;
+    ensure_database(&bootstrap_client, WAREHOUSE_METADATA_DATABASE).await?;
+    ensure_migration_metadata(&bootstrap_client).await?;
 
-    let applied = load_applied_migrations(&client).await?;
+    let client = options.client();
+    let applied = load_applied_migrations(&bootstrap_client).await?;
     let migrations = load_migration_files(migrations_dir)?;
     apply_migration_files(&client, &applied, migrations).await
+}
+
+async fn ensure_database(client: &Client, database: &str) -> anyhow::Result<()> {
+    client
+        .query(&format!("CREATE DATABASE IF NOT EXISTS {database}"))
+        .execute()
+        .await?;
+    Ok(())
 }
 
 async fn ensure_migration_metadata(client: &Client) -> anyhow::Result<()> {
     client
         .query(&format!(
-            "CREATE DATABASE IF NOT EXISTS {WAREHOUSE_DATABASE}"
-        ))
-        .execute()
-        .await?;
-    client
-        .query(
             r#"
-CREATE TABLE IF NOT EXISTS warehouse.schema_migrations
+CREATE TABLE IF NOT EXISTS {SCHEMA_MIGRATIONS_QUALIFIED_TABLE}
 (
     version UInt32,
     description String,
@@ -779,7 +834,7 @@ CREATE TABLE IF NOT EXISTS warehouse.schema_migrations
 ENGINE = MergeTree
 ORDER BY (version, applied_at)
 "#,
-        )
+        ))
         .execute()
         .await?;
     Ok(())
@@ -789,17 +844,17 @@ async fn load_applied_migrations(
     client: &Client,
 ) -> anyhow::Result<BTreeMap<u32, AppliedMigrationRow>> {
     let rows = client
-        .query(
+        .query(&format!(
             r#"
 SELECT
     version,
     argMax(checksum, applied_at) AS checksum,
     argMax(success, applied_at) AS success
-FROM warehouse.schema_migrations
+FROM {SCHEMA_MIGRATIONS_QUALIFIED_TABLE}
 GROUP BY version
 ORDER BY version
 "#,
-        )
+        ))
         .fetch_all::<AppliedMigrationRow>()
         .await?;
 
@@ -889,13 +944,13 @@ async fn record_migration(
     success: bool,
 ) -> anyhow::Result<()> {
     client
-        .query(
+        .query(&format!(
             r#"
-INSERT INTO warehouse.schema_migrations
+INSERT INTO {SCHEMA_MIGRATIONS_QUALIFIED_TABLE}
     (version, description, checksum, execution_ms, success)
 VALUES (?, ?, ?, ?, ?)
 "#,
-        )
+        ))
         .bind(migration.version)
         .bind(migration.description.as_str())
         .bind(migration.checksum.as_str())

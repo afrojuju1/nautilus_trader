@@ -70,7 +70,7 @@ x-alpaca-runtime: &alpaca-runtime
     CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://host.docker.internal:8123}
     CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
     CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
-    CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-warehouse}
+    CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-market}
   volumes:
     - alpaca-state:/state
     - ${NAUTILUS_ALPACA_DOCKER_BASE_CONFIG:-./alpaca-options-engine.base.toml.example}:/config/base-options-engine.toml:ro

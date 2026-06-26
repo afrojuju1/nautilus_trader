@@ -2,7 +2,7 @@ name: nautilus-warehouse
 
 x-clickhouse-image: &clickhouse-image ${CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:25.3}
 x-clickhouse-env: &clickhouse-env
-  CLICKHOUSE_DB: ${CLICKHOUSE_DB:-warehouse}
+  CLICKHOUSE_DB: ${CLICKHOUSE_DB:-market}
   CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
   CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
   CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: ${CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT:-1}

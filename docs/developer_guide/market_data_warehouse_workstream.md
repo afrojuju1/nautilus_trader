@@ -106,6 +106,8 @@ manage ClickHouse. The initial warehouse migration path should be:
   Rust client.
 - Record applied version, description, checksum, and timestamp in `warehouse.schema_migrations`.
   This is warehouse control metadata, not market data and not Alpaca-owned state.
+- Treat `market` as the canonical market-data database. Runtime and deployment defaults should set
+  `CLICKHOUSE_DATABASE`/`CLICKHOUSE_DB` to `market`; `warehouse` is reserved for operator metadata.
 - Make migration files idempotent where ClickHouse DDL allows it, and fail closed on checksum drift
   for an already-applied version.
 - Revisit an external schema tool such as Atlas only if ClickHouse schema complexity outgrows this
@@ -299,6 +301,10 @@ Common fields:
 | `venue` | Venue portion or adapter source where useful for partition/query filtering. |
 | `source` | Source system or adapter such as `alpaca`, `databento`, or another future data source. |
 | `ingest_run_id` | Backfill or live sink run identifier for lineage. |
+
+Operator validation over ClickHouse must be range-bounded. `validate-quotes` should include
+`--start-ns` and `--end-ns` so queries can prune by the `event_date` partition instead of scanning
+the full quote table. Use ingest-run-specific smoke commands for tiny write/read checks.
 
 Initial ClickHouse table sketches:
 

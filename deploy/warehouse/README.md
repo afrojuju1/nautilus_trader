@@ -25,6 +25,17 @@ docker compose -f deploy/warehouse/compose.yml --profile smoke run --rm clickhou
 
 Expected output includes `warehouse_ok` and the running ClickHouse version.
 
+## Database Ownership
+
+The canonical market-data tables live in the `market` database, for example
+`market.quote_ticks`. The warehouse operator stores migration metadata in
+`warehouse.schema_migrations`; that database is control metadata, not the destination for quote,
+trade, bar, or Greeks rows.
+
+Keep `CLICKHOUSE_DB`/`CLICKHOUSE_DATABASE` set to `market` for normal local and self-hosted
+operation. The migration command bootstraps both `market` and `warehouse` on an empty ClickHouse
+instance.
+
 ## Useful Commands
 
 ```bash
