@@ -1,8 +1,12 @@
+# syntax=docker/dockerfile:1.7
+
 FROM rust:1.96.0-slim-bookworm@sha256:b5f842fac1e3b4ff718a652a8e0173b62d9403ec826ef4998880b9347db30684 AS builder
 
 WORKDIR /workspace
 
 ARG CARGO_BUILD_JOBS=1
+ARG CARGO_PROFILE=release-rollout
+ARG ALPACA_BUILD_TOOLS=false
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 
 RUN apt-get update \
@@ -22,15 +26,20 @@ COPY crates ./crates
 COPY examples/tutorials ./examples/tutorials
 COPY patches ./patches
 
-RUN cargo build --locked --release -p nautilus-alpaca --features live,warehouse-clickhouse \
-    --bin alpaca-options-engine \
-    --bin alpaca-operator-status \
-    --bin alpaca-fleet-status \
-    --bin alpaca-check-account-orders \
-    --bin alpaca-option-chain-scan-live-node \
-    --bin alpaca-compare-option-chain-scan \
-    --bin alpaca-candidate-alerts \
-    --bin alpaca-performance-report
+RUN --mount=type=cache,id=nautilus-alpaca-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=nautilus-alpaca-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=nautilus-alpaca-target,target=/workspace/target,sharing=locked \
+    set -eux; \
+    core_bins="alpaca-options-engine alpaca-operator-status alpaca-check-account-orders alpaca-option-chain-scan-live-node"; \
+    tool_bins="alpaca-fleet-status alpaca-compare-option-chain-scan alpaca-candidate-alerts alpaca-performance-report"; \
+    bins="$core_bins"; \
+    if [ "$ALPACA_BUILD_TOOLS" = "true" ]; then bins="$bins $tool_bins"; fi; \
+    cargo_args=""; \
+    for bin in $bins; do cargo_args="$cargo_args --bin $bin"; done; \
+    cargo build --locked --profile "$CARGO_PROFILE" -p nautilus-alpaca --features live,warehouse-clickhouse $cargo_args; \
+    case "$CARGO_PROFILE" in release) profile_dir=release ;; dev) profile_dir=debug ;; *) profile_dir="$CARGO_PROFILE" ;; esac; \
+    mkdir -p /artifacts; \
+    for bin in $bins; do cp "/workspace/target/$profile_dir/$bin" "/artifacts/$bin"; done
 
 FROM debian:bookworm-slim
 
@@ -45,14 +54,7 @@ RUN apt-get update \
     && mkdir -p /config /state /workspace \
     && chown -R nautilus:nautilus /config /state /workspace
 
-COPY --from=builder /workspace/target/release/alpaca-options-engine /usr/local/bin/
-COPY --from=builder /workspace/target/release/alpaca-operator-status /usr/local/bin/
-COPY --from=builder /workspace/target/release/alpaca-fleet-status /usr/local/bin/
-COPY --from=builder /workspace/target/release/alpaca-check-account-orders /usr/local/bin/
-COPY --from=builder /workspace/target/release/alpaca-option-chain-scan-live-node /usr/local/bin/
-COPY --from=builder /workspace/target/release/alpaca-compare-option-chain-scan /usr/local/bin/
-COPY --from=builder /workspace/target/release/alpaca-candidate-alerts /usr/local/bin/
-COPY --from=builder /workspace/target/release/alpaca-performance-report /usr/local/bin/
+COPY --from=builder /artifacts/ /usr/local/bin/
 COPY deploy/alpaca/alpaca-options-runner.sh /usr/local/bin/alpaca-options-runner
 COPY deploy/alpaca/alpaca-control.sh /usr/local/bin/alpaca-control
 

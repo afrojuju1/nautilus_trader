@@ -177,6 +177,22 @@ Avoid running `docker compose config` with a real Alpaca env file because Compos
 environment values. Validate the Compose shape without `--env-file`, or use the checked
 `alpaca-options-engine.docker.env.example` template.
 
+The default Docker build is optimized for local rollouts: it uses the `release-rollout` Cargo
+profile and the normal runtime image includes only the engine, operator status, account check, and
+live option-chain smoke binary. Compose services that require fleet status, compare scan, candidate
+alerts, or performance report tooling build `nautilus-alpaca-tools:local` separately. Set
+`ALPACA_DOCKER_BUILD_TOOLS=true` only when the normal runtime image must also carry those optional
+tools. Set `ALPACA_DOCKER_CARGO_PROFILE=release` for a production-style release build:
+
+```bash
+ALPACA_DOCKER_CARGO_PROFILE=release \
+ALPACA_DOCKER_BUILD_TOOLS=true \
+docker compose \
+  -f deploy/alpaca/compose.yml \
+  --profile engine \
+  build alpaca-options
+```
+
 If local TOML configs are mode-restricted, stage container-readable copies outside the repo before
 starting the service. Credentials stay in the external env file and are not copied:
 

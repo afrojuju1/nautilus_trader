@@ -4,6 +4,10 @@ x-alpaca-runtime: &alpaca-runtime
   build:
     context: ../..
     dockerfile: deploy/alpaca/Dockerfile
+    args:
+      CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-1}
+      CARGO_PROFILE: ${ALPACA_DOCKER_CARGO_PROFILE:-release-rollout}
+      ALPACA_BUILD_TOOLS: ${ALPACA_DOCKER_BUILD_TOOLS:-false}
   image: nautilus-alpaca:local
   depends_on:
     postgres:
@@ -76,6 +80,17 @@ x-alpaca-runtime: &alpaca-runtime
     - ${NAUTILUS_ALPACA_DOCKER_BASE_CONFIG:-./alpaca-options-engine.base.toml.example}:/config/base-options-engine.toml:ro
     - ${NAUTILUS_ALPACA_DOCKER_CONFIG:-./alpaca-options-engine.toml.example}:/config/options-engine.toml:ro
 
+x-alpaca-tools-runtime: &alpaca-tools-runtime
+  <<: *alpaca-runtime
+  build:
+    context: ../..
+    dockerfile: deploy/alpaca/Dockerfile
+    args:
+      CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-1}
+      CARGO_PROFILE: ${ALPACA_DOCKER_CARGO_PROFILE:-release-rollout}
+      ALPACA_BUILD_TOOLS: "true"
+  image: nautilus-alpaca-tools:local
+
 services:
   postgres:
     container_name: nautilus-alpaca-database
@@ -109,7 +124,7 @@ services:
     command: ["alpaca-operator-status", "--json"]
 
   alpaca-compare-option-chain-scan:
-    <<: *alpaca-runtime
+    <<: *alpaca-tools-runtime
     profiles: ["cutover"]
     command: ["alpaca-compare-option-chain-scan", "--pretty"]
 
