@@ -23,6 +23,7 @@ crate-type = ["rlib"]
 [features]
 default = []
 streaming = ["nautilus-persistence"]
+warehouse-clickhouse = ["streaming", "nautilus-persistence/clickhouse"]
 ffi = [
   "nautilus-common/ffi",
   "nautilus-core/ffi",

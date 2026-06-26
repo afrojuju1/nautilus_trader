@@ -2,6 +2,9 @@ FROM rust:1.96.0-slim-bookworm@sha256:b5f842fac1e3b4ff718a652a8e0173b62d9403ec82
 
 WORKDIR /workspace
 
+ARG CARGO_BUILD_JOBS=1
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -19,7 +22,7 @@ COPY crates ./crates
 COPY examples/tutorials ./examples/tutorials
 COPY patches ./patches
 
-RUN cargo build --locked --release -p nautilus-alpaca --features live \
+RUN cargo build --locked --release -p nautilus-alpaca --features live,warehouse-clickhouse \
     --bin alpaca-options-engine \
     --bin alpaca-operator-status \
     --bin alpaca-fleet-status \

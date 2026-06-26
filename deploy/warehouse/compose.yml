@@ -14,8 +14,8 @@ services:
     environment:
       <<: *clickhouse-env
     ports:
-      - "127.0.0.1:${CLICKHOUSE_HTTP_PORT:-8123}:8123"
-      - "127.0.0.1:${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+      - "${CLICKHOUSE_HTTP_HOST:-127.0.0.1}:${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_HOST:-127.0.0.1}:${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - clickhouse-logs:/var/log/clickhouse-server

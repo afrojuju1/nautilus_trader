@@ -25,7 +25,7 @@ install_runtime_file() {
 
 cd "$REPO"
 
-cargo build --release -p nautilus-alpaca --features live \
+cargo build --release -p nautilus-alpaca --features live,warehouse-clickhouse \
   --bin alpaca-options-engine \
   --bin alpaca-operator-status \
   --bin alpaca-fleet-status \

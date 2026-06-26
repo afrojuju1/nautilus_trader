@@ -312,7 +312,7 @@ fn account_id_from_env() -> AccountId {
 }
 
 fn strike_range_from_env() -> anyhow::Result<StrikeRange> {
-    if let Ok(raw) = env::var("ALPACA_OPTION_CHAIN_FIXED_STRIKES") {
+    if let Some(raw) = optional_raw_env("ALPACA_OPTION_CHAIN_FIXED_STRIKES") {
         let strikes = split_values(raw)
             .into_iter()
             .map(|value| Ok(Price::from(value.as_str())))

@@ -33,6 +33,7 @@ extension-module = [
 ]
 high-precision = ["nautilus-model/high-precision"]
 backtest-node = ["dep:nautilus-backtest", "dep:nautilus-persistence"]
+warehouse-clickhouse = ["nautilus-live/warehouse-clickhouse"]
 live = [
   "dep:anyhow",
   "dep:async-trait",

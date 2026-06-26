@@ -127,6 +127,9 @@ use time_range::{
 };
 use ustr::Ustr;
 
+#[cfg(feature = "warehouse-clickhouse")]
+use nautilus_persistence::warehouse::live::LiveMarketDataDualWriter;
+
 #[cfg(feature = "defi")]
 #[allow(unused_imports)] // Brings DeFi impl blocks into scope
 use crate::defi::engine as _;
@@ -193,6 +196,8 @@ pub struct DataEngine {
     pub(crate) config: DataEngineConfig,
     #[cfg(feature = "streaming")]
     catalogs: CatalogMap,
+    #[cfg(feature = "warehouse-clickhouse")]
+    live_market_data_writer: Option<LiveMarketDataDualWriter>,
     #[cfg(feature = "defi")]
     pub(crate) pool_updaters: AHashMap<InstrumentId, Rc<PoolUpdater>>,
     #[cfg(feature = "defi")]
@@ -276,6 +281,10 @@ impl DataEngine {
             config,
             #[cfg(feature = "streaming")]
             catalogs: CatalogMap::new(),
+            #[cfg(feature = "warehouse-clickhouse")]
+            live_market_data_writer: LiveMarketDataDualWriter::from_env().unwrap_or_else(|error| {
+                panic!("failed to configure live market-data dual-write: {error:?}");
+            }),
             #[cfg(feature = "defi")]
             pool_updaters: AHashMap::new(),
             #[cfg(feature = "defi")]
@@ -2448,6 +2457,11 @@ impl DataEngine {
     }
 
     fn handle_quote(&self, quote: QuoteTick) {
+        #[cfg(feature = "warehouse-clickhouse")]
+        if let Some(writer) = &self.live_market_data_writer {
+            writer.write_quote(quote);
+        }
+
         if let Err(e) = self.cache.as_ref().borrow_mut().add_quote(quote) {
             log_error_on_cache_insert(&e);
         }

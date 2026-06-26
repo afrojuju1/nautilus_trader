@@ -32,6 +32,11 @@ node = [
 plugin = ["node", "dep:aws-lc-rs", "dep:nautilus-plugin"]
 examples = ["node", "dep:nautilus-testkit", "nautilus-trading/examples"]
 streaming = ["node", "nautilus-persistence", "nautilus-system/streaming"]
+warehouse-clickhouse = [
+  "streaming",
+  "nautilus-data/warehouse-clickhouse",
+  "nautilus-persistence/clickhouse",
+]
 extension-module = [
   "nautilus-common/extension-module",
   "nautilus-core/extension-module",
