@@ -142,7 +142,7 @@ pub struct RiskBudget {
     pub max_vega_abs: Option<f64>,
 }
 
-/// Fleet state counts used by account-engine admission and operator status.
+/// Fleet state counts used by options admission and operator status.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FleetExposure {
     /// Active entries across enabled accounts.

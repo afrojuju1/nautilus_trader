@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Runtime state and operator-event helpers shared by Alpaca account-engine binaries.
+//! Runtime state and operator-event helpers shared by Alpaca options binaries.
 
 use std::{
     fs,

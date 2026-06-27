@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Native Nautilus entrypoint for the Alpaca options-engine account engine.
+//! Native Nautilus entrypoint for the Alpaca options-engine management runtime.
 
 use std::env;
 

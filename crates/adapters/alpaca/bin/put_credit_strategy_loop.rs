@@ -15,7 +15,7 @@
 
 //! Timer-style put-credit strategy loop using the shared Alpaca scanner.
 //!
-//! The production account engine is `alpaca-options-engine`.
+//! Production entries are owned by `alpaca-option-chain-scan-live-node`.
 
 use std::{env, str::FromStr, time::Duration};
 

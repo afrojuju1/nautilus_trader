@@ -174,7 +174,7 @@ impl AlpacaOptionsEntryStrategyConfig {
         }
     }
 
-    /// Builds a strategy config from the account-engine runtime config.
+    /// Builds a strategy config from the Alpaca options runtime config.
     #[must_use]
     pub fn from_engine_config(base: StrategyConfig, engine: &OptionsEngineConfig) -> Self {
         Self {

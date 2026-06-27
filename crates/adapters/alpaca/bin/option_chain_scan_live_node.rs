@@ -82,7 +82,6 @@ struct Args {
     strike_range: StrikeRange,
     snapshot_interval_ms: Option<u64>,
     snapshot_greeks_poll_secs: Option<u64>,
-    entry_submit_enabled: bool,
     max_runtime_secs: Option<u64>,
 }
 
@@ -93,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
 
     let runtime_config = OptionsEngineConfig::from_runtime_env()?;
     let args = Args::from_env(&runtime_config)?;
-    let live_submit_requested = runtime_config.submit_enabled && args.entry_submit_enabled;
+    let live_submit_requested = runtime_config.submit_enabled;
     let runtime_config = if live_submit_requested {
         OptionsEngineConfig::from_runtime_env_with_storage()
             .await
@@ -135,13 +134,12 @@ async fn main() -> anyhow::Result<()> {
     let strategy_state_entry_count = strategy_state.entries.len();
 
     log::info!(
-        "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategies={:?} runtime_submit_enabled={} node_entry_submit_enabled={} storage_required={} strategy_state_entries={}",
+        "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategies={:?} submit_enabled={} storage_required={} strategy_state_entries={}",
         series_id,
         args.snapshot_interval_ms,
         args.max_runtime_secs,
         runtime_config.enabled_strategy_names(),
         runtime_config.submit_enabled,
-        args.entry_submit_enabled,
         live_submit_requested,
         strategy_state_entry_count,
     );
@@ -183,8 +181,6 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut entry_config =
         AlpacaOptionsEntryStrategyConfig::from_engine_config(strategy_config, &runtime_config);
-    entry_config.admission.submit_enabled =
-        entry_config.admission.submit_enabled && args.entry_submit_enabled;
     entry_config.admission.account_admission_reasons = startup_account_admission_reasons;
     entry_config.initial_state = strategy_state;
     entry_config.state_persistence = live_submit_persistence
@@ -217,7 +213,7 @@ async fn prepare_state_persistence(
     let storage = config
         .storage_repository
         .as_ref()
-        .context("ALPACA_STORAGE_DATABASE_URL is required when live entry submit is enabled")?
+        .context("ALPACA_STORAGE_DATABASE_URL is required when ALPACA_SUBMIT=true")?
         .clone();
     let migration_status = storage.migration_status().await?;
     if let Some(dirty_version) = migration_status.dirty_version {
@@ -418,7 +414,6 @@ impl Args {
                 "ALPACA_OPTION_CHAIN_SNAPSHOT_POLL_SECS",
                 None,
             )?,
-            entry_submit_enabled: bool_env("ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED", false)?,
             max_runtime_secs: optional_u64_env("ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS", None)?,
         })
     }
@@ -485,17 +480,6 @@ fn optional_f64_env(name: &str) -> anyhow::Result<Option<f64>> {
         .parse::<f64>()
         .map(Some)
         .with_context(|| format!("invalid {name}={value:?}, expected number"))
-}
-
-fn bool_env(name: &str, default: bool) -> anyhow::Result<bool> {
-    let Some(value) = optional_raw_env(name) else {
-        return Ok(default);
-    };
-    match value.as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => bail!("invalid {name}={value:?}, expected true or false"),
-    }
 }
 
 fn optional_raw_env(name: &str) -> Option<String> {

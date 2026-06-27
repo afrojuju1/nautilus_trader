@@ -123,7 +123,7 @@ pub struct EntryAdmissionConfig {
 }
 
 impl EntryAdmissionConfig {
-    /// Builds entry-admission config from the account-engine runtime config.
+    /// Builds entry-admission config from the Alpaca options runtime config.
     #[must_use]
     pub fn from_engine_config(engine: &OptionsEngineConfig) -> Self {
         let fleet_exposure = engine.fleet.as_ref().map(|fleet| fleet.exposure());

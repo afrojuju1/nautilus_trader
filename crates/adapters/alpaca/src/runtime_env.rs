@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Runtime environment loading for deployed Alpaca account-engine utilities.
+//! Runtime environment loading for deployed Alpaca options utilities.
 
 use std::{
     env,

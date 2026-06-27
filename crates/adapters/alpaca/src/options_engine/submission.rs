@@ -31,37 +31,16 @@ use crate::{
     config::AlpacaExecClientConfig,
     execution::AlpacaExecutionClient,
     http::{client::AlpacaHttpClient, error::Error, models::AlpacaOrder},
-    options_entry_strategy::{apply_order_list_id, build_selected_entry_orders},
-    options_runtime::{OptionsEngineConfig, SelectedOptionsEntry},
+    options_entry_strategy::apply_order_list_id,
+    options_runtime::OptionsEngineConfig,
     runtime::StrategyStateEntry,
+};
+#[cfg(test)]
+use crate::{
+    options_entry_strategy::build_selected_entry_orders, options_runtime::SelectedOptionsEntry,
 };
 
 use super::{CloseQuote, DEFAULT_EVENT_TIMEOUT_SECS, STRATEGY_FAMILY, SubmitOutcome};
-
-pub(super) async fn submit_selected_entry(
-    entry: &SelectedOptionsEntry,
-    order_list_id: &str,
-    quantity: u64,
-    config: &OptionsEngineConfig,
-) -> anyhow::Result<SubmitOutcome> {
-    submit_with_execution_session(
-        order_list_id,
-        config.cancel_after_accept,
-        |client, trader_id, client_id, strategy_id| {
-            let mut factory = option_order_factory(trader_id, strategy_id);
-            let orders = build_selected_entry_orders(&mut factory, entry, order_list_id, quantity)?;
-            submit_orders(
-                client,
-                order_list_id,
-                orders,
-                trader_id,
-                client_id,
-                strategy_id,
-            )
-        },
-    )
-    .await
-}
 
 pub(super) async fn submit_close_entry(
     entry: &StrategyStateEntry,
@@ -125,8 +104,7 @@ where
 
     let expected_events = submit(&mut client, trader_id, Some(client_id), strategy_id)?;
 
-    let (accepted, rejected, rejection_reasons) =
-        collect_execution_events(&mut rx, expected_events).await;
+    let (accepted, _, _) = collect_execution_events(&mut rx, expected_events).await;
     let parent_order_id = lookup_parent_order(&exec_config, order_list_id).await?;
     if cancel_after_accept && accepted > 0 {
         cancel_parent_order(&exec_config, parent_order_id.as_deref()).await?;
@@ -137,9 +115,7 @@ where
 
     Ok(SubmitOutcome {
         accepted,
-        rejected,
         parent_order_id,
-        rejection_reasons,
     })
 }
 

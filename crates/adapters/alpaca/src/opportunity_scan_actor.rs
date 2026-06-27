@@ -285,7 +285,7 @@ impl DataActor for OptionChainOpportunityScanActor {
     }
 }
 
-/// Builds read-only option-chain scanner settings from the account-engine runtime config.
+/// Builds read-only option-chain scanner settings from the Alpaca options runtime config.
 #[must_use]
 pub fn option_chain_scan_config_from_engine(
     config: &OptionsEngineConfig,

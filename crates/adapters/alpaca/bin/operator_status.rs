@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Operator status command for the supervised Alpaca account engine.
+//! Operator status command for the supervised Alpaca options runtimes.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -506,7 +506,8 @@ fn build_status(
         dry_run_strategies: config.dry_run_strategies.clone(),
     };
 
-    let last_scan = latest_event(events, "strategy_iteration");
+    let last_scan = latest_event(events, "option_chain_opportunity_scan")
+        .or_else(|| latest_event(events, "management_iteration"));
     let last_scanner_diagnostic = latest_event(events, "scanner_diagnostic");
     let last_decision = latest_event(events, "decision");
     let last_management_snapshot = latest_event(events, "management_snapshot");

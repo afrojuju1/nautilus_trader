@@ -77,7 +77,7 @@ const CANDIDATE_ALERT_IRON_CONDOR_MIN_SCORE: f64 = 80.0;
 const CANDIDATE_ALERT_CREDIT_MIN_SCORE: f64 = 80.0;
 const CANDIDATE_ALERT_DEBIT_MIN_SCORE: f64 = 80.0;
 
-/// Runtime config for the options account-engine slice.
+/// Runtime config for the Alpaca options slice.
 #[derive(Debug)]
 pub struct OptionsEngineConfig {
     /// Underlyings to scan.

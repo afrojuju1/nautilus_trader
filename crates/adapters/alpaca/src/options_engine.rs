@@ -13,294 +13,58 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Account-engine runtime for the Alpaca options-engine strategy slice.
+//! Management runtime for the Alpaca options-engine strategy slice.
 //!
 //! This module owns the process loop and broker orchestration used by the installed
-//! `alpaca-options-engine` binary. The binary stays as a thin entrypoint so the live
-//! runtime can be tested and evolved from library code.
+//! `alpaca-options-engine` binary for existing-entry management. New entries are owned by
+//! the Nautilus live-node strategy path.
 
-use std::{collections::BTreeSet, env, future::Future, pin::Pin, time::Duration};
+use std::{collections::BTreeSet, env, time::Duration};
 
 use crate::{
-    candidate_engine::{CreditSpreadKind, NakedOptionScannerConfig},
     config::AlpacaDataClientConfig,
-    execution::check_option_spread_entry_admission,
     http::{
         client::AlpacaHttpClient,
-        models::{AlpacaOrder, ListActivitiesRequest, ListOrdersRequest, OptionSnapshotsRequest},
+        models::{AlpacaOrder, ListActivitiesRequest, OptionSnapshotsRequest},
     },
     management::{credit_spread_close_reason, days_to_expiration, recorded_age_secs},
-    options_entry_admission::{
-        EntryAdmissionConfig, EntryAdmissionSnapshot, EntryGateDecision, EntryMode,
-        UNCOVERED_OPTION_PERMISSION_REJECTION_REASON, entry_gate_decision,
-        is_uncovered_option_permission_rejection, selected_entry_mode, selected_submit_enabled,
-        submission_block_for_selected as admission_block_for_selected,
-    },
-    options_entry_strategy::entry_order_list_id,
-    options_runtime::{
-        OptionsEngineConfig, OptionsOpportunitySet, SelectedOptionsEntry,
-        scan_options_opportunities,
-    },
+    options_entry_admission::EntryAdmissionConfig,
+    options_runtime::OptionsEngineConfig,
     performance::{EntryOrderIds, collect_order_ids, entry_performance},
-    runtime::{
-        StrategyState, StrategyStateEntry, credit_spread_strategy_name, emit_operator_event,
-    },
+    runtime::{StrategyState, StrategyStateEntry, emit_operator_event},
     state_reconciliation::reconcile_strategy_state,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use nautilus_core::UUID4;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::time::sleep;
 
-mod events;
 mod submission;
 
 #[cfg(test)]
 use crate::state_reconciliation::{ReconciliationAction, reconciliation_action};
-use events::{
-    insert_string_field, insert_value_field, record_decision_event,
-    record_selected_candidate_alert, record_submit_rejected_candidate_alert,
-    record_submit_result_event, selected_entry_alert_payload,
-};
-use submission::{
-    cancel_parent_order_by_id, lookup_parent_order_snapshot, submit_close_entry,
-    submit_selected_entry,
-};
+use submission::{cancel_parent_order_by_id, lookup_parent_order_snapshot, submit_close_entry};
 
 const DEFAULT_EVENT_TIMEOUT_SECS: u64 = 20;
 const STRATEGY_FAMILY: &str = "ALPACA-OPTIONS-ENGINE";
-const SELECTED_CANDIDATE_ALERT: &str = "selected_candidate";
-const CANDIDATE_SUBMIT_REJECTED_ALERT: &str = "candidate_submit_rejected";
 #[derive(Clone, Debug)]
 struct SubmitOutcome {
     accepted: usize,
-    rejected: usize,
     parent_order_id: Option<String>,
-    rejection_reasons: Vec<String>,
 }
 
-impl SubmitOutcome {
-    fn has_uncovered_option_permission_rejection(&self) -> bool {
-        self.rejection_reasons
-            .iter()
-            .any(|reason| is_uncovered_option_permission_rejection(reason))
-    }
-}
-
-/// Strategy decision emitted into the Alpaca account engine.
-#[derive(Clone, Debug)]
-pub enum StrategyDecision {
-    /// No broker action should be taken because an account-level gate blocked entries.
-    Skip {
-        /// Stable skip reason.
-        reason: &'static str,
-    },
-    /// No eligible candidate was found.
-    NoEntry,
-    /// New entries are blocked by account-level risk caps.
-    RiskBlocked {
-        /// Stable risk reason.
-        reason: &'static str,
-        /// Current observed count.
-        current: usize,
-        /// Configured limit.
-        limit: usize,
-    },
-    /// Candidate was selected by discovery, but submit admission blocked broker action.
-    SelectedBlocked {
-        /// Selected strategy candidate.
-        entry: SelectedOptionsEntry,
-        /// Stable block reason.
-        reason: String,
-        /// Current observed count, if the block is count based.
-        current: Option<usize>,
-        /// Configured limit, if the block is count based.
-        limit: Option<usize>,
-        /// Additional diagnostic details.
-        details: Vec<String>,
-    },
-    /// Candidate was selected for either broker submission or dry-run recording.
-    Selected {
-        /// Selected strategy candidate.
-        entry: SelectedOptionsEntry,
-        /// Entry action mode.
-        mode: EntryMode,
-    },
-}
-
-/// Account-engine context passed to hosted strategies for one iteration.
-#[derive(Debug)]
-pub struct AccountEngineContext<'a> {
-    client: &'a AlpacaHttpClient,
-    data_config: &'a AlpacaDataClientConfig,
-    config: &'a OptionsEngineConfig,
-    state: &'a StrategyState,
-    trade_date: &'a str,
-}
-
-impl<'a> AccountEngineContext<'a> {
-    fn new(
-        client: &'a AlpacaHttpClient,
-        data_config: &'a AlpacaDataClientConfig,
-        config: &'a OptionsEngineConfig,
-        state: &'a StrategyState,
-        trade_date: &'a str,
-    ) -> Self {
-        Self {
-            client,
-            data_config,
-            config,
-            state,
-            trade_date,
-        }
-    }
-
-    /// Returns the market trade date for this iteration.
-    #[must_use]
-    pub fn trade_date(&self) -> &str {
-        self.trade_date
-    }
-}
-
-/// Strategy interface hosted by the single Alpaca account engine.
-pub trait StrategyRuntime {
-    /// Stable strategy runtime name.
-    fn name(&self) -> &'static str;
-
-    /// Evaluates one strategy iteration and emits an account-engine decision.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if strategy evaluation needs broker data and broker I/O fails.
-    fn evaluate<'a>(
-        &'a self,
-        context: AccountEngineContext<'a>,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<StrategyDecision>> + 'a>>;
-}
-
-/// Options strategy implementation hosted by the Alpaca account engine.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct OptionsRuntimeStrategy;
-
-impl OptionsRuntimeStrategy {
-    async fn evaluate_opportunities(
-        &self,
-        context: &AccountEngineContext<'_>,
-        opportunities: OptionsOpportunitySet,
-    ) -> anyhow::Result<StrategyDecision> {
-        let selected = opportunities.into_selected_entry();
-        let Some(selected) = selected else {
-            return Ok(StrategyDecision::NoEntry);
-        };
-        let admission_config = EntryAdmissionConfig::from_engine_config(context.config);
-        if selected_submit_enabled(&admission_config, &selected)
-            && let Some(block) =
-                submission_block_for_selected(context, &admission_config, &selected).await?
-        {
-            return Ok(StrategyDecision::SelectedBlocked {
-                entry: selected,
-                reason: block.reason,
-                current: block.current,
-                limit: block.limit,
-                details: block.details,
-            });
-        }
-        Ok(selected_strategy_decision(&admission_config, selected))
-    }
-}
-
-impl StrategyRuntime for OptionsRuntimeStrategy {
-    fn name(&self) -> &'static str {
-        "options_engine"
-    }
-
-    fn evaluate<'a>(
-        &'a self,
-        context: AccountEngineContext<'a>,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<StrategyDecision>> + 'a>> {
-        Box::pin(async move {
-            let admission_config = EntryAdmissionConfig::from_engine_config(context.config);
-            match entry_gate_decision(&admission_config, Utc::now()) {
-                EntryGateDecision::KillSwitch => {
-                    return Ok(StrategyDecision::Skip {
-                        reason: "kill_switch_enabled",
-                    });
-                }
-                EntryGateDecision::OutsideEntryWindow => {
-                    return Ok(StrategyDecision::Skip {
-                        reason: "outside_entry_window",
-                    });
-                }
-                EntryGateDecision::Continue => {}
-            }
-
-            let opportunities = scan_options_opportunities(
-                context.client,
-                context.data_config,
-                context.config,
-                context.trade_date,
-            )
-            .await?;
-            self.evaluate_opportunities(&context, opportunities).await
-        })
-    }
-}
-
-fn selected_strategy_decision(
-    config: &EntryAdmissionConfig,
-    selected: SelectedOptionsEntry,
-) -> StrategyDecision {
-    let mode = selected_entry_mode(config, &selected);
-    StrategyDecision::Selected {
-        entry: selected,
-        mode,
-    }
-}
-
-async fn submission_block_for_selected(
-    context: &AccountEngineContext<'_>,
-    admission_config: &EntryAdmissionConfig,
-    selected: &SelectedOptionsEntry,
-) -> anyhow::Result<Option<crate::options_entry_admission::SubmissionBlock>> {
-    let account = context.client.account().await?;
-    let positions = context.client.positions().await?;
-    let open_orders = context
-        .client
-        .orders(&ListOrdersRequest::open_nested())
-        .await?;
-    let symbols = selected.option_symbols();
-    let admission =
-        check_option_spread_entry_admission(&account, &positions, &open_orders, &symbols);
-    let snapshot = EntryAdmissionSnapshot {
-        open_order_count: open_orders.len(),
-        broker_admission_reasons: if admission.allowed {
-            Vec::new()
-        } else {
-            admission.reasons
-        },
-    };
-    Ok(admission_block_for_selected(
-        admission_config,
-        context.state,
-        selected,
-        context.trade_date,
-        &snapshot,
-    ))
-}
-
-/// Runs the Alpaca options-engine account engine until configured shutdown.
+/// Runs the Alpaca options-engine management runtime until configured shutdown.
 ///
 /// # Errors
 ///
-/// Returns an error if configuration parsing, broker I/O, selection, submission, cancellation,
+/// Returns an error if configuration parsing, broker I/O, management submission, cancellation,
 /// state persistence, or execution-client lifecycle operations fail.
 pub async fn run_options_engine() -> anyhow::Result<()> {
     let config = OptionsEngineConfig::from_env_with_storage().await?;
     let mut state = config.load_strategy_state().await?;
-    let strategy = OptionsRuntimeStrategy;
 
     println!(
-        "options_engine_entry: underlyings={} strategies={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} state_path={}",
+        "options_engine_management: underlyings={} strategies={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} state_path={}",
         config.underlyings.join(","),
         config.enabled_strategy_names().join(","),
         config.submit_enabled,
@@ -339,7 +103,7 @@ pub async fn run_options_engine() -> anyhow::Result<()> {
             "state_path": config.state_path.display().to_string(),
             "candidate_ledger_enabled": config.candidate_ledger_enabled,
             "candidate_ledger_max_candidates": config.candidate_ledger_max_candidates,
-            "hosted_strategy": strategy.name(),
+            "entry_owner": "nautilus_strategy",
         }),
     );
 
@@ -358,30 +122,16 @@ pub async fn run_options_engine() -> anyhow::Result<()> {
     let mut iteration = 1_u64;
     loop {
         let trade_date = EntryAdmissionConfig::from_engine_config(&config).market_trade_date();
-        println!("strategy_iteration={iteration} trade_date={trade_date}");
+        println!("management_iteration={iteration} trade_date={trade_date}");
         emit_operator_event(
-            "strategy_iteration",
+            "management_iteration",
             json!({
                 "iteration": iteration,
                 "trade_date": trade_date,
             }),
         );
-        record_scan_started(&config, &trade_date, iteration, strategy.name()).await;
 
         if manage_existing_entries(&http_client, &data_config, &config, &mut state).await? {
-            config.save_strategy_state(&state).await?;
-        }
-
-        let decision = strategy
-            .evaluate(AccountEngineContext::new(
-                &http_client,
-                &data_config,
-                &config,
-                &state,
-                &trade_date,
-            ))
-            .await?;
-        if apply_strategy_decision(decision, &config, &mut state, &trade_date).await? {
             config.save_strategy_state(&state).await?;
         }
 
@@ -394,376 +144,6 @@ pub async fn run_options_engine() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-async fn record_scan_started(
-    config: &OptionsEngineConfig,
-    trade_date: &str,
-    iteration: u64,
-    hosted_strategy: &str,
-) {
-    config
-        .record_candidate_ledger(
-            trade_date,
-            "scan_started",
-            json!({
-                "iteration": iteration,
-                "hosted_strategy": hosted_strategy,
-                "underlyings": &config.underlyings,
-                "strategies": config.enabled_strategy_names(),
-                "dry_run_strategies": config.dry_run_strategy_names(),
-                "entry_window": {
-                    "start": config.entry_start.to_string(),
-                    "end": config.entry_end.to_string(),
-                    "timezone": config.entry_timezone.to_string(),
-                    "ignore": config.ignore_entry_window,
-                },
-            }),
-        )
-        .await;
-    config
-        .record_candidate_ledger(
-            trade_date,
-            "threshold_snapshot",
-            candidate_ledger_threshold_snapshot(config),
-        )
-        .await;
-}
-
-fn candidate_ledger_threshold_snapshot(config: &OptionsEngineConfig) -> serde_json::Value {
-    json!({
-        "underlyings": &config.underlyings,
-        "strategies": config.enabled_strategy_names(),
-        "dry_run_strategies": config.dry_run_strategy_names(),
-        "quantity": config.quantity,
-        "submit_enabled": config.submit_enabled,
-        "manage_enabled": config.manage_enabled,
-        "close_enabled": config.close_enabled,
-        "kill_switch": config.kill_switch,
-        "risk": {
-            "max_active_entries": config.max_active_entries,
-            "max_daily_submits": config.max_daily_submits,
-            "max_open_orders": config.max_open_orders,
-            "max_active_entries_per_underlying": config.max_active_entries_per_underlying,
-            "max_active_entries_per_sector": config.max_active_entries_per_sector,
-            "sectors": &config.sectors,
-        },
-        "credit_scanner": {
-            "min_dte": config.scanner.min_dte,
-            "max_dte": config.scanner.max_dte,
-            "short_delta_min": config.scanner.short_delta_min,
-            "short_delta_max": config.scanner.short_delta_max,
-            "widths": &config.scanner.widths,
-            "min_open_interest": config.scanner.min_open_interest,
-            "max_leg_spread_pct": config.scanner.max_leg_spread_pct,
-            "min_return_on_risk": config.scanner.min_return_on_risk,
-            "min_credit_to_width": config.scanner.min_credit_to_width,
-        },
-        "iron_condor_scanner": {
-            "min_return_on_risk": config.iron_condor_scanner.min_return_on_risk,
-            "require_equal_widths": config.iron_condor_scanner.require_equal_widths,
-        },
-        "debit_scanner": {
-            "min_dte": config.debit_scanner.min_dte,
-            "max_dte": config.debit_scanner.max_dte,
-            "long_delta_min": config.debit_scanner.long_delta_min,
-            "long_delta_max": config.debit_scanner.long_delta_max,
-            "widths": &config.debit_scanner.widths,
-            "min_open_interest": config.debit_scanner.min_open_interest,
-            "max_leg_spread_pct": config.debit_scanner.max_leg_spread_pct,
-            "max_debit_to_width": config.debit_scanner.max_debit_to_width,
-            "min_debit_to_width": config.debit_scanner.min_debit_to_width,
-            "min_reward_to_risk": config.debit_scanner.min_reward_to_risk,
-        },
-        "naked_scanner": naked_scanner_threshold_snapshot(&config.naked_scanner),
-        "naked_1_3dte_scanner": naked_scanner_threshold_snapshot(&config.naked_1_3dte_scanner),
-    })
-}
-
-fn naked_scanner_threshold_snapshot(scanner: &NakedOptionScannerConfig) -> serde_json::Value {
-    json!({
-        "min_dte": scanner.min_dte,
-        "max_dte": scanner.max_dte,
-        "short_delta_min": scanner.short_delta_min,
-        "short_delta_max": scanner.short_delta_max,
-        "min_open_interest": scanner.min_open_interest,
-        "max_spread_pct": scanner.max_spread_pct,
-        "min_credit": scanner.min_credit,
-        "min_bid_size": scanner.min_bid_size,
-        "min_ask_size": scanner.min_ask_size,
-        "min_daily_volume": scanner.min_daily_volume,
-        "min_implied_volatility": scanner.min_implied_volatility,
-        "max_implied_volatility": scanner.max_implied_volatility,
-        "min_annualized_premium_yield": scanner.min_annualized_premium_yield,
-        "max_buying_power_usage_pct": scanner.max_buying_power_usage_pct,
-        "min_return_on_buying_power": scanner.min_return_on_buying_power,
-        "min_breakeven_pop": scanner.min_breakeven_pop,
-        "max_probability_of_touch": scanner.max_probability_of_touch,
-        "min_distance_to_breakeven_pct": scanner.min_distance_to_breakeven_pct,
-        "min_expected_move_coverage": scanner.min_expected_move_coverage,
-        "min_score": scanner.min_score,
-    })
-}
-
-async fn apply_strategy_decision(
-    decision: StrategyDecision,
-    config: &OptionsEngineConfig,
-    state: &mut StrategyState,
-    trade_date: &str,
-) -> anyhow::Result<bool> {
-    match decision {
-        StrategyDecision::Skip {
-            reason: "outside_entry_window",
-        } => {
-            println!(
-                "decision: skipped reason=outside_entry_window window={}-{} timezone={}",
-                config.entry_start, config.entry_end, config.entry_timezone
-            );
-            record_decision_event(
-                config,
-                trade_date,
-                json!({
-                    "action": "skipped",
-                    "reason": "outside_entry_window",
-                    "window_start": config.entry_start.to_string(),
-                    "window_end": config.entry_end.to_string(),
-                    "timezone": config.entry_timezone.to_string(),
-                    "trade_date": trade_date,
-                }),
-            )
-            .await;
-            Ok(false)
-        }
-        StrategyDecision::Skip { reason } => {
-            println!("decision: skipped reason={reason}");
-            record_decision_event(
-                config,
-                trade_date,
-                json!({
-                    "action": "skipped",
-                    "reason": reason,
-                    "trade_date": trade_date,
-                }),
-            )
-            .await;
-            Ok(false)
-        }
-        StrategyDecision::RiskBlocked {
-            reason,
-            current,
-            limit,
-        } => {
-            println!("decision: skipped reason={reason} current={current} limit={limit}");
-            record_decision_event(
-                config,
-                trade_date,
-                json!({
-                    "action": "skipped",
-                    "reason": reason,
-                    "current": current,
-                    "limit": limit,
-                    "trade_date": trade_date,
-                }),
-            )
-            .await;
-            Ok(false)
-        }
-        StrategyDecision::SelectedBlocked {
-            entry,
-            reason,
-            current,
-            limit,
-            details,
-        } => {
-            let (candidate_identity_key, mut candidate_alert_payload) =
-                selected_entry_alert_payload(
-                    &entry,
-                    trade_date,
-                    "selected_but_blocked",
-                    None,
-                    config.quantity,
-                );
-            insert_string_field(&mut candidate_alert_payload, "reason", reason.clone());
-            insert_value_field(
-                &mut candidate_alert_payload,
-                "current",
-                current.map_or(Value::Null, Value::from),
-            );
-            insert_value_field(
-                &mut candidate_alert_payload,
-                "limit",
-                limit.map_or(Value::Null, Value::from),
-            );
-            insert_value_field(&mut candidate_alert_payload, "details", json!(&details));
-            println!(
-                "decision: selected_but_blocked underlying={} reason={} current={} limit={} details={} score={:.1}",
-                entry.underlying(),
-                reason,
-                current
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "n/a".to_string()),
-                limit
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "n/a".to_string()),
-                if details.is_empty() {
-                    "none".to_string()
-                } else {
-                    details.join(" | ")
-                },
-                entry.score(),
-            );
-            record_decision_event(config, trade_date, candidate_alert_payload.clone()).await;
-            record_selected_candidate_alert(
-                config,
-                trade_date,
-                &candidate_identity_key,
-                candidate_alert_payload,
-            )
-            .await;
-            Ok(false)
-        }
-        StrategyDecision::Selected { entry, mode } => {
-            apply_selected_entry_decision(entry, mode, config, state, trade_date).await
-        }
-        StrategyDecision::NoEntry => {
-            println!("decision: no_entry");
-            record_decision_event(
-                config,
-                trade_date,
-                json!({
-                    "action": "no_entry",
-                    "trade_date": trade_date,
-                }),
-            )
-            .await;
-            Ok(false)
-        }
-    }
-}
-
-async fn apply_selected_entry_decision(
-    entry: SelectedOptionsEntry,
-    mode: EntryMode,
-    config: &OptionsEngineConfig,
-    state: &mut StrategyState,
-    trade_date: &str,
-) -> anyhow::Result<bool> {
-    let order_list_id = mode
-        .is_submit()
-        .then(|| entry_order_list_id(trade_date, entry.underlying()));
-    let (candidate_identity_key, mut candidate_alert_payload) = selected_entry_alert_payload(
-        &entry,
-        trade_date,
-        mode.action(),
-        order_list_id.as_deref(),
-        config.quantity,
-    );
-    if mode == EntryMode::DryRun {
-        insert_string_field(
-            &mut candidate_alert_payload,
-            "reason",
-            "submission_disabled".to_string(),
-        );
-    }
-
-    println!(
-        "decision: {} underlying={} strategy={} symbols={} {}={:.2} score={:.1}{}",
-        mode.action(),
-        entry.underlying(),
-        entry.strategy_name(),
-        entry.option_symbols().join(","),
-        entry.entry_premium_kind(),
-        entry.entry_premium(),
-        entry.score(),
-        order_list_id
-            .as_ref()
-            .map(|value| format!(" order_list_id={value}"))
-            .unwrap_or_else(|| " reason=submission_disabled".to_string()),
-    );
-    record_decision_event(config, trade_date, candidate_alert_payload.clone()).await;
-    record_selected_candidate_alert(
-        config,
-        trade_date,
-        &candidate_identity_key,
-        candidate_alert_payload.clone(),
-    )
-    .await;
-
-    if mode == EntryMode::DryRun {
-        return Ok(false);
-    }
-
-    let Some(order_list_id) = order_list_id else {
-        anyhow::bail!("submit mode missing order list ID");
-    };
-    let outcome = submit_selected_entry(&entry, &order_list_id, config.quantity, config).await?;
-    let terminal_rejection =
-        entry.is_naked_option() && outcome.accepted == 0 && outcome.rejected > 0;
-    let uncovered_permission_rejection =
-        terminal_rejection && outcome.has_uncovered_option_permission_rejection();
-    if outcome.accepted > 0 || terminal_rejection {
-        state.record_entry_submission(entry.state_entry_draft(
-            trade_date,
-            &order_list_id,
-            config.quantity,
-            outcome.parent_order_id.clone(),
-        ));
-        if terminal_rejection && let Some(entry) = state.entries.last_mut() {
-            entry.mark_canceled();
-            entry.close_reason = Some(
-                if uncovered_permission_rejection {
-                    UNCOVERED_OPTION_PERMISSION_REJECTION_REASON
-                } else {
-                    "entry_rejected"
-                }
-                .to_string(),
-            );
-        }
-    }
-
-    println!(
-        "submit_result: accepted={} rejected={}",
-        outcome.accepted, outcome.rejected
-    );
-    let mut submit_payload = json!({
-        "accepted": outcome.accepted,
-        "rejected": outcome.rejected,
-        "parent_order_id": outcome.parent_order_id.clone(),
-        "underlying": entry.underlying(),
-        "strategy": entry.strategy_name(),
-    });
-    if entry.is_naked_option() {
-        insert_value_field(
-            &mut submit_payload,
-            "terminal_rejection_recorded",
-            Value::Bool(terminal_rejection),
-        );
-    }
-    if uncovered_permission_rejection {
-        insert_value_field(
-            &mut submit_payload,
-            "broker_permission_block",
-            Value::String("uncovered_options_not_eligible".to_string()),
-        );
-    }
-    insert_value_field(
-        &mut submit_payload,
-        "rejection_reasons",
-        json!(&outcome.rejection_reasons),
-    );
-    record_submit_result_event(config, trade_date, submit_payload).await;
-    if outcome.rejected > 0 {
-        record_submit_rejected_candidate_alert(
-            config,
-            trade_date,
-            &candidate_identity_key,
-            candidate_alert_payload,
-            &outcome,
-            entry.is_naked_option().then_some(terminal_rejection),
-        )
-        .await;
-    }
-    Ok(outcome.accepted > 0 || terminal_rejection)
 }
 
 async fn manage_existing_entries(
@@ -1343,10 +723,6 @@ fn close_order_list_id(entry: &StrategyStateEntry) -> String {
     )
 }
 
-fn strategy_name(kind: CreditSpreadKind) -> &'static str {
-    credit_spread_strategy_name(kind)
-}
-
 fn order_age_secs(order: &AlpacaOrder) -> Option<u64> {
     order
         .submitted_at
@@ -1427,16 +803,21 @@ mod tests {
     use super::*;
     use crate::{
         candidate_engine::{
-            DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
+            CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
             NakedOptionCandidate, NakedOptionKind, NakedOptionScannerConfig,
             OptionCapitalRequirementModel, PutCreditScannerConfig, ScoredContract,
         },
         common::consts::ALPACA_CLIENT_ID,
         fleet::{AccountConfig, FleetConfig, FleetSection, ResolvedFleetConfig},
-        options_entry_admission::admission_block_reason,
-        options_runtime::SelectedNakedOptionEntry,
+        options_entry_admission::{
+            EntryAdmissionSnapshot, EntryGateDecision,
+            UNCOVERED_OPTION_PERMISSION_REJECTION_REASON, admission_block_reason,
+            entry_gate_decision, submission_block_for_selected as admission_block_for_selected,
+        },
+        options_runtime::{SelectedNakedOptionEntry, SelectedOptionsEntry},
         runtime::{
-            debit_spread_strategy_name, naked_option_strategy_name, save_strategy_state_atomic,
+            credit_spread_strategy_name, debit_spread_strategy_name, naked_option_strategy_name,
+            save_strategy_state_atomic,
         },
         storage::STORAGE_SCHEMA_DEFAULT,
     };
@@ -1746,20 +1127,6 @@ mod tests {
     }
 
     #[test]
-    fn submit_outcome_detects_uncovered_permission_rejection() {
-        let outcome = SubmitOutcome {
-            accepted: 0,
-            rejected: 1,
-            parent_order_id: None,
-            rejection_reasons: vec![
-                "submit-order-rejected: Alpaca request failed with HTTP 403 for https://paper-api.alpaca.markets/v2/orders: {\"code\":40310000,\"message\":\"account not eligible to trade uncovered option contracts\"}".to_string(),
-            ],
-        };
-
-        assert!(outcome.has_uncovered_option_permission_rejection());
-    }
-
-    #[test]
     fn broker_permission_guard_blocks_naked_after_uncovered_rejection() {
         let mut rejected = state_entry();
         rejected.strategy = naked_option_strategy_name(NakedOptionKind::Call).to_string();
@@ -1813,13 +1180,6 @@ mod tests {
             debit_spread_close_reason(&config, &entry, 1.0),
             Some("manual_flatten".to_string()),
         );
-    }
-
-    #[test]
-    fn options_engine_strategy_has_stable_host_name() {
-        let strategy = OptionsRuntimeStrategy;
-
-        assert_eq!(strategy.name(), "options_engine");
     }
 
     #[test]
