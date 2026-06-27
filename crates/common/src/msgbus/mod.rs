@@ -37,7 +37,8 @@
 //! See [`core`] module documentation for design decisions and performance details.
 
 mod api;
-pub mod backing;
+mod backing;
+pub mod config;
 pub mod core;
 pub mod matching;
 pub mod message;
@@ -47,6 +48,8 @@ pub mod switchboard;
 pub mod typed_endpoints;
 pub mod typed_handler;
 pub mod typed_router;
+
+pub(crate) mod external;
 
 use std::{
     any::Any,
@@ -70,12 +73,18 @@ use nautilus_model::{
 use smallvec::SmallVec;
 
 #[cfg(feature = "live")]
-pub use self::backing::MessageBusSubscriber;
+pub use self::backing::{
+    MessageBusExternalIngress, MessageBusExternalReceiver, external_io_from_backing,
+};
 pub use self::{
     api::*,
-    backing::MessageBusPublisher,
+    backing::{
+        MessageBusBacking, MessageBusBackingFactory, MessageBusExternalEgress,
+        external_egress_from_backing,
+    },
+    config::MessageBusConfig,
     core::{MessageBus, Subscription},
-    message::BusMessage,
+    message::{BusMessage, BusPayloadCategory, BusPayloadType},
     mstr::{Endpoint, MStr, Pattern, Topic},
     switchboard::MessagingSwitchboard,
     typed_endpoints::{EndpointMap, IntoEndpointMap},
@@ -100,7 +109,7 @@ pub(super) const HANDLER_BUFFER_CAP: usize = 64;
 // during handler calls (enabling re-entrant publishes).
 thread_local! {
     pub(super) static MESSAGE_BUS: RefCell<Option<Rc<RefCell<MessageBus>>>> = const { RefCell::new(None) };
-    pub(super) static HAS_PUBLISHER: Cell<bool> = const { Cell::new(false) };
+    pub(super) static HAS_EXTERNAL_EGRESS: Cell<bool> = const { Cell::new(false) };
     pub(super) static SUPPRESS_EXTERNAL_DEPTH: Cell<u32> = const { Cell::new(0) };
 
     pub(super) static ANY_HANDLERS: RefCell<SmallVec<[ShareableMessageHandler; HANDLER_BUFFER_CAP]>> =
@@ -187,7 +196,7 @@ impl Drop for SuppressExternalGuard {
 
 /// Sets the thread-local message bus, replacing any existing one.
 pub fn set_message_bus(msgbus: Rc<RefCell<MessageBus>>) {
-    HAS_PUBLISHER.with(|flag| flag.set(msgbus.borrow().has_publisher()));
+    HAS_EXTERNAL_EGRESS.with(|flag| flag.set(msgbus.borrow().has_external_egress()));
     MESSAGE_BUS.with(|bus| {
         *bus.borrow_mut() = Some(msgbus);
     });

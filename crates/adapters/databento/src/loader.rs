@@ -328,9 +328,14 @@ impl DatabentoDataLoader {
         T: dbn::Record + dbn::HasRType + 'static,
     {
         let decoder = Decoder::from_zstd_file(filepath)?;
-        let metadata = decoder.metadata().clone();
-        let mut metadata_cache = MetadataCache::new(metadata);
+        let mut metadata_cache = if instrument_id.is_none() {
+            Some(MetadataCache::new(decoder.metadata().clone()))
+        } else {
+            None
+        };
         let mut dbn_stream = decoder.decode_stream::<T>();
+        let fixed_instrument_id = instrument_id.is_some();
+        let mut fixed_price_precision = price_precision;
 
         Ok(std::iter::from_fn(move || {
             let result: anyhow::Result<Option<(Option<Data>, Option<Data>)>> = (|| {
@@ -340,19 +345,14 @@ impl DatabentoDataLoader {
 
                 if let Some(rec) = dbn_stream.get() {
                     let record = dbn::RecordRef::from(rec);
-                    let instrument_id = if let Some(id) = &instrument_id {
-                        *id
-                    } else {
-                        decode_nautilus_instrument_id(
-                            &record,
-                            &mut metadata_cache,
-                            &self.publisher_venue_map,
-                            &self.symbol_venue_map,
-                        )
-                        .context("failed to decode instrument id")?
-                    };
-                    let resolved_precision =
-                        self.resolve_price_precision(&instrument_id, price_precision)?;
+                    let instrument_id = self
+                        .resolve_record_instrument_id(&record, instrument_id, &mut metadata_cache)
+                        .context("failed to decode instrument id")?;
+                    let resolved_precision = self.resolve_stream_price_precision(
+                        &instrument_id,
+                        fixed_instrument_id,
+                        &mut fixed_price_precision,
+                    )?;
                     let (item1, item2) = decode_record(
                         &record,
                         instrument_id,
@@ -425,19 +425,42 @@ impl DatabentoDataLoader {
         instrument_id: Option<InstrumentId>,
         price_precision: Option<u8>,
     ) -> anyhow::Result<Vec<OrderBookDelta>> {
-        self.read_records::<dbn::MboMsg>(filepath, instrument_id, price_precision, false, None)?
-            .filter_map(|result| match result {
-                Ok((Some(item1), _)) => {
-                    if let Data::Delta(delta) = item1 {
-                        Some(Ok(delta))
-                    } else {
-                        None
-                    }
-                }
-                Ok((None, _)) => None,
-                Err(e) => Some(Err(e)),
-            })
+        self.read_order_book_deltas(filepath, instrument_id, price_precision)?
             .collect()
+    }
+
+    /// Reads order book delta messages from a DBN MBO schema file without collecting them.
+    ///
+    /// Cannot include trades.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if opening or decoding order book deltas fails.
+    pub fn read_order_book_deltas(
+        &self,
+        filepath: &Path,
+        instrument_id: Option<InstrumentId>,
+        price_precision: Option<u8>,
+    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<OrderBookDelta>> + '_> {
+        let records = self.read_records::<dbn::MboMsg>(
+            filepath,
+            instrument_id,
+            price_precision,
+            false,
+            None,
+        )?;
+
+        Ok(records.filter_map(|result| match result {
+            Ok((Some(item1), _)) => {
+                if let Data::Delta(delta) = item1 {
+                    Some(Ok(delta))
+                } else {
+                    None
+                }
+            }
+            Ok((None, _)) => None,
+            Err(e) => Some(Err(e)),
+        }))
     }
 
     /// Loads order book depth10 snapshots from a DBN MBP-10 schema file.
@@ -693,8 +716,11 @@ impl DatabentoDataLoader {
         T: dbn::Record + dbn::HasRType + 'static,
     {
         let decoder = Decoder::from_zstd_file(filepath)?;
-        let metadata = decoder.metadata().clone();
-        let mut metadata_cache = MetadataCache::new(metadata);
+        let mut metadata_cache = if instrument_id.is_none() {
+            Some(MetadataCache::new(decoder.metadata().clone()))
+        } else {
+            None
+        };
         let mut dbn_stream = decoder.decode_stream::<T>();
 
         Ok(std::iter::from_fn(move || {
@@ -705,17 +731,13 @@ impl DatabentoDataLoader {
             match dbn_stream.get() {
                 Some(rec) => {
                     let record = dbn::RecordRef::from(rec);
-                    let instrument_id = match &instrument_id {
-                        Some(id) => *id, // Copy
-                        None => match decode_nautilus_instrument_id(
-                            &record,
-                            &mut metadata_cache,
-                            &self.publisher_venue_map,
-                            &self.symbol_venue_map,
-                        ) {
-                            Ok(id) => id,
-                            Err(e) => return Some(Err(e)),
-                        },
+                    let instrument_id = match self.resolve_record_instrument_id(
+                        &record,
+                        instrument_id,
+                        &mut metadata_cache,
+                    ) {
+                        Ok(id) => id,
+                        Err(e) => return Some(Err(e)),
                     };
 
                     let msg = match record.get::<dbn::StatusMsg>() {
@@ -749,9 +771,14 @@ impl DatabentoDataLoader {
         T: dbn::Record + dbn::HasRType + 'static,
     {
         let decoder = Decoder::from_zstd_file(filepath)?;
-        let metadata = decoder.metadata().clone();
-        let mut metadata_cache = MetadataCache::new(metadata);
+        let mut metadata_cache = if instrument_id.is_none() {
+            Some(MetadataCache::new(decoder.metadata().clone()))
+        } else {
+            None
+        };
         let mut dbn_stream = decoder.decode_stream::<T>();
+        let fixed_instrument_id = instrument_id.is_some();
+        let mut fixed_price_precision = price_precision;
 
         Ok(std::iter::from_fn(move || {
             if let Err(e) = dbn_stream.advance() {
@@ -761,23 +788,22 @@ impl DatabentoDataLoader {
             match dbn_stream.get() {
                 Some(rec) => {
                     let record = dbn::RecordRef::from(rec);
-                    let instrument_id = match &instrument_id {
-                        Some(id) => *id, // Copy
-                        None => match decode_nautilus_instrument_id(
-                            &record,
-                            &mut metadata_cache,
-                            &self.publisher_venue_map,
-                            &self.symbol_venue_map,
-                        ) {
-                            Ok(id) => id,
-                            Err(e) => return Some(Err(e)),
-                        },
+                    let instrument_id = match self.resolve_record_instrument_id(
+                        &record,
+                        instrument_id,
+                        &mut metadata_cache,
+                    ) {
+                        Ok(id) => id,
+                        Err(e) => return Some(Err(e)),
                     };
-                    let resolved_precision =
-                        match self.resolve_price_precision(&instrument_id, price_precision) {
-                            Ok(p) => p,
-                            Err(e) => return Some(Err(e)),
-                        };
+                    let resolved_precision = match self.resolve_stream_price_precision(
+                        &instrument_id,
+                        fixed_instrument_id,
+                        &mut fixed_price_precision,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => return Some(Err(e)),
+                    };
 
                     let msg = match record.get::<dbn::ImbalanceMsg>() {
                         Some(m) => m,
@@ -815,9 +841,14 @@ impl DatabentoDataLoader {
         T: dbn::Record + dbn::HasRType + 'static,
     {
         let decoder = Decoder::from_zstd_file(filepath)?;
-        let metadata = decoder.metadata().clone();
-        let mut metadata_cache = MetadataCache::new(metadata);
+        let mut metadata_cache = if instrument_id.is_none() {
+            Some(MetadataCache::new(decoder.metadata().clone()))
+        } else {
+            None
+        };
         let mut dbn_stream = decoder.decode_stream::<T>();
+        let fixed_instrument_id = instrument_id.is_some();
+        let mut fixed_price_precision = price_precision;
 
         // Loop over skipped records so one unsupported stat_type does not terminate
         // the stream; precheck before precision resolution.
@@ -839,23 +870,22 @@ impl DatabentoDataLoader {
                     continue;
                 }
 
-                let instrument_id = match &instrument_id {
-                    Some(id) => *id, // Copy
-                    None => match decode_nautilus_instrument_id(
-                        &record,
-                        &mut metadata_cache,
-                        &self.publisher_venue_map,
-                        &self.symbol_venue_map,
-                    ) {
-                        Ok(id) => id,
-                        Err(e) => return Some(Err(e)),
-                    },
+                let instrument_id = match self.resolve_record_instrument_id(
+                    &record,
+                    instrument_id,
+                    &mut metadata_cache,
+                ) {
+                    Ok(id) => id,
+                    Err(e) => return Some(Err(e)),
                 };
-                let resolved_precision =
-                    match self.resolve_price_precision(&instrument_id, price_precision) {
-                        Ok(p) => p,
-                        Err(e) => return Some(Err(e)),
-                    };
+                let resolved_precision = match self.resolve_stream_price_precision(
+                    &instrument_id,
+                    fixed_instrument_id,
+                    &mut fixed_price_precision,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => return Some(Err(e)),
+                };
                 let ts_init = msg.ts_recv.into();
 
                 match decode_statistics_msg(msg, instrument_id, resolved_precision, Some(ts_init)) {
@@ -866,10 +896,51 @@ impl DatabentoDataLoader {
             }
         }))
     }
+
+    fn resolve_record_instrument_id(
+        &self,
+        record: &dbn::RecordRef,
+        instrument_id: Option<InstrumentId>,
+        metadata_cache: &mut Option<MetadataCache>,
+    ) -> anyhow::Result<InstrumentId> {
+        if let Some(instrument_id) = instrument_id {
+            return Ok(instrument_id);
+        }
+
+        let metadata_cache = metadata_cache
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("missing metadata cache for dynamic instrument id"))?;
+
+        decode_nautilus_instrument_id(
+            record,
+            metadata_cache,
+            &self.publisher_venue_map,
+            &self.symbol_venue_map,
+        )
+    }
+
+    fn resolve_stream_price_precision(
+        &self,
+        instrument_id: &InstrumentId,
+        fixed_instrument_id: bool,
+        fixed_price_precision: &mut Option<u8>,
+    ) -> anyhow::Result<u8> {
+        if let Some(precision) = *fixed_price_precision {
+            return Ok(precision);
+        }
+
+        let precision = self.resolve_price_precision(instrument_id, None)?;
+        if fixed_instrument_id {
+            *fixed_price_precision = Some(precision);
+        }
+
+        Ok(precision)
+    }
 }
 
 /// Applies default venue-to-dataset mappings for consolidated Databento feeds.
-/// GLBX.MDP3 covers CME Globex exchange MICs; OPRA.PILLAR covers OPRA option venues.
+/// GLBX.MDP3 covers CME Globex exchange MICs; OPRA.PILLAR covers OPRA option venues;
+/// EQUS.MINI is the consolidated US equities default.
 fn apply_default_venue_dataset_mappings(venue_dataset_map: &mut IndexMap<Venue, Dataset>) {
     let glbx = Dataset::from("GLBX.MDP3");
 
@@ -885,6 +956,10 @@ fn apply_default_venue_dataset_mappings(venue_dataset_map: &mut IndexMap<Venue, 
     ] {
         _ = venue_dataset_map.insert(venue, glbx);
     }
+
+    // publishers.json seeds the consolidated EQUS venue with the unreleased EQUS.PLUS,
+    // so pin it to EQUS.MINI, the cheapest released US equities feed.
+    _ = venue_dataset_map.insert(Venue::from("EQUS"), Dataset::from("EQUS.MINI"));
 
     let opra = Dataset::from("OPRA.PILLAR");
     for venue_code in [
@@ -945,10 +1020,14 @@ mod tests {
         let xcbo = Venue::from("XCBO");
         let result = loader.get_dataset_for_venue(&xcbo).unwrap();
         assert_eq!(*result, Ustr::from("OPRA.PILLAR"));
+
+        let equs = Venue::from("EQUS");
+        let result = loader.get_dataset_for_venue(&equs).unwrap();
+        assert_eq!(*result, Ustr::from("EQUS.MINI"));
     }
 
     #[rstest]
-    #[case(test_data_path().join("test_data.definition.dbn.zst"))]
+    #[case(test_data_path().join("test_data.definition.equity.dbn.zst"))]
     fn test_load_instruments(mut loader: DatabentoDataLoader, #[case] path: PathBuf) {
         let instruments = loader.load_instruments(&path, false, false).unwrap();
 
@@ -964,7 +1043,7 @@ mod tests {
     fn test_load_instruments_populates_price_precisions_cache(
         mut loader_without_seed: DatabentoDataLoader,
     ) {
-        let path = test_data_path().join("test_data.definition.dbn.zst");
+        let path = test_data_path().join("test_data.definition.equity.dbn.zst");
         assert!(loader_without_seed.get_price_precisions().is_empty());
 
         let instruments = loader_without_seed
@@ -1062,6 +1141,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(deltas.len(), 2);
+    }
+
+    #[rstest]
+    fn test_read_order_book_deltas_streams_without_collecting(loader: DatabentoDataLoader) {
+        let path = test_data_path().join("test_data.mbo.dbn.zst");
+        let instrument_id = InstrumentId::from("ESM4.GLBX");
+
+        let count = loader
+            .read_order_book_deltas(&path, Some(instrument_id), None)
+            .unwrap()
+            .map(|result| result.map(|_| 1usize))
+            .sum::<anyhow::Result<usize>>()
+            .unwrap();
+
+        assert_eq!(count, 2);
     }
 
     #[rstest]

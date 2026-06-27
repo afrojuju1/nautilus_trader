@@ -41,8 +41,9 @@ use nautilus_common::{
 };
 use nautilus_core::{UnixNanos, WeakCell};
 use nautilus_execution::{
-    client::core::ExecutionClientCore, matching_engine::adapter::OrderEngineAdapter,
-    models::fill::FillModelAny,
+    client::core::ExecutionClientCore,
+    matching_engine::adapter::OrderEngineAdapter,
+    models::{fee::FeeModelHandle, fill::FillModelHandle},
 };
 use nautilus_model::{
     accounts::AccountAny,
@@ -168,8 +169,13 @@ impl SandboxInner {
 
         if !self.matching_engines.contains_key(&instrument_id) {
             let engine_config = self.config.to_matching_engine_config();
-            let fill_model = FillModelAny::default();
-            let fee_model = self.config.fee_model.clone().unwrap_or_default();
+            let fill_model = FillModelHandle::default();
+            let fee_model = self
+                .config
+                .fee_model
+                .clone()
+                .map(FeeModelHandle::from)
+                .unwrap_or_default();
             let raw_id = self.next_engine_raw_id;
             self.next_engine_raw_id = self.next_engine_raw_id.wrapping_add(1);
 

@@ -13,105 +13,40 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::fmt::Debug;
+//! External message bus backing traits.
+//!
+//! Ingress and egress are named from the local message bus boundary. Egress carries serialized
+//! [`BusMessage`] values from the local bus to external streams. Ingress exposes serialized
+//! [`BusMessage`] values read from external streams so a live bridge can republish them on the
+//! local bus.
+//!
+//! - `MessageBusBackingFactory` creates concrete backing technology for a bus runtime.
+//! - `MessageBusBacking` owns the runtime facade used by core bus wiring.
+//! - `MessageBusExternalEgress` accepts outbound messages from the local bus.
+//! - `MessageBusExternalIngress` exposes the inbound external stream receiver.
+//! - `external_egress_from_backing` adapts a backing into an egress surface.
+//! - `external_io_from_backing` adapts one backing into shared egress and ingress surfaces.
 
-use bytes::Bytes;
+use std::{
+    cell::{Cell, RefCell},
+    fmt::Debug,
+    rc::Rc,
+};
+
 use nautilus_core::UUID4;
 use nautilus_model::identifiers::TraderId;
-use serde::{Deserialize, Serialize};
-use ustr::Ustr;
 
-use crate::enums::SerializationEncoding;
+use super::config::MessageBusConfig;
+use crate::msgbus::BusMessage;
 
-/// Configuration for `MessageBus` instances.
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.common", from_py_object)
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.common")
-)]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-#[serde(default, deny_unknown_fields)]
-pub struct MessageBusConfig {
-    /// The encoding for backing operations, controls the type of serializer used.
-    #[builder(default = SerializationEncoding::Json)]
-    pub encoding: SerializationEncoding,
-    /// If timestamps should be persisted as ISO 8601 strings.
-    /// If `false`, then timestamps will be persisted as UNIX nanoseconds.
-    #[builder(default)]
-    pub timestamps_as_iso8601: bool,
-    /// The buffer interval (milliseconds) between pipelined/batched transactions.
-    /// The recommended range if using buffered pipelining is [10, 1000] milliseconds,
-    /// with a good compromise being 100 milliseconds.
-    pub buffer_interval_ms: Option<u32>,
-    /// The lookback window in minutes for automatic stream trimming.
-    /// The actual window may extend up to one minute beyond the specified value since streams are trimmed at most once every minute.
-    /// This feature requires Redis version 6.2 or higher; otherwise, it will result in a command syntax error.
-    pub autotrim_mins: Option<u32>,
-    /// If a 'trader-' prefix is used for stream names.
-    #[builder(default = true)]
-    pub use_trader_prefix: bool,
-    /// If the trader's ID is used for stream names.
-    #[builder(default = true)]
-    pub use_trader_id: bool,
-    /// If the trader's instance ID is used for stream names. Default is `false`.
-    #[builder(default)]
-    pub use_instance_id: bool,
-    /// The prefix for externally published stream names. Must have a `backing` config.
-    #[builder(default = "stream".to_string())]
-    pub streams_prefix: String,
-    /// If `true`, messages will be written to separate streams per topic.
-    /// If `false`, all messages will be written to the same stream.
-    #[builder(default = true)]
-    pub stream_per_topic: bool,
-    /// The external stream keys the message bus will listen to for publishing deserialized message payloads internally.
-    pub external_streams: Option<Vec<String>>,
-    /// A list of serializable types **not** to publish externally.
-    pub types_filter: Option<Vec<String>>,
-    /// The heartbeat interval (seconds).
-    pub heartbeat_interval_secs: Option<u16>,
-}
-
-impl Default for MessageBusConfig {
-    fn default() -> Self {
-        Self::builder().build()
-    }
-}
-
-/// External publisher for serialized message bus publications.
-///
-/// The core bus passes each outbound [`BusMessage`](super::BusMessage) as a `topic` and serialized
-/// `payload`. Implementations must not block the publishing thread. If the underlying publisher is
-/// full, drop the message in the implementation rather than applying back-pressure to the node.
-pub trait MessageBusPublisher {
-    fn is_closed(&self) -> bool;
-    fn publish(&self, topic: Ustr, payload: Bytes);
-    fn close(&mut self);
-}
-
-/// External subscriber for serialized message bus publications.
-///
-/// The core bus consumes each inbound [`BusMessage`](super::BusMessage) as a transport-neutral
-/// `topic` and serialized `payload`. The receiver can be taken only once so subscribers can hand
-/// ownership of the inbound stream to the live bridge without exposing their backing transport.
+/// Receiver for external message bus ingress publications.
 #[cfg(feature = "live")]
-pub trait MessageBusSubscriber {
-    fn is_closed(&self) -> bool;
+pub type MessageBusExternalReceiver = tokio::sync::mpsc::Receiver<BusMessage>;
 
-    /// # Errors
-    ///
-    /// Returns an error if the receiver has already been taken or is unavailable.
-    fn take_receiver(&mut self) -> anyhow::Result<tokio::sync::mpsc::Receiver<super::BusMessage>>;
-
-    fn close(&mut self);
-}
-
-/// Factory for constructing external message bus backings at runtime.
+/// Factory for constructing external message bus backings.
 ///
-/// Implementations own the concrete backing configuration and return the transport-neutral
-/// [`MessageBusBacking`] surface used by the core bus.
+/// Implementations own concrete backing configuration and return the [`MessageBusBacking`] surface
+/// used by the core bus runtime.
 pub trait MessageBusBackingFactory: Debug + Send + Sync {
     /// Creates a message bus backing for the given bus runtime.
     ///
@@ -126,33 +61,217 @@ pub trait MessageBusBackingFactory: Debug + Send + Sync {
     ) -> anyhow::Result<Box<dyn MessageBusBacking>>;
 }
 
-/// A generic message bus backing facade.
+/// External message bus backing facade.
 ///
-/// Implementations own the concrete backing technology and expose transport-neutral publisher and
-/// subscriber surfaces through separate traits.
+/// Implementations own the concrete backing technology and provide the runtime-facing publication
+/// surface used by the core bus. With the `live` feature, the same backing can also hand an
+/// inbound receiver to the live bridge.
 pub trait MessageBusBacking {
+    /// Returns `true` if the backing has been closed.
     fn is_closed(&self) -> bool;
-    fn publish(&self, topic: Ustr, payload: Bytes);
+
+    /// Queues a serialized bus message for external egress.
+    fn publish(&self, message: BusMessage);
+
+    /// Takes the inbound message receiver for live bridge consumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the receiver has already been taken or is unavailable.
+    #[cfg(feature = "live")]
+    fn take_receiver(&mut self) -> anyhow::Result<MessageBusExternalReceiver> {
+        anyhow::bail!("external ingress receiver unavailable")
+    }
+
+    /// Closes the backing and releases any owned resources.
     fn close(&mut self);
 }
 
-#[cfg(test)]
+/// External egress surface for serialized message bus publications.
+///
+/// The core bus passes each outbound message as a [`BusMessage`] carrying the
+/// `topic`, `payload_type`, and serialized `payload`. Implementations must not block the publishing
+/// thread. If the underlying channel is full, drop the message in the implementation rather than
+/// applying back-pressure to the node.
+pub trait MessageBusExternalEgress {
+    /// Returns `true` if egress has been closed.
+    fn is_closed(&self) -> bool;
+
+    /// Queues a serialized bus message for external egress.
+    fn publish(&self, message: BusMessage);
+
+    /// Closes egress and stops accepting outbound messages.
+    fn close(&mut self);
+}
+
+/// External ingress surface for serialized message bus publications.
+///
+/// The live bridge consumes each inbound [`BusMessage`] as a topic and serialized
+/// payload. The receiver can be taken only once so ingress can hand ownership of the external stream
+/// to the bridge without exposing concrete backing details.
+#[cfg(feature = "live")]
+pub trait MessageBusExternalIngress {
+    /// Returns `true` if ingress has been closed.
+    fn is_closed(&self) -> bool;
+
+    /// Takes the inbound message receiver for live bridge consumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the receiver has already been taken or is unavailable.
+    fn take_receiver(&mut self) -> anyhow::Result<MessageBusExternalReceiver>;
+
+    /// Closes ingress and stops accepting inbound messages.
+    fn close(&mut self);
+}
+
+type SharedMessageBusBacking = Rc<RefCell<Box<dyn MessageBusBacking>>>;
+type SharedMessageBusCloseState = Rc<Cell<bool>>;
+
+/// Wraps a message bus backing for external egress installation.
+#[must_use]
+pub fn external_egress_from_backing(
+    backing: Box<dyn MessageBusBacking>,
+) -> Box<dyn MessageBusExternalEgress> {
+    Box::new(BackingExternalEgress {
+        backing: Rc::new(RefCell::new(backing)),
+        closed: Rc::new(Cell::new(false)),
+    })
+}
+
+/// Splits a message bus backing into external egress and ingress surfaces.
+#[cfg(feature = "live")]
+#[must_use]
+pub fn external_io_from_backing(
+    backing: Box<dyn MessageBusBacking>,
+) -> (
+    Box<dyn MessageBusExternalEgress>,
+    Box<dyn MessageBusExternalIngress>,
+) {
+    let backing = Rc::new(RefCell::new(backing));
+    let closed = Rc::new(Cell::new(false));
+    (
+        Box::new(BackingExternalEgress {
+            backing: backing.clone(),
+            closed: closed.clone(),
+        }),
+        Box::new(BackingExternalIngress { backing, closed }),
+    )
+}
+
+struct BackingExternalEgress {
+    backing: SharedMessageBusBacking,
+    closed: SharedMessageBusCloseState,
+}
+
+impl MessageBusExternalEgress for BackingExternalEgress {
+    fn is_closed(&self) -> bool {
+        self.backing.borrow().is_closed()
+    }
+
+    fn publish(&self, message: BusMessage) {
+        self.backing.borrow().publish(message);
+    }
+
+    fn close(&mut self) {
+        if !self.closed.replace(true) {
+            self.backing.borrow_mut().close();
+        }
+    }
+}
+
+#[cfg(feature = "live")]
+struct BackingExternalIngress {
+    backing: SharedMessageBusBacking,
+    closed: SharedMessageBusCloseState,
+}
+
+#[cfg(feature = "live")]
+impl MessageBusExternalIngress for BackingExternalIngress {
+    fn is_closed(&self) -> bool {
+        self.backing.borrow().is_closed()
+    }
+
+    fn take_receiver(&mut self) -> anyhow::Result<MessageBusExternalReceiver> {
+        self.backing.borrow_mut().take_receiver()
+    }
+
+    fn close(&mut self) {
+        if !self.closed.replace(true) {
+            self.backing.borrow_mut().close();
+        }
+    }
+}
+
+#[cfg(all(test, feature = "live"))]
 mod tests {
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    use bytes::Bytes;
     use rstest::*;
-    use serde_json::json;
 
-    use super::*;
-    #[cfg(feature = "live")]
-    use crate::msgbus::{BusMessage, MessageBusSubscriber as ReexportedMessageBusSubscriber};
+    use super::{MessageBusBacking, external_egress_from_backing, external_io_from_backing};
+    use crate::{
+        enums::SerializationEncoding,
+        msgbus::{
+            BusMessage, BusPayloadType,
+            MessageBusExternalIngress as ReexportedMessageBusExternalIngress,
+        },
+    };
 
-    #[cfg(feature = "live")]
-    struct CapturingSubscriber {
+    struct CapturingBacking {
         rx: Option<tokio::sync::mpsc::Receiver<BusMessage>>,
         closed: bool,
     }
 
-    #[cfg(feature = "live")]
-    impl ReexportedMessageBusSubscriber for CapturingSubscriber {
+    impl MessageBusBacking for CapturingBacking {
+        fn is_closed(&self) -> bool {
+            self.closed
+        }
+
+        fn publish(&self, _message: BusMessage) {}
+
+        fn take_receiver(&mut self) -> anyhow::Result<tokio::sync::mpsc::Receiver<BusMessage>> {
+            self.rx
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("Stream receiver already taken"))
+        }
+
+        fn close(&mut self) {
+            self.closed = true;
+        }
+    }
+
+    struct CapturingPublishBacking {
+        publications: Rc<RefCell<Vec<BusMessage>>>,
+        closed: Rc<Cell<bool>>,
+        close_count: Rc<Cell<u32>>,
+    }
+
+    impl MessageBusBacking for CapturingPublishBacking {
+        fn is_closed(&self) -> bool {
+            self.closed.get()
+        }
+
+        fn publish(&self, message: BusMessage) {
+            self.publications.borrow_mut().push(message);
+        }
+
+        fn close(&mut self) {
+            self.close_count.set(self.close_count.get() + 1);
+            self.closed.set(true);
+        }
+    }
+
+    struct CapturingExternalIngress {
+        rx: Option<tokio::sync::mpsc::Receiver<BusMessage>>,
+        closed: bool,
+    }
+
+    impl ReexportedMessageBusExternalIngress for CapturingExternalIngress {
         fn is_closed(&self) -> bool {
             self.closed
         }
@@ -168,101 +287,141 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "live")]
     #[rstest]
-    fn test_message_bus_subscriber_reexport_accepts_bus_messages() {
+    fn test_message_bus_external_ingress_reexport_accepts_bus_messages() {
         let (tx, rx) = tokio::sync::mpsc::channel::<BusMessage>(1);
-        let mut subscriber = CapturingSubscriber {
+        let mut ingress = CapturingExternalIngress {
             rx: Some(rx),
             closed: false,
         };
-        let message = BusMessage::with_str_topic("events/data", Bytes::from_static(b"payload"));
+        let message = BusMessage::with_str_topic(
+            "events/data",
+            BusPayloadType::QuoteTick,
+            Bytes::from_static(b"payload"),
+            SerializationEncoding::Json,
+        );
 
         tx.try_send(message.clone()).unwrap();
-        let mut stream_rx = ReexportedMessageBusSubscriber::take_receiver(&mut subscriber).unwrap();
+        let mut stream_rx =
+            ReexportedMessageBusExternalIngress::take_receiver(&mut ingress).unwrap();
         let received = stream_rx.try_recv().unwrap();
 
         assert_eq!(received.topic, message.topic);
         assert_eq!(received.payload, message.payload);
-        assert!(ReexportedMessageBusSubscriber::take_receiver(&mut subscriber).is_err());
+        assert!(ReexportedMessageBusExternalIngress::take_receiver(&mut ingress).is_err());
 
-        ReexportedMessageBusSubscriber::close(&mut subscriber);
-        assert!(ReexportedMessageBusSubscriber::is_closed(&subscriber));
+        ReexportedMessageBusExternalIngress::close(&mut ingress);
+        assert!(ReexportedMessageBusExternalIngress::is_closed(&ingress));
     }
 
     #[rstest]
-    fn test_default_message_bus_config() {
-        let config = MessageBusConfig::default();
-        assert_eq!(config.encoding, SerializationEncoding::Json);
-        assert!(!config.timestamps_as_iso8601);
-        assert_eq!(config.buffer_interval_ms, None);
-        assert_eq!(config.autotrim_mins, None);
-        assert!(config.use_trader_prefix);
-        assert!(config.use_trader_id);
-        assert!(!config.use_instance_id);
-        assert_eq!(config.streams_prefix, "stream");
-        assert!(config.stream_per_topic);
-        assert_eq!(config.external_streams, None);
-        assert_eq!(config.types_filter, None);
-    }
-
-    #[rstest]
-    fn test_deserialize_message_bus_config() {
-        let config_json = json!({
-            "encoding": "json",
-            "timestamps_as_iso8601": true,
-            "buffer_interval_ms": 100,
-            "autotrim_mins": 60,
-            "use_trader_prefix": false,
-            "use_trader_id": false,
-            "use_instance_id": true,
-            "streams_prefix": "data_streams",
-            "stream_per_topic": false,
-            "external_streams": ["stream1", "stream2"],
-            "types_filter": ["type1", "type2"]
-        });
-        let config: MessageBusConfig = serde_json::from_value(config_json).unwrap();
-        assert_eq!(config.encoding, SerializationEncoding::Json);
-        assert!(config.timestamps_as_iso8601);
-        assert_eq!(config.buffer_interval_ms, Some(100));
-        assert_eq!(config.autotrim_mins, Some(60));
-        assert!(!config.use_trader_prefix);
-        assert!(!config.use_trader_id);
-        assert!(config.use_instance_id);
-        assert_eq!(config.streams_prefix, "data_streams");
-        assert!(!config.stream_per_topic);
-        assert_eq!(
-            config.external_streams,
-            Some(vec!["stream1".to_string(), "stream2".to_string()])
+    fn test_external_io_from_backing_shares_close_state() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<BusMessage>(1);
+        let backing = CapturingBacking {
+            rx: Some(rx),
+            closed: false,
+        };
+        let message = BusMessage::with_str_topic(
+            "events/data",
+            BusPayloadType::QuoteTick,
+            Bytes::from_static(b"payload"),
+            SerializationEncoding::Json,
         );
-        assert_eq!(
-            config.types_filter,
-            Some(vec!["type1".to_string(), "type2".to_string()])
+        let (mut egress, mut ingress) = external_io_from_backing(Box::new(backing));
+
+        tx.try_send(message.clone()).unwrap();
+        let mut stream_rx = ingress.take_receiver().unwrap();
+        let received = stream_rx.try_recv().unwrap();
+
+        assert_eq!(received.topic, message.topic);
+        assert!(!egress.is_closed());
+        assert!(!ingress.is_closed());
+
+        egress.close();
+
+        assert!(egress.is_closed());
+        assert!(ingress.is_closed());
+    }
+
+    #[rstest]
+    fn test_external_egress_from_backing_forwards_publications() {
+        let publications = Rc::new(RefCell::new(Vec::new()));
+        let closed = Rc::new(Cell::new(false));
+        let close_count = Rc::new(Cell::new(0));
+        let backing = CapturingPublishBacking {
+            publications: publications.clone(),
+            closed: closed.clone(),
+            close_count,
+        };
+        let mut egress = external_egress_from_backing(Box::new(backing));
+        let message = BusMessage::with_str_topic(
+            "events/data",
+            BusPayloadType::QuoteTick,
+            Bytes::from_static(b"payload"),
+            SerializationEncoding::Json,
         );
+
+        egress.publish(message.clone());
+        egress.close();
+
+        let publications = publications.borrow();
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].topic, message.topic);
+        assert!(closed.get());
     }
 
     #[rstest]
-    fn test_deserialize_message_bus_config_rejects_backing_field() {
-        let config_json = json!({
-            "backing": {},
-        });
+    fn test_external_io_from_backing_closes_shared_backing_once() {
+        let publications = Rc::new(RefCell::new(Vec::new()));
+        let closed = Rc::new(Cell::new(false));
+        let close_count = Rc::new(Cell::new(0));
+        let backing = CapturingPublishBacking {
+            publications,
+            closed,
+            close_count: close_count.clone(),
+        };
+        let (mut egress, mut ingress) = external_io_from_backing(Box::new(backing));
 
-        let error = serde_json::from_value::<MessageBusConfig>(config_json).unwrap_err();
-        assert!(error.to_string().contains("unknown field `backing`"));
+        egress.close();
+        ingress.close();
+
+        assert_eq!(close_count.get(), 1);
     }
 
     #[rstest]
-    #[case("sbe", SerializationEncoding::Sbe)]
-    #[case("capnp", SerializationEncoding::Capnp)]
-    fn test_deserialize_message_bus_config_with_schema_encoding(
-        #[case] encoding_name: &str,
-        #[case] expected: SerializationEncoding,
-    ) {
-        let config_json = json!({
-            "encoding": encoding_name,
-        });
+    fn test_external_io_from_backing_close_does_not_depend_on_backing_is_closed() {
+        let publications = Rc::new(RefCell::new(Vec::new()));
+        let closed = Rc::new(Cell::new(true));
+        let close_count = Rc::new(Cell::new(0));
+        let backing = CapturingPublishBacking {
+            publications,
+            closed,
+            close_count: close_count.clone(),
+        };
+        let (mut egress, mut ingress) = external_io_from_backing(Box::new(backing));
 
-        let config: MessageBusConfig = serde_json::from_value(config_json).unwrap();
-        assert_eq!(config.encoding, expected);
+        egress.close();
+        ingress.close();
+
+        assert_eq!(close_count.get(), 1);
+    }
+
+    #[rstest]
+    fn test_external_io_from_backing_default_receiver_is_unavailable() {
+        let publications = Rc::new(RefCell::new(Vec::new()));
+        let closed = Rc::new(Cell::new(false));
+        let close_count = Rc::new(Cell::new(0));
+        let backing = CapturingPublishBacking {
+            publications,
+            closed,
+            close_count,
+        };
+        let (_egress, mut ingress) = external_io_from_backing(Box::new(backing));
+
+        let error = ingress
+            .take_receiver()
+            .expect_err("egress-only backing should not provide ingress receiver");
+
+        assert_eq!(error.to_string(), "external ingress receiver unavailable");
     }
 }

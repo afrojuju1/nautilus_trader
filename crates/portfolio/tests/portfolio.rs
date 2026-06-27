@@ -613,7 +613,7 @@ fn test_order_topic_republishes_last_account_state_without_order_update(
         .price(Price::new(50000.0, 0))
         .build();
     let accepted = OrderEventAny::Accepted(accept_order(&order));
-    let topic = switchboard::get_event_orders_topic(order.strategy_id());
+    let topic = switchboard::get_event_order_topic(order.strategy_id());
 
     msgbus::publish_order_event(topic, &accepted);
 
@@ -696,7 +696,7 @@ fn test_order_endpoint_then_topic_publishes_account_state_once(
         MessagingSwitchboard::portfolio_update_order(),
         accepted_event.clone(),
     );
-    let topic = switchboard::get_event_orders_topic(order.strategy_id());
+    let topic = switchboard::get_event_order_topic(order.strategy_id());
     msgbus::publish_order_event(topic, &accepted_event);
 
     let captured = captured.borrow();
@@ -1305,7 +1305,7 @@ fn test_rejected_endpoint_then_topic_republishes_existing_account_state_once(
         MessagingSwitchboard::portfolio_update_order(),
         rejected_event.clone(),
     );
-    let topic = switchboard::get_event_orders_topic(order.strategy_id());
+    let topic = switchboard::get_event_order_topic(order.strategy_id());
     msgbus::publish_order_event(topic, &rejected_event);
 
     let captured = captured.borrow();
@@ -2919,7 +2919,10 @@ fn test_position_records_account_currency_realized_pnl(
         .unwrap();
     simple_cache.set_mark_xrate(Currency::USD(), Currency::EUR(), 0.9);
 
-    let config = PortfolioConfig::builder().use_mark_xrates(true).build();
+    let config = PortfolioConfig::builder()
+        .use_mark_xrates(true)
+        .build()
+        .unwrap();
     let mut portfolio = Portfolio::new(
         Rc::new(RefCell::new(simple_cache)),
         Rc::new(RefCell::new(clock)),
@@ -4313,7 +4316,8 @@ fn test_snapshot_timer_arms_and_disarms_on_position_lifecycle(
 
     let config = PortfolioConfig::builder()
         .snapshot_interval_ms(1_000)
-        .build();
+        .build()
+        .unwrap();
 
     let mut portfolio = Portfolio::new(
         Rc::new(RefCell::new(simple_cache)),
@@ -4751,7 +4755,10 @@ fn test_equity_cash_account_foreign_settlement_converts(
         .unwrap();
     simple_cache.set_mark_xrate(Currency::USD(), Currency::EUR(), 0.9);
 
-    let config = PortfolioConfig::builder().use_mark_xrates(true).build();
+    let config = PortfolioConfig::builder()
+        .use_mark_xrates(true)
+        .build()
+        .unwrap();
 
     let mut portfolio = Portfolio::new(
         Rc::new(RefCell::new(simple_cache)),
@@ -4829,7 +4836,10 @@ fn test_equity_rounds_once_across_small_foreign_positions(
         .unwrap();
     simple_cache.set_mark_xrate(Currency::USD(), Currency::EUR(), 0.004);
 
-    let config = PortfolioConfig::builder().use_mark_xrates(true).build();
+    let config = PortfolioConfig::builder()
+        .use_mark_xrates(true)
+        .build()
+        .unwrap();
 
     let mut portfolio = Portfolio::new(
         Rc::new(RefCell::new(simple_cache)),
@@ -4905,7 +4915,10 @@ fn test_missing_xrate_flags_instrument(
         .add_instrument(instrument_audusd.clone())
         .unwrap();
 
-    let config = PortfolioConfig::builder().use_mark_xrates(true).build();
+    let config = PortfolioConfig::builder()
+        .use_mark_xrates(true)
+        .build()
+        .unwrap();
 
     let mut portfolio = Portfolio::new(
         Rc::new(RefCell::new(simple_cache)),
@@ -5156,7 +5169,8 @@ fn test_initialize_positions_arms_snapshot_timer_for_reconciled_venues(
 
     let config = PortfolioConfig::builder()
         .snapshot_interval_ms(1_000)
-        .build();
+        .build()
+        .unwrap();
 
     // Pre-populate the cache with an open position BEFORE the Portfolio exists,
     // mimicking live-node state after startup reconciliation.
@@ -5221,7 +5235,8 @@ fn test_emit_snapshot_publishes_and_appends_to_ring(instrument_audusd: Instrumen
 
     let config = PortfolioConfig::builder()
         .snapshot_interval_ms(1_000)
-        .build();
+        .build()
+        .unwrap();
     let mut portfolio = Portfolio::new(cache, clock, Some(config));
 
     // Capture published snapshots
@@ -5298,7 +5313,8 @@ fn test_reset_cancels_snapshot_timers(
 
     let config = PortfolioConfig::builder()
         .snapshot_interval_ms(1_000)
-        .build();
+        .build()
+        .unwrap();
 
     let mut portfolio = Portfolio::new(
         Rc::new(RefCell::new(simple_cache)),
@@ -5349,5 +5365,70 @@ fn test_reset_cancels_snapshot_timers(
             .iter()
             .any(|n| *n == expected_name),
         "reset() should cancel any armed portfolio snapshot timer"
+    );
+}
+
+#[rstest]
+fn test_portfolio_statistics_returns_snapshot(
+    mut simple_cache: Cache,
+    clock: TestClock,
+    instrument_audusd: InstrumentAny,
+) {
+    let account_id = AccountId::new("SIM-001");
+    simple_cache
+        .add_instrument(instrument_audusd.clone())
+        .unwrap();
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(simple_cache)),
+        Rc::new(RefCell::new(clock)),
+        None,
+    );
+
+    let account_state = get_cash_account(Some(account_id.as_str()));
+    portfolio.update_account(&account_state);
+
+    let position_id = PositionId::new("P-STATS-1");
+    let fill_open = make_fill_for_account(
+        &instrument_audusd,
+        account_id,
+        OrderSide::Buy,
+        Quantity::from("100000"),
+        Price::new(0.80000, instrument_audusd.price_precision()),
+        position_id,
+    );
+    let mut position = Position::new(&instrument_audusd, fill_open);
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_position(&position, OmsType::Hedging)
+        .unwrap();
+    portfolio.update_position(&PositionEvent::PositionOpened(get_open_position(&position)));
+
+    let fill_close = make_fill_for_account(
+        &instrument_audusd,
+        account_id,
+        OrderSide::Sell,
+        Quantity::from("100000"),
+        Price::new(0.80100, instrument_audusd.price_precision()),
+        position_id,
+    );
+    position.apply(&fill_close);
+    portfolio
+        .cache()
+        .borrow_mut()
+        .update_position(&position)
+        .unwrap();
+    portfolio.update_position(&PositionEvent::PositionClosed(get_close_position(
+        &position,
+    )));
+
+    let snapshot = portfolio.statistics();
+
+    assert!(!snapshot.pnls.is_empty());
+    assert!(
+        snapshot
+            .pnls
+            .values()
+            .all(|m| m.contains_key("PnL (total)"))
     );
 }

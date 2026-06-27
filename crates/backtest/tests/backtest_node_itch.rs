@@ -244,7 +244,7 @@ fn test_itch_node_grid_market_maker() {
     let unlimited = RateLimit::new(1_000_000, 1_000_000_000);
     let engine_config = BacktestEngineConfig {
         risk_engine: Some(RiskEngineConfig {
-            max_order_submit: unlimited.clone(),
+            max_order_submit: unlimited,
             max_order_modify: unlimited,
             ..Default::default()
         }),
@@ -263,12 +263,15 @@ fn test_itch_node_grid_market_maker() {
     let mut node = BacktestNode::new(vec![config]).unwrap();
     node.build().unwrap();
 
-    let grid_config = GridMarketMakerConfig::new(instrument_id, Quantity::from("100"))
-        .with_trade_size(Quantity::from("100"))
-        .with_num_levels(3)
-        .with_grid_step_bps(10)
-        .with_skew_factor(0.01)
-        .with_requote_threshold_bps(5);
+    let grid_config = GridMarketMakerConfig::builder()
+        .instrument_id(instrument_id)
+        .max_position(Quantity::from("100"))
+        .trade_size(Quantity::from("100"))
+        .num_levels(3)
+        .grid_step_bps(10)
+        .skew_factor(0.01)
+        .requote_threshold_bps(5)
+        .build();
     let strategy = GridMarketMaker::new(grid_config);
 
     let engine = node.get_engine_mut(&config_id).unwrap();
@@ -299,7 +302,7 @@ fn test_itch_node_streaming_grid_market_maker() {
     let unlimited = RateLimit::new(1_000_000, 1_000_000_000);
     let engine_config = BacktestEngineConfig {
         risk_engine: Some(RiskEngineConfig {
-            max_order_submit: unlimited.clone(),
+            max_order_submit: unlimited,
             max_order_modify: unlimited,
             ..Default::default()
         }),
@@ -320,12 +323,15 @@ fn test_itch_node_streaming_grid_market_maker() {
     let mut node = BacktestNode::new(vec![config]).unwrap();
     node.build().unwrap();
 
-    let grid_config = GridMarketMakerConfig::new(instrument_id, Quantity::from("100"))
-        .with_trade_size(Quantity::from("100"))
-        .with_num_levels(3)
-        .with_grid_step_bps(10)
-        .with_skew_factor(0.01)
-        .with_requote_threshold_bps(5);
+    let grid_config = GridMarketMakerConfig::builder()
+        .instrument_id(instrument_id)
+        .max_position(Quantity::from("100"))
+        .trade_size(Quantity::from("100"))
+        .num_levels(3)
+        .grid_step_bps(10)
+        .skew_factor(0.01)
+        .requote_threshold_bps(5)
+        .build();
     let strategy = GridMarketMaker::new(grid_config);
 
     let engine = node.get_engine_mut(&config_id).unwrap();

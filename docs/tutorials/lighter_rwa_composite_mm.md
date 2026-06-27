@@ -7,7 +7,9 @@ Lighter mid, then shifts both sides from a normalized Databento residual and the
 current Lighter inventory.
 
 The setup uses a Rust [`LiveNode`][live-node], while the strategy itself runs as the native
-Rust `CompositeMarketMaker` strategy.
+Rust `CompositeMarketMaker` strategy. If you are new to the Lighter adapter, start with
+[Get started with Lighter][lighter-get-started] first. That guide isolates the Rust and Python v2
+data-client paths before this tutorial adds Databento signal data and live order flow.
 
 ## Introduction
 
@@ -37,7 +39,7 @@ quote center up or down through the normalized residual.
 ```mermaid
 flowchart LR
     subgraph Databento ["Databento data client"]
-        DQ["NVDA.EQUS QuoteTick<br/>dataset = EQUS.PLUS<br/>schema = mbp-1"]
+        DQ["NVDA.EQUS QuoteTick<br/>dataset = EQUS.MINI<br/>schema = mbp-1"]
         DS["signal_mid = (bid + ask) / 2"]
         DR["residual = signal_mid / baseline - 1"]
     end
@@ -72,8 +74,10 @@ inside the same event-driven runtime.
 - A Cargo project with the Nautilus, Lighter, and Databento crates as
   dependencies (see [Project setup](#project-setup)).
 - Python 3.12+ to regenerate the rendered panels.
-- A Databento API key with live access to Databento US Equities Plus
-  (`EQUS.PLUS`) for the bundled `NVDA.EQUS` route.
+- A Databento API key with live access to Databento US Equities Mini
+  (`EQUS.MINI`), the default dataset for the bundled `NVDA.EQUS` route. Higher
+  tiers such as `EQUS.PLUS` need a separate Databento license; select one with
+  `venue_dataset_map` when your account is entitled.
 - Lighter API credentials (numeric account index, API key index, and API secret)
   for the configured environment (testnet by default), required only to connect
   and submit orders.
@@ -135,14 +139,17 @@ Lighter traded market:
 
 | Role              | Instrument ID       | Source    | Notes                                      |
 | ----------------- | ------------------- | --------- | ------------------------------------------ |
-| Signal instrument | `NVDA.EQUS`         | Databento | EQUS.PLUS top‑of‑book quote updates.       |
+| Signal instrument | `NVDA.EQUS`         | Databento | EQUS.MINI top‑of‑book quote updates.       |
 | Target instrument | `NVDA-PERP.LIGHTER` | Lighter   | RWA perpetual traded through Lighter.      |
 
 Subscribing to `NVDA.EQUS` requests top-of-book (`mbp-1`) quotes for `NVDA` from
-Databento's `EQUS.PLUS` dataset by default, delivered as a single `QuoteTick`
-stream. The adapter resolves the `EQUS` venue from a publishers file: the
-example points `DatabentoLiveClientConfig` at the `publishers.json` bundled with
-the Databento adapter. See [Instrument IDs and symbology][databento-symbology]
+Databento's `EQUS.MINI` dataset by default, delivered as a single `QuoteTick`
+stream. `EQUS.MINI` is the lowest-cost consolidated US equities tier; richer
+tiers such as `EQUS.PLUS` need a separate Databento license and can be selected
+with the client's `venue_dataset_map` (for example `{"EQUS": "EQUS.PLUS"}`) once
+your account is entitled. The adapter resolves the `EQUS` venue from a publishers
+file: the example points `DatabentoLiveClientConfig` at the `publishers.json`
+bundled with the Databento adapter. See [Instrument IDs and symbology][databento-symbology]
 for the mapping rules.
 
 The older Databento Equities Basic (`DBEQ.BASIC`) dataset name appears in some
@@ -172,11 +179,13 @@ instead of hiding it in a custom strategy.
 There are two ways to run this: from a NautilusTrader checkout via the shipped
 [Lighter NVDA composite market maker example][example-script] binary, or by
 copying the node wiring below into a `main` in your own project that depends on
-the crates from [Project setup](#project-setup).
+the crates from [Project setup](#project-setup). A Python v2 counterpart also lives at
+[`python/examples/lighter/nvda_composite_mm.py`][python-example-script]; it uses the same Rust
+strategy through PyO3.
 
-From a checkout, with the credential variables set, the shipped binary builds
-the node, registers all three clients, adds the native strategy, and exits without
-connecting:
+From a checkout, with the credential variables set, the shipped binary connects
+the data and execution clients. It defaults to `DRY_RUN = true`, which starts
+the clients without adding the order-submitting strategy:
 
 ```bash
 cargo run --bin lighter-nvda-composite-mm --package nautilus-tutorials --features examples
@@ -198,30 +207,32 @@ let signal_instrument_id = InstrumentId::from(SIGNAL_INSTRUMENT_ID);
 let databento_api_key = get_env_var("DATABENTO_API_KEY")?;
 let databento_config =
     DatabentoLiveClientConfig::new(databento_api_key, publishers_filepath, true, true);
-let lighter_data_config = LighterDataClientConfig {
-    environment: lighter_environment,
-    ..Default::default()
-};
+let lighter_data_config = LighterDataClientConfig::builder()
+    .environment(lighter_environment)
+    .build();
 let lighter_exec_config = LighterExecClientConfig::builder()
     .trader_id(trader_id)
     .account_id(account_id)
     .environment(lighter_environment)
     .build();
 
-let strategy_config =
-    CompositeMarketMakerConfig::new(instrument_id, signal_instrument_id, max_position)
-        .with_strategy_id(StrategyId::from("NVDA_COMPOSITE_MM-001"))
-        .with_order_id_tag("001".to_string())
-        .with_trade_size(trade_size)
-        .with_half_spread_bps(HALF_SPREAD_BPS)
-        .with_inventory_skew_factor(INVENTORY_SKEW_FACTOR)
-        .with_signal_skew_factor(SIGNAL_SKEW_FACTOR)
-        .with_requote_threshold_bps(REQUOTE_THRESHOLD_BPS)
-        .with_on_cancel_resubmit(ON_CANCEL_RESUBMIT);
+let mut strategy_config = CompositeMarketMakerConfig::builder()
+    .instrument_id(instrument_id)
+    .signal_instrument_id(signal_instrument_id)
+    .max_position(max_position)
+    .trade_size(trade_size)
+    .half_spread_bps(HALF_SPREAD_BPS)
+    .inventory_skew_factor(INVENTORY_SKEW_FACTOR)
+    .signal_skew_factor(SIGNAL_SKEW_FACTOR)
+    .requote_threshold_bps(REQUOTE_THRESHOLD_BPS)
+    .on_cancel_resubmit(ON_CANCEL_RESUBMIT)
+    .build();
+strategy_config.base.strategy_id = Some(StrategyId::from("NVDA_COMPOSITE_MM-001"));
+strategy_config.base.order_id_tag = Some("001".to_string());
 
 let mut node = LiveNode::builder(trader_id, Environment::Live)?
     .with_name("LIGHTER-NVDA-COMPOSITE-MM-001".to_string())
-    .with_reconciliation(RUN_LIVE)
+    .with_reconciliation(!DRY_RUN)
     .add_data_client(
         None,
         Box::new(DatabentoDataClientFactory::new()),
@@ -239,15 +250,15 @@ let mut node = LiveNode::builder(trader_id, Environment::Live)?
     )?
     .build()?;
 
-node.add_strategy(CompositeMarketMaker::new(strategy_config))?;
+if !DRY_RUN {
+    node.add_strategy(CompositeMarketMaker::new(strategy_config))?;
+}
 ```
 
-To connect and allow order submission, edit the constants near the top of the
-example source:
+To allow order submission, edit the constant near the top of the example source:
 
 ```rust
-const RUN_LIVE: bool = true;
-const ALLOW_LIVE_ORDERS: bool = true;
+const DRY_RUN: bool = false;
 ```
 
 Then run the same command:
@@ -257,10 +268,9 @@ cargo run --bin lighter-nvda-composite-mm --package nautilus-tutorials --feature
 ```
 
 :::warning
-This command can submit live orders. Start with the smallest accepted size on a
-funded test account or a mainnet account sized for loss. Confirm the active
-instrument ID, account ID, numeric account index, and Lighter credentials before
-setting `RUN_LIVE` and `ALLOW_LIVE_ORDERS` to `true`.
+This command can submit live orders when `DRY_RUN` is `false`. Start with the smallest accepted size
+on a funded test account or a mainnet account sized for loss. Confirm the active instrument ID,
+account ID, numeric account index, and Lighter credentials before changing it.
 :::
 
 For a testnet smoke run, keep `LIGHTER_ENVIRONMENT` as
@@ -274,7 +284,7 @@ Databento residual remains zero until the first `NVDA.EQUS` quote arrives.
 | Parameter               | Value               | Description                                                    |
 | ----------------------- | ------------------- | -------------------------------------------------------------- |
 | `instrument_id`         | `NVDA-PERP.LIGHTER` | Lighter RWA perpetual to quote.                                |
-| `signal_instrument_id`  | `NVDA.EQUS`         | Databento US Equities Plus signal feed.                        |
+| `signal_instrument_id`  | `NVDA.EQUS`         | Databento US Equities Mini signal feed.                        |
 | `trade_size`            | `0.05`              | Size per bid or ask.                                           |
 | `max_position`          | `0.20`              | Hard cap on net Lighter exposure.                              |
 | `half_spread_bps`       | `25`                | Half‑spread around the Lighter anchor.                         |
@@ -354,6 +364,7 @@ the Lighter BBO only for post-only and basis limits.
 [composite-market-maker]: https://github.com/nautechsystems/nautilus_trader/blob/develop/crates/trading/src/examples/strategies/composite_market_maker/strategy.rs
 [live-node]: ../how_to/run_rust_live_trading.md
 [project-setup]: ../concepts/rust.md#project-setup
+[lighter-get-started]: ../how_to/get_started_lighter.md
 [databento-symbology]: ../integrations/databento.md#instrument-ids-and-symbology
 [databento-publishers]: https://github.com/nautechsystems/nautilus_trader/blob/develop/crates/adapters/databento/publishers.json
 [RWA docs]: https://docs.lighter.xyz/trading/real-world-assets-rwas
@@ -361,3 +372,4 @@ the Lighter BBO only for post-only and basis limits.
 [market details endpoint]: https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails
 [Databento US Equities]: https://databento.com/blog/introducing-databento-us-equities
 [example-script]: https://github.com/nautechsystems/nautilus_trader/blob/develop/examples/tutorials/src/bin/lighter_nvda_composite_mm.rs
+[python-example-script]: https://github.com/nautechsystems/nautilus_trader/blob/develop/python/examples/lighter/nvda_composite_mm.py

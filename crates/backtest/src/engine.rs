@@ -86,9 +86,9 @@ use crate::{
 /// - Strategy and portfolio performance analysis.
 /// - Transition from backtesting to live trading.
 pub struct BacktestEngine {
+    kernel: NautilusKernel,
     instance_id: UUID4,
     config: BacktestEngineConfig,
-    kernel: NautilusKernel,
     accumulator: TimeEventAccumulator,
     run_config_id: Option<String>,
     run_id: Option<UUID4>,
@@ -137,11 +137,13 @@ impl BacktestEngine {
         cache_config.drop_instruments_on_reset = false;
         config.cache = Some(cache_config);
         let kernel = NautilusKernel::new("BacktestEngine".to_string(), config.clone())?;
+        let instance_id = kernel.instance_id;
+
         Ok(Self {
-            instance_id: kernel.instance_id,
+            kernel,
+            instance_id,
             config,
             accumulator: TimeEventAccumulator::new(),
-            kernel,
             run_config_id: None,
             run_id: None,
             venues: AHashMap::new(),
@@ -331,6 +333,8 @@ impl BacktestEngine {
     pub fn add_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
         let instrument_id = instrument.id();
         if let Some(exchange) = self.venues.get(&instrument.id().venue) {
+            let previous_expiration_ns = exchange.borrow().instrument_expiration(instrument_id);
+
             if matches!(
                 instrument,
                 InstrumentAny::CurrencyPair(_) | InstrumentAny::TokenizedAsset(_)
@@ -344,6 +348,19 @@ impl BacktestEngine {
             exchange.borrow_mut().add_instrument(instrument.clone())?;
             if let Some(expiration_ns) = instrument.expiration_ns() {
                 self.set_instrument_expiration_timer(exchange, instrument_id, expiration_ns)?;
+            }
+
+            if let Some(previous_expiration_ns) = previous_expiration_ns
+                && instrument.expiration_ns() != Some(previous_expiration_ns)
+                && !exchange
+                    .borrow()
+                    .has_unprocessed_instrument_expiration(previous_expiration_ns)
+            {
+                let timer_name = Self::instrument_expiration_timer_name(
+                    instrument_id.venue,
+                    previous_expiration_ns,
+                );
+                self.kernel.clock.borrow_mut().cancel_timer(&timer_name);
             }
         } else {
             anyhow::bail!(
@@ -490,34 +507,6 @@ impl BacktestEngine {
         Ok(())
     }
 
-    /// Adds a strategy to the backtest engine.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the strategy is already registered or the trader is in an invalid
-    /// state for strategy registration.
-    pub fn add_strategy<T>(&mut self, strategy: T) -> anyhow::Result<()>
-    where
-        T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
-    {
-        self.kernel.trader.borrow_mut().add_strategy(strategy)
-    }
-
-    /// Adds the given strategies to the backtest engine. Stops at the first error.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any strategy fails to register; preceding strategies remain registered.
-    pub fn add_strategies<T>(&mut self, strategies: Vec<T>) -> anyhow::Result<()>
-    where
-        T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
-    {
-        for strategy in strategies {
-            self.add_strategy(strategy)?;
-        }
-        Ok(())
-    }
-
     /// Adds an actor to the backtest engine.
     ///
     /// # Errors
@@ -542,6 +531,34 @@ impl BacktestEngine {
     {
         for actor in actors {
             self.add_actor(actor)?;
+        }
+        Ok(())
+    }
+
+    /// Adds a strategy to the backtest engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy is already registered or the trader is in an invalid
+    /// state for strategy registration.
+    pub fn add_strategy<T>(&mut self, strategy: T) -> anyhow::Result<()>
+    where
+        T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
+    {
+        self.kernel.trader.borrow_mut().add_strategy(strategy)
+    }
+
+    /// Adds the given strategies to the backtest engine. Stops at the first error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any strategy fails to register; preceding strategies remain registered.
+    pub fn add_strategies<T>(&mut self, strategies: Vec<T>) -> anyhow::Result<()>
+    where
+        T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
+    {
+        for strategy in strategies {
+            self.add_strategy(strategy)?;
         }
         Ok(())
     }
@@ -1011,18 +1028,10 @@ impl BacktestEngine {
             snapshot_positions,
         );
 
-        let mut analyzer = self.build_analyzer(&cache, &positions);
-        analyzer.recorded_realized_pnls = self.kernel.portfolio.borrow().recorded_realized_pnls();
-        let mut stats_pnls = AHashMap::new();
-
-        for currency in analyzer.currencies() {
-            if let Ok(pnls) = analyzer.get_performance_stats_pnls(Some(currency), None) {
-                stats_pnls.insert(currency.code.to_string(), pnls);
-            }
-        }
-
-        let stats_returns = analyzer.get_performance_stats_returns();
-        let stats_general = analyzer.get_performance_stats_general();
+        let stats = self.kernel.portfolio.borrow().statistics();
+        let stats_pnls = stats.pnls;
+        let stats_returns = stats.returns;
+        let stats_general = stats.general;
 
         BacktestResult {
             trader_id: self.config.trader_id().to_string(),
@@ -1146,46 +1155,6 @@ impl BacktestEngine {
         }
 
         summary
-    }
-
-    fn build_analyzer(&self, cache: &Cache, positions: &[Position]) -> PortfolioAnalyzer {
-        let mut analyzer = PortfolioAnalyzer::default();
-        let mut snapshot_positions = Vec::new();
-
-        for position in positions {
-            snapshot_positions.extend(cache.position_snapshots(Some(&position.id), None));
-        }
-
-        // Aggregate starting and current balances across all venue accounts
-        for venue in self.venues.keys() {
-            if let Some(account) = cache.account_for_venue(venue) {
-                let account_ref: &dyn Account = match &*account {
-                    AccountAny::Margin(margin) => margin,
-                    AccountAny::Cash(cash) => cash,
-                    AccountAny::Betting(betting) => betting,
-                };
-
-                for (currency, money) in account_ref.starting_balances() {
-                    analyzer
-                        .account_balances_starting
-                        .entry(currency)
-                        .and_modify(|existing| *existing = *existing + money)
-                        .or_insert(money);
-                }
-
-                for (currency, money) in account_ref.balances_total() {
-                    analyzer
-                        .account_balances
-                        .entry(currency)
-                        .and_modify(|existing| *existing = *existing + money)
-                        .or_insert(money);
-                }
-            }
-        }
-
-        analyzer.add_positions(positions);
-        analyzer.add_positions(&snapshot_positions);
-        analyzer
     }
 
     fn route_data_to_exchange(&self, data: &Data) {
@@ -1402,7 +1371,12 @@ impl BacktestEngine {
             return Ok(());
         }
 
-        let timer_name = Self::instrument_expiration_timer_name(instrument_id);
+        let timer_name = Self::instrument_expiration_timer_name(instrument_id.venue, expiration_ns);
+        let timer_key = ustr::Ustr::from(timer_name.as_str());
+        if self.kernel.clock.borrow().timer_exists(&timer_key) {
+            return Ok(());
+        }
+
         let exchange: Weak<RefCell<SimulatedExchange>> = Rc::downgrade(exchange);
         let callback: Rc<dyn Fn(TimeEvent)> = Rc::new(move |event: TimeEvent| {
             if let Some(exchange) = exchange.upgrade() {
@@ -1411,11 +1385,7 @@ impl BacktestEngine {
                     .process_instrument_expirations(event.ts_event);
             }
         });
-        let timer_key = ustr::Ustr::from(timer_name.as_str());
         let mut clock = self.kernel.clock.borrow_mut();
-        if clock.timer_exists(&timer_key) {
-            clock.cancel_timer(&timer_name);
-        }
 
         clock.set_time_alert_ns(
             &timer_name,
@@ -1427,8 +1397,8 @@ impl BacktestEngine {
         Ok(())
     }
 
-    fn instrument_expiration_timer_name(instrument_id: InstrumentId) -> String {
-        format!("INSTRUMENT-EXPIRATION:{instrument_id}")
+    fn instrument_expiration_timer_name(venue: Venue, expiration_ns: UnixNanos) -> String {
+        format!("INSTRUMENT-EXPIRATION:{venue}:{expiration_ns}")
     }
 
     fn schedule_funding_settlement_if_required(
@@ -1461,11 +1431,7 @@ impl BacktestEngine {
                     .process_funding_settlement(instrument_id, event.ts_event);
             }
         });
-        let timer_key = ustr::Ustr::from(timer_name.as_str());
         let mut clock = self.kernel.clock.borrow_mut();
-        if clock.timer_exists(&timer_key) {
-            clock.cancel_timer(&timer_name);
-        }
 
         clock.set_time_alert_ns(
             &timer_name,
@@ -1715,8 +1681,13 @@ impl BacktestEngine {
             return;
         }
 
-        let mut analyzer = self.build_analyzer(&cache, &positions);
-        analyzer.recorded_realized_pnls = self.kernel.portfolio.borrow().recorded_realized_pnls();
+        let accounts = cache.accounts_all_owned();
+        let mut snapshots = Vec::new();
+        for position in &positions {
+            snapshots.extend(cache.position_snapshots(Some(&position.id), None));
+        }
+        let recorded = self.kernel.portfolio.borrow().recorded_realized_pnls();
+        let analyzer = PortfolioAnalyzer::from_accounts(&accounts, &positions, &snapshots, recorded);
         log_portfolio_performance(&analyzer);
     }
 
@@ -2053,7 +2024,8 @@ mod tests {
                 .cache(
                     CacheConfig::builder()
                         .drop_instruments_on_reset(value)
-                        .build(),
+                        .build()
+                        .unwrap(),
                 )
                 .build(),
         };

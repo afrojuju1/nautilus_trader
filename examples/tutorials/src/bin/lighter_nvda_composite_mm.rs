@@ -20,8 +20,8 @@
 //! - Lighter `NVDA-PERP.LIGHTER` data and execution as the target instrument.
 //! - The native Rust `CompositeMarketMaker` strategy.
 //!
-//! The default path builds the node and exits without connecting. Edit
-//! `RUN_LIVE` and `ALLOW_LIVE_ORDERS` below to connect and allow live post-only
+//! The default path connects the data and execution clients without adding the
+//! order-submitting strategy. Set `DRY_RUN` to `false` to allow live post-only
 //! order submission.
 //!
 //! Run with:
@@ -55,8 +55,9 @@ use nautilus_trading::examples::strategies::composite_market_maker::{
     CompositeMarketMaker, CompositeMarketMakerConfig,
 };
 
-const RUN_LIVE: bool = false;
-const ALLOW_LIVE_ORDERS: bool = false;
+// DRY_RUN connects the node and clients without adding the order-submitting
+// CompositeMarketMaker strategy.
+const DRY_RUN: bool = true;
 const LIGHTER_ENVIRONMENT: LighterEnvironment = LighterEnvironment::Testnet;
 
 const TRADER_ID: &str = "TESTER-001";
@@ -78,12 +79,6 @@ const EXPIRE_TIME_SECS: Option<u64> = None;
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
 
-    if RUN_LIVE && !ALLOW_LIVE_ORDERS {
-        return Err(invalid_input_error(
-            "set ALLOW_LIVE_ORDERS to true before running live".to_string(),
-        ));
-    }
-
     let environment = Environment::Live;
     let lighter_environment = LIGHTER_ENVIRONMENT;
     let trader_id = TraderId::from(TRADER_ID);
@@ -102,10 +97,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .join("../../crates/adapters/databento/publishers.json");
     let databento_config =
         DatabentoLiveClientConfig::new(databento_api_key, publishers_filepath, true, true);
-    let lighter_data_config = LighterDataClientConfig {
-        environment: lighter_environment,
-        ..Default::default()
-    };
+    let lighter_data_config = LighterDataClientConfig::builder()
+        .environment(lighter_environment)
+        .build();
     let lighter_exec_config = LighterExecClientConfig::builder()
         .trader_id(trader_id)
         .account_id(account_id)
@@ -115,28 +109,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let max_position = parse_quantity("MAX_POSITION", MAX_POSITION)?;
     let trade_size = parse_quantity("TRADE_SIZE", TRADE_SIZE)?;
 
-    let strategy_config =
-        CompositeMarketMakerConfig::new(instrument_id, signal_instrument_id, max_position)
-            .with_strategy_id(StrategyId::from("NVDA_COMPOSITE_MM-001"))
-            .with_order_id_tag("001".to_string())
-            .with_trade_size(trade_size)
-            .with_half_spread_bps(HALF_SPREAD_BPS)
-            .with_inventory_skew_factor(INVENTORY_SKEW_FACTOR)
-            .with_signal_skew_factor(SIGNAL_SKEW_FACTOR)
-            .with_requote_threshold_bps(REQUOTE_THRESHOLD_BPS)
-            .with_on_cancel_resubmit(ON_CANCEL_RESUBMIT);
-    let strategy_config = match SIGNAL_BASELINE {
-        Some(baseline) => strategy_config.with_signal_baseline(baseline),
-        None => strategy_config,
-    };
-    let strategy_config = match EXPIRE_TIME_SECS {
-        Some(secs) => strategy_config.with_expire_time_secs(secs),
-        None => strategy_config,
-    };
+    let mut strategy_config = CompositeMarketMakerConfig::builder()
+        .instrument_id(instrument_id)
+        .signal_instrument_id(signal_instrument_id)
+        .max_position(max_position)
+        .trade_size(trade_size)
+        .half_spread_bps(HALF_SPREAD_BPS)
+        .inventory_skew_factor(INVENTORY_SKEW_FACTOR)
+        .signal_skew_factor(SIGNAL_SKEW_FACTOR)
+        .requote_threshold_bps(REQUOTE_THRESHOLD_BPS)
+        .on_cancel_resubmit(ON_CANCEL_RESUBMIT)
+        .maybe_signal_baseline(SIGNAL_BASELINE)
+        .maybe_expire_time_secs(EXPIRE_TIME_SECS)
+        .build();
+    strategy_config.base.strategy_id = Some(StrategyId::from("NVDA_COMPOSITE_MM-001"));
+    strategy_config.base.order_id_tag = Some("001".to_string());
 
     let mut node = LiveNode::builder(trader_id, environment)?
         .with_name("LIGHTER-NVDA-COMPOSITE-MM-001".to_string())
-        .with_reconciliation(RUN_LIVE)
+        .with_reconciliation(!DRY_RUN)
         .with_delay_post_stop_secs(5)
         .add_data_client(
             None,
@@ -155,16 +146,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )?
         .build()?;
 
-    node.add_strategy(CompositeMarketMaker::new(strategy_config))?;
-
-    if RUN_LIVE {
-        node.run().await?;
+    if DRY_RUN {
+        println!("DRY_RUN is true; starting clients without the CompositeMarketMaker strategy.");
     } else {
-        println!(
-            "Built Lighter NVDA composite market maker node. \
-             Set RUN_LIVE and ALLOW_LIVE_ORDERS to true in this file to connect."
-        );
+        node.add_strategy(CompositeMarketMaker::new(strategy_config))?;
     }
+
+    node.run().await?;
 
     Ok(())
 }

@@ -32,12 +32,12 @@ The DeFi domain model lives in `nautilus_model::defi`.
 Chains can be loaded by numeric ID with `Chain::from_chain_id` or by name with
 `Chain::from_chain_name`.
 
-| Chain family                                    | Code | Name         | Decimals |
-|-------------------------------------------------|------|--------------|----------|
-| Ethereum and L2s                                | ETH  | Ethereum     | 18       |
-| Polygon                                         | POL  | Polygon      | 18       |
-| Avalanche                                       | AVAX | Avalanche    | 18       |
-| BSC                                             | BNB  | Binance Coin | 18       |
+| Chain family                | Code | Name         | Decimals |
+|-----------------------------|------|--------------|----------|
+| Ethereum and L2s            | ETH  | Ethereum     | 18       |
+| Polygon                     | POL  | Polygon      | 18       |
+| Avalanche                   | AVAX | Avalanche    | 18       |
+| BSC                         | BNB  | Binance Coin | 18       |
 
 ### DEX and pools
 
@@ -80,10 +80,10 @@ cache database path.
 Set the HyperSync token and RPC URLs outside the repository. Do not commit `.env` files containing
 secrets.
 
-```fish
-set -x ENVIO_API_TOKEN "<envio-token>"
-set -x RPC_HTTP_URL "https://your-rpc.example"
-set -x RPC_WSS_URL "wss://your-rpc.example"
+```bash
+export ENVIO_API_TOKEN="<envio-token>"
+export RPC_HTTP_URL="https://your-rpc.example"
+export RPC_WSS_URL="wss://your-rpc.example"
 ```
 
 For local `.env` usage:
@@ -132,7 +132,7 @@ For other chains or archive access, use a directory such as [chainlist.org](http
 
 The development compose file starts Postgres, Redis, and pgAdmin.
 
-```fish
+```bash
 make start-services
 make init-db
 ```
@@ -142,7 +142,7 @@ The default Postgres service listens on `127.0.0.1:5432` with database `nautilus
 
 Check that the schema exists:
 
-```fish
+```bash
 docker exec nautilus-database psql -U nautilus -d nautilus -Atc \
     "select count(*) from information_schema.tables where table_schema='public'"
 ```
@@ -234,16 +234,23 @@ state. Structural state must match exactly: the current tick, active liquidity, 
 gross liquidity, and position liquidity. A mismatch in any of these fails closed, and the snapshot
 is not marked valid.
 
-Two fields are tolerated as non-blocking and logged as a warning rather than an error:
+Three kinds of mismatch are tolerated as non-blocking and logged as a warning rather than an error:
 
 - Sqrt price, which differs when replay is event-scoped but the RPC snapshot is block-scoped.
-- Fee protocol, which lags the on-chain value until `SetFeeProtocol` events are indexed and
-  replayed.
+- Fee protocol, retained as a non-blocking safety net. Uniswap V3 `SetFeeProtocol` events are indexed
+  and applied during replay, so the replayed `fee_protocol` matches the on-chain value for Uniswap V3
+  pools. The tolerance covers residual differences, such as an event not yet synced or a fork's
+  non-Uniswap-V3 fee-protocol semantics.
+- Protocol-fee balances (`protocol_fees_token0` and `protocol_fees_token1`), which can diverge when
+  per-step rounding during replay accrual differs from the on-chain accumulator. The on-chain
+  snapshot reads `protocolFees()` directly, and Uniswap V3 `CollectProtocol` withdrawals are indexed
+  and applied during replay (each withdrawal decrements the tracked balances), so the replayed
+  balances track the on-chain ones.
 
-A fee-protocol-only mismatch still accepts the snapshot, matching backtest replay behavior. The
-accepted snapshot carries the replayed `fee_protocol`, so a profiler restored from it splits protocol
-and LP fees with that lagging setting until `SetFeeProtocol` replay lands. The protocol-fee split on
-such a snapshot can diverge from on-chain until then.
+A non-structural-only mismatch still accepts the snapshot, matching backtest replay behavior. Because
+`SetFeeProtocol` is applied during both the analyze-pool bootstrap and backtest replay-forward, the
+accepted snapshot carries the replayed `fee_protocol` consistent with the events that produced it, so
+a profiler restored from it splits protocol and LP fees with that setting.
 
 ### Snapshot bootstrap guard
 
@@ -253,7 +260,7 @@ target block before syncing pool events. If no usable snapshot exists, or the on
 empty creation-block snapshot with no positions or ticks, it returns `needs_bootstrap` and skips the
 creation-to-target bootstrap for that pool.
 
-```fish
+```bash
 nautilus blockchain analyze-pools \
     --chain ethereum \
     --dex UniswapV3 \
@@ -374,7 +381,7 @@ structural state (tick, liquidity, ticks, positions) still validates to `on_chai
 
 ### HyperSync authentication
 
-```fish
+```bash
 curl -fsS --max-time 15 \
     -H "Authorization: Bearer $ENVIO_API_TOKEN" \
     https://1.hypersync.xyz/height
@@ -384,12 +391,8 @@ Expected result: JSON with a numeric `height`.
 
 ### Small HyperSync query
 
-```fish
-set query (string join '' \
-    '{"from_block":25170900,' \
-    '"to_block":25170901,' \
-    '"include_all_blocks":true,' \
-    '"field_selection":{"block":["number","timestamp","hash"]}}')
+```bash
+query='{"from_block":25170900,"to_block":25170901,"include_all_blocks":true,"field_selection":{"block":["number","timestamp","hash"]}}'
 
 curl -sS --max-time 30 \
     -H "Authorization: Bearer $ENVIO_API_TOKEN" \
@@ -404,7 +407,7 @@ Expected result: HTTP `200` with a non-zero response size.
 
 ### Adapter compile check
 
-```fish
+```bash
 cargo check -p nautilus-blockchain --features hypersync
 ```
 
@@ -414,7 +417,7 @@ This ignored test uses real HyperSync replay for the Ethereum WETH/USDT Uniswap 
 deliberately invalid local HTTP RPC URL. It verifies that final RPC hydration failure returns an
 error instead of allowing a stale snapshot through the construction path.
 
-```fish
+```bash
 cargo test -p nautilus-blockchain --features hypersync \
     live_hypersync_bootstrap_fails_closed_when_rpc_hydration_fails \
     -- --ignored --nocapture
@@ -447,7 +450,24 @@ A DEX can be registered for a chain yet lack the event parsers a command needs. 
 rejects such a DEX up front with `missing pool-event parser(s) for ...`, listing the absent families
 (analysis needs Initialize, Swap, Mint, Burn, and Collect parsers). `sync-dex` likewise rejects a DEX
 that cannot parse `PoolCreated` logs for discovery. This fails fast instead of syncing and erroring
-deep in profiling. PancakeSwap V3 is fully supported on BSC, Base, Arbitrum, and Ethereum.
+deep in profiling.
+
+The two commands need different parsers, so a DEX can support one and not the other:
+
+- `sync-dex` (discovery) needs a `PoolCreated` parser.
+- `analyze-pool(s)` (snapshots) need the Initialize, Swap, Mint, Burn, and Collect parsers, seeding
+  the starting price from Initialize.
+- Replay-ready DEXes additionally parse `SetFeeProtocol`, so replay keeps `fee_protocol` correct.
+
+Uniswap V3 is replay-ready on Ethereum, Base, Arbitrum, and BSC. PancakeSwap V3 is snapshot-capable on
+the same four chains, but has no `SetFeeProtocol` parser, so it is not replay-ready. Aerodrome
+Slipstream is snapshot-capable on Base, but has no `PoolCreated` parser, so `sync-dex` cannot discover
+its pools; register an Aerodrome Slipstream pool another way before `analyze-pool(s)`. Other
+registered DEXes (for example Uniswap V2/V4, Camelot, Fluid) support discovery only. Polygon is a
+valid chain for `sync-blocks`, but has no DEX registrations, so the DEX commands reject it.
+
+`blockchain analyze-pool --help` and `blockchain sync-dex --help` print the current supported chain
+and DEX combinations, derived from the registered parsers.
 
 #### Use checksummed pool addresses
 
@@ -508,7 +528,7 @@ about 935 pools).
 Discover pools first (cheap: `PoolCreated` is sparse, token metadata batches through Multicall3),
 then analyze specific pools:
 
-```fish
+```bash
 ./target/debug/nautilus blockchain sync-dex --chain arbitrum --dex PancakeSwapV3 \
     --rpc-url https://arb1.arbitrum.io/rpc \
     --host 127.0.0.1 --port 5432 --username nautilus --password pass --database nautilus
@@ -520,8 +540,20 @@ then analyze specific pools:
     --concurrency 1
 ```
 
-Verify by counting rows in `pool_swap_event`, `pool_liquidity_event`, `pool_collect_event`,
-`pool_flash_event`, `pool_snapshot`, `pool_position`, and `pool_tick`.
+Verify by counting rows in these tables:
+
+- `pool_swap_event`
+- `pool_liquidity_event`
+- `pool_collect_event`
+- `pool_flash_event`
+- `pool_fee_protocol_update_event`
+- `pool_fee_protocol_collect_event`
+- `pool_snapshot`
+- `pool_position`
+- `pool_tick`
+
+The `pool_fee_protocol_update_event` and `pool_fee_protocol_collect_event` tables stay small, since
+`SetFeeProtocol` and `CollectProtocol` fire rarely (often zero to a handful of times per pool).
 
 ### Gotchas found running this
 
@@ -547,6 +579,52 @@ Verify by counting rows in `pool_swap_event`, `pool_liquidity_event`, `pool_coll
 - The capability guard fails an unregistered combination before any sync: `sync-dex` needs a
   `PoolCreated` parser, and `analyze-pool(s)` need `Initialize`, `Swap`, `Mint`, `Burn`, and `Collect`
   parsers (see [Unsupported DEX combinations fail before sync](#unsupported-dex-combinations-fail-before-sync)).
+
+## Extending the adapter
+
+The event model targets Uniswap V3 concentrated-liquidity pools. `DexPoolData` and its structs encode
+V3 semantics directly: `PoolSwap` carries `sqrt_price_x96` and `tick`, `PoolLiquidityUpdate` carries
+`tick_lower` and `tick_upper`. The `DexType` and `AmmType` enums name other families (Uniswap V2,
+Uniswap V4, Curve, Balancer, Maverick), but only Uniswap V2 (pool discovery) and Uniswap V4
+(`Initialize`) are wired at all.
+
+### Adding an event or protocol family
+
+Design the taxonomy before writing a parser. Most families do not fit the V3 structs: Uniswap V2
+emits `Sync`, Uniswap V4 replaces mint and burn with `ModifyLiquidity` plus `Donate`, and Curve and
+Balancer pools hold more than two tokens. Adding events piecemeal forces optional fields, duplicate
+variants, and renames.
+
+The design pass should:
+
+- Map the protocol's events and decide, per event, whether each reuses, extends, or adds a
+  `DexPoolData` variant.
+- Decide whether the family needs a new taxonomy axis. Singleton or `poolId` protocols (Uniswap V4,
+  Balancer) and multi-token pools (Curve) break the per-pool-address, token-pair assumptions.
+- Name events with the `<concept>_<verb>` convention, such as `fee_protocol_update`. Reserve the
+  literal on-chain event name for signatures and error labels.
+
+Then wire each event through the full path, mirroring an existing one such as `fee_protocol_collect`:
+
+- Event struct
+- HyperSync and RPC parsers
+- `DexExtended` parser slot
+- `DexPoolData` and `DefiData` variants
+- Profiler apply method
+- Event table and its insert
+- `stream_pool_events` UNION arm and row mapper
+- PyO3 binding
+
+Cover it with a parser round-trip test, a profiler apply test, and the parser-parity test.
+
+Incremental sync resumes from each pool's last-synced block, so adding an event type does not
+backfill pools already synced past those blocks: the new event tables stay empty for historical
+ranges. Re-sync a pool from its creation block (a reset sync) to populate them.
+
+### Adding a chain
+
+A new chain is registration only, provided its DEXes reuse modeled events: add the `Chain`, its RPC
+client, and the per-DEX registrations. A chain that brings a new family needs the design pass above.
 
 ## Current limitations
 

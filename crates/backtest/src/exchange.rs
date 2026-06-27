@@ -38,7 +38,7 @@ use nautilus_core::{
 use nautilus_execution::{
     matching_core::RestingOrder,
     matching_engine::{config::OrderMatchingEngineConfig, engine::OrderMatchingEngine},
-    models::{fee::FeeModelAny, fill::FillModelAny, latency::LatencyModel},
+    models::{fee::FeeModelHandle, fill::FillModelAny, latency::LatencyModel},
 };
 use nautilus_model::{
     accounts::{Account, AccountAny, margin_model::MarginModelAny},
@@ -131,7 +131,7 @@ pub struct SimulatedExchange {
     book_type: BookType,
     default_leverage: Decimal,
     exec_client: Option<Rc<dyn ExecutionClient>>,
-    fee_model: FeeModelAny,
+    fee_model: FeeModelHandle,
     fill_model: FillModelAny,
     latency_model: Option<Box<dyn LatencyModel>>,
     instruments: AHashMap<InstrumentId, InstrumentAny>,
@@ -216,7 +216,7 @@ impl SimulatedExchange {
             book_type: config.book_type,
             default_leverage,
             exec_client: None,
-            fee_model: config.fee_model,
+            fee_model: config.fee_model.into(),
             fill_model: config.fill_model,
             latency_model: config.latency_model,
             instruments: AHashMap::new(),
@@ -276,7 +276,7 @@ impl SimulatedExchange {
     /// Sets the fill model for the exchange.
     pub fn set_fill_model(&mut self, fill_model: FillModelAny) {
         for matching_engine in self.matching_engines.values_mut() {
-            matching_engine.set_fill_model(fill_model.clone());
+            matching_engine.set_fill_model(fill_model.clone().into());
             log::info!(
                 "Setting fill model for {} to {}",
                 matching_engine.venue,
@@ -305,6 +305,23 @@ impl SimulatedExchange {
     /// Returns an iterator over the instrument IDs registered with this exchange.
     pub fn instrument_ids(&self) -> impl Iterator<Item = &InstrumentId> {
         self.instruments.keys()
+    }
+
+    /// Returns the expiration timestamp for the given instrument, if present.
+    #[must_use]
+    pub fn instrument_expiration(&self, instrument_id: InstrumentId) -> Option<UnixNanos> {
+        self.matching_engines
+            .get(&instrument_id)
+            .and_then(|matching_engine| matching_engine.instrument.expiration_ns())
+    }
+
+    /// Returns whether an unprocessed instrument remains for the given expiration.
+    #[must_use]
+    pub fn has_unprocessed_instrument_expiration(&self, expiration_ns: UnixNanos) -> bool {
+        self.matching_engines.values().any(|matching_engine| {
+            !matching_engine.is_expiration_processed()
+                && matching_engine.instrument.expiration_ns() == Some(expiration_ns)
+        })
     }
 
     pub fn initialize_account(&mut self) {
@@ -404,7 +421,7 @@ impl SimulatedExchange {
         let matching_engine = OrderMatchingEngine::new(
             instrument,
             raw_id,
-            self.fill_model.clone(),
+            self.fill_model.clone().into(),
             self.fee_model.clone(),
             self.book_type,
             self.oms_type,
@@ -1183,7 +1200,7 @@ impl SimulatedExchange {
             let PositionEvent::PositionAdjusted(adjustment) = &event else {
                 continue;
             };
-            let topic = switchboard::get_event_positions_topic(adjustment.strategy_id);
+            let topic = switchboard::get_event_position_topic(adjustment.strategy_id);
             msgbus::publish_position_event(topic, &event);
         }
     }

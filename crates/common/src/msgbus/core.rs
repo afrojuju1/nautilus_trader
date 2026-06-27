@@ -112,9 +112,11 @@ use smallvec::SmallVec;
 use ustr::Ustr;
 
 use super::{
-    HAS_PUBLISHER, ShareableMessageHandler,
-    backing::MessageBusPublisher,
+    HAS_EXTERNAL_EGRESS, ShareableMessageHandler,
+    backing::MessageBusExternalEgress,
+    config::MessageBusConfig,
     matching::is_matching_backtracking,
+    message::{BusPayloadCategory, BusPayloadType},
     mstr::{Endpoint, MStr, Pattern, Topic},
     set_message_bus,
     switchboard::MessagingSwitchboard,
@@ -279,9 +281,12 @@ pub struct MessageBus {
     req_count: u64,
     res_count: u64,
     pub_count: u64,
-    publisher: Option<Box<dyn MessageBusPublisher>>,
+    external_egress: Option<Box<dyn MessageBusExternalEgress>>,
     encoding: SerializationEncoding,
-    types_filter: AHashSet<String>,
+    encoding_market_data: Option<SerializationEncoding>,
+    encoding_builtin: Option<SerializationEncoding>,
+    types_filter: AHashSet<BusPayloadType>,
+    streaming_types: AHashSet<BusPayloadType>,
 }
 
 impl Debug for MessageBus {
@@ -291,7 +296,7 @@ impl Debug for MessageBus {
             .field("instance_id", &self.instance_id)
             .field("name", &self.name)
             .field("has_backing", &self.has_backing)
-            .field("publisher", &self.publisher.is_some())
+            .field("external_egress", &self.external_egress.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -371,9 +376,12 @@ impl MessageBus {
             req_count: 0,
             res_count: 0,
             pub_count: 0,
-            publisher: None,
+            external_egress: None,
             encoding: SerializationEncoding::Json,
+            encoding_market_data: None,
+            encoding_builtin: None,
             types_filter: AHashSet::new(),
+            streaming_types: AHashSet::new(),
         }
     }
 
@@ -410,37 +418,87 @@ impl MessageBus {
             .expect("EndpointMap type mismatch - this is a bug")
     }
 
-    /// Sets an external publisher for serialized published messages.
-    pub fn set_publisher(
+    /// Sets external egress for serialized published messages.
+    pub fn set_external_egress(
         &mut self,
-        publisher: Box<dyn MessageBusPublisher>,
+        external_egress: Box<dyn MessageBusExternalEgress>,
         encoding: SerializationEncoding,
     ) {
-        self.publisher = Some(publisher);
+        self.external_egress = Some(external_egress);
         self.encoding = encoding;
+        self.encoding_market_data = None;
+        self.encoding_builtin = None;
         self.has_backing = true;
-        HAS_PUBLISHER.with(|flag| flag.set(true));
+        HAS_EXTERNAL_EGRESS.with(|flag| flag.set(true));
+    }
+
+    /// Sets external egress and category encoding policy from a validated config.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`crate::config::ConfigError`] if the config selects an unsupported encoding.
+    pub fn set_external_egress_config(
+        &mut self,
+        external_egress: Box<dyn MessageBusExternalEgress>,
+        config: &MessageBusConfig,
+    ) -> crate::config::ConfigResult<()> {
+        config.validate()?;
+
+        self.external_egress = Some(external_egress);
+        self.encoding = config.encoding;
+        self.encoding_market_data = config.encoding_market_data;
+        self.encoding_builtin = config.encoding_builtin;
+        self.has_backing = true;
+        HAS_EXTERNAL_EGRESS.with(|flag| flag.set(true));
+
+        Ok(())
     }
 
     /// Sets the type names excluded from external publishing.
     pub fn set_types_filter(&mut self, filter: Vec<String>) {
-        self.types_filter = filter.into_iter().collect();
+        self.types_filter = filter
+            .into_iter()
+            .map(|type_name| BusPayloadType::from_name(&type_name))
+            .filter(|payload_type| !payload_type.as_str().is_empty())
+            .collect();
+    }
+
+    /// Registers a payload type for external-to-internal streaming.
+    pub fn add_streaming_type(&mut self, payload_type: BusPayloadType) {
+        if !payload_type.as_str().is_empty() {
+            self.streaming_types.insert(payload_type);
+        }
+    }
+
+    /// Returns whether the payload type is registered for external-to-internal streaming.
+    #[must_use]
+    pub fn is_streaming_type(&self, payload_type: BusPayloadType) -> bool {
+        !payload_type.as_str().is_empty() && self.streaming_types.contains(&payload_type)
+    }
+
+    /// Clears all payload types registered for external-to-internal streaming.
+    pub fn clear_streaming_types(&mut self) {
+        self.streaming_types.clear();
     }
 
     #[must_use]
-    pub(crate) fn has_publisher(&self) -> bool {
-        self.publisher.is_some()
+    pub(crate) fn has_external_egress(&self) -> bool {
+        self.external_egress.is_some()
     }
 
-    pub(crate) fn publisher(&self) -> Option<&dyn MessageBusPublisher> {
-        self.publisher.as_deref()
+    pub(crate) fn external_egress(&self) -> Option<&dyn MessageBusExternalEgress> {
+        self.external_egress.as_deref()
     }
 
-    pub(crate) fn encoding(&self) -> SerializationEncoding {
-        self.encoding
+    pub(crate) fn encoding_for(&self, payload_type: BusPayloadType) -> SerializationEncoding {
+        match payload_type.category() {
+            BusPayloadCategory::MarketData => self.encoding_market_data.unwrap_or(self.encoding),
+            BusPayloadCategory::BuiltIn => self.encoding_builtin.unwrap_or(self.encoding),
+            BusPayloadCategory::Other => self.encoding,
+        }
     }
 
-    pub(crate) fn types_filter(&self) -> &AHashSet<String> {
+    pub(crate) fn types_filter(&self) -> &AHashSet<BusPayloadType> {
         &self.types_filter
     }
 
@@ -496,16 +554,17 @@ impl MessageBus {
 
         self.routers_typed.clear();
         self.endpoints_typed.clear();
+        self.clear_streaming_types();
         self.sent_count = 0;
         self.req_count = 0;
         self.res_count = 0;
         self.pub_count = 0;
 
-        if let Some(mut publisher) = self.publisher.take() {
-            publisher.close();
+        if let Some(mut external_egress) = self.external_egress.take() {
+            external_egress.close();
         }
         self.has_backing = false;
-        HAS_PUBLISHER.with(|flag| flag.set(false));
+        HAS_EXTERNAL_EGRESS.with(|flag| flag.set(false));
     }
 
     /// Returns the memory address of this instance as a hexadecimal string.
@@ -641,11 +700,11 @@ impl MessageBus {
     ///
     /// This function never returns an error (TBD once backing database added).
     pub fn close(&mut self) -> anyhow::Result<()> {
-        if let Some(mut publisher) = self.publisher.take() {
-            publisher.close();
+        if let Some(mut external_egress) = self.external_egress.take() {
+            external_egress.close();
         }
         self.has_backing = false;
-        HAS_PUBLISHER.with(|flag| flag.set(false));
+        HAS_EXTERNAL_EGRESS.with(|flag| flag.set(false));
         Ok(())
     }
 
@@ -754,6 +813,128 @@ mod tests {
 
         assert_eq!(msgbus.trader_id, trader_id);
         assert_eq!(msgbus.name, stringify!(MessageBus));
+    }
+
+    #[rstest]
+    fn encoding_for_uses_market_data_override() {
+        let msgbus = MessageBus {
+            encoding: SerializationEncoding::Json,
+            encoding_market_data: Some(SerializationEncoding::MsgPack),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            msgbus.encoding_for(BusPayloadType::QuoteTick),
+            SerializationEncoding::MsgPack
+        );
+        assert_eq!(
+            msgbus.encoding_for(BusPayloadType::Custom(Ustr::from("CustomPayload"))),
+            SerializationEncoding::Json
+        );
+    }
+
+    #[rstest]
+    fn encoding_for_uses_builtin_override() {
+        let msgbus = MessageBus {
+            encoding: SerializationEncoding::Json,
+            encoding_builtin: Some(SerializationEncoding::MsgPack),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            msgbus.encoding_for(BusPayloadType::OrderEvent),
+            SerializationEncoding::MsgPack
+        );
+        assert_eq!(
+            msgbus.encoding_for(BusPayloadType::Instrument),
+            SerializationEncoding::Json
+        );
+    }
+
+    #[rstest]
+    fn encoding_for_uses_default_without_category_override() {
+        let msgbus = MessageBus {
+            encoding: SerializationEncoding::MsgPack,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            msgbus.encoding_for(BusPayloadType::QuoteTick),
+            SerializationEncoding::MsgPack
+        );
+        assert_eq!(
+            msgbus.encoding_for(BusPayloadType::OrderEvent),
+            SerializationEncoding::MsgPack
+        );
+        assert_eq!(
+            msgbus.encoding_for(BusPayloadType::Custom(Ustr::from("CustomPayload"))),
+            SerializationEncoding::MsgPack
+        );
+    }
+
+    #[rstest]
+    fn set_types_filter_resolves_canonical_and_custom_names() {
+        let mut msgbus = MessageBus::default();
+
+        msgbus.set_types_filter(vec![
+            "QuoteTick".to_string(),
+            "ExternalCustomPayload".to_string(),
+            String::new(),
+        ]);
+
+        let filter = msgbus.types_filter();
+        assert_eq!(filter.len(), 2);
+        assert!(filter.contains(&BusPayloadType::QuoteTick));
+        assert!(filter.contains(&BusPayloadType::Custom(Ustr::from("ExternalCustomPayload"))));
+        assert!(!filter.contains(&BusPayloadType::Custom(Ustr::default())));
+    }
+
+    #[rstest]
+    fn streaming_type_registration_uses_canonical_payload_names() {
+        let mut msgbus = MessageBus::default();
+
+        msgbus.add_streaming_type(BusPayloadType::QuoteTick);
+        msgbus.add_streaming_type(BusPayloadType::Custom(Ustr::from("CustomPayload")));
+
+        assert!(msgbus.is_streaming_type(BusPayloadType::QuoteTick));
+        assert!(msgbus.is_streaming_type(BusPayloadType::Custom(Ustr::from("CustomPayload"))));
+        assert!(msgbus.streaming_types.contains(&BusPayloadType::QuoteTick));
+        assert!(
+            msgbus
+                .streaming_types
+                .contains(&BusPayloadType::Custom(Ustr::from("CustomPayload")))
+        );
+        assert!(!msgbus.is_streaming_type(BusPayloadType::TradeTick));
+    }
+
+    #[rstest]
+    fn streaming_type_registration_ignores_empty_custom_payload_type() {
+        let mut msgbus = MessageBus::default();
+
+        msgbus.add_streaming_type(BusPayloadType::Custom(Ustr::default()));
+
+        assert!(!msgbus.is_streaming_type(BusPayloadType::Custom(Ustr::default())));
+        assert!(msgbus.streaming_types.is_empty());
+    }
+
+    #[rstest]
+    fn clear_streaming_types_removes_registered_types() {
+        let mut msgbus = MessageBus::default();
+        msgbus.add_streaming_type(BusPayloadType::QuoteTick);
+
+        msgbus.clear_streaming_types();
+
+        assert!(!msgbus.is_streaming_type(BusPayloadType::QuoteTick));
+    }
+
+    #[rstest]
+    fn dispose_clears_streaming_types() {
+        let mut msgbus = MessageBus::default();
+        msgbus.add_streaming_type(BusPayloadType::QuoteTick);
+
+        msgbus.dispose();
+
+        assert!(!msgbus.is_streaming_type(BusPayloadType::QuoteTick));
     }
 
     #[rstest]

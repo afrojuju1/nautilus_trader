@@ -39,7 +39,7 @@
 //! or as part of a Rust only build.
 //!
 //! - `node` (default): Enables the full live node, builder, config, and execution manager.
-//! - `plugin` (default): Enables the host-side plug-in adapters and loader from `nautilus-plugin`.
+//! - `plugin` (default): Keeps compatibility stubs for plug-in config validation.
 //! - `ffi`: Enables the C foreign function interface (FFI) from [cbindgen](https://github.com/mozilla/cbindgen).
 //! - `streaming`: Enables `persistence` dependency for streaming configuration (requires `node`).
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs) (auto-enables `node` and `streaming`).
@@ -60,20 +60,22 @@
 //! the transitive dependencies on `nautilus-system`, `nautilus-trading`,
 //! `nautilus-portfolio`, `nautilus-risk`, and `nautilus-data`.
 //!
-//! # Opting out of plug-in support
+//! # Plug-in support
 //!
-//! Builds that statically link every actor and strategy can drop the plug-in
-//! adapter machinery (and its `libloading`-backed loader) by disabling the
-//! `plugin` feature:
+//! The open-source live crate does not host dynamic plug-ins directly.
+//! `nautilus-plugin` is the public guest ABI crate, while host-side loading,
+//! vtables, bridge adapters, and server policy belong to the host-side plug-in
+//! integration.
+//! A non-empty `LiveNodeConfig.plugins` list is rejected unless an application
+//! provides that host-side integration.
 //!
 //! ```toml
 //! nautilus-live = { workspace = true, default-features = false, features = ["node"] }
 //! ```
 //!
-//! With `plugin` disabled, the `plugin` module is removed, the unsafe FFI
-//! surface that supports it does not link, and `nautilus-plugin` is not pulled
-//! into the dependency graph. A non-empty `LiveNodeConfig.plugins` list is
-//! rejected at build time under this configuration.
+//! With `plugin` disabled, the compatibility `plugin` module is removed. A
+//! non-empty `LiveNodeConfig.plugins` list is rejected under this configuration
+//! as well.
 
 #![warn(rustc::all)]
 #![warn(clippy::pedantic)]
@@ -105,31 +107,20 @@
     reason = "config types deserialize plain field values; unsafe in unrelated impls is sound"
 )]
 
-pub mod emitter;
+pub mod execution;
 pub mod runner;
 
 #[cfg(feature = "node")]
-pub mod builder;
-
-#[cfg(feature = "node")]
-pub mod config;
-
-#[cfg(feature = "node")]
-pub mod manager;
-
-#[cfg(feature = "node")]
 pub mod node;
-
-#[cfg(feature = "node")]
-mod execution;
-
-#[cfg(feature = "plugin")]
-pub mod plugin;
 
 #[cfg(feature = "python")]
 pub mod python;
 
 // Re-exports for adapters
-pub use emitter::ExecutionEventEmitter;
+pub use execution::{emitter, emitter::ExecutionEventEmitter, manager};
 pub use nautilus_common::factories::OrderEventFactory;
 pub use nautilus_execution::client::core::ExecutionClientCore;
+#[cfg(feature = "plugin")]
+pub use node::plugin;
+#[cfg(feature = "node")]
+pub use node::{builder, config};

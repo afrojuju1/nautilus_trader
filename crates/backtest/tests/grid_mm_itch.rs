@@ -49,7 +49,7 @@ fn create_engine(instrument: &InstrumentAny) -> BacktestEngine {
     let unlimited = RateLimit::new(1_000_000, 1_000_000_000);
     let config = BacktestEngineConfig {
         risk_engine: Some(RiskEngineConfig {
-            max_order_submit: unlimited.clone(),
+            max_order_submit: unlimited,
             max_order_modify: unlimited,
             ..Default::default()
         }),
@@ -74,12 +74,15 @@ fn create_engine(instrument: &InstrumentAny) -> BacktestEngine {
 }
 
 fn create_strategy(instrument_id: InstrumentId) -> GridMarketMaker {
-    let config = GridMarketMakerConfig::new(instrument_id, Quantity::from("100"))
-        .with_trade_size(Quantity::from("100"))
-        .with_num_levels(3)
-        .with_grid_step_bps(10)
-        .with_skew_factor(0.01)
-        .with_requote_threshold_bps(5);
+    let config = GridMarketMakerConfig::builder()
+        .instrument_id(instrument_id)
+        .max_position(Quantity::from("100"))
+        .trade_size(Quantity::from("100"))
+        .num_levels(3)
+        .grid_step_bps(10)
+        .skew_factor(0.01)
+        .requote_threshold_bps(5)
+        .build();
     GridMarketMaker::new(config)
 }
 
