@@ -161,6 +161,8 @@ claude.config.json
 .codex/*
 !.codex/skills/
 .codex/skills/*
+!.codex/skills/market-data-warehouse/
+!.codex/skills/market-data-warehouse/**
 !.codex/skills/sync-nautilus-fork/
 !.codex/skills/sync-nautilus-fork/**
 .cursor/

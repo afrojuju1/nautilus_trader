@@ -76,6 +76,8 @@ Rules:
 - Historical candidate replay belongs in the read-only `alpaca-ops replay` / `performance` research
   path. It may read candidate ledgers and historical market data, but must not submit orders, cancel
   orders, reconcile broker state, or mutate strategy state.
+- Do not wire or stamp regime routing metadata until real feature inputs exist. Avoid placeholder
+  neutral regime labels because they make candidate evidence look more complete than it is.
 - For Alpaca execution changes, run targeted checks before commit:
 
 ```bash
@@ -84,7 +86,8 @@ cargo test -p nautilus-alpaca --features live --lib
 cargo check -p nautilus-alpaca --features live --bins
 ```
 
-- Keep Alpaca verification tiered:
+Keep Alpaca verification tiered:
+
 - Unit/config/strategy/order changes: run the targeted checks above.
 - Build-only or docs-only deploy changes: run `cargo fmt -p nautilus-alpaca` and `cargo check -p nautilus-alpaca --features live --bins` when Rust code or scripts can affect binaries.
 - Broker/account probes: run only when touching account admission, execution submission, order reconciliation, or before/after a smoke test.
@@ -105,6 +108,28 @@ docker exec nautilus-alpaca-alpaca-options-1 alpaca-options-node --check-config
   result is reported. Compile checks and container health are build/runtime proof only.
 - Earnings-calendar input for Alpaca earnings strategies uses Alpha Vantage only through local secrets and cache. Keep `ALPHA_VANTAGE_API_KEY` in an untracked `.env` or external env file, never commit it. Refresh with `earnings-sync`; it caches raw Alpha Vantage `EARNINGS_CALENDAR` output for 23 hours by default, writes the full normalized feed to `$XDG_STATE_HOME/nautilus_trader/earnings/earnings_events.csv` or `$HOME/.local/state/nautilus_trader/earnings/earnings_events.csv`, and writes the stricter strategy-safe feed to `earnings_events_approved.csv` in the same directory.
 - Treat Alpha Vantage earnings timing quality as mixed: `pre-market` and `post-market` can be normalized to `before_open` and `after_close`, but blank timing becomes `unknown` and must remain blocked by default unless the user explicitly approves unknown-timing entries. The approved feed should also exclude weekend dates and non-common symbol shapes before any strategy consumes it.
+
+## Storage And Warehouse Architecture
+
+- Use the repo-local `market-data-warehouse` Codex skill at
+  `.codex/skills/market-data-warehouse` for ClickHouse, catalog backfill, dual-write, flagged
+  read-cutover, and Postgres operational-storage work when available.
+- ClickHouse is a repo-level analytical market-data warehouse, not an Alpaca adapter feature. Alpaca
+  data may be the first proof source, but warehouse schema, migrations, deployment, and read paths
+  should stay source-neutral.
+- Keep `ParquetDataCatalog` as the replay/backtest-compatible store. Write market data to both the
+  catalog and ClickHouse during the initial rollout, then cut reads over to ClickHouse only by an
+  explicit flag after validation.
+- Keep Postgres as the slim operational source of truth for strategy state, state events, candidate
+  ledgers, candidate outcomes, performance ledgers, runtime leases, and small ingest manifests.
+- Do not store bulk quotes, trades, bars, Greeks, scanner feature series, or market-data-shaped
+  caches in Postgres. Do not make ClickHouse the source of truth for broker evidence or realized
+  PnL.
+- Use `sqlx` migrations for Postgres operational schema changes. Do not add a custom Postgres
+  migration manager.
+- Avoid `shadow_compare`, standing comparison loops, or other one-off validation daemons. Add
+  explicit operator validation commands for requested dataset/range checks and keep cutover
+  rollback as a simple config flag.
 
 ## Issue Tracking
 

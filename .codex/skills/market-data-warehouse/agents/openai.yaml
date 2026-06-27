@@ -1,0 +1,4 @@
+interface:
+  display_name: "Market Data Warehouse"
+  short_description: "Guide ClickHouse and storage work"
+  default_prompt: "Use $market-data-warehouse to plan or implement Nautilus market-data warehouse work without making it Alpaca-specific."

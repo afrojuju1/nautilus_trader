@@ -9,9 +9,10 @@ description: Safely sync Ade's Nautilus Trader fork with the base upstream repos
 
 Sync `/home/ade/Projects/nautilus_trader` with `nautechsystems/nautilus_trader` by merging
 upstream into the fork, never by resetting the fork to upstream. Preserve fork-only Alpaca adapter,
-runtime, docs, and deployment work unless Ade explicitly decides otherwise. The current Alpaca
-order-capable runtime is `alpaca-options-node`; run `alpaca-options-node --check-config` for
-config checks.
+runtime, docs, deployment, Beads, repo-level warehouse, ClickHouse, `nautilus-persistence`, and
+sqlx/Postgres operational-storage work unless Ade explicitly decides otherwise. The current Alpaca
+order-capable runtime is `alpaca-options-node`; run `alpaca-options-node --check-config` for config
+checks.
 
 ## Modes
 
@@ -70,6 +71,8 @@ Prefer:
 - Keeping active docs and examples aligned with the current architecture.
 - Preserving the Nautilus-native Alpaca runtime path over repo-local bridges, wrappers, or old
   account-engine loops.
+- Preserving repo-level market-data warehouse ownership over adapter-owned ClickHouse modules,
+  migrations, deployment files, or one-off comparison loops.
 
 Do not resurrect retired Alpaca artifacts during conflict resolution unless Ade explicitly asks for a
 new staged bridge:
@@ -80,16 +83,23 @@ new staged bridge:
 
 Use `ALPACA_SUBMIT` as the runtime submit gate.
 
+Do not turn ClickHouse or warehouse code into an Alpaca-only sync resolution. Warehouse work belongs
+under repo-level ownership such as `nautilus-persistence`, `schema/sql/clickhouse/`, and
+`deploy/warehouse/`.
+
 After resolving conflicts:
 
 ```bash
 git status --short
 git diff --check
 rg -n "alpaca-submit-order-list-bridge|submit_order_list_bridge|alpaca-put-credit-strategy-loop|put_credit_strategy_loop|ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED" crates/adapters/alpaca deploy/alpaca nautilus_trader/adapters/alpaca
+rg -n "shadow_compare|ALPACA_.*CLICKHOUSE|ClickHouse" crates/adapters/alpaca deploy/alpaca nautilus_trader/adapters/alpaca
 git log --oneline upstream/develop..develop
 ```
 
 Confirm the fork-only commits are still visible before committing or pushing.
+Matches from the warehouse ownership scan require review because ClickHouse should stay
+source-neutral and outside Alpaca-owned paths.
 
 ## Validation
 
