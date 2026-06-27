@@ -36,6 +36,16 @@ git fetch upstream
 git log --oneline --decorate --graph --left-right --cherry-pick origin/develop...upstream/develop
 ```
 
+When `old_upstream` is available, include a storage/schema drift scan before merging:
+
+```bash
+git diff --name-only "${old_upstream}..upstream/develop" -- '*migration*' 'schema/**' 'crates/persistence/**' 'nautilus_trader/persistence/**' 'nautilus_trader/adapters/**' 'crates/adapters/**' 'docs/**'
+```
+
+Review matches for new database columns, migrations, storage models, catalog/ClickHouse contracts,
+Postgres schema changes, persistence config, or data-reader/writer semantics that fork-only Alpaca
+or warehouse work may need to adopt.
+
 If `upstream` is missing during an explicit sync, add:
 
 ```bash
@@ -100,6 +110,49 @@ git log --oneline upstream/develop..develop
 Confirm the fork-only commits are still visible before committing or pushing.
 Matches from the warehouse ownership scan require review because ClickHouse should stay
 source-neutral and outside Alpaca-owned paths.
+
+## Schema And Storage Parity
+
+Treat upstream database, catalog, and persistence changes as first-class follow-up work, not as
+chat-only notes.
+
+During sync, inspect upstream changes to:
+
+- SQL migrations, schema files, and generated database metadata.
+- Postgres, ClickHouse, catalog, cache, and persistence crates/modules.
+- Rust/Python storage models, row structs, serializers, data readers, and writer config.
+- Operator commands or docs that describe new storage fields, migrations, or read/write behavior.
+
+If a storage/schema change is required for the merge to compile or for the fork runtime to keep
+working, adapt it in the sync and validate it before finishing.
+
+If upstream added storage capability that the fork should support but it is not necessary to resolve
+inside the sync, create a Bead before the final response. Use a concrete title and acceptance
+criteria, for example:
+
+```bash
+bd create "Adapt Alpaca strategy_state to upstream <column-or-contract>" \
+  --type task \
+  --priority 1 \
+  --label upstream-sync \
+  --label storage-parity
+```
+
+Good parity Beads name the upstream change, the fork-owned surface that must adapt, and the proof
+needed. Create these for items such as:
+
+- New or renamed Postgres columns that fork-owned queries, migrations, or read models should carry.
+- New persistence metadata required by upstream readers/writers.
+- Catalog or ClickHouse table-contract changes that affect warehouse backfill, dual-write, or
+  flagged read cutover.
+- New storage config/env fields that deployment, Docker, or operator commands need to expose.
+- Upstream abstractions that let fork-owned storage code be deleted or moved into a base path.
+
+Do not create Beads for upstream storage changes with no plausible fork impact. If none are found,
+say that in the final summary.
+
+If a parity item is completed during the sync, close the Bead with validation notes. Otherwise leave
+it open and include it under remaining risks/follow-ups in the final response.
 
 ## Validation
 
