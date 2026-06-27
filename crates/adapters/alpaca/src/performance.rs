@@ -104,10 +104,16 @@ pub struct CandidateOutcomeSummary {
     pub dates: Vec<String>,
     /// Total candidate-outcome records.
     pub records: usize,
+    /// Unique candidates represented by candidate-outcome records.
+    pub candidates: usize,
     /// Candidate-outcome records for candidates selected by the strategy.
     pub selected_records: usize,
+    /// Unique selected candidates represented by candidate-outcome records.
+    pub selected_candidates: usize,
     /// Candidate-outcome records for candidates submitted to the broker.
     pub traded_records: usize,
+    /// Unique traded candidates represented by candidate-outcome records.
+    pub traded_candidates: usize,
     /// Winning hypothetical outcomes.
     pub wins: usize,
     /// Losing hypothetical outcomes.
@@ -124,16 +130,26 @@ pub struct CandidateOutcomeSummary {
     pub largest_loss: Option<f64>,
     /// Candidate-outcome records for candidates submitted to the broker.
     pub submitted_records: usize,
+    /// Unique candidates submitted to the broker.
+    pub submitted_candidates: usize,
     /// Candidate-outcome records rejected by the broker.
     pub rejected_records: usize,
+    /// Unique candidates rejected by the broker.
+    pub rejected_candidates: usize,
     /// Candidate-outcome records for selected candidates not traded at the broker.
     pub virtual_records: usize,
+    /// Unique virtual candidates not traded at the broker.
+    pub virtual_candidates: usize,
     /// First virtual close records for selected candidates not traded at the broker.
     pub virtual_close_records: usize,
+    /// Unique virtual candidates with first virtual close records.
+    pub virtual_close_candidates: usize,
     /// Parse errors encountered while reading outcome records.
     pub parse_errors: usize,
     /// Records containing quote warnings.
     pub records_with_warnings: usize,
+    /// Share of candidate-outcome records containing quote warnings.
+    pub warning_rate: Option<f64>,
     /// Summaries by mark source.
     pub by_mark_source: BTreeMap<String, CandidateOutcomeBucketSummary>,
     /// Selected-candidate outcome summary.
@@ -159,18 +175,36 @@ pub struct CandidateOutcomeSummary {
 pub struct CandidateOutcomeBucketSummary {
     /// Total candidate-outcome records.
     pub records: usize,
+    /// Unique candidates represented by candidate-outcome records.
+    pub candidates: usize,
     /// Candidate-outcome records for selected candidates.
     pub selected_records: usize,
+    /// Unique selected candidates represented by candidate-outcome records.
+    pub selected_candidates: usize,
     /// Candidate-outcome records for submitted candidates.
     pub traded_records: usize,
+    /// Unique traded candidates represented by candidate-outcome records.
+    pub traded_candidates: usize,
     /// Candidate-outcome records for broker submission attempts.
     pub submitted_records: usize,
+    /// Unique candidates submitted to the broker.
+    pub submitted_candidates: usize,
     /// Candidate-outcome records rejected by the broker.
     pub rejected_records: usize,
+    /// Unique candidates rejected by the broker.
+    pub rejected_candidates: usize,
     /// Candidate-outcome records for selected candidates not traded at the broker.
     pub virtual_records: usize,
+    /// Unique virtual candidates not traded at the broker.
+    pub virtual_candidates: usize,
     /// First virtual close records for selected candidates not traded at the broker.
     pub virtual_close_records: usize,
+    /// Unique virtual candidates with first virtual close records.
+    pub virtual_close_candidates: usize,
+    /// Records containing quote warnings.
+    pub records_with_warnings: usize,
+    /// Share of candidate-outcome records containing quote warnings.
+    pub warning_rate: Option<f64>,
     /// Winning hypothetical outcomes.
     pub wins: usize,
     /// Losing hypothetical outcomes.

@@ -110,7 +110,7 @@ fn print_usage() {
            account\n\
            fleet [--json] [--include-disabled] [--registry PATH]\n\
            alerts candidates [--send|--dry-run] [--date YYYY-MM-DD] [--lookback-minutes N]\n\
-           performance [--json] [--send-discord] [--since YYYY-MM-DD] [--until YYYY-MM-DD]\n\
+           performance [--json] [--send-discord] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--no-track-candidate-outcomes]\n\
            replay [--json] [--include-records] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--max-candidates N] [--max-rank N] [--lookahead-minutes N] [--timeframe 1Min]\n\
            sync-state"
     );

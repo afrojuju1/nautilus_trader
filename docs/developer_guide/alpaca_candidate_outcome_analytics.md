@@ -1,6 +1,6 @@
 # Alpaca Candidate Outcome Analytics
 
-Status: design contract.
+Status: implemented read-model contract.
 
 This document defines how to read and aggregate Alpaca candidate outcome records. The goal is to
 make strategy review boring and defensible: one candidate should not silently become four samples
@@ -123,16 +123,33 @@ Minimum checks before using a range for research:
 - Time sanity: `mark_ts_utc` is at or after candidate `ts_utc` and no later than the configured
   lookahead target.
 
-## Required Read Model
+## Operator Read Model
 
-The next implementation should add an operator-facing read model rather than asking operators to
-interpret raw rows. The read model should produce:
+`alpaca-ops performance` and `alpaca-control performance` expose the candidate-outcome read model
+from Postgres. Operators should use that output instead of interpreting raw rows. The read model
+produces:
 
 - Unique candidate counts by account, date, strategy, underlying, selected/submitted/traded state,
   and mark source.
 - Horizon-specific PnL summaries with no accidental cross-bucket double counting.
 - Coverage and warning summaries.
 - A clear separation between analytical outcomes and realized broker PnL.
+
+Top-level `candidate_outcomes.records` is the observation-row count. Top-level
+`candidate_outcomes.candidates` is the unique candidate count across all observation buckets in the
+date range. Bucket, strategy, mark-source, selected, submitted, rejected, virtual, and virtual-close
+summaries also expose both `records` and `candidates` fields.
+
+`hypothetical_pnl` is still horizon-record PnL. Do not treat the top-level value as candidate-level
+PnL when multiple observation buckets are present. Use `by_bucket` for horizon-specific PnL, and
+choose a canonical bucket before comparing candidate-level strategy alternatives.
+
+`records_with_warnings` and `warning_rate` surface quote/bar quality. Segment or exclude warning
+records before using outcomes for threshold tuning.
+
+Use `--no-track-candidate-outcomes` when you want a read-only report over already persisted
+candidate-outcome rows. Without that flag, the performance command first attempts to track outcomes
+for the configured trade date and then reports the updated read model.
 
 This can remain in Postgres initially because `candidate_outcome` is small operational/research
 evidence. If outcome volume grows enough to need analytical scans across many months and accounts,

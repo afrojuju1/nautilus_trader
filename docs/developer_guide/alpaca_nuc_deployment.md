@@ -560,6 +560,7 @@ positions. They do not submit or cancel orders:
 ```bash
 alpaca-control performance --all
 alpaca-control performance --all --json
+alpaca-control performance --all --no-track-candidate-outcomes
 alpaca-control performance --all --since 2026-05-01 --until 2026-05-08
 alpaca-control alerts performance
 alpaca-control alerts performance-enable
@@ -578,6 +579,9 @@ alpaca-control performance --no-track-historical-fill
 alpaca-control performance --track-historical-fill-lookahead-minutes 390
 alpaca-control performance --track-historical-fill-timeframe 1Min
 ```
+
+Use `alpaca-control performance --all --no-track-candidate-outcomes` to read the existing
+candidate-outcome analytics without adding new outcome rows.
 
 The command reports one engine state:
 

@@ -49,6 +49,7 @@ struct Args {
     json_output: bool,
     send_discord: bool,
     alerts_env_file: Option<PathBuf>,
+    track_candidate_outcomes: bool,
     track_date: Option<NaiveDate>,
     track_max_candidates: usize,
     track_max_rank: u64,
@@ -66,6 +67,7 @@ impl Default for Args {
             json_output: false,
             send_discord: false,
             alerts_env_file: None,
+            track_candidate_outcomes: true,
             track_date: tracking_defaults.trade_date,
             track_max_candidates: tracking_defaults.max_candidates,
             track_max_rank: tracking_defaults.max_rank,
@@ -137,33 +139,37 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     }
 
     append_closed_entries_to_performance_ledger(&config, &report_entries, &mut warnings).await?;
-    let tracked = track_candidate_outcomes(
-        &client,
-        &data_config,
-        &config,
-        &CandidateOutcomeTrackingRequest {
-            trade_date: args.track_date,
-            max_candidates: args.track_max_candidates,
-            max_rank: args.track_max_rank,
-            historical_fill_missing: args.track_historical_fill_missing,
-            historical_fill_lookahead_minutes: args.track_historical_fill_lookahead_minutes,
-            historical_fill_timeframe: args.track_historical_fill_timeframe,
-        },
-    )
-    .await?;
-    warnings.push(format!(
-        "candidate_outcomes_appended={} snapshot_candidates={} historical_bar_candidates={} missing_mark_candidates={}",
-        tracked.appended,
-        tracked.snapshot_candidates,
-        tracked.historical_bar_candidates,
-        tracked.missing_mark_candidates,
-    ));
-    warnings.extend(
-        tracked
-            .warnings
-            .into_iter()
-            .map(|warning| format!("candidate_outcomes_{warning}")),
-    );
+    if args.track_candidate_outcomes {
+        let tracked = track_candidate_outcomes(
+            &client,
+            &data_config,
+            &config,
+            &CandidateOutcomeTrackingRequest {
+                trade_date: args.track_date,
+                max_candidates: args.track_max_candidates,
+                max_rank: args.track_max_rank,
+                historical_fill_missing: args.track_historical_fill_missing,
+                historical_fill_lookahead_minutes: args.track_historical_fill_lookahead_minutes,
+                historical_fill_timeframe: args.track_historical_fill_timeframe,
+            },
+        )
+        .await?;
+        warnings.push(format!(
+            "candidate_outcomes_appended={} snapshot_candidates={} historical_bar_candidates={} missing_mark_candidates={}",
+            tracked.appended,
+            tracked.snapshot_candidates,
+            tracked.historical_bar_candidates,
+            tracked.missing_mark_candidates,
+        ));
+        warnings.extend(
+            tracked
+                .warnings
+                .into_iter()
+                .map(|warning| format!("candidate_outcomes_{warning}")),
+        );
+    } else {
+        warnings.push("candidate_outcomes_tracking_skipped".to_string());
+    }
 
     let candidate_ledger =
         summarize_candidate_ledger_records(&config, args.since, args.until).await?;
@@ -212,6 +218,9 @@ fn parse_args() -> anyhow::Result<Args> {
             }
             "--track-date" => {
                 args.track_date = Some(parse_date_arg("--track-date", iter.next())?);
+            }
+            "--no-track-candidate-outcomes" => {
+                args.track_candidate_outcomes = false;
             }
             "--track-max-candidates" => {
                 args.track_max_candidates =
@@ -270,7 +279,7 @@ fn parse_string_arg(name: &str, value: Option<String>) -> anyhow::Result<String>
 
 fn print_usage() {
     eprintln!(
-        "usage: alpaca-ops performance [--json] [--send-discord] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--track-date YYYY-MM-DD] [--track-max-candidates N] [--track-max-rank N] [--no-track-historical-fill] [--track-historical-fill-lookahead-minutes N] [--track-historical-fill-timeframe 1Min]"
+        "usage: alpaca-ops performance [--json] [--send-discord] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--no-track-candidate-outcomes] [--track-date YYYY-MM-DD] [--track-max-candidates N] [--track-max-rank N] [--no-track-historical-fill] [--track-historical-fill-lookahead-minutes N] [--track-historical-fill-timeframe 1Min]"
     );
 }
 
@@ -453,7 +462,7 @@ fn format_discord_digest(report: &PerformanceReport) -> String {
         "**Alpaca performance digest** `{account}`\n\
 	candidate_ledger={} selected={} submit_results={}\n\
 	closed={} wins={} losses={} realized={} avg_win={} avg_loss={} largest_loss={}\n\
-	candidate_outcomes={} hypothetical={} selected_outcomes={} selected_hypothetical={}\n\
+	candidate_outcomes={} outcome_records={} hypothetical={} selected_outcomes={} selected_hypothetical={}\n\
 	virtual_closes={} virtual_close_pnl={}\n\
 	open_unrealized={} observed_total={}",
         report.candidate_ledger.candidates,
@@ -466,11 +475,12 @@ fn format_discord_digest(report: &PerformanceReport) -> String {
         format_optional_money(ledger.average_win),
         format_optional_money(ledger.average_loss),
         format_optional_money(ledger.largest_loss),
+        report.candidate_outcomes.candidates,
         report.candidate_outcomes.records,
         format_money(report.candidate_outcomes.hypothetical_pnl),
-        report.candidate_outcomes.selected.records,
+        report.candidate_outcomes.selected.candidates,
         format_money(report.candidate_outcomes.selected.hypothetical_pnl),
-        report.candidate_outcomes.virtual_closes.records,
+        report.candidate_outcomes.virtual_closes.candidates,
         format_money(report.candidate_outcomes.virtual_closes.hypothetical_pnl),
         format_money(report.summary.open_unrealized_pnl),
         format_money(report.summary.open_unrealized_pnl + ledger.realized_pnl),
@@ -508,15 +518,22 @@ fn print_human_report(report: &PerformanceReport) {
         report.ledger_summary.records_with_warnings,
     );
     println!(
-        "candidate_outcomes files={} records={} selected={} submitted={} traded={} rejected={} virtual={} virtual_closes={} wins={} losses={} flats={} hypothetical={} avg_win={} avg_loss={} largest_loss={} warnings={} parse_errors={}",
+        "candidate_outcomes files={} records={} candidates={} selected_records={} selected_candidates={} submitted_records={} submitted_candidates={} traded_records={} traded_candidates={} rejected_records={} rejected_candidates={} virtual_records={} virtual_candidates={} virtual_close_records={} virtual_close_candidates={} wins={} losses={} flats={} hypothetical={} avg_win={} avg_loss={} largest_loss={} warnings={} warning_rate={} parse_errors={}",
         report.candidate_outcomes.files,
         report.candidate_outcomes.records,
+        report.candidate_outcomes.candidates,
         report.candidate_outcomes.selected_records,
+        report.candidate_outcomes.selected_candidates,
         report.candidate_outcomes.submitted_records,
+        report.candidate_outcomes.submitted_candidates,
         report.candidate_outcomes.traded_records,
+        report.candidate_outcomes.traded_candidates,
         report.candidate_outcomes.rejected_records,
+        report.candidate_outcomes.rejected_candidates,
         report.candidate_outcomes.virtual_records,
+        report.candidate_outcomes.virtual_candidates,
         report.candidate_outcomes.virtual_close_records,
+        report.candidate_outcomes.virtual_close_candidates,
         report.candidate_outcomes.wins,
         report.candidate_outcomes.losses,
         report.candidate_outcomes.flats,
@@ -525,11 +542,13 @@ fn print_human_report(report: &PerformanceReport) {
         format_optional_money(report.candidate_outcomes.average_loss),
         format_optional_money(report.candidate_outcomes.largest_loss),
         report.candidate_outcomes.records_with_warnings,
+        format_rate(report.candidate_outcomes.warning_rate),
         report.candidate_outcomes.parse_errors,
     );
     println!(
-        "selected_outcomes records={} wins={} losses={} flats={} hypothetical={} avg_win={} avg_loss={} largest_loss={}",
+        "selected_outcomes records={} candidates={} wins={} losses={} flats={} hypothetical={} avg_win={} avg_loss={} largest_loss={} warnings={} warning_rate={}",
         report.candidate_outcomes.selected.records,
+        report.candidate_outcomes.selected.candidates,
         report.candidate_outcomes.selected.wins,
         report.candidate_outcomes.selected.losses,
         report.candidate_outcomes.selected.flats,
@@ -537,10 +556,13 @@ fn print_human_report(report: &PerformanceReport) {
         format_optional_money(report.candidate_outcomes.selected.average_win),
         format_optional_money(report.candidate_outcomes.selected.average_loss),
         format_optional_money(report.candidate_outcomes.selected.largest_loss),
+        report.candidate_outcomes.selected.records_with_warnings,
+        format_rate(report.candidate_outcomes.selected.warning_rate),
     );
     println!(
-        "virtual_closes records={} wins={} losses={} flats={} hypothetical={} avg_win={} avg_loss={} largest_loss={}",
+        "virtual_closes records={} candidates={} wins={} losses={} flats={} hypothetical={} avg_win={} avg_loss={} largest_loss={} warnings={} warning_rate={}",
         report.candidate_outcomes.virtual_closes.records,
+        report.candidate_outcomes.virtual_closes.candidates,
         report.candidate_outcomes.virtual_closes.wins,
         report.candidate_outcomes.virtual_closes.losses,
         report.candidate_outcomes.virtual_closes.flats,
@@ -548,24 +570,38 @@ fn print_human_report(report: &PerformanceReport) {
         format_optional_money(report.candidate_outcomes.virtual_closes.average_win),
         format_optional_money(report.candidate_outcomes.virtual_closes.average_loss),
         format_optional_money(report.candidate_outcomes.virtual_closes.largest_loss),
+        report
+            .candidate_outcomes
+            .virtual_closes
+            .records_with_warnings,
+        format_rate(report.candidate_outcomes.virtual_closes.warning_rate),
     );
     if !report.candidate_outcomes.by_bucket.is_empty() {
         println!("candidate_outcomes_by_bucket:");
         for (bucket, summary) in &report.candidate_outcomes.by_bucket {
             println!(
-                "  bucket={} records={} selected={} submitted={} traded={} rejected={} virtual={} virtual_closes={} wins={} losses={} flats={} hypothetical={}",
+                "  bucket={} records={} candidates={} selected_records={} selected_candidates={} submitted_records={} submitted_candidates={} traded_records={} traded_candidates={} rejected_records={} rejected_candidates={} virtual_records={} virtual_candidates={} virtual_close_records={} virtual_close_candidates={} wins={} losses={} flats={} hypothetical={} warnings={} warning_rate={}",
                 bucket,
                 summary.records,
+                summary.candidates,
                 summary.selected_records,
+                summary.selected_candidates,
                 summary.submitted_records,
+                summary.submitted_candidates,
                 summary.traded_records,
+                summary.traded_candidates,
                 summary.rejected_records,
+                summary.rejected_candidates,
                 summary.virtual_records,
+                summary.virtual_candidates,
                 summary.virtual_close_records,
+                summary.virtual_close_candidates,
                 summary.wins,
                 summary.losses,
                 summary.flats,
                 format_money(summary.hypothetical_pnl),
+                summary.records_with_warnings,
+                format_rate(summary.warning_rate),
             );
         }
     }
@@ -573,19 +609,28 @@ fn print_human_report(report: &PerformanceReport) {
         println!("candidate_outcomes_by_mark_source:");
         for (source, summary) in &report.candidate_outcomes.by_mark_source {
             println!(
-                "  source={} records={} selected={} submitted={} traded={} rejected={} virtual={} virtual_closes={} wins={} losses={} flats={} hypothetical={}",
+                "  source={} records={} candidates={} selected_records={} selected_candidates={} submitted_records={} submitted_candidates={} traded_records={} traded_candidates={} rejected_records={} rejected_candidates={} virtual_records={} virtual_candidates={} virtual_close_records={} virtual_close_candidates={} wins={} losses={} flats={} hypothetical={} warnings={} warning_rate={}",
                 source,
                 summary.records,
+                summary.candidates,
                 summary.selected_records,
+                summary.selected_candidates,
                 summary.submitted_records,
+                summary.submitted_candidates,
                 summary.traded_records,
+                summary.traded_candidates,
                 summary.rejected_records,
+                summary.rejected_candidates,
                 summary.virtual_records,
+                summary.virtual_candidates,
                 summary.virtual_close_records,
+                summary.virtual_close_candidates,
                 summary.wins,
                 summary.losses,
                 summary.flats,
                 format_money(summary.hypothetical_pnl),
+                summary.records_with_warnings,
+                format_rate(summary.warning_rate),
             );
         }
     }
@@ -593,13 +638,16 @@ fn print_human_report(report: &PerformanceReport) {
         println!("virtual_closes_by_reason:");
         for (reason, summary) in &report.candidate_outcomes.by_virtual_close_reason {
             println!(
-                "  reason={} records={} wins={} losses={} flats={} hypothetical={}",
+                "  reason={} records={} candidates={} wins={} losses={} flats={} hypothetical={} warnings={} warning_rate={}",
                 reason,
                 summary.records,
+                summary.candidates,
                 summary.wins,
                 summary.losses,
                 summary.flats,
                 format_money(summary.hypothetical_pnl),
+                summary.records_with_warnings,
+                format_rate(summary.warning_rate),
             );
         }
     }
@@ -687,6 +735,13 @@ fn print_entry(entry: &EntryPerformance) {
 
 fn format_optional_money(value: Option<f64>) -> String {
     value.map_or_else(|| "n/a".to_string(), format_money)
+}
+
+fn format_rate(value: Option<f64>) -> String {
+    value.map_or_else(
+        || "n/a".to_string(),
+        |value| format!("{:.1}%", value * 100.0),
+    )
 }
 
 fn format_optional_secs(value: Option<f64>) -> String {

@@ -294,43 +294,53 @@ pub async fn summarize_candidate_outcomes(
             summary.parse_errors += 1;
             continue;
         };
+        let candidate_key = candidate_outcome_candidate_key(&record)
+            .unwrap_or_else(|| format!("unknown|{}", aggregate.records));
         let flags = outcome_flags(&record);
-        aggregate.add(hypothetical_pnl, flags);
+        let has_warnings = record
+            .get("quote_warnings")
+            .and_then(Value::as_array)
+            .is_some_and(|warnings| !warnings.is_empty());
+        aggregate.add(&candidate_key, hypothetical_pnl, flags, has_warnings);
         if flags.was_selected {
-            selected_aggregate.add(hypothetical_pnl, flags);
+            selected_aggregate.add(&candidate_key, hypothetical_pnl, flags, has_warnings);
         }
         if flags.was_submitted {
-            submitted_aggregate.add(hypothetical_pnl, flags);
+            submitted_aggregate.add(&candidate_key, hypothetical_pnl, flags, has_warnings);
         }
         if flags.was_rejected {
-            rejected_aggregate.add(hypothetical_pnl, flags);
+            rejected_aggregate.add(&candidate_key, hypothetical_pnl, flags, has_warnings);
         }
         if flags.virtual_trade {
-            virtual_aggregate.add(hypothetical_pnl, flags);
+            virtual_aggregate.add(&candidate_key, hypothetical_pnl, flags, has_warnings);
         }
         if flags.virtual_close {
-            virtual_close_aggregate.add(hypothetical_pnl, flags);
+            virtual_close_aggregate.add(&candidate_key, hypothetical_pnl, flags, has_warnings);
             if let Some(reason) = record.get("virtual_close_reason").and_then(Value::as_str) {
                 close_reason_stats
                     .entry(reason.to_string())
                     .or_default()
-                    .add(hypothetical_pnl, flags);
+                    .add(&candidate_key, hypothetical_pnl, flags, has_warnings);
             }
         }
         if let Some(trade_date) = record.get("trade_date").and_then(Value::as_str) {
             dates.insert(trade_date.to_string());
         }
         if let Some(bucket) = record.get("observation_bucket").and_then(Value::as_str) {
-            bucket_stats
-                .entry(bucket.to_string())
-                .or_default()
-                .add(hypothetical_pnl, flags);
+            bucket_stats.entry(bucket.to_string()).or_default().add(
+                &candidate_key,
+                hypothetical_pnl,
+                flags,
+                has_warnings,
+            );
         }
         if let Some(strategy) = record.get("strategy").and_then(Value::as_str) {
-            strategy_stats
-                .entry(strategy.to_string())
-                .or_default()
-                .add(hypothetical_pnl, flags);
+            strategy_stats.entry(strategy.to_string()).or_default().add(
+                &candidate_key,
+                hypothetical_pnl,
+                flags,
+                has_warnings,
+            );
         }
         let mark_source = record
             .get("mark_source")
@@ -339,20 +349,19 @@ pub async fn summarize_candidate_outcomes(
         mark_source_stats
             .entry(mark_source.to_string())
             .or_default()
-            .add(hypothetical_pnl, flags);
+            .add(&candidate_key, hypothetical_pnl, flags, has_warnings);
 
-        if record
-            .get("quote_warnings")
-            .and_then(Value::as_array)
-            .is_some_and(|warnings| !warnings.is_empty())
-        {
+        if has_warnings {
             summary.records_with_warnings += 1;
         }
     }
 
     summary.records = aggregate.records;
+    summary.candidates = aggregate.candidates.len();
     summary.selected_records = aggregate.selected_records;
+    summary.selected_candidates = aggregate.selected_candidates.len();
     summary.traded_records = aggregate.traded_records;
+    summary.traded_candidates = aggregate.traded_candidates.len();
     summary.wins = aggregate.wins;
     summary.losses = aggregate.losses;
     summary.flats = aggregate.flats;
@@ -361,9 +370,14 @@ pub async fn summarize_candidate_outcomes(
     summary.average_loss = aggregate.average_loss();
     summary.largest_loss = aggregate.largest_loss;
     summary.submitted_records = aggregate.submitted_records;
+    summary.submitted_candidates = aggregate.submitted_candidates.len();
     summary.rejected_records = aggregate.rejected_records;
+    summary.rejected_candidates = aggregate.rejected_candidates.len();
     summary.virtual_records = aggregate.virtual_records;
+    summary.virtual_candidates = aggregate.virtual_candidates.len();
     summary.virtual_close_records = aggregate.virtual_close_records;
+    summary.virtual_close_candidates = aggregate.virtual_close_candidates.len();
+    summary.warning_rate = aggregate.warning_rate();
     summary.selected = selected_aggregate.into();
     summary.submitted = submitted_aggregate.into();
     summary.rejected = rejected_aggregate.into();
@@ -398,6 +412,14 @@ fn candidate_outcome_semantic_key(record: &Value) -> Option<String> {
         record.get("trade_date")?.as_str()?,
         record.get("candidate_identity_key")?.as_str()?,
         record.get("observation_bucket")?.as_str()?,
+    ))
+}
+
+fn candidate_outcome_candidate_key(record: &Value) -> Option<String> {
+    Some(format!(
+        "{}|{}",
+        record.get("trade_date")?.as_str()?,
+        record.get("candidate_identity_key")?.as_str()?,
     ))
 }
 
@@ -512,12 +534,20 @@ impl BucketStats {
 #[derive(Clone, Default)]
 struct OutcomeStats {
     records: usize,
+    candidates: std::collections::BTreeSet<String>,
     selected_records: usize,
+    selected_candidates: std::collections::BTreeSet<String>,
     submitted_records: usize,
+    submitted_candidates: std::collections::BTreeSet<String>,
     traded_records: usize,
+    traded_candidates: std::collections::BTreeSet<String>,
     rejected_records: usize,
+    rejected_candidates: std::collections::BTreeSet<String>,
     virtual_records: usize,
+    virtual_candidates: std::collections::BTreeSet<String>,
     virtual_close_records: usize,
+    virtual_close_candidates: std::collections::BTreeSet<String>,
+    records_with_warnings: usize,
     wins: usize,
     losses: usize,
     flats: usize,
@@ -528,26 +558,43 @@ struct OutcomeStats {
 }
 
 impl OutcomeStats {
-    fn add(&mut self, hypothetical_pnl: f64, flags: OutcomeFlags) {
+    fn add(
+        &mut self,
+        candidate_key: &str,
+        hypothetical_pnl: f64,
+        flags: OutcomeFlags,
+        has_warnings: bool,
+    ) {
         self.records += 1;
+        self.candidates.insert(candidate_key.to_string());
         self.hypothetical_pnl += hypothetical_pnl;
         if flags.was_selected {
             self.selected_records += 1;
+            self.selected_candidates.insert(candidate_key.to_string());
         }
         if flags.was_submitted {
             self.submitted_records += 1;
+            self.submitted_candidates.insert(candidate_key.to_string());
         }
         if flags.was_traded {
             self.traded_records += 1;
+            self.traded_candidates.insert(candidate_key.to_string());
         }
         if flags.was_rejected {
             self.rejected_records += 1;
+            self.rejected_candidates.insert(candidate_key.to_string());
         }
         if flags.virtual_trade {
             self.virtual_records += 1;
+            self.virtual_candidates.insert(candidate_key.to_string());
         }
         if flags.virtual_close {
             self.virtual_close_records += 1;
+            self.virtual_close_candidates
+                .insert(candidate_key.to_string());
+        }
+        if has_warnings {
+            self.records_with_warnings += 1;
         }
         if hypothetical_pnl > 0.0 {
             self.wins += 1;
@@ -571,18 +618,31 @@ impl OutcomeStats {
     fn average_loss(&self) -> Option<f64> {
         (self.losses > 0).then_some(self.loss_sum / self.losses as f64)
     }
+
+    fn warning_rate(&self) -> Option<f64> {
+        (self.records > 0).then_some(self.records_with_warnings as f64 / self.records as f64)
+    }
 }
 
 impl From<OutcomeStats> for crate::performance::CandidateOutcomeBucketSummary {
     fn from(value: OutcomeStats) -> Self {
         Self {
             records: value.records,
+            candidates: value.candidates.len(),
             selected_records: value.selected_records,
+            selected_candidates: value.selected_candidates.len(),
             submitted_records: value.submitted_records,
+            submitted_candidates: value.submitted_candidates.len(),
             traded_records: value.traded_records,
+            traded_candidates: value.traded_candidates.len(),
             rejected_records: value.rejected_records,
+            rejected_candidates: value.rejected_candidates.len(),
             virtual_records: value.virtual_records,
+            virtual_candidates: value.virtual_candidates.len(),
             virtual_close_records: value.virtual_close_records,
+            virtual_close_candidates: value.virtual_close_candidates.len(),
+            records_with_warnings: value.records_with_warnings,
+            warning_rate: value.warning_rate(),
             wins: value.wins,
             losses: value.losses,
             flats: value.flats,
@@ -652,6 +712,7 @@ mod tests {
     fn outcome_stats_count_selected_and_virtual_records() {
         let mut stats = OutcomeStats::default();
         stats.add(
+            "2026-06-01|candidate-a",
             12.0,
             OutcomeFlags {
                 was_selected: true,
@@ -661,16 +722,23 @@ mod tests {
                 virtual_trade: true,
                 virtual_close: true,
             },
+            true,
         );
 
         let summary: crate::performance::CandidateOutcomeBucketSummary = stats.into();
 
         assert_eq!(summary.records, 1);
+        assert_eq!(summary.candidates, 1);
         assert_eq!(summary.selected_records, 1);
+        assert_eq!(summary.selected_candidates, 1);
         assert_eq!(summary.submitted_records, 0);
         assert_eq!(summary.traded_records, 0);
         assert_eq!(summary.virtual_records, 1);
+        assert_eq!(summary.virtual_candidates, 1);
         assert_eq!(summary.virtual_close_records, 1);
+        assert_eq!(summary.virtual_close_candidates, 1);
+        assert_eq!(summary.records_with_warnings, 1);
+        assert_eq!(summary.warning_rate, Some(1.0));
         assert_eq!(summary.wins, 1);
         assert_eq!(summary.hypothetical_pnl, 12.0);
     }
