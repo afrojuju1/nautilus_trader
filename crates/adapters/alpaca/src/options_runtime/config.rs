@@ -294,6 +294,8 @@ struct ManagementSection {
     close_price_cushion: Option<f64>,
     max_close_attempts: Option<u32>,
     close_reprice_cooldown_secs: Option<u64>,
+    active_risk_candidate_quote_limit: Option<usize>,
+    active_risk_quote_stale_secs: Option<u64>,
     profit_target_close_fraction: Option<f64>,
     stop_loss_close_multiple: Option<f64>,
     max_hold_secs: Option<u64>,
@@ -315,6 +317,12 @@ impl ManagementSection {
             close_reprice_cooldown_secs: self
                 .close_reprice_cooldown_secs
                 .or(parent.close_reprice_cooldown_secs),
+            active_risk_candidate_quote_limit: self
+                .active_risk_candidate_quote_limit
+                .or(parent.active_risk_candidate_quote_limit),
+            active_risk_quote_stale_secs: self
+                .active_risk_quote_stale_secs
+                .or(parent.active_risk_quote_stale_secs),
             profit_target_close_fraction: self
                 .profit_target_close_fraction
                 .or(parent.profit_target_close_fraction),
@@ -554,6 +562,12 @@ pub(super) fn build_options_runtime_config(
             .unwrap_or(3),
         close_reprice_cooldown_secs: env_parse("ALPACA_CLOSE_REPRICE_COOLDOWN_SECS")
             .or(file.management.close_reprice_cooldown_secs)
+            .unwrap_or(30),
+        active_risk_candidate_quote_limit: env_parse("ALPACA_ACTIVE_RISK_CANDIDATE_QUOTE_LIMIT")
+            .or(file.management.active_risk_candidate_quote_limit)
+            .unwrap_or(5),
+        active_risk_quote_stale_secs: env_parse("ALPACA_ACTIVE_RISK_QUOTE_STALE_SECS")
+            .or(file.management.active_risk_quote_stale_secs)
             .unwrap_or(30),
         profit_target_close_fraction: file.management.profit_target_close_fraction.unwrap_or(0.50),
         stop_loss_close_multiple: file.management.stop_loss_close_multiple.unwrap_or(2.0),

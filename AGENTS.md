@@ -70,6 +70,9 @@ Rules:
   `AlpacaOptionsStrategy` path. Use the account-activity lifecycle poller and strategy lifecycle
   admission block; do not add a standalone lifecycle loop unless Ade explicitly asks for a separate
   operator daemon.
+- Active-risk option quote freshness belongs in `AlpacaOptionsStrategy` through Nautilus
+  `subscribe_quotes` and the strategy cache. Do not add a standalone quote loop; improve the Alpaca
+  data client when quote transport needs to move from REST snapshots to streaming.
 - For Alpaca execution changes, run targeted checks before commit:
 
 ```bash

@@ -53,6 +53,10 @@ pub struct AlpacaOptionsManagementConfig {
     pub max_close_attempts: u32,
     /// Minimum delay after a close submission before another close may be submitted.
     pub close_reprice_cooldown_secs: u64,
+    /// Number of high-rank candidate entries to keep quote-subscribed for active risk checks.
+    pub active_risk_candidate_quote_limit: usize,
+    /// Maximum accepted active-risk quote age. Zero disables freshness blocks.
+    pub active_risk_quote_stale_secs: u64,
     /// Profit-target close fraction.
     pub profit_target_close_fraction: f64,
     /// Stop-loss close multiple.
@@ -81,6 +85,8 @@ impl AlpacaOptionsManagementConfig {
             close_price_cushion: config.close_price_cushion,
             max_close_attempts: config.max_close_attempts,
             close_reprice_cooldown_secs: config.close_reprice_cooldown_secs,
+            active_risk_candidate_quote_limit: config.active_risk_candidate_quote_limit,
+            active_risk_quote_stale_secs: config.active_risk_quote_stale_secs,
             profit_target_close_fraction: config.profit_target_close_fraction,
             stop_loss_close_multiple: config.stop_loss_close_multiple,
             max_hold_secs: config.max_hold_secs,
@@ -114,6 +120,8 @@ impl Default for AlpacaOptionsManagementConfig {
             close_price_cushion: 0.0,
             max_close_attempts: 0,
             close_reprice_cooldown_secs: 0,
+            active_risk_candidate_quote_limit: 5,
+            active_risk_quote_stale_secs: 30,
             profit_target_close_fraction: 0.50,
             stop_loss_close_multiple: 2.0,
             max_hold_secs: 0,

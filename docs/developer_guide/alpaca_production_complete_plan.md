@@ -66,13 +66,13 @@ Known gaps:
 - Multi-account support currently has an operator/deployment foundation only. It still needs account
   admission policy, allocation rules, per-role strategy configs, and paper proof before undefined
   risk is allowed to submit.
-- Assignment, exercise, and expiration are still not first-class runtime events. Alpaca exposes
-  option non-trade activity records for these lifecycle events, but assignment events are not
-  delivered over trade-update websockets, so production readiness needs a REST poller and explicit
-  expiry-risk controls.
-- The scanner still relies primarily on REST snapshots. Alpaca option quote/trade streams can
-  improve active-position marks and quote freshness, but subscriptions require explicit symbols and
-  entitlement-aware feed selection.
+- Assignment, exercise, and expiration lifecycle risk is now polled from Alpaca account activities
+  and blocks entry admission when configured. Remaining lifecycle work is paper observation and
+  performance-ledger attribution.
+- The scanner still relies primarily on REST snapshots. Active-risk option quote freshness now uses
+  explicit Nautilus quote subscriptions for active entries and high-rank candidates, backed by the
+  current Alpaca option snapshot poller. A true Alpaca option quote/trade stream decoder remains a
+  data-client latency and stream-health improvement.
 - Historical opportunity tracking exists, but strategy tuning still needs a replay/research harness
   over historical option data and candidate ledgers before sizing or strategy expansion is justified
   by evidence.
@@ -576,13 +576,19 @@ Required before promoting beyond experimental:
      `AlpacaOptionsStrategy` lifecycle entry blocks. Performance-ledger attribution remains
      reporting work, not an order-path safety blocker.
 
-3. Real-time option quote cache for active risk.
-   - Subscribe to explicit active-position and high-rank candidate option symbols on Alpaca's
-     option data stream.
-   - Decode the stream format, store last quote/trade timestamp, and fall back to REST snapshots
-     when a subscription, entitlement, or stream-health check fails.
-   - Use the cache first for active-position marks, close triggers, stale-quote alerts, and
-     candidate freshness checks.
+3. Active-risk option quote cache. **Status: runtime implementation complete on the current
+   Nautilus quote subscription path.**
+   - `AlpacaOptionsStrategy` subscribes explicit active-entry option legs and top-ranked candidate
+     option legs through Nautilus `subscribe_quotes`.
+   - `AlpacaDataClient` currently satisfies those subscriptions with Alpaca option REST snapshots
+     and emits `QuoteTick` values using Alpaca quote timestamps when present.
+   - Management close marks and close triggers read the Nautilus quote cache first. Stale cached
+     active-entry quotes block close attempts, emit `active_risk_quote_stale`, and surface in
+     `alpaca-ops status`.
+   - Candidate entry checks block on stale cached selected-leg quotes, but do not block first-time
+     entries solely because the subscription cache has not emitted yet.
+   - Remaining data-client improvement: add a true Alpaca option quote/trade websocket decoder and
+     stream-health handling to reduce REST snapshot latency.
 
 4. Historical option research and replay harness.
    - Replay candidate ledgers against Alpaca historical option data where available.
@@ -718,7 +724,9 @@ Implement the Phase 7.5 required platform work in this order:
 
 1. Account capability preflight. Done in the runtime path.
 2. Assignment, exercise, and expiration risk daemon. Done for runtime gating and operator status.
-3. Real-time option quote cache for active risk.
+3. Active-risk option quote cache on the current Nautilus subscription path. Done for runtime
+   gating and operator status; true option quote/trade streaming remains a later data-client
+   improvement.
 4. Historical option research and replay harness.
 5. Strategy regime router with portfolio Greek/stress governor.
 6. Fill-quality intelligence and smart MLeg repricing.

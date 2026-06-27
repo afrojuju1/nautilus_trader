@@ -145,6 +145,10 @@ pub struct AlpacaOptionsRuntimeConfig {
     pub max_close_attempts: u32,
     /// Minimum delay after a close submission before another close may be submitted.
     pub close_reprice_cooldown_secs: u64,
+    /// Number of high-rank candidate entries to keep quote-subscribed for active risk checks.
+    pub active_risk_candidate_quote_limit: usize,
+    /// Maximum accepted active-risk quote age. Zero disables freshness blocks.
+    pub active_risk_quote_stale_secs: u64,
     /// Profit-target close fraction.
     pub profit_target_close_fraction: f64,
     /// Stop-loss close multiple.

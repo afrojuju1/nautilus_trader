@@ -239,6 +239,13 @@ loop.
 - [x] Keep broker reconciliation, close decisions, and operator events visible during cutover.
   - Startup broker reconciliation remains in the live-node readiness path.
   - Management emits `management_snapshot` and `management_block` events from the strategy path.
+- [x] Keep active-risk option quotes in the Nautilus strategy/cache path.
+  - `AlpacaOptionsStrategy` subscribes active-entry close legs and top-ranked candidate legs through
+    `subscribe_quotes`.
+  - Cached `QuoteTick` timestamps drive stale-quote close blocks, selected-candidate freshness
+    blocks when a stale cached quote exists, and `alpaca-ops status` quote-cache/stale alerts.
+  - Missing active close-leg quotes remain a `close_quote_missing` management block; first-time
+    candidate entries are not blocked solely because the subscription cache has not emitted yet.
 - [x] Remove direct management behavior from the account-engine loop once the new owner is proven.
   - The legacy `options_engine` library module was removed.
   - `alpaca-options-node` no longer runs a management loop and remains a config-check command.

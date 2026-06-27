@@ -651,7 +651,7 @@ fn print_usage() {
 
 fn print_config_check(config: &AlpacaOptionsRuntimeConfig) {
     println!(
-        "alpaca_options_runtime_config: underlyings={} strategy_families={} dry_run_families={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} expiration_exit_days={} lifecycle_poll_secs={} lifecycle_activity_lookback_hours={} lifecycle_activity_block_hours={} expiration_entry_block_days={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_max_candidates={}",
+        "alpaca_options_runtime_config: underlyings={} strategy_families={} dry_run_families={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} active_risk_candidate_quote_limit={} active_risk_quote_stale_secs={} expiration_exit_days={} lifecycle_poll_secs={} lifecycle_activity_lookback_hours={} lifecycle_activity_block_hours={} expiration_entry_block_days={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_max_candidates={}",
         config.underlyings.join(","),
         config.enabled_strategy_family_names().join(","),
         config.dry_run_strategy_family_names().join(","),
@@ -678,6 +678,8 @@ fn print_config_check(config: &AlpacaOptionsRuntimeConfig) {
         config.close_price_cushion,
         config.max_close_attempts,
         config.close_reprice_cooldown_secs,
+        config.active_risk_candidate_quote_limit,
+        config.active_risk_quote_stale_secs,
         config.expiration_exit_days,
         config.lifecycle_poll_secs,
         config.lifecycle_activity_lookback_hours,

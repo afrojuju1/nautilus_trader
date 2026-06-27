@@ -87,6 +87,7 @@ struct OperatorStatus {
     last_decision: Option<Value>,
     last_management_snapshot: Option<Value>,
     last_management_block: Option<Value>,
+    last_active_risk_quote_cache: Option<Value>,
     last_lifecycle_event: Option<Value>,
     last_broker_event: Option<Value>,
     alerts: Vec<OperatorAlert>,
@@ -550,6 +551,7 @@ fn build_status(
         .or_else(|| latest_event(events, "decision"));
     let last_management_snapshot = latest_event(events, "management_snapshot");
     let last_management_block = latest_event(events, "management_block");
+    let last_active_risk_quote_cache = latest_event(events, "active_risk_quote_cache");
     let last_lifecycle_event = latest_event(events, "option_lifecycle_poll")
         .or_else(|| latest_event(events, "option_lifecycle_poll_error"));
     let last_broker_event = latest_broker_event(recent_orders, activities);
@@ -596,6 +598,7 @@ fn build_status(
         last_decision,
         last_management_snapshot,
         last_management_block,
+        last_active_risk_quote_cache,
         last_lifecycle_event,
         last_broker_event,
         alerts,
@@ -811,11 +814,13 @@ fn build_alerts(
             .get("reason")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        alerts.push(alert(
-            AlertSeverity::Warning,
-            "management_block",
-            format!("recent management block: {reason}"),
-        ));
+        if reason != "active_risk_quote_stale" {
+            alerts.push(alert(
+                AlertSeverity::Warning,
+                "management_block",
+                format!("recent management block: {reason}"),
+            ));
+        }
     }
     if let Some(event) = latest_recent_event(events, "management_snapshot", 3600)
         && let Some(reason) = event.get("close_reason").and_then(Value::as_str)
@@ -828,6 +833,13 @@ fn build_alerts(
             AlertSeverity::Warning,
             "close_trigger_active",
             format!("{underlying} has an active close trigger: {reason}"),
+        ));
+    }
+    if recent_management_block_reason(events, "active_risk_quote_stale", 3600) {
+        alerts.push(alert(
+            AlertSeverity::Warning,
+            "active_risk_quote_stale",
+            "active-risk option quotes are stale for at least one managed entry".to_string(),
         ));
     }
     if recent_event_count(events, "option_lifecycle_poll_error", 3600) > 0 {
@@ -1041,6 +1053,13 @@ fn print_human_status(status: &OperatorStatus) {
             .map_or_else(|| "none".to_string(), compact_json)
     );
     println!(
+        "last_active_risk_quote_cache: {}",
+        status
+            .last_active_risk_quote_cache
+            .as_ref()
+            .map_or_else(|| "none".to_string(), compact_json)
+    );
+    println!(
         "last_lifecycle_event: {}",
         status
             .last_lifecycle_event
@@ -1147,6 +1166,19 @@ fn latest_recent_event(events: &[Value], event_type: &str, lookback_secs: i64) -
                     .is_some_and(|ts| ts >= cutoff)
         })
         .cloned()
+}
+
+fn recent_management_block_reason(events: &[Value], reason: &str, lookback_secs: i64) -> bool {
+    let cutoff = Utc::now() - Duration::seconds(lookback_secs);
+    events.iter().any(|event| {
+        event.get("type").and_then(Value::as_str) == Some("management_block")
+            && event.get("reason").and_then(Value::as_str) == Some(reason)
+            && event
+                .get("ts_utc")
+                .and_then(Value::as_str)
+                .and_then(parse_utc)
+                .is_some_and(|ts| ts >= cutoff)
+    })
 }
 
 fn latest_recent_lifecycle_block(events: &[Value], lookback_secs: i64) -> Option<&Value> {

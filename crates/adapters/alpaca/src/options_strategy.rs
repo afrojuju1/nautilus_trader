@@ -263,7 +263,8 @@ pub struct AlpacaOptionsStrategy {
     pending_close_client_order_ids: BTreeMap<String, String>,
     submitted_underlying_keys: BTreeSet<String>,
     recorded_candidate_alert_keys: BTreeSet<String>,
-    management_quote_subscriptions: BTreeSet<InstrumentId>,
+    active_risk_quote_subscriptions: BTreeSet<InstrumentId>,
+    candidate_quote_instrument_ids: BTreeSet<InstrumentId>,
 }
 
 impl AlpacaOptionsStrategy {
@@ -280,7 +281,8 @@ impl AlpacaOptionsStrategy {
             pending_close_client_order_ids: BTreeMap::new(),
             submitted_underlying_keys: BTreeSet::new(),
             recorded_candidate_alert_keys: BTreeSet::new(),
-            management_quote_subscriptions: BTreeSet::new(),
+            active_risk_quote_subscriptions: BTreeSet::new(),
+            candidate_quote_instrument_ids: BTreeSet::new(),
         }
     }
 
@@ -298,6 +300,7 @@ impl AlpacaOptionsStrategy {
         &mut self,
         data: &OptionsCandidateData,
     ) -> anyhow::Result<Option<AlpacaOptionsSubmission>> {
+        self.update_candidate_quote_subscriptions(&data.candidates);
         let Some(entry) = data.candidates.selected_entry().cloned() else {
             return Ok(None);
         };
@@ -398,6 +401,10 @@ impl AlpacaOptionsStrategy {
         }
 
         if let Some(block) = self.lifecycle_submission_block(&entry) {
+            self.log_entry_block(&data.candidates.trade_date, &entry, &block);
+            return Ok(None);
+        }
+        if let Some(block) = self.selected_entry_quote_freshness_block(&entry) {
             self.log_entry_block(&data.candidates.trade_date, &entry, &block);
             return Ok(None);
         }
@@ -631,7 +638,7 @@ impl AlpacaOptionsStrategy {
     }
 
     fn manage_active_entries(&mut self) -> anyhow::Result<()> {
-        self.refresh_management_quote_subscriptions();
+        self.refresh_active_risk_quote_subscriptions();
         let active_order_list_ids = self
             .state
             .entries
@@ -691,6 +698,22 @@ impl AlpacaOptionsStrategy {
                 );
                 return Ok(());
             }
+        }
+
+        let stale_quote_symbols = self.stale_active_risk_quote_symbols(&entry);
+        if !stale_quote_symbols.is_empty() {
+            emit_operator_event(
+                "management_block",
+                json!({
+                    "action": "close_blocked",
+                    "reason": "active_risk_quote_stale",
+                    "underlying": entry.underlying,
+                    "strategy": entry.strategy,
+                    "symbols": stale_quote_symbols,
+                    "limit_secs": self.config.management.active_risk_quote_stale_secs,
+                }),
+            );
+            return Ok(());
         }
 
         let Some(close_quote) = self.close_quote_from_cache(&entry) else {
@@ -1044,7 +1067,15 @@ impl AlpacaOptionsStrategy {
             .collect()
     }
 
-    fn refresh_management_quote_subscriptions(&mut self) {
+    fn update_candidate_quote_subscriptions(&mut self, candidates: &OptionsCandidateSet) {
+        self.candidate_quote_instrument_ids = candidate_quote_instrument_ids(
+            candidates,
+            self.config.management.active_risk_candidate_quote_limit,
+        );
+        self.refresh_active_risk_quote_subscriptions();
+    }
+
+    fn refresh_active_risk_quote_subscriptions(&mut self) {
         let desired = self
             .state
             .entries
@@ -1060,24 +1091,38 @@ impl AlpacaOptionsStrategy {
                     Vec::new()
                 }
             })
+            .chain(self.candidate_quote_instrument_ids.iter().copied())
             .collect::<BTreeSet<_>>();
 
         for instrument_id in desired
-            .difference(&self.management_quote_subscriptions)
+            .difference(&self.active_risk_quote_subscriptions)
             .copied()
             .collect::<Vec<_>>()
         {
             self.subscribe_quotes(instrument_id, self.config.client_id, None);
         }
         for instrument_id in self
-            .management_quote_subscriptions
+            .active_risk_quote_subscriptions
             .difference(&desired)
             .copied()
             .collect::<Vec<_>>()
         {
             self.unsubscribe_quotes(instrument_id, self.config.client_id, None);
         }
-        self.management_quote_subscriptions = desired;
+        if desired != self.active_risk_quote_subscriptions {
+            emit_operator_event(
+                "active_risk_quote_cache",
+                json!({
+                    "active_entry_quote_symbols": active_entry_quote_symbols(&self.state),
+                    "candidate_quote_symbols_count": self.candidate_quote_instrument_ids.len(),
+                    "candidate_quote_limit": self.config.management.active_risk_candidate_quote_limit,
+                    "candidate_quote_symbols": instrument_symbols(&self.candidate_quote_instrument_ids),
+                    "subscribed_symbols": instrument_symbols(&desired),
+                    "subscribed_count": desired.len(),
+                }),
+            );
+        }
+        self.active_risk_quote_subscriptions = desired;
     }
 
     fn state_entry(&self, order_list_id: &str) -> Option<&StrategyStateEntry> {
@@ -1628,6 +1673,61 @@ impl AlpacaOptionsStrategy {
             .and_then(|risk| risk.submission_block(entry, Utc::now()))
     }
 
+    fn selected_entry_quote_freshness_block(
+        &self,
+        entry: &SelectedOptionsEntry,
+    ) -> Option<SubmissionBlock> {
+        if self.config.management.active_risk_quote_stale_secs == 0 {
+            return None;
+        }
+        let stale_symbols = entry
+            .option_symbols()
+            .into_iter()
+            .filter(|symbol| {
+                alpaca_instrument_id(symbol)
+                    .ok()
+                    .and_then(|instrument_id| self.cache().quote(&instrument_id))
+                    .is_some_and(|quote| {
+                        quote_age_secs(quote.ts_event, Utc::now()).is_some_and(|age| {
+                            age > self.config.management.active_risk_quote_stale_secs
+                        })
+                    })
+            })
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+
+        (!stale_symbols.is_empty()).then(|| SubmissionBlock {
+            reason: "active_risk_quote_stale".to_string(),
+            current: None,
+            limit: None,
+            details: stale_symbols
+                .into_iter()
+                .map(|symbol| format!("symbol={symbol}"))
+                .collect(),
+        })
+    }
+
+    fn stale_active_risk_quote_symbols(&self, entry: &StrategyStateEntry) -> Vec<String> {
+        if self.config.management.active_risk_quote_stale_secs == 0 {
+            return Vec::new();
+        }
+        entry
+            .symbols()
+            .into_iter()
+            .filter(|symbol| {
+                alpaca_instrument_id(symbol)
+                    .ok()
+                    .and_then(|instrument_id| self.cache().quote(&instrument_id))
+                    .is_some_and(|quote| {
+                        quote_age_secs(quote.ts_event, Utc::now()).is_some_and(|age| {
+                            age > self.config.management.active_risk_quote_stale_secs
+                        })
+                    })
+            })
+            .map(ToString::to_string)
+            .collect()
+    }
+
     fn log_entry_block(
         &mut self,
         trade_date: &str,
@@ -1853,7 +1953,7 @@ nautilus_strategy!(AlpacaOptionsStrategy, {
 impl DataActor for AlpacaOptionsStrategy {
     fn on_start(&mut self) -> anyhow::Result<()> {
         self.subscribe_data(OptionsCandidateData::data_type(), None, None);
-        self.refresh_management_quote_subscriptions();
+        self.refresh_active_risk_quote_subscriptions();
         if self.config.management.interval_secs > 0 {
             self.clock().set_timer(
                 MANAGEMENT_TIMER,
@@ -1872,14 +1972,15 @@ impl DataActor for AlpacaOptionsStrategy {
         self.unsubscribe_data(OptionsCandidateData::data_type(), None, None);
         self.clock().cancel_timer(MANAGEMENT_TIMER);
         for instrument_id in self
-            .management_quote_subscriptions
+            .active_risk_quote_subscriptions
             .iter()
             .copied()
             .collect::<Vec<_>>()
         {
             self.unsubscribe_quotes(instrument_id, self.config.client_id, None);
         }
-        self.management_quote_subscriptions.clear();
+        self.active_risk_quote_subscriptions.clear();
+        self.candidate_quote_instrument_ids.clear();
         Ok(())
     }
 
@@ -2003,6 +2104,46 @@ fn close_order_list_id(entry: &StrategyStateEntry) -> String {
         entry.underlying,
         UUID4::new()
     )
+}
+
+fn candidate_quote_instrument_ids(
+    candidates: &OptionsCandidateSet,
+    limit: usize,
+) -> BTreeSet<InstrumentId> {
+    if limit == 0 {
+        return BTreeSet::new();
+    }
+    candidates
+        .ranked_entries()
+        .iter()
+        .take(limit)
+        .flat_map(SelectedOptionsEntry::option_symbols)
+        .filter_map(|symbol| alpaca_instrument_id(symbol).ok())
+        .collect()
+}
+
+fn active_entry_quote_symbols(state: &StrategyState) -> Vec<String> {
+    state
+        .entries
+        .iter()
+        .filter(|entry| entry.is_active())
+        .flat_map(StrategyStateEntry::symbols)
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn instrument_symbols(instrument_ids: &BTreeSet<InstrumentId>) -> Vec<String> {
+    instrument_ids
+        .iter()
+        .map(|instrument_id| instrument_id.symbol.to_string())
+        .collect()
+}
+
+fn quote_age_secs(ts_event: UnixNanos, now: DateTime<Utc>) -> Option<u64> {
+    let now_ns = u64::try_from(now.timestamp_nanos_opt()?).ok()?;
+    Some(now_ns.saturating_sub(ts_event.as_u64()) / 1_000_000_000)
 }
 
 /// Minimal order creation surface used by the Alpaca options entry strategy.
