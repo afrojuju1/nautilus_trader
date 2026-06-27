@@ -43,6 +43,7 @@ pub(super) struct RuntimeConfigFile {
     naked_scanner: NakedScannerSection,
     naked_1_3dte_scanner: NakedScannerSection,
     management: ManagementSection,
+    lifecycle: LifecycleSection,
     risk: RiskSection,
 }
 
@@ -60,6 +61,7 @@ impl RuntimeConfigFile {
                 .naked_1_3dte_scanner
                 .merge_parent(parent.naked_1_3dte_scanner),
             management: self.management.merge_parent(parent.management),
+            lifecycle: self.lifecycle.merge_parent(parent.lifecycle),
             risk: self.risk.merge_parent(parent.risk),
         }
     }
@@ -327,6 +329,30 @@ impl ManagementSection {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+struct LifecycleSection {
+    poll_secs: Option<u64>,
+    activity_lookback_hours: Option<u64>,
+    activity_block_hours: Option<u64>,
+    expiration_entry_block_days: Option<i64>,
+}
+
+impl LifecycleSection {
+    fn merge_parent(self, parent: Self) -> Self {
+        Self {
+            poll_secs: self.poll_secs.or(parent.poll_secs),
+            activity_lookback_hours: self
+                .activity_lookback_hours
+                .or(parent.activity_lookback_hours),
+            activity_block_hours: self.activity_block_hours.or(parent.activity_block_hours),
+            expiration_entry_block_days: self
+                .expiration_entry_block_days
+                .or(parent.expiration_entry_block_days),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct RiskSection {
     max_active_entries: Option<usize>,
     max_daily_submits: Option<usize>,
@@ -465,6 +491,9 @@ pub(super) fn build_options_runtime_config(
         dry_run_strategy_family_config_from_values(dry_run_strategy_values)?;
     let scanner = scanner_config_from_file(&file.scanner);
     let stale_entry_secs = file.management.stale_entry_secs.unwrap_or(900);
+    let interval_secs = env_parse("ALPACA_INTERVAL_SECS")
+        .or(file.runtime.interval_secs)
+        .unwrap_or(300);
     let fleet = load_fleet_config_from_env()?;
     let mut config = AlpacaOptionsRuntimeConfig {
         underlyings: underlyings_from_sources(cli_underlyings, &file.universe),
@@ -487,9 +516,7 @@ pub(super) fn build_options_runtime_config(
         max_iterations: env_parse("ALPACA_MAX_ITERATIONS")
             .or(file.runtime.max_iterations)
             .unwrap_or(1),
-        interval_secs: env_parse("ALPACA_INTERVAL_SECS")
-            .or(file.runtime.interval_secs)
-            .unwrap_or(300),
+        interval_secs,
         quantity: env_parse("ALPACA_QTY")
             .or(file.universe.quantity)
             .unwrap_or(1),
@@ -532,6 +559,18 @@ pub(super) fn build_options_runtime_config(
         stop_loss_close_multiple: file.management.stop_loss_close_multiple.unwrap_or(2.0),
         max_hold_secs: file.management.max_hold_secs.unwrap_or(0),
         expiration_exit_days: file.management.expiration_exit_days.unwrap_or(1),
+        lifecycle_poll_secs: env_parse("ALPACA_LIFECYCLE_POLL_SECS")
+            .or(file.lifecycle.poll_secs)
+            .unwrap_or(interval_secs.max(60)),
+        lifecycle_activity_lookback_hours: env_parse("ALPACA_LIFECYCLE_ACTIVITY_LOOKBACK_HOURS")
+            .or(file.lifecycle.activity_lookback_hours)
+            .unwrap_or(72),
+        lifecycle_activity_block_hours: env_parse("ALPACA_LIFECYCLE_ACTIVITY_BLOCK_HOURS")
+            .or(file.lifecycle.activity_block_hours)
+            .unwrap_or(24),
+        expiration_entry_block_days: env_parse("ALPACA_EXPIRATION_ENTRY_BLOCK_DAYS")
+            .or(file.lifecycle.expiration_entry_block_days)
+            .unwrap_or(0),
         ignore_entry_window: env_bool("ALPACA_IGNORE_ENTRY_WINDOW")
             .or(file.runtime.ignore_entry_window)
             .unwrap_or(false),

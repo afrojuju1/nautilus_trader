@@ -40,6 +40,7 @@ use crate::{
         is_uncovered_option_permission_rejection, selected_submit_enabled,
         submission_block_for_selected,
     },
+    options_lifecycle::OptionLifecycleRiskHandle,
     options_management::{
         AlpacaOptionsManagementConfig, CloseQuote, close_attempts_exhausted,
         close_quote_from_ticks, close_reason, close_reprice_cooldown_remaining_secs,
@@ -174,6 +175,8 @@ pub struct AlpacaOptionsStrategyConfig {
     pub state_persistence: Option<StrategyStatePersistenceHandle>,
     /// Async candidate-ledger persistence boundary used for scanner and strategy evidence.
     pub candidate_ledger_persistence: Option<CandidateLedgerPersistenceHandle>,
+    /// Shared lifecycle-risk state from the account-activity poller.
+    pub lifecycle_risk: Option<OptionLifecycleRiskHandle>,
     /// Management settings owned by the live strategy runtime.
     pub management: AlpacaOptionsManagementConfig,
 }
@@ -190,6 +193,7 @@ impl AlpacaOptionsStrategyConfig {
             initial_state: StrategyState::default(),
             state_persistence: None,
             candidate_ledger_persistence: None,
+            lifecycle_risk: None,
             management: AlpacaOptionsManagementConfig::default(),
         }
     }
@@ -205,6 +209,7 @@ impl AlpacaOptionsStrategyConfig {
             initial_state: StrategyState::default(),
             state_persistence: None,
             candidate_ledger_persistence: None,
+            lifecycle_risk: None,
             management: AlpacaOptionsManagementConfig::from_runtime_config(engine),
         }
     }
@@ -389,6 +394,11 @@ impl AlpacaOptionsStrategy {
                 None,
                 &[],
             );
+            return Ok(None);
+        }
+
+        if let Some(block) = self.lifecycle_submission_block(&entry) {
+            self.log_entry_block(&data.candidates.trade_date, &entry, &block);
             return Ok(None);
         }
 
@@ -1609,6 +1619,13 @@ impl AlpacaOptionsStrategy {
             open_order_count,
             broker_admission_reasons,
         })
+    }
+
+    fn lifecycle_submission_block(&self, entry: &SelectedOptionsEntry) -> Option<SubmissionBlock> {
+        self.config
+            .lifecycle_risk
+            .as_ref()
+            .and_then(|risk| risk.submission_block(entry, Utc::now()))
     }
 
     fn log_entry_block(

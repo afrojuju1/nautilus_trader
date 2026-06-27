@@ -667,6 +667,10 @@ pub struct AlpacaAccount {
     pub daytrading_buying_power: Option<String>,
     /// Options buying power.
     pub options_buying_power: Option<String>,
+    /// Options approval level granted to the account.
+    pub options_approved_level: Option<u8>,
+    /// Effective options trading level for the account.
+    pub options_trading_level: Option<u8>,
     /// Pattern day trader flag.
     pub pattern_day_trader: Option<bool>,
     /// Trading blocked flag.
@@ -679,6 +683,31 @@ pub struct AlpacaAccount {
     pub trade_suspended_by_user: Option<bool>,
     /// Account multiplier.
     pub multiplier: Option<String>,
+}
+
+/// Alpaca account configuration model.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AlpacaAccountConfiguration {
+    /// Day-trading buying-power check mode.
+    pub dtbp_check: Option<String>,
+    /// Fractional-trading setting.
+    pub fractional_trading: Option<bool>,
+    /// Maximum margin multiplier setting.
+    pub max_margin_multiplier: Option<String>,
+    /// Maximum options trading level configured for the account.
+    pub max_options_trading_level: Option<u8>,
+    /// Long-only account setting.
+    pub no_shorting: Option<bool>,
+    /// Pattern-day-trader check mode.
+    pub pdt_check: Option<String>,
+    /// PTP exception-entry setting.
+    pub ptp_no_exception_entry: Option<bool>,
+    /// Trading suspension setting.
+    pub suspend_trade: Option<bool>,
+    /// Trade-confirmation email setting.
+    pub trade_confirm_email: Option<String>,
+    /// Overnight-trading disablement setting.
+    pub disable_overnight_trading: Option<bool>,
 }
 
 /// Alpaca open position model.

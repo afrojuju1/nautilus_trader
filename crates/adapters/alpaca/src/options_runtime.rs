@@ -32,6 +32,7 @@ use crate::{
     config::AlpacaDataClientConfig,
     fleet::ResolvedFleetConfig,
     http::client::AlpacaHttpClient,
+    options_lifecycle::OptionLifecycleRiskConfig,
     options_management::CreditSpreadManagementConfig,
     runtime::{
         StrategyState, credit_spread_strategy_name, debit_spread_strategy_name,
@@ -152,6 +153,14 @@ pub struct AlpacaOptionsRuntimeConfig {
     pub max_hold_secs: u64,
     /// Expiration-risk exit days. Negative disables.
     pub expiration_exit_days: i64,
+    /// Lifecycle account-activity poll interval. Zero disables background polling.
+    pub lifecycle_poll_secs: u64,
+    /// Lifecycle account-activity lookback.
+    pub lifecycle_activity_lookback_hours: u64,
+    /// Recent assignment/exercise block window.
+    pub lifecycle_activity_block_hours: u64,
+    /// Calendar DTE threshold that blocks new entries. Negative disables.
+    pub expiration_entry_block_days: i64,
     /// Whether the entry window gate should be ignored.
     pub ignore_entry_window: bool,
     /// Entry window start.
@@ -210,6 +219,13 @@ impl AlpacaOptionsRuntimeConfig {
         config.storage_schema = storage::STORAGE_SCHEMA_DEFAULT.to_string();
         config.storage_account_id = None;
         Ok(config)
+    }
+
+    /// Builds the default runtime config for unit tests.
+    #[cfg(test)]
+    pub(crate) fn from_runtime_config_for_tests() -> Self {
+        build_options_runtime_config(config::RuntimeConfigFile::default(), Vec::new())
+            .expect("default Alpaca options runtime config should parse")
     }
 
     /// Builds config without reading positional CLI underlyings.
@@ -317,6 +333,17 @@ impl AlpacaOptionsRuntimeConfig {
             stop_loss_close_multiple: self.stop_loss_close_multiple,
             max_hold_secs: self.max_hold_secs,
             expiration_exit_days: self.expiration_exit_days,
+        }
+    }
+
+    /// Returns lifecycle-risk settings for the live strategy runtime.
+    #[must_use]
+    pub const fn lifecycle_risk_config(&self) -> OptionLifecycleRiskConfig {
+        OptionLifecycleRiskConfig {
+            poll_secs: self.lifecycle_poll_secs,
+            activity_lookback_hours: self.lifecycle_activity_lookback_hours,
+            activity_block_hours: self.lifecycle_activity_block_hours,
+            expiration_entry_block_days: self.expiration_entry_block_days,
         }
     }
 

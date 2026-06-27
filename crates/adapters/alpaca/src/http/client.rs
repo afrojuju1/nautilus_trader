@@ -31,12 +31,12 @@ use crate::{
     http::{
         error::{Error, Result},
         models::{
-            AlpacaAccount, AlpacaActivity, AlpacaMarketCalendarDay, AlpacaOrder, AlpacaPosition,
-            ListActivitiesRequest, ListOptionContractsRequest, ListOrdersRequest,
-            MarketCalendarRequest, OptionBarsRequest, OptionBarsResponse, OptionContractsResponse,
-            OptionSnapshotsRequest, OptionSnapshotsResponse, OptionTradesRequest,
-            OptionTradesResponse, ReplaceOrderRequest, StockBarsRequest, StockBarsResponse,
-            StockSnapshotsRequest, StockSnapshotsResponse,
+            AlpacaAccount, AlpacaAccountConfiguration, AlpacaActivity, AlpacaMarketCalendarDay,
+            AlpacaOrder, AlpacaPosition, ListActivitiesRequest, ListOptionContractsRequest,
+            ListOrdersRequest, MarketCalendarRequest, OptionBarsRequest, OptionBarsResponse,
+            OptionContractsResponse, OptionSnapshotsRequest, OptionSnapshotsResponse,
+            OptionTradesRequest, OptionTradesResponse, ReplaceOrderRequest, StockBarsRequest,
+            StockBarsResponse, StockSnapshotsRequest, StockSnapshotsResponse,
         },
     },
     orders::{EquityOrderPayload, MlegOrderPayload, SimpleOrderPayload},
@@ -384,6 +384,16 @@ impl AlpacaHttpClient {
     /// Returns an error if the request fails or the response cannot be decoded.
     pub async fn account(&self) -> Result<AlpacaAccount> {
         self.get_trading_json("/v2/account", &[]).await
+    }
+
+    /// Returns the current Alpaca trading account configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be decoded.
+    pub async fn account_configuration(&self) -> Result<AlpacaAccountConfiguration> {
+        self.get_trading_json("/v2/account/configurations", &[])
+            .await
     }
 
     /// Returns Alpaca market calendar days for a date range.

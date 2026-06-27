@@ -556,20 +556,25 @@ documentation and evidence-driven strategy operation.
 
 Required before promoting beyond experimental:
 
-1. Account capability preflight.
+1. Account capability preflight. **Status: runtime implementation complete.**
    - Read account options approval/trading-level fields and account configuration limits at startup
      and in operator status.
    - Map enabled strategies to the required options level and fail closed when an account is not
      approved for the configured strategy set.
    - Emit clear operator blocks such as `options_level_insufficient` before scanning or submitting.
+   - Implemented through `account_capabilities`, `AlpacaHttpClient::account_configuration`, and
+     `alpaca-options-node` live-submit readiness.
 
-2. Assignment, exercise, and expiration risk daemon.
-   - Poll account activities for option assignment, expiry, and option trade records because these
+2. Assignment, exercise, and expiration risk daemon. **Status: runtime implementation complete.**
+   - Poll account activities for option assignment, exercise, and expiry records because these
      lifecycle events are not guaranteed through trade-update websockets.
    - Add DTE-zero and near-expiry controls aligned with Alpaca's expiration handling window.
-   - Surface exercise/assignment/expiry events in performance ledgers, operator status, and alerts.
+   - Surface exercise/assignment/expiry events in operator status and alerts.
    - Keep manual DNE and exercise instructions as documented operator procedures unless an explicit
      API-backed workflow is designed and paper-proven.
+   - Implemented through `options_lifecycle`, the node-level account-activity poller, and
+     `AlpacaOptionsStrategy` lifecycle entry blocks. Performance-ledger attribution remains
+     reporting work, not an order-path safety blocker.
 
 3. Real-time option quote cache for active risk.
    - Subscribe to explicit active-position and high-rank candidate option symbols on Alpaca's
@@ -711,8 +716,8 @@ Current status:
 
 Implement the Phase 7.5 required platform work in this order:
 
-1. Account capability preflight.
-2. Assignment, exercise, and expiration risk daemon.
+1. Account capability preflight. Done in the runtime path.
+2. Assignment, exercise, and expiration risk daemon. Done for runtime gating and operator status.
 3. Real-time option quote cache for active risk.
 4. Historical option research and replay harness.
 5. Strategy regime router with portfolio Greek/stress governor.

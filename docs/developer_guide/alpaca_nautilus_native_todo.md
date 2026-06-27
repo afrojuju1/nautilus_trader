@@ -206,6 +206,13 @@ loop.
   events, and durable strategy state.
 - [ ] Check broker account/orders after the run and cancel accepted smoke orders unless explicitly
   leaving them open.
+- [x] Keep account capability preflight in the live-submit readiness path before paper submission.
+  - `alpaca-options-node` checks options approval/trading level, account configuration max options
+    level, account configuration trading blocks, and options buying power.
+- [x] Keep lifecycle risk blocks in the strategy admission path before paper submission.
+  - The node polls option assignment, exercise, and expiration account activities.
+  - Recent assignment/exercise activity and same-day-expiry candidates block live entry submission.
+  - `alpaca-ops status` surfaces the latest lifecycle poll and raises lifecycle alerts.
 
 ### 5. Remove Old Entry Loop
 

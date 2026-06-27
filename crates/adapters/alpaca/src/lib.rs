@@ -40,6 +40,8 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 #[cfg(feature = "live")]
+pub mod account_capabilities;
+#[cfg(feature = "live")]
 pub mod candidate_engine;
 #[cfg(feature = "live")]
 pub mod candidate_ledger_persistence;
@@ -64,6 +66,8 @@ pub mod option_chain_candidates;
 pub mod options_entry;
 #[cfg(feature = "live")]
 pub mod options_entry_admission;
+#[cfg(feature = "live")]
+pub mod options_lifecycle;
 #[cfg(feature = "live")]
 pub mod options_management;
 #[cfg(feature = "live")]

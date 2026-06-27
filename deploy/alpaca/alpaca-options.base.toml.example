@@ -131,3 +131,9 @@ profit_target_close_fraction = 0.50
 stop_loss_close_multiple = 2.0
 max_hold_secs = 0
 expiration_exit_days = 1
+
+[lifecycle]
+poll_secs = 300
+activity_lookback_hours = 72
+activity_block_hours = 24
+expiration_entry_block_days = 0

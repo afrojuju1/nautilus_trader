@@ -87,6 +87,7 @@ struct OperatorStatus {
     last_decision: Option<Value>,
     last_management_snapshot: Option<Value>,
     last_management_block: Option<Value>,
+    last_lifecycle_event: Option<Value>,
     last_broker_event: Option<Value>,
     alerts: Vec<OperatorAlert>,
 }
@@ -136,6 +137,8 @@ struct AccountStatus {
     trade_suspended_by_user: bool,
     buying_power: String,
     options_buying_power: String,
+    options_approved_level: Option<u8>,
+    options_trading_level: Option<u8>,
     portfolio_value: String,
     cash: String,
 }
@@ -443,6 +446,8 @@ fn build_status(
             .options_buying_power
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
+        options_approved_level: account.options_approved_level,
+        options_trading_level: account.options_trading_level,
         portfolio_value: account
             .portfolio_value
             .clone()
@@ -545,6 +550,8 @@ fn build_status(
         .or_else(|| latest_event(events, "decision"));
     let last_management_snapshot = latest_event(events, "management_snapshot");
     let last_management_block = latest_event(events, "management_block");
+    let last_lifecycle_event = latest_event(events, "option_lifecycle_poll")
+        .or_else(|| latest_event(events, "option_lifecycle_poll_error"));
     let last_broker_event = latest_broker_event(recent_orders, activities);
 
     let mut alerts = build_alerts(
@@ -589,6 +596,7 @@ fn build_status(
         last_decision,
         last_management_snapshot,
         last_management_block,
+        last_lifecycle_event,
         last_broker_event,
         alerts,
     }
@@ -822,6 +830,20 @@ fn build_alerts(
             format!("{underlying} has an active close trigger: {reason}"),
         ));
     }
+    if recent_event_count(events, "option_lifecycle_poll_error", 3600) > 0 {
+        alerts.push(alert(
+            AlertSeverity::Critical,
+            "option_lifecycle_poll_error",
+            "the option lifecycle risk poller failed in the last hour".to_string(),
+        ));
+    }
+    if let Some(event) = latest_recent_lifecycle_block(events, 86_400) {
+        alerts.push(alert(
+            AlertSeverity::Critical,
+            "option_lifecycle_block",
+            format!("recent option lifecycle block: {}", compact_json(event)),
+        ));
+    }
     if recent_event_count(events, "runner_start", 3600) > 1 {
         alerts.push(alert(
             AlertSeverity::Warning,
@@ -907,13 +929,21 @@ fn print_human_status(status: &OperatorStatus) {
             .map_or_else(|| "none".to_string(), |value| value.to_string()),
     );
     println!(
-        "account: status={} trading_blocked={} account_blocked={} suspended={} buying_power={} options_buying_power={} portfolio_value={} cash={}",
+        "account: status={} trading_blocked={} account_blocked={} suspended={} buying_power={} options_buying_power={} options_approved_level={} options_trading_level={} portfolio_value={} cash={}",
         status.account.status,
         status.account.trading_blocked,
         status.account.account_blocked,
         status.account.trade_suspended_by_user,
         status.account.buying_power,
         status.account.options_buying_power,
+        status
+            .account
+            .options_approved_level
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        status
+            .account
+            .options_trading_level
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
         status.account.portfolio_value,
         status.account.cash,
     );
@@ -1007,6 +1037,13 @@ fn print_human_status(status: &OperatorStatus) {
         "last_management_block: {}",
         status
             .last_management_block
+            .as_ref()
+            .map_or_else(|| "none".to_string(), compact_json)
+    );
+    println!(
+        "last_lifecycle_event: {}",
+        status
+            .last_lifecycle_event
             .as_ref()
             .map_or_else(|| "none".to_string(), compact_json)
     );
@@ -1110,6 +1147,22 @@ fn latest_recent_event(events: &[Value], event_type: &str, lookback_secs: i64) -
                     .is_some_and(|ts| ts >= cutoff)
         })
         .cloned()
+}
+
+fn latest_recent_lifecycle_block(events: &[Value], lookback_secs: i64) -> Option<&Value> {
+    let cutoff = Utc::now() - Duration::seconds(lookback_secs);
+    events.iter().rev().find(|event| {
+        event.get("type").and_then(Value::as_str) == Some("option_lifecycle_poll")
+            && event
+                .get("ts_utc")
+                .and_then(Value::as_str)
+                .and_then(parse_utc)
+                .is_some_and(|ts| ts >= cutoff)
+            && event
+                .get("blocks")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| !blocks.is_empty())
+    })
 }
 
 fn latest_broker_event(orders: &[AlpacaOrder], activities: &[AlpacaActivity]) -> Option<Value> {

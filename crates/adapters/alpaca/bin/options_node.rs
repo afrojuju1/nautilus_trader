@@ -3,7 +3,9 @@
 use std::{env, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
+use chrono::{Duration as ChronoDuration, Utc};
 use nautilus_alpaca::{
+    account_capabilities::{account_capability_preflight, emit_account_capability_preflight},
     candidate_ledger_persistence::CandidateLedgerPersistenceHandle,
     candidate_scan_actor::{
         OptionChainCandidateScanActor, OptionChainCandidateScanActorConfig,
@@ -14,6 +16,11 @@ use nautilus_alpaca::{
     execution::account_entry_admission_reasons,
     factories::{AlpacaDataClientFactory, AlpacaExecutionClientFactory},
     http::{client::AlpacaHttpClient, models::AlpacaAccount},
+    options_lifecycle::{
+        OptionLifecycleRiskConfig, OptionLifecycleRiskHandle, emit_lifecycle_poll,
+        emit_lifecycle_poll_error, lifecycle_events_from_activities,
+        option_lifecycle_activity_request,
+    },
     options_runtime::AlpacaOptionsRuntimeConfig,
     options_strategy::{AlpacaOptionsStrategy, AlpacaOptionsStrategyConfig},
     parse::parse_option_series_id,
@@ -129,6 +136,8 @@ async fn main() -> anyhow::Result<()> {
         snapshot_greeks_poll_secs: args.snapshot_greeks_poll_secs,
         ..Default::default()
     };
+    let lifecycle_config = runtime_config.lifecycle_risk_config();
+    let lifecycle_risk = OptionLifecycleRiskHandle::new(lifecycle_config.clone());
     let options_buying_power = load_options_buying_power_if_needed(&runtime_config, &data_config)
         .await
         .context("failed to load options buying-power context")?;
@@ -152,6 +161,13 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to prepare Alpaca live-submit broker state")?
     } else {
         Vec::new()
+    };
+    let _lifecycle_daemon = if live_submit_requested || runtime_config.manage_enabled {
+        start_lifecycle_risk_daemon(&data_config, lifecycle_risk.clone(), lifecycle_config)
+            .await
+            .context("failed to start Alpaca option lifecycle risk daemon")?
+    } else {
+        None
     };
     let strategy_state_entry_count = strategy_state.entries.len();
 
@@ -214,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
     entry_config.candidate_ledger_persistence = live_submit_persistence
         .as_ref()
         .map(|persistence| persistence.candidate_ledger.clone());
+    entry_config.lifecycle_risk = Some(lifecycle_risk);
     let strategy = AlpacaOptionsStrategy::new(entry_config);
     node.add_strategy(strategy)?;
 
@@ -324,6 +341,29 @@ async fn prepare_live_submit_broker_state(
 ) -> anyhow::Result<Vec<String>> {
     let client = AlpacaHttpClient::from_data_config(data_config)?;
     let account = client.account().await?;
+    let account_config = client
+        .account_configuration()
+        .await
+        .context("failed to load Alpaca account configuration")?;
+    let capability_preflight = account_capability_preflight(config, &account, &account_config);
+    emit_account_capability_preflight(config, &capability_preflight);
+    if !capability_preflight.is_ready() {
+        emit_operator_event(
+            "live_submit_readiness_block",
+            json!({
+                "reason": "account_capability_preflight",
+                "details": capability_preflight.reasons.clone(),
+                "required_options_level": capability_preflight.required_options_level,
+                "options_trading_level": capability_preflight.options_trading_level,
+                "options_approved_level": capability_preflight.options_approved_level,
+                "max_options_trading_level": capability_preflight.max_options_trading_level,
+            }),
+        );
+        bail!(
+            "live submit blocked by Alpaca account capability preflight: {}",
+            capability_preflight.reasons.join("; ")
+        );
+    }
     let account_reasons = account_entry_admission_reasons(&account);
     if !account_reasons.is_empty() {
         emit_operator_event(
@@ -366,6 +406,53 @@ async fn prepare_live_submit_broker_state(
         }),
     );
     Ok(account_reasons)
+}
+
+async fn start_lifecycle_risk_daemon(
+    data_config: &AlpacaDataClientConfig,
+    handle: OptionLifecycleRiskHandle,
+    config: OptionLifecycleRiskConfig,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    let client = AlpacaHttpClient::from_data_config(data_config)?;
+    poll_lifecycle_risk_once(&client, &handle, &config).await;
+    if config.poll_secs == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(config.poll_secs));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            poll_lifecycle_risk_once(&client, &handle, &config).await;
+        }
+    })))
+}
+
+async fn poll_lifecycle_risk_once(
+    client: &AlpacaHttpClient,
+    handle: &OptionLifecycleRiskHandle,
+    config: &OptionLifecycleRiskConfig,
+) {
+    let now = Utc::now();
+    let after = now - ChronoDuration::hours(clamped_hours(config.activity_lookback_hours));
+    let request = option_lifecycle_activity_request(after);
+    match client.account_activities_all(&request).await {
+        Ok(activities) => {
+            let events = lifecycle_events_from_activities(&activities);
+            handle.update_events(events.clone(), now);
+            emit_lifecycle_poll(&events, &handle.snapshot().account_blocks);
+        }
+        Err(error) => {
+            let error = error.to_string();
+            handle.record_poll_error(error.clone(), now);
+            emit_lifecycle_poll_error(&error);
+        }
+    }
+}
+
+fn clamped_hours(hours: u64) -> i64 {
+    hours.min(i64::MAX as u64) as i64
 }
 
 fn emit_unmanaged_broker_state_block(report: &StrategyStateReconciliationReport) {
@@ -564,7 +651,7 @@ fn print_usage() {
 
 fn print_config_check(config: &AlpacaOptionsRuntimeConfig) {
     println!(
-        "alpaca_options_runtime_config: underlyings={} strategy_families={} dry_run_families={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_max_candidates={}",
+        "alpaca_options_runtime_config: underlyings={} strategy_families={} dry_run_families={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} expiration_exit_days={} lifecycle_poll_secs={} lifecycle_activity_lookback_hours={} lifecycle_activity_block_hours={} expiration_entry_block_days={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_max_candidates={}",
         config.underlyings.join(","),
         config.enabled_strategy_family_names().join(","),
         config.dry_run_strategy_family_names().join(","),
@@ -591,6 +678,11 @@ fn print_config_check(config: &AlpacaOptionsRuntimeConfig) {
         config.close_price_cushion,
         config.max_close_attempts,
         config.close_reprice_cooldown_secs,
+        config.expiration_exit_days,
+        config.lifecycle_poll_secs,
+        config.lifecycle_activity_lookback_hours,
+        config.lifecycle_activity_block_hours,
+        config.expiration_entry_block_days,
         config.max_iterations,
         config.interval_secs,
         config.state_path.display(),

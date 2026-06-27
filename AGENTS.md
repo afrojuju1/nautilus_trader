@@ -63,6 +63,13 @@ Rules:
   `alpaca-put-credit-strategy-loop` unless Ade explicitly asks for a staged bridge.
 - Use the normal runtime submission gate `ALPACA_SUBMIT`; do not reintroduce
   `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED`.
+- Live submit readiness must keep the Alpaca account capability preflight active. `alpaca-options-node`
+  checks account options approval/trading level, account configuration max options level, buying
+  power, and account configuration trading blocks before starting broker submission.
+- Assignment, exercise, and expiration lifecycle risk belongs in the `alpaca-options-node` /
+  `AlpacaOptionsStrategy` path. Use the account-activity lifecycle poller and strategy lifecycle
+  admission block; do not add a standalone lifecycle loop unless Ade explicitly asks for a separate
+  operator daemon.
 - For Alpaca execution changes, run targeted checks before commit:
 
 ```bash

@@ -284,6 +284,19 @@ pub fn admission_block_reason(reasons: &[String]) -> &'static str {
         ) || reason.starts_with("account status is ")
     }) {
         "account_not_tradable"
+    } else if reasons.iter().any(|reason| {
+        reason.starts_with("options_trading_level_")
+            || reason.starts_with("options_approved_level_")
+            || reason.starts_with("max_options_trading_level_")
+            || reason == "options_buying_power_non_positive"
+    }) {
+        "options_level_insufficient"
+    } else if reasons.iter().any(|reason| {
+        reason.starts_with("lifecycle_activity_poll_failed")
+            || reason.starts_with("assignment activity ")
+            || reason.starts_with("exercise activity ")
+    }) {
+        "account_lifecycle_event"
     } else if reasons
         .iter()
         .any(|reason| reason == "candidate option symbols must resolve to one underlying")
