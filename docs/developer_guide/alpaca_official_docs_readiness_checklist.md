@@ -138,7 +138,7 @@ for official NautilusTrader documentation.
 - [x] Document historical opportunity tracking and close-PnL accounting.
 - [ ] Document account capability preflight and options-level strategy gating.
 - [ ] Document assignment, exercise, expiry, and option non-trade activity polling once implemented.
-- [ ] Document historical option replay outputs once implemented.
+- [x] Document historical option replay outputs once implemented.
 
 ## Strategy runtime documentation
 
@@ -233,5 +233,5 @@ for official NautilusTrader documentation.
 - [ ] Phase 3: add account capability preflight.
 - [ ] Phase 3: add assignment/exercise/expiry polling and lifecycle-risk handling.
 - [ ] Phase 3: add real-time option quote/trade cache or explicitly defer it.
-- [ ] Phase 3: add historical option replay/research harness.
+- [x] Phase 3: add historical option replay/research harness.
 - [ ] Phase 3: broaden remaining data, order, and historical-data support.

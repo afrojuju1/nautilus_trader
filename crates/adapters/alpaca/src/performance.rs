@@ -26,10 +26,15 @@ use crate::{
 };
 
 mod candidate_outcomes;
+mod replay;
 
 pub use candidate_outcomes::{
     collect_order_ids, earliest_entry_timestamp, entry_in_date_range, entry_performance,
     performance_record_key, summarize_performance, track_candidate_outcomes,
+};
+pub use replay::{
+    HistoricalReplayBucketSummary, HistoricalReplayRecord, HistoricalReplayReport,
+    HistoricalReplayRequest, replay_historical_candidates,
 };
 
 /// Standard OCC equity-option contract multiplier.

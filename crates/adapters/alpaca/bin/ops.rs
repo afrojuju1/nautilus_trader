@@ -8,6 +8,8 @@ mod candidate_alerts;
 mod check_account_orders;
 #[path = "fleet_status.rs"]
 mod fleet_status;
+#[path = "historical_replay.rs"]
+mod historical_replay;
 #[path = "operator_status.rs"]
 mod operator_status;
 #[path = "performance_report.rs"]
@@ -40,6 +42,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Performance => {
             set_arg_offset(arg_offset)?;
             performance_report::run().await
+        }
+        Command::Replay => {
+            set_arg_offset(arg_offset)?;
+            historical_replay::run().await
         }
         Command::SyncState => {
             set_arg_offset(arg_offset)?;
@@ -77,6 +83,7 @@ fn command() -> anyhow::Result<(Command, usize)> {
         }
         "candidate-alerts" => Ok((Command::CandidateAlerts, 2)),
         "performance" => Ok((Command::Performance, 2)),
+        "replay" | "historical-replay" => Ok((Command::Replay, 2)),
         "sync-state" => Ok((Command::SyncState, 2)),
         "--help" | "-h" | "help" => Ok((Command::Help, 2)),
         other => anyhow::bail!("unsupported alpaca-ops command `{other}`"),
@@ -90,6 +97,7 @@ enum Command {
     Fleet,
     CandidateAlerts,
     Performance,
+    Replay,
     SyncState,
     Help,
 }
@@ -103,6 +111,7 @@ fn print_usage() {
            fleet [--json] [--include-disabled] [--registry PATH]\n\
            alerts candidates [--send|--dry-run] [--date YYYY-MM-DD] [--lookback-minutes N]\n\
            performance [--json] [--send-discord] [--since YYYY-MM-DD] [--until YYYY-MM-DD]\n\
+           replay [--json] [--include-records] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--max-candidates N] [--max-rank N] [--lookahead-minutes N] [--timeframe 1Min]\n\
            sync-state"
     );
 }

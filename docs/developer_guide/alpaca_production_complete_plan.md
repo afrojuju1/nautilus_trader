@@ -590,10 +590,16 @@ Required before promoting beyond experimental:
    - Remaining data-client improvement: add a true Alpaca option quote/trade websocket decoder and
      stream-health handling to reduce REST snapshot latency.
 
-4. Historical option research and replay harness.
-   - Replay candidate ledgers against Alpaca historical option data where available.
-   - Produce score-bucket, strategy, underlying, DTE, delta, spread-width, and liquidity summaries.
-   - Feed results back into scanner thresholds before expanding size, symbols, or strategy count.
+4. Historical option research and replay harness. **Status: initial read-only harness complete.**
+   - `alpaca-ops replay` replays candidate ledgers against Alpaca historical option bars where
+     available.
+   - Produces score-bucket, strategy, underlying, DTE, delta, spread-width, and liquidity summaries
+     with evaluated and missing-mark counts.
+   - Uses bar-close research marks only; it is not an execution-quality fill simulator.
+   - See [Alpaca Historical Option Replay](alpaca_historical_replay.md) for the data contract and
+     validation commands.
+   - Remaining research improvement: add richer historical Greek and option-chain evidence when
+     those datasets are available in the warehouse.
 
 High-value after the required platform work:
 
@@ -727,7 +733,9 @@ Implement the Phase 7.5 required platform work in this order:
 3. Active-risk option quote cache on the current Nautilus subscription path. Done for runtime
    gating and operator status; true option quote/trade streaming remains a later data-client
    improvement.
-4. Historical option research and replay harness.
+4. Historical option research and replay harness. Initial read-only `alpaca-ops replay` command is
+   done for historical option-bar marks and aggregate summaries; richer historical Greek and
+   option-chain evidence depends on warehouse availability.
 5. Strategy regime router with portfolio Greek/stress governor.
 6. Fill-quality intelligence and smart MLeg repricing.
 7. Event shock guard and replay lab.

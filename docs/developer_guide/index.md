@@ -28,6 +28,7 @@ This approach combines Python's simplicity and ecosystem with Rust's performance
 - [Alpaca Options TradingNode Migration](alpaca_options_trading_node_migration.md)
 - [Nautilus-Native Candidate Scanning](nautilus_native_candidate_scanning.md)
 - [Alpaca Regime Router](alpaca_regime_router.md)
+- [Alpaca Historical Option Replay](alpaca_historical_replay.md)
 - [Market Data Warehouse Workstream](market_data_warehouse_workstream.md)
 - [Alpaca Official Docs Readiness Checklist](alpaca_official_docs_readiness_checklist.md)
 - [Alpaca NUC Deployment](alpaca_nuc_deployment.md)

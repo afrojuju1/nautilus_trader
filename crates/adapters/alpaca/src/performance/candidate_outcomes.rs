@@ -307,41 +307,41 @@ pub fn performance_record_key(entry: &EntryPerformance) -> String {
 }
 
 #[derive(Clone, Debug)]
-struct TrackCandidate {
-    identity_key: String,
-    trade_date: String,
-    ts_utc: Option<DateTime<Utc>>,
-    candidate_type: String,
-    strategy: String,
-    underlying: String,
-    rank: Option<u64>,
-    score: Option<f64>,
-    symbols: Vec<String>,
-    entry_kind: CandidateEntryKind,
-    entry_net_premium: f64,
-    quantity: u64,
-    record: Value,
-    was_selected: bool,
-    was_submitted: bool,
-    was_traded: bool,
-    was_rejected: bool,
-    was_dry_run: bool,
-    virtual_trade: bool,
-    selected_action: Option<String>,
-    accepted: Option<u64>,
-    rejected: Option<u64>,
-    terminal_rejection_recorded: Option<bool>,
-    rejection_reasons: Vec<String>,
+pub(super) struct TrackCandidate {
+    pub(super) identity_key: String,
+    pub(super) trade_date: String,
+    pub(super) ts_utc: Option<DateTime<Utc>>,
+    pub(super) candidate_type: String,
+    pub(super) strategy: String,
+    pub(super) underlying: String,
+    pub(super) rank: Option<u64>,
+    pub(super) score: Option<f64>,
+    pub(super) symbols: Vec<String>,
+    pub(super) entry_kind: CandidateEntryKind,
+    pub(super) entry_net_premium: f64,
+    pub(super) quantity: u64,
+    pub(super) record: Value,
+    pub(super) was_selected: bool,
+    pub(super) was_submitted: bool,
+    pub(super) was_traded: bool,
+    pub(super) was_rejected: bool,
+    pub(super) was_dry_run: bool,
+    pub(super) virtual_trade: bool,
+    pub(super) selected_action: Option<String>,
+    pub(super) accepted: Option<u64>,
+    pub(super) rejected: Option<u64>,
+    pub(super) terminal_rejection_recorded: Option<bool>,
+    pub(super) rejection_reasons: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CandidateEntryKind {
+pub(super) enum CandidateEntryKind {
     Credit,
     Debit,
 }
 
 #[derive(Clone, Debug, Default)]
-struct CandidateSelection {
+pub(super) struct CandidateSelection {
     action: Option<String>,
     accepted: Option<u64>,
     rejected: Option<u64>,
@@ -418,7 +418,9 @@ struct CandidateOutcomeValue {
     warnings: Vec<String>,
 }
 
-fn selected_candidate_actions(records: &[Value]) -> BTreeMap<String, CandidateSelection> {
+pub(super) fn selected_candidate_actions(
+    records: &[Value],
+) -> BTreeMap<String, CandidateSelection> {
     let mut selected = BTreeMap::<String, CandidateSelection>::new();
     for record in records
         .iter()
@@ -461,7 +463,7 @@ fn selected_candidate_actions(records: &[Value]) -> BTreeMap<String, CandidateSe
     selected
 }
 
-fn collect_track_candidates(
+pub(super) fn collect_track_candidates(
     records: &[Value],
     selected: &BTreeMap<String, CandidateSelection>,
     max_rank: u64,

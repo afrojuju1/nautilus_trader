@@ -73,6 +73,9 @@ Rules:
 - Active-risk option quote freshness belongs in `AlpacaOptionsStrategy` through Nautilus
   `subscribe_quotes` and the strategy cache. Do not add a standalone quote loop; improve the Alpaca
   data client when quote transport needs to move from REST snapshots to streaming.
+- Historical candidate replay belongs in the read-only `alpaca-ops replay` / `performance` research
+  path. It may read candidate ledgers and historical market data, but must not submit orders, cancel
+  orders, reconcile broker state, or mutate strategy state.
 - For Alpaca execution changes, run targeted checks before commit:
 
 ```bash
