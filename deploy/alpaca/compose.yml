@@ -137,7 +137,7 @@ services:
   alpaca-options:
     <<: *alpaca-runtime
     profiles: ["engine"]
-    command: ["alpaca-options-engine"]
+    command: ["alpaca-option-chain-scan-live-node"]
     restart: unless-stopped
 
 volumes:

@@ -34,8 +34,11 @@ The Rust Alpaca runtime currently includes the following implemented components:
   cached instrument replay.
 - `AlpacaExecutionClient`: Rust execution client for simple option limit orders and multi-leg
   option limit orders, with trade-update and REST reconciliation paths.
-- `alpaca-options-engine`: Account-level options runtime for paper trading with strategy hosting,
-  risk gates, management, close handling, candidate ledgers, and performance reporting.
+- `alpaca-option-chain-scan-live-node`: Account-level options runtime for paper trading with
+  Nautilus strategy hosting, risk gates, management, close handling, candidate ledgers, and
+  performance reporting.
+- `alpaca-options-engine --check-config`: Legacy config-check command for deployed options
+  runtime configuration.
 - Operator binaries for read-only account status, option-chain inspection, dry-run scanning,
   multi-leg payload validation, fleet status, alerts, and performance reports.
 
@@ -209,7 +212,7 @@ cargo run -p nautilus-alpaca --features live --bin alpaca-validate-mleg-order --
   SPY260619P00450000 SPY260619P00445000 0.40 1
 ```
 
-Before running the account engine, check config with submission disabled:
+Before running the live node, check config with submission disabled:
 
 ```bash
 export ALPACA_SUBMIT=false

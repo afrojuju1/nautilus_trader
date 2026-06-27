@@ -316,7 +316,7 @@ the service exits without starting another Alpaca account owner.
 
 The service runs installed release binaries by default:
 
-- Runner: `~/.local/bin/alpaca-options-engine`
+- Runner: `~/.local/bin/alpaca-option-chain-scan-live-node`
 - Operator status: `~/.local/bin/alpaca-operator-status`
 - Fleet status: `~/.local/bin/alpaca-fleet-status`
 
@@ -627,7 +627,7 @@ Stuck close order:
 
 - Check `orders.open`, `active_entries[].close_attempts`, `last_management_snapshot`, and
   `last_management_block`.
-- The engine cancels stale close orders after `management.stale_close_secs`.
+- The live Nautilus strategy cancels stale close orders after `management.stale_close_secs`.
 - If `close_attempts_exhausted` appears, inspect the spread, then either increase
   `management.max_close_attempts`, set `ALPACA_FORCE_FLATTEN=true`, or flatten manually at the
   broker.

@@ -8,13 +8,15 @@ use std::{
     sync::Arc,
 };
 
-use chrono::{NaiveDate, Utc};
-use nautilus_common::{actor::DataActor, cache::CacheApi, factories::OrderFactory};
+use chrono::{DateTime, NaiveDate, Utc};
+use nautilus_common::{
+    actor::DataActor, cache::CacheApi, factories::OrderFactory, timer::TimeEvent,
+};
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     data::{CustomData, CustomDataTrait, DataType, HasTsInit},
-    enums::{OrderSide, TimeInForce},
-    events::{OrderAccepted, OrderDenied, OrderRejected},
+    enums::{OrderSide, OrderStatus, TimeInForce},
+    events::{OrderAccepted, OrderCanceled, OrderDenied, OrderFilled, OrderRejected},
     identifiers::{ClientId, ClientOrderId, InstrumentId, OrderListId},
     instruments::Instrument,
     orders::{Order, OrderAny},
@@ -38,11 +40,16 @@ use crate::{
         is_uncovered_option_permission_rejection, selected_submit_enabled,
         submission_block_for_selected,
     },
+    options_management::{
+        AlpacaOptionsManagementConfig, CloseQuote, close_attempts_exhausted,
+        close_quote_from_ticks, close_reason, close_reprice_cooldown_remaining_secs,
+        emit_management_snapshot, management_instrument_ids,
+    },
     options_runtime::{
         OptionsEngineConfig, OptionsOpportunitySet, OptionsScanOutcome, OptionsScanReport,
         SelectedOptionsEntry,
     },
-    runtime::{StrategyState, StrategyStateEntryDraft, emit_operator_event},
+    runtime::{StrategyState, StrategyStateEntry, StrategyStateEntryDraft, emit_operator_event},
     state_persistence::StrategyStatePersistenceHandle,
     storage::StrategyStateMutation,
 };
@@ -50,6 +57,7 @@ use serde_json::{Value, json};
 
 const SELECTED_CANDIDATE_ALERT: &str = "selected_candidate";
 const CANDIDATE_SUBMIT_REJECTED_ALERT: &str = "candidate_submit_rejected";
+const MANAGEMENT_TIMER: &str = "alpaca_options_management";
 
 /// Custom data type published by option-chain scanner actors for entry strategies.
 #[derive(Clone, Debug)]
@@ -167,6 +175,8 @@ pub struct AlpacaOptionsEntryStrategyConfig {
     pub state_persistence: Option<StrategyStatePersistenceHandle>,
     /// Async candidate-ledger persistence boundary used for scanner and strategy evidence.
     pub candidate_ledger_persistence: Option<CandidateLedgerPersistenceHandle>,
+    /// Management settings owned by the live strategy runtime.
+    pub management: AlpacaOptionsManagementConfig,
 }
 
 impl AlpacaOptionsEntryStrategyConfig {
@@ -181,6 +191,7 @@ impl AlpacaOptionsEntryStrategyConfig {
             initial_state: StrategyState::default(),
             state_persistence: None,
             candidate_ledger_persistence: None,
+            management: AlpacaOptionsManagementConfig::default(),
         }
     }
 
@@ -195,6 +206,7 @@ impl AlpacaOptionsEntryStrategyConfig {
             initial_state: StrategyState::default(),
             state_persistence: None,
             candidate_ledger_persistence: None,
+            management: AlpacaOptionsManagementConfig::from_engine_config(engine),
         }
     }
 }
@@ -223,6 +235,17 @@ struct PendingEntrySubmission {
     rejection_reasons: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+struct PendingCloseSubmission {
+    entry_order_list_id: String,
+    close_order_list_id: String,
+    close_reason: String,
+    order_count: usize,
+    accepted: usize,
+    rejected: usize,
+    recorded: bool,
+}
+
 /// Nautilus strategy responsible for converting selected option opportunities into orders.
 #[derive(Debug)]
 pub struct AlpacaOptionsEntryStrategy {
@@ -231,8 +254,11 @@ pub struct AlpacaOptionsEntryStrategy {
     state: StrategyState,
     pending_submissions: BTreeMap<String, PendingEntrySubmission>,
     pending_client_order_ids: BTreeMap<String, String>,
+    pending_close_submissions: BTreeMap<String, PendingCloseSubmission>,
+    pending_close_client_order_ids: BTreeMap<String, String>,
     submitted_underlying_keys: BTreeSet<String>,
     recorded_candidate_alert_keys: BTreeSet<String>,
+    management_quote_subscriptions: BTreeSet<InstrumentId>,
 }
 
 impl AlpacaOptionsEntryStrategy {
@@ -245,8 +271,11 @@ impl AlpacaOptionsEntryStrategy {
             config,
             pending_submissions: BTreeMap::new(),
             pending_client_order_ids: BTreeMap::new(),
+            pending_close_submissions: BTreeMap::new(),
+            pending_close_client_order_ids: BTreeMap::new(),
             submitted_underlying_keys: BTreeSet::new(),
             recorded_candidate_alert_keys: BTreeSet::new(),
+            management_quote_subscriptions: BTreeSet::new(),
         }
     }
 
@@ -591,6 +620,736 @@ impl AlpacaOptionsEntryStrategy {
         Ok(())
     }
 
+    fn manage_active_entries(&mut self) -> anyhow::Result<()> {
+        self.refresh_management_quote_subscriptions();
+        let active_order_list_ids = self
+            .state
+            .entries
+            .iter()
+            .filter(|entry| entry.is_active())
+            .map(|entry| entry.order_list_id.clone())
+            .collect::<Vec<_>>();
+
+        for order_list_id in active_order_list_ids {
+            self.manage_active_entry(&order_list_id)?;
+        }
+        Ok(())
+    }
+
+    fn manage_active_entry(&mut self, order_list_id: &str) -> anyhow::Result<()> {
+        let Some(entry) = self.state_entry(order_list_id).cloned() else {
+            return Ok(());
+        };
+        if let Some(close_order_list_id) = entry.close_order_list_id.as_deref() {
+            self.manage_existing_close_order(&entry, close_order_list_id)?;
+            return Ok(());
+        }
+
+        match self.order_list_status(&entry.order_list_id) {
+            OrderListRuntimeStatus::Filled => {}
+            OrderListRuntimeStatus::Working => {
+                self.manage_working_entry_order(&entry)?;
+                return Ok(());
+            }
+            OrderListRuntimeStatus::TerminalWithoutFill => {
+                self.mark_entry_canceled(&entry.order_list_id, "entry_terminal_without_fill")?;
+                return Ok(());
+            }
+            OrderListRuntimeStatus::Missing => {
+                emit_operator_event(
+                    "management_block",
+                    json!({
+                        "action": "entry_status_unavailable",
+                        "reason": "entry_order_missing_from_cache",
+                        "underlying": entry.underlying,
+                        "strategy": entry.strategy,
+                        "order_list_id": entry.order_list_id,
+                    }),
+                );
+                return Ok(());
+            }
+            OrderListRuntimeStatus::Partial => {
+                emit_operator_event(
+                    "management_block",
+                    json!({
+                        "action": "entry_status_unavailable",
+                        "reason": "partial_entry_state",
+                        "underlying": entry.underlying,
+                        "strategy": entry.strategy,
+                        "order_list_id": entry.order_list_id,
+                    }),
+                );
+                return Ok(());
+            }
+        }
+
+        let Some(close_quote) = self.close_quote_from_cache(&entry) else {
+            emit_operator_event(
+                "management_block",
+                json!({
+                    "action": "close_blocked",
+                    "reason": "close_quote_unavailable",
+                    "underlying": entry.underlying,
+                    "strategy": entry.strategy,
+                    "short_symbol": entry.short_symbol,
+                    "long_symbol": entry.long_symbol,
+                }),
+            );
+            return Ok(());
+        };
+
+        let trigger = close_reason(&self.config.management, &entry, close_quote.debit);
+        emit_management_snapshot(&entry, &close_quote, trigger.as_deref());
+        let Some(trigger) = trigger else {
+            return Ok(());
+        };
+
+        if !(self.config.management.manage_enabled && self.config.management.close_enabled) {
+            let reason = if !self.config.management.manage_enabled {
+                "management_disabled"
+            } else {
+                "close_disabled"
+            };
+            emit_operator_event(
+                "management_block",
+                json!({
+                    "action": "close_blocked",
+                    "reason": reason,
+                    "underlying": entry.underlying,
+                    "strategy": entry.strategy,
+                    "trigger": trigger,
+                    "manage_enabled": self.config.management.manage_enabled,
+                    "close_enabled": self.config.management.close_enabled,
+                }),
+            );
+            return Ok(());
+        }
+
+        if close_attempts_exhausted(&self.config.management, &entry) {
+            emit_operator_event(
+                "management_block",
+                json!({
+                    "action": "close_blocked",
+                    "reason": "max_close_attempts",
+                    "underlying": entry.underlying,
+                    "strategy": entry.strategy,
+                    "trigger": trigger,
+                    "attempts": entry.close_attempts,
+                    "limit": self.config.management.max_close_attempts,
+                }),
+            );
+            return Ok(());
+        }
+
+        if let Some(remaining_secs) =
+            close_reprice_cooldown_remaining_secs(&self.config.management, &entry)
+        {
+            emit_operator_event(
+                "management_block",
+                json!({
+                    "action": "close_blocked",
+                    "reason": "close_reprice_cooldown",
+                    "underlying": entry.underlying,
+                    "strategy": entry.strategy,
+                    "trigger": trigger,
+                    "remaining_secs": remaining_secs,
+                }),
+            );
+            return Ok(());
+        }
+
+        if !self.config.management.inside_close_window(Utc::now()) {
+            emit_operator_event(
+                "management_block",
+                json!({
+                    "action": "close_blocked",
+                    "reason": "outside_close_window",
+                    "underlying": entry.underlying,
+                    "strategy": entry.strategy,
+                    "trigger": trigger,
+                    "window_start": self.config.management.close_start.to_string(),
+                    "window_end": self.config.management.close_end.to_string(),
+                    "timezone": self.config.management.entry_timezone.to_string(),
+                }),
+            );
+            return Ok(());
+        }
+
+        let close_order_list_id = close_order_list_id(&entry);
+        let submit_quote =
+            close_quote.with_price_cushion(self.config.management.close_price_cushion);
+        self.submit_close_entry(entry, submit_quote, trigger, close_order_list_id)?;
+        Ok(())
+    }
+
+    fn manage_working_entry_order(&mut self, entry: &StrategyStateEntry) -> anyhow::Result<()> {
+        if !self.config.management.manage_enabled || self.config.management.stale_entry_secs == 0 {
+            return Ok(());
+        }
+        let Some(age) = age_secs_from_rfc3339(&entry.recorded_at_utc) else {
+            return Ok(());
+        };
+        if age < self.config.management.stale_entry_secs {
+            return Ok(());
+        }
+
+        emit_operator_event(
+            "management_snapshot",
+            json!({
+                "action": "stale_entry_cancel",
+                "underlying": entry.underlying,
+                "strategy": entry.strategy,
+                "order_list_id": entry.order_list_id,
+                "age_secs": age,
+                "limit_secs": self.config.management.stale_entry_secs,
+            }),
+        );
+        self.cancel_order_list_orders(&entry.order_list_id)
+    }
+
+    fn manage_existing_close_order(
+        &mut self,
+        entry: &StrategyStateEntry,
+        close_order_list_id: &str,
+    ) -> anyhow::Result<()> {
+        match self.order_list_status(close_order_list_id) {
+            OrderListRuntimeStatus::Filled => {
+                self.mark_entry_closed(&entry.order_list_id, close_order_list_id, None)?;
+            }
+            OrderListRuntimeStatus::Working => {
+                self.manage_working_close_order(entry, close_order_list_id)?;
+            }
+            OrderListRuntimeStatus::TerminalWithoutFill => {
+                self.clear_close_submission(&entry.order_list_id, "close_terminal_without_fill")?;
+            }
+            OrderListRuntimeStatus::Missing => {
+                emit_operator_event(
+                    "management_block",
+                    json!({
+                        "action": "close_status_unavailable",
+                        "reason": "close_order_missing_from_cache",
+                        "underlying": entry.underlying,
+                        "strategy": entry.strategy,
+                        "order_list_id": entry.order_list_id,
+                        "close_order_list_id": close_order_list_id,
+                    }),
+                );
+            }
+            OrderListRuntimeStatus::Partial => {
+                emit_operator_event(
+                    "management_block",
+                    json!({
+                        "action": "close_status_unavailable",
+                        "reason": "partial_close_state",
+                        "underlying": entry.underlying,
+                        "strategy": entry.strategy,
+                        "order_list_id": entry.order_list_id,
+                        "close_order_list_id": close_order_list_id,
+                    }),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn manage_working_close_order(
+        &mut self,
+        entry: &StrategyStateEntry,
+        close_order_list_id: &str,
+    ) -> anyhow::Result<()> {
+        if !(self.config.management.manage_enabled && self.config.management.close_enabled)
+            || self.config.management.stale_close_secs == 0
+        {
+            return Ok(());
+        }
+        let Some(last_submitted_at) = entry.last_close_submitted_at_utc.as_deref() else {
+            return Ok(());
+        };
+        let Some(age) = age_secs_from_rfc3339(last_submitted_at) else {
+            return Ok(());
+        };
+        if age < self.config.management.stale_close_secs {
+            return Ok(());
+        }
+
+        emit_operator_event(
+            "management_snapshot",
+            json!({
+                "action": "stale_close_cancel",
+                "underlying": entry.underlying,
+                "strategy": entry.strategy,
+                "order_list_id": entry.order_list_id,
+                "close_order_list_id": close_order_list_id,
+                "age_secs": age,
+                "limit_secs": self.config.management.stale_close_secs,
+            }),
+        );
+        self.cancel_order_list_orders(close_order_list_id)
+    }
+
+    fn submit_close_entry(
+        &mut self,
+        entry: StrategyStateEntry,
+        quote: CloseQuote,
+        close_reason: String,
+        close_order_list_id: String,
+    ) -> anyhow::Result<()> {
+        let orders = self.build_close_orders(&entry, &quote, &close_order_list_id)?;
+        let client_order_ids = orders
+            .iter()
+            .map(|order| order.client_order_id().to_string())
+            .collect::<Vec<_>>();
+        let order_count = orders.len();
+        self.record_pending_close_submission(
+            entry.order_list_id.clone(),
+            close_order_list_id.clone(),
+            close_reason,
+            order_count,
+            client_order_ids,
+        );
+
+        if let Err(error) = self.submit_close_orders(orders, &close_order_list_id) {
+            self.remove_pending_close_submission(&close_order_list_id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn build_close_orders(
+        &mut self,
+        entry: &StrategyStateEntry,
+        quote: &CloseQuote,
+        order_list_id: &str,
+    ) -> anyhow::Result<Vec<OrderAny>> {
+        let mut order_api = self.order();
+        build_close_entry_orders(&mut order_api, entry, quote, order_list_id)
+    }
+
+    fn submit_close_orders(
+        &mut self,
+        mut orders: Vec<OrderAny>,
+        order_list_id: &str,
+    ) -> anyhow::Result<()> {
+        if orders.len() == 1 {
+            self.submit_order(orders.remove(0), None, self.config.client_id, None)?;
+        } else {
+            apply_order_list_id(&mut orders, order_list_id);
+            self.submit_order_list(orders, None, self.config.client_id, None)?;
+        }
+        Ok(())
+    }
+
+    fn cancel_order_list_orders(&mut self, order_list_id: &str) -> anyhow::Result<()> {
+        let client_order_ids = self
+            .order_list_orders(order_list_id)
+            .into_iter()
+            .filter(|order| order.status().is_cancellable())
+            .map(|order| order.client_order_id())
+            .collect::<Vec<_>>();
+        if client_order_ids.is_empty() {
+            return Ok(());
+        }
+
+        for client_order_id in client_order_ids {
+            self.cancel_order(client_order_id, self.config.client_id, None)?;
+        }
+        Ok(())
+    }
+
+    fn close_quote_from_cache(&self, entry: &StrategyStateEntry) -> Option<CloseQuote> {
+        let cache = self.cache();
+        close_quote_from_ticks(
+            entry,
+            cache.quote(&alpaca_instrument_id(&entry.short_symbol).ok()?),
+            if entry.long_symbol.is_empty() {
+                None
+            } else {
+                cache.quote(&alpaca_instrument_id(&entry.long_symbol).ok()?)
+            },
+            entry
+                .short_call_symbol
+                .as_deref()
+                .and_then(|symbol| alpaca_instrument_id(symbol).ok())
+                .and_then(|instrument_id| cache.quote(&instrument_id)),
+            entry
+                .long_call_symbol
+                .as_deref()
+                .and_then(|symbol| alpaca_instrument_id(symbol).ok())
+                .and_then(|instrument_id| cache.quote(&instrument_id)),
+        )
+    }
+
+    fn order_list_status(&self, order_list_id: &str) -> OrderListRuntimeStatus {
+        let orders = self.order_list_orders(order_list_id);
+        if orders.is_empty() {
+            return OrderListRuntimeStatus::Missing;
+        }
+        if orders
+            .iter()
+            .all(|order| order.status() == OrderStatus::Filled)
+        {
+            return OrderListRuntimeStatus::Filled;
+        }
+        if orders
+            .iter()
+            .any(|order| order.is_open() || order.is_inflight())
+        {
+            return OrderListRuntimeStatus::Working;
+        }
+        if orders.iter().all(Order::is_closed) {
+            return OrderListRuntimeStatus::TerminalWithoutFill;
+        }
+        OrderListRuntimeStatus::Partial
+    }
+
+    fn order_list_orders(&self, order_list_id: &str) -> Vec<OrderAny> {
+        let cache = self.cache();
+        let order_list_id = OrderListId::from(order_list_id);
+        if let Some(order_list) = cache.order_list(&order_list_id) {
+            return order_list
+                .client_order_ids
+                .iter()
+                .filter_map(|client_order_id| cache.order(client_order_id))
+                .collect();
+        }
+
+        let closed_orders = cache
+            .client_order_ids_closed(None, None, None, None)
+            .into_iter()
+            .filter_map(|client_order_id| cache.order(&client_order_id));
+
+        cache
+            .orders_open(None, None, None, None, None)
+            .into_iter()
+            .chain(cache.orders_inflight(None, None, None, None, None))
+            .chain(closed_orders)
+            .filter(|order| {
+                order.order_list_id() == Some(order_list_id)
+                    || order.client_order_id().as_str() == order_list_id.as_str()
+                    || order
+                        .client_order_id()
+                        .as_str()
+                        .starts_with(&format!("{order_list_id}-"))
+            })
+            .collect()
+    }
+
+    fn refresh_management_quote_subscriptions(&mut self) {
+        let desired = self
+            .state
+            .entries
+            .iter()
+            .filter(|entry| entry.is_active())
+            .flat_map(|entry| match management_instrument_ids(entry) {
+                Ok(instrument_ids) => instrument_ids,
+                Err(error) => {
+                    log::error!(
+                        "Failed to build Alpaca management instrument IDs: order_list_id={} error={error:#}",
+                        entry.order_list_id
+                    );
+                    Vec::new()
+                }
+            })
+            .collect::<BTreeSet<_>>();
+
+        for instrument_id in desired
+            .difference(&self.management_quote_subscriptions)
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            self.subscribe_quotes(instrument_id, self.config.client_id, None);
+        }
+        for instrument_id in self
+            .management_quote_subscriptions
+            .difference(&desired)
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            self.unsubscribe_quotes(instrument_id, self.config.client_id, None);
+        }
+        self.management_quote_subscriptions = desired;
+    }
+
+    fn state_entry(&self, order_list_id: &str) -> Option<&StrategyStateEntry> {
+        self.state
+            .entries
+            .iter()
+            .find(|entry| entry.order_list_id == order_list_id)
+    }
+
+    fn state_entry_mut(&mut self, order_list_id: &str) -> Option<&mut StrategyStateEntry> {
+        self.state
+            .entries
+            .iter_mut()
+            .find(|entry| entry.order_list_id == order_list_id)
+    }
+
+    fn record_pending_close_submission(
+        &mut self,
+        entry_order_list_id: String,
+        close_order_list_id: String,
+        close_reason: String,
+        order_count: usize,
+        client_order_ids: Vec<String>,
+    ) {
+        for client_order_id in client_order_ids {
+            self.pending_close_client_order_ids
+                .insert(client_order_id, close_order_list_id.clone());
+        }
+        self.pending_close_submissions.insert(
+            close_order_list_id.clone(),
+            PendingCloseSubmission {
+                entry_order_list_id,
+                close_order_list_id,
+                close_reason,
+                order_count,
+                accepted: 0,
+                rejected: 0,
+                recorded: false,
+            },
+        );
+    }
+
+    fn remove_pending_close_submission(&mut self, close_order_list_id: &str) {
+        if let Some(pending) = self.pending_close_submissions.remove(close_order_list_id) {
+            self.pending_close_client_order_ids
+                .retain(|_, value| value != &pending.close_order_list_id);
+        }
+    }
+
+    fn handle_close_order_accepted(&mut self, event: &OrderAccepted) -> bool {
+        let client_order_id = event.client_order_id.to_string();
+        let Some(close_order_list_id) = self
+            .pending_close_client_order_ids
+            .get(&client_order_id)
+            .cloned()
+        else {
+            return false;
+        };
+
+        let mut state_update = None;
+        let mut should_remove = false;
+        if let Some(pending) = self.pending_close_submissions.get_mut(&close_order_list_id) {
+            pending.accepted = pending.accepted.saturating_add(1);
+            if !pending.recorded {
+                state_update = Some((
+                    pending.entry_order_list_id.clone(),
+                    pending.close_order_list_id.clone(),
+                    Some(event.venue_order_id.to_string()),
+                    pending.close_reason.clone(),
+                ));
+                pending.recorded = true;
+            }
+            should_remove = pending.accepted + pending.rejected >= pending.order_count;
+        }
+
+        if let Some((entry_order_list_id, close_order_list_id, parent_order_id, close_reason)) =
+            state_update
+        {
+            let mutation = if let Some(entry) = self.state_entry_mut(&entry_order_list_id) {
+                entry.record_close_submission(
+                    close_order_list_id.clone(),
+                    parent_order_id.clone(),
+                    close_reason.clone(),
+                );
+                Some(close_accepted_state_mutation(
+                    event,
+                    entry,
+                    &close_order_list_id,
+                    parent_order_id.as_deref(),
+                    &close_reason,
+                ))
+            } else {
+                None
+            };
+            if let Some(mutation) = mutation {
+                self.persist_strategy_state_mutation(mutation);
+            }
+        }
+
+        if should_remove {
+            self.remove_pending_close_submission(&close_order_list_id);
+        }
+        true
+    }
+
+    fn handle_close_order_rejected(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        reason: &str,
+    ) -> bool {
+        let Some(close_order_list_id) = self
+            .pending_close_client_order_ids
+            .get(client_order_id.as_str())
+            .cloned()
+        else {
+            return false;
+        };
+
+        let mut should_remove = false;
+        if let Some(pending) = self.pending_close_submissions.get_mut(&close_order_list_id) {
+            pending.rejected = pending.rejected.saturating_add(1);
+            should_remove = pending.accepted + pending.rejected >= pending.order_count;
+            emit_operator_event(
+                "management_block",
+                json!({
+                    "action": "close_rejected",
+                    "reason": reason,
+                    "order_list_id": pending.entry_order_list_id,
+                    "close_order_list_id": pending.close_order_list_id,
+                    "accepted": pending.accepted,
+                    "rejected": pending.rejected,
+                }),
+            );
+        }
+
+        if should_remove {
+            self.remove_pending_close_submission(&close_order_list_id);
+        }
+        true
+    }
+
+    fn handle_close_order_filled(&mut self, event: &OrderFilled) -> bool {
+        let Some(close_order_list_id) = self.close_order_list_id_for_client(&event.client_order_id)
+        else {
+            return false;
+        };
+        let Some(entry_order_list_id) = self.entry_order_list_id_for_close(&close_order_list_id)
+        else {
+            return false;
+        };
+        if self.order_list_status(&close_order_list_id) == OrderListRuntimeStatus::Filled {
+            if let Err(error) = self.mark_entry_closed(
+                &entry_order_list_id,
+                &close_order_list_id,
+                Some(event.venue_order_id.to_string()),
+            ) {
+                log::error!("Failed to mark Alpaca options entry closed: {error:#}");
+            }
+        }
+        true
+    }
+
+    fn handle_close_order_canceled(&mut self, event: &OrderCanceled) -> bool {
+        let Some(close_order_list_id) = self.close_order_list_id_for_client(&event.client_order_id)
+        else {
+            return false;
+        };
+        let Some(entry_order_list_id) = self.entry_order_list_id_for_close(&close_order_list_id)
+        else {
+            return false;
+        };
+        if self.order_list_status(&close_order_list_id)
+            == OrderListRuntimeStatus::TerminalWithoutFill
+            && let Err(error) = self.clear_close_submission(&entry_order_list_id, "close_canceled")
+        {
+            log::error!("Failed to clear Alpaca close submission: {error:#}");
+        }
+        true
+    }
+
+    fn handle_entry_order_canceled(&mut self, event: &OrderCanceled) -> bool {
+        let client_order_id = event.client_order_id.to_string();
+        let Some(order_list_id) = self
+            .pending_client_order_ids
+            .get(&client_order_id)
+            .cloned()
+            .or_else(|| self.order_list_id_for_client(&event.client_order_id))
+        else {
+            return false;
+        };
+        if self.order_list_status(&order_list_id) == OrderListRuntimeStatus::TerminalWithoutFill
+            && let Err(error) = self.mark_entry_canceled(&order_list_id, "entry_canceled")
+        {
+            log::error!("Failed to mark Alpaca entry canceled: {error:#}");
+        }
+        true
+    }
+
+    fn close_order_list_id_for_client(&self, client_order_id: &ClientOrderId) -> Option<String> {
+        self.pending_close_client_order_ids
+            .get(client_order_id.as_str())
+            .cloned()
+            .or_else(|| self.order_list_id_for_client(client_order_id))
+            .filter(|order_list_id| {
+                self.state.entries.iter().any(|entry| {
+                    entry.close_order_list_id.as_deref() == Some(order_list_id.as_str())
+                })
+            })
+    }
+
+    fn entry_order_list_id_for_close(&self, close_order_list_id: &str) -> Option<String> {
+        self.state
+            .entries
+            .iter()
+            .find(|entry| entry.close_order_list_id.as_deref() == Some(close_order_list_id))
+            .map(|entry| entry.order_list_id.clone())
+    }
+
+    fn order_list_id_for_client(&self, client_order_id: &ClientOrderId) -> Option<String> {
+        self.cache()
+            .order(client_order_id)
+            .and_then(|order| order.order_list_id())
+            .map(|order_list_id| order_list_id.to_string())
+    }
+
+    fn mark_entry_closed(
+        &mut self,
+        entry_order_list_id: &str,
+        close_order_list_id: &str,
+        close_parent_order_id: Option<String>,
+    ) -> anyhow::Result<()> {
+        let Some(entry) = self.state_entry_mut(entry_order_list_id) else {
+            return Ok(());
+        };
+        if entry.closed {
+            return Ok(());
+        }
+        entry.mark_closed(close_parent_order_id.clone());
+        let mutation = entry_closed_state_mutation(
+            entry,
+            close_order_list_id,
+            close_parent_order_id.as_deref(),
+        );
+        let _ = entry;
+        self.persist_strategy_state_mutation(mutation);
+        Ok(())
+    }
+
+    fn mark_entry_canceled(
+        &mut self,
+        entry_order_list_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let Some(entry) = self.state_entry_mut(entry_order_list_id) else {
+            return Ok(());
+        };
+        if entry.canceled {
+            return Ok(());
+        }
+        entry.mark_canceled();
+        let mutation = entry_canceled_state_mutation(entry, reason);
+        let _ = entry;
+        self.persist_strategy_state_mutation(mutation);
+        Ok(())
+    }
+
+    fn clear_close_submission(
+        &mut self,
+        entry_order_list_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let Some(entry) = self.state_entry_mut(entry_order_list_id) else {
+            return Ok(());
+        };
+        let close_order_list_id = entry.close_order_list_id.clone();
+        entry.clear_close_submission();
+        let mutation = close_cleared_state_mutation(entry, close_order_list_id.as_deref(), reason);
+        let _ = entry;
+        self.persist_strategy_state_mutation(mutation);
+        Ok(())
+    }
+
     fn record_pending_submission(
         &mut self,
         entry: SelectedOptionsEntry,
@@ -620,6 +1379,10 @@ impl AlpacaOptionsEntryStrategy {
     }
 
     fn handle_order_accepted(&mut self, event: OrderAccepted) {
+        if self.handle_close_order_accepted(&event) {
+            return;
+        }
+
         let client_order_id = event.client_order_id.to_string();
         let Some(order_list_id) = self.pending_client_order_ids.get(&client_order_id).cloned()
         else {
@@ -667,6 +1430,10 @@ impl AlpacaOptionsEntryStrategy {
         ts_event: UnixNanos,
         event_type: &'static str,
     ) {
+        if self.handle_close_order_rejected(&client_order_id, reason) {
+            return;
+        }
+
         let client_order_id = client_order_id.to_string();
         let Some(order_list_id) = self.pending_client_order_ids.get(&client_order_id).cloned()
         else {
@@ -1018,6 +1785,19 @@ impl AlpacaOptionsEntryStrategy {
 }
 
 nautilus_strategy!(AlpacaOptionsEntryStrategy, {
+    fn external_order_claims(&self) -> Option<Vec<InstrumentId>> {
+        let claims = self
+            .state
+            .entries
+            .iter()
+            .filter(|entry| entry.is_active())
+            .flat_map(|entry| management_instrument_ids(entry).unwrap_or_default())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        (!claims.is_empty()).then_some(claims)
+    }
+
     fn on_order_accepted(&mut self, event: OrderAccepted) {
         self.handle_order_accepted(event);
     }
@@ -1046,11 +1826,40 @@ nautilus_strategy!(AlpacaOptionsEntryStrategy, {
 impl DataActor for AlpacaOptionsEntryStrategy {
     fn on_start(&mut self) -> anyhow::Result<()> {
         self.subscribe_data(OptionsOpportunityData::data_type(), None, None);
+        self.refresh_management_quote_subscriptions();
+        if self.config.management.interval_secs > 0 {
+            self.clock().set_timer(
+                MANAGEMENT_TIMER,
+                std::time::Duration::from_secs(self.config.management.interval_secs),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
+        }
         Ok(())
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
         self.unsubscribe_data(OptionsOpportunityData::data_type(), None, None);
+        self.clock().cancel_timer(MANAGEMENT_TIMER);
+        for instrument_id in self
+            .management_quote_subscriptions
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            self.unsubscribe_quotes(instrument_id, self.config.client_id, None);
+        }
+        self.management_quote_subscriptions.clear();
+        Ok(())
+    }
+
+    fn on_time_event(&mut self, event: &TimeEvent) -> anyhow::Result<()> {
+        if event.name.as_str() == MANAGEMENT_TIMER {
+            self.manage_active_entries()?;
+        }
         Ok(())
     }
 
@@ -1062,6 +1871,97 @@ impl DataActor for AlpacaOptionsEntryStrategy {
         self.submit_opportunity_data(opportunities)?;
         Ok(())
     }
+
+    fn on_order_filled(&mut self, event: &OrderFilled) -> anyhow::Result<()> {
+        self.handle_close_order_filled(event);
+        Ok(())
+    }
+
+    fn on_order_canceled(&mut self, event: &OrderCanceled) -> anyhow::Result<()> {
+        if !self.handle_close_order_canceled(event) {
+            self.handle_entry_order_canceled(event);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrderListRuntimeStatus {
+    Missing,
+    Working,
+    Filled,
+    TerminalWithoutFill,
+    Partial,
+}
+
+/// Builds Nautilus reduce-only orders for closing an active strategy-state entry.
+///
+/// # Errors
+///
+/// Returns an error when quantity, price, or Alpaca option symbol inputs are invalid.
+pub fn build_close_entry_orders(
+    orders: &mut impl OptionsEntryOrderCreator,
+    entry: &StrategyStateEntry,
+    quote: &CloseQuote,
+    order_list_id: &str,
+) -> anyhow::Result<Vec<OrderAny>> {
+    let mut close_orders = vec![limit_option_order(
+        orders,
+        if entry.is_naked_option() {
+            ClientOrderId::from(order_list_id)
+        } else {
+            labeled_client_order_id(order_list_id, "short-close")
+        },
+        &entry.short_symbol,
+        OrderSide::Buy,
+        entry.quantity,
+        quote.short_ask,
+        true,
+    )?];
+
+    if !entry.long_symbol.is_empty() {
+        close_orders.push(limit_option_order(
+            orders,
+            labeled_client_order_id(order_list_id, "long-close"),
+            &entry.long_symbol,
+            OrderSide::Sell,
+            entry.quantity,
+            quote.long_bid,
+            true,
+        )?);
+    }
+    if let (
+        Some(short_call_symbol),
+        Some(long_call_symbol),
+        Some(short_call_ask),
+        Some(long_call_bid),
+    ) = (
+        entry.short_call_symbol.as_deref(),
+        entry.long_call_symbol.as_deref(),
+        quote.short_call_ask,
+        quote.long_call_bid,
+    ) {
+        close_orders.push(limit_option_order(
+            orders,
+            labeled_client_order_id(order_list_id, "short-call-close"),
+            short_call_symbol,
+            OrderSide::Buy,
+            entry.quantity,
+            short_call_ask,
+            true,
+        )?);
+        close_orders.push(limit_option_order(
+            orders,
+            labeled_client_order_id(order_list_id, "long-call-close"),
+            long_call_symbol,
+            OrderSide::Sell,
+            entry.quantity,
+            long_call_bid,
+            true,
+        )?);
+    }
+
+    Ok(close_orders)
 }
 
 /// Builds a unique order-list ID for one submitted entry.
@@ -1069,6 +1969,15 @@ impl DataActor for AlpacaOptionsEntryStrategy {
 pub fn entry_order_list_id(trade_date: &str, underlying: &str) -> String {
     format!(
         "options-engine-entry-{trade_date}-{underlying}-{}",
+        UUID4::new()
+    )
+}
+
+fn close_order_list_id(entry: &StrategyStateEntry) -> String {
+    format!(
+        "options-engine-close-{}-{}-{}",
+        entry.trade_date,
+        entry.underlying,
         UUID4::new()
     )
 }
@@ -1400,6 +2309,110 @@ fn rejected_state_mutation(
     Ok(mutation)
 }
 
+fn close_accepted_state_mutation(
+    event: &OrderAccepted,
+    entry: &StrategyStateEntry,
+    close_order_list_id: &str,
+    close_parent_order_id: Option<&str>,
+    close_reason: &str,
+) -> anyhow::Result<StrategyStateMutation> {
+    let mut mutation = StrategyStateMutation::new(
+        uuid_from_nautilus(event.event_id)?,
+        "close_accepted",
+        serde_json::json!({
+            "order_list_id": entry.order_list_id,
+            "close_order_list_id": close_order_list_id,
+            "close_parent_order_id": close_parent_order_id,
+            "client_order_id": event.client_order_id.to_string(),
+            "venue_order_id": event.venue_order_id.to_string(),
+            "instrument_id": event.instrument_id.to_string(),
+            "account_id": event.account_id.to_string(),
+            "reconciliation": event.reconciliation,
+            "close_reason": close_reason,
+            "entry": state_entry_payload(entry),
+        }),
+    );
+    populate_entry_mutation_fields(&mut mutation, entry);
+    mutation.order_list_id = Some(close_order_list_id.to_string());
+    mutation.client_order_id = Some(event.client_order_id.to_string());
+    mutation.venue_order_id = Some(event.venue_order_id.to_string());
+    mutation.ts_event = Some(event.ts_event.to_datetime_utc());
+    Ok(mutation)
+}
+
+fn entry_closed_state_mutation(
+    entry: &StrategyStateEntry,
+    close_order_list_id: &str,
+    close_parent_order_id: Option<&str>,
+) -> anyhow::Result<StrategyStateMutation> {
+    let mut mutation = StrategyStateMutation::new(
+        Uuid::new_v4(),
+        "entry_closed",
+        serde_json::json!({
+            "order_list_id": entry.order_list_id,
+            "close_order_list_id": close_order_list_id,
+            "close_parent_order_id": close_parent_order_id,
+            "entry": state_entry_payload(entry),
+        }),
+    );
+    populate_entry_mutation_fields(&mut mutation, entry);
+    mutation.order_list_id = Some(close_order_list_id.to_string());
+    mutation.venue_order_id = close_parent_order_id.map(ToString::to_string);
+    mutation.ts_event = Some(Utc::now());
+    Ok(mutation)
+}
+
+fn entry_canceled_state_mutation(
+    entry: &StrategyStateEntry,
+    reason: &str,
+) -> anyhow::Result<StrategyStateMutation> {
+    let mut mutation = StrategyStateMutation::new(
+        Uuid::new_v4(),
+        "entry_canceled",
+        serde_json::json!({
+            "order_list_id": entry.order_list_id,
+            "reason": reason,
+            "entry": state_entry_payload(entry),
+        }),
+    );
+    populate_entry_mutation_fields(&mut mutation, entry);
+    mutation.order_list_id = Some(entry.order_list_id.clone());
+    mutation.ts_event = Some(Utc::now());
+    Ok(mutation)
+}
+
+fn close_cleared_state_mutation(
+    entry: &StrategyStateEntry,
+    close_order_list_id: Option<&str>,
+    reason: &str,
+) -> anyhow::Result<StrategyStateMutation> {
+    let mut mutation = StrategyStateMutation::new(
+        Uuid::new_v4(),
+        "close_cleared",
+        serde_json::json!({
+            "order_list_id": entry.order_list_id,
+            "close_order_list_id": close_order_list_id,
+            "reason": reason,
+            "entry": state_entry_payload(entry),
+        }),
+    );
+    populate_entry_mutation_fields(&mut mutation, entry);
+    mutation.order_list_id = close_order_list_id
+        .map(ToString::to_string)
+        .or_else(|| Some(entry.order_list_id.clone()));
+    mutation.ts_event = Some(Utc::now());
+    Ok(mutation)
+}
+
+fn populate_entry_mutation_fields(
+    mutation: &mut StrategyStateMutation,
+    entry: &StrategyStateEntry,
+) {
+    mutation.strategy = Some(entry.strategy.clone());
+    mutation.underlying = Some(entry.underlying.clone());
+    mutation.trade_date = parse_trade_date(&entry.trade_date);
+}
+
 fn uuid_from_nautilus(event_id: UUID4) -> anyhow::Result<Uuid> {
     Ok(Uuid::parse_str(event_id.as_str())?)
 }
@@ -1424,6 +2437,46 @@ fn state_entry_draft_payload(draft: &StrategyStateEntryDraft) -> serde_json::Val
         "score": draft.score,
         "parent_order_id": draft.parent_order_id,
     })
+}
+
+fn state_entry_payload(entry: &StrategyStateEntry) -> serde_json::Value {
+    serde_json::json!({
+        "trade_date": entry.trade_date,
+        "underlying": entry.underlying,
+        "strategy": entry.strategy,
+        "order_list_id": entry.order_list_id,
+        "short_symbol": entry.short_symbol,
+        "long_symbol": entry.long_symbol,
+        "short_call_symbol": entry.short_call_symbol,
+        "long_call_symbol": entry.long_call_symbol,
+        "quantity": entry.quantity,
+        "credit": entry.credit,
+        "debit": entry.debit,
+        "score": entry.score,
+        "parent_order_id": entry.parent_order_id,
+        "close_order_list_id": entry.close_order_list_id,
+        "close_parent_order_id": entry.close_parent_order_id,
+        "close_reason": entry.close_reason,
+        "close_attempts": entry.close_attempts,
+        "last_close_submitted_at_utc": entry.last_close_submitted_at_utc,
+        "submitted": entry.submitted,
+        "canceled": entry.canceled,
+        "closed": entry.closed,
+        "recorded_at_utc": entry.recorded_at_utc,
+        "closed_at_utc": entry.closed_at_utc,
+    })
+}
+
+fn age_secs_from_rfc3339(value: &str) -> Option<u64> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .and_then(|timestamp| {
+            Utc::now()
+                .signed_duration_since(timestamp.with_timezone(&Utc))
+                .to_std()
+                .ok()
+        })
+        .map(|duration| duration.as_secs())
 }
 
 fn scan_report_payload(report: &OptionsScanReport) -> serde_json::Value {

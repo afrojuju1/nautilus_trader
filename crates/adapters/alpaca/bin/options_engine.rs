@@ -13,10 +13,11 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Native Nautilus entrypoint for the Alpaca options-engine management runtime.
+//! Legacy config-check entrypoint for the Alpaca options runtime.
 
 use std::env;
 
+use anyhow::bail;
 use nautilus_alpaca::options_runtime::OptionsEngineConfig;
 
 #[tokio::main]
@@ -64,7 +65,9 @@ async fn main() -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    nautilus_alpaca::options_engine::run_options_engine().await
+    bail!(
+        "alpaca-options-engine no longer owns Alpaca option management; run alpaca-option-chain-scan-live-node"
+    )
 }
 
 fn format_limit(limit: Option<usize>) -> String {

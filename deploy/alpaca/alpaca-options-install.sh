@@ -26,12 +26,15 @@ install_runtime_file() {
 cd "$REPO"
 
 cargo build --release -p nautilus-alpaca --features live,warehouse-clickhouse \
+  --bin alpaca-option-chain-scan-live-node \
   --bin alpaca-options-engine \
   --bin alpaca-operator-status \
   --bin alpaca-fleet-status \
   --bin alpaca-candidate-alerts \
   --bin alpaca-performance-report
 
+install -Dm755 target/release/alpaca-option-chain-scan-live-node \
+  "$HOME/.local/bin/alpaca-option-chain-scan-live-node"
 install -Dm755 target/release/alpaca-options-engine \
   "$HOME/.local/bin/alpaca-options-engine"
 install -Dm755 target/release/alpaca-operator-status \
@@ -90,7 +93,8 @@ echo "alerts_env_file=$ALERTS_ENV_FILE"
 echo "profile_manifest_file=$PROFILE_MANIFEST_FILE"
 echo "account_env_dir=$ACCOUNT_ENV_DIR"
 echo "account_config_dir=$ACCOUNT_CONFIG_DIR"
-echo "runner=$HOME/.local/bin/alpaca-options-engine"
+echo "runner=$HOME/.local/bin/alpaca-option-chain-scan-live-node"
+echo "config_check=$HOME/.local/bin/alpaca-options-engine --check-config"
 echo "operator=$HOME/.local/bin/alpaca-operator-status"
 echo "fleet_operator=$HOME/.local/bin/alpaca-fleet-status"
 echo "candidate_alerts=$HOME/.local/bin/alpaca-candidate-alerts"

@@ -65,7 +65,7 @@ ENV HOME=/home/nautilus \
     XDG_CONFIG_HOME=/config \
     XDG_STATE_HOME=/state \
     NAUTILUS_ALPACA_REPO=/workspace \
-    NAUTILUS_ALPACA_RUNNER_BIN=/usr/local/bin/alpaca-options-engine \
+    NAUTILUS_ALPACA_RUNNER_BIN=/usr/local/bin/alpaca-option-chain-scan-live-node \
     NAUTILUS_ALPACA_OPERATOR_BIN=/usr/local/bin/alpaca-operator-status \
     NAUTILUS_ALPACA_FLEET_BIN=/usr/local/bin/alpaca-fleet-status \
     NAUTILUS_ALPACA_OPTION_CHAIN_LIVE_BIN=/usr/local/bin/alpaca-option-chain-scan-live-node \
@@ -73,4 +73,4 @@ ENV HOME=/home/nautilus \
     NAUTILUS_ALPACA_CANDIDATE_ALERTS_BIN=/usr/local/bin/alpaca-candidate-alerts \
     NAUTILUS_ALPACA_PERFORMANCE_BIN=/usr/local/bin/alpaca-performance-report
 
-CMD ["alpaca-options-engine", "--help"]
+CMD ["alpaca-option-chain-scan-live-node", "--help"]

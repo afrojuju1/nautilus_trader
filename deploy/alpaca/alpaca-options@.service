@@ -11,7 +11,7 @@ Environment=NAUTILUS_ALPACA_ACCOUNT=%i
 Environment=NAUTILUS_ALPACA_ENV_FILE=%h/.config/nautilus-trader/alpaca/accounts/%i.env
 Environment=NAUTILUS_ALPACA_SERVICE=alpaca-options@%i.service
 Environment=NAUTILUS_ALPACA_REPO=%h/Projects/nautilus_trader
-Environment=NAUTILUS_ALPACA_RUNNER_BIN=%h/.local/bin/alpaca-options-engine
+Environment=NAUTILUS_ALPACA_RUNNER_BIN=%h/.local/bin/alpaca-option-chain-scan-live-node
 Environment=NAUTILUS_ALPACA_OPERATOR_BIN=%h/.local/bin/alpaca-operator-status
 Environment=NAUTILUS_ALPACA_LOG_DIR=%h/.local/state/nautilus_trader/alpaca/%i/logs
 Environment=NAUTILUS_ALPACA_LOCK_DIR=%h/.local/state/nautilus_trader/alpaca/%i/locks

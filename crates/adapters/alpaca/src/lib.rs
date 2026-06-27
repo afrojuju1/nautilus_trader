@@ -63,13 +63,13 @@ pub mod opportunity_scan_actor;
 #[cfg(feature = "live")]
 pub mod option_chain_candidates;
 #[cfg(feature = "live")]
-pub mod options_engine;
-#[cfg(feature = "live")]
 pub mod options_entry;
 #[cfg(feature = "live")]
 pub mod options_entry_admission;
 #[cfg(feature = "live")]
 pub mod options_entry_strategy;
+#[cfg(feature = "live")]
+pub mod options_management;
 #[cfg(feature = "live")]
 pub mod options_runtime;
 pub mod orders;
