@@ -93,6 +93,18 @@ min_score = 72.0
 
 [risk]
 max_active_entries_per_underlying = 1
+# Optional risk-capital caps. Defined-risk spreads use max loss; naked options use scanner
+# buying-power requirement because naked calls have no finite max loss.
+# max_single_entry_risk_capital_usd = 500.0
+# max_portfolio_risk_capital_usd = 1500.0
+block_unestimated_risk_capital = true
+
+[event_shock]
+# Optional approved event source for symbol-level entry blocks.
+# earnings_events_path = "~/.local/state/nautilus_trader/earnings/earnings_events_approved.csv"
+require_earnings_events = false
+block_days_before_earnings = 1
+block_days_after_earnings = 1
 
 [risk.sectors]
 SPY = "broad_index"
@@ -125,6 +137,8 @@ close_regular_hours_only = true
 close_start = "09:30"
 close_end = "16:00"
 close_price_cushion = 0.02
+close_reprice_step = 0.01
+max_close_price_cushion = 0.05
 max_close_attempts = 3
 close_reprice_cooldown_secs = 30
 active_risk_candidate_quote_limit = 5

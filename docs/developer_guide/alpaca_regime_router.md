@@ -1,6 +1,6 @@
 # Alpaca Regime Router
 
-Status: proposed focused architecture.
+Status: proposed focused architecture; not yet implemented.
 
 This document defines the target architecture for Alpaca option strategy regime routing. It refines
 the regime-router slice described in the Nautilus-native candidate scanning architecture and the
@@ -9,6 +9,16 @@ Alpaca production roadmap.
 The goal is not to create a generic Nautilus regime framework. The goal is to give the Alpaca
 options runtime a deterministic, replayable routing layer that can adjust which strategy families
 are eligible under current market conditions.
+
+Current implementation boundary:
+
+- Portfolio risk-capital admission, earnings event-shock blocks, fill-quality reporting, close
+  reprice laddering, and replay decision explanations now exist in the Alpaca runtime/reporting
+  paths.
+- Those are prerequisite signals and safety gates, not a regime router.
+- Do not stamp default or `neutral` regime metadata into candidate ledgers until a real
+  `RegimeFeatureActor` or equivalent feature input contract exists. Misleading regime labels are
+  worse than missing labels.
 
 ## Boundary
 

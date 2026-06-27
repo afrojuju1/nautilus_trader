@@ -163,6 +163,7 @@ fn print_human_report(report: &HistoricalReplayReport) {
     print_bucket_map("by_delta_bucket", &report.by_delta_bucket);
     print_bucket_map("by_spread_width_bucket", &report.by_spread_width_bucket);
     print_bucket_map("by_liquidity_bucket", &report.by_liquidity_bucket);
+    print_bucket_map("by_decision_reason", &report.by_decision_reason);
     if !report.records.is_empty() {
         println!("records:");
         for record in &report.records {
@@ -218,7 +219,7 @@ fn print_bucket(prefix: &str, name: &str, summary: &HistoricalReplayBucketSummar
 
 fn print_record(record: &HistoricalReplayRecord) {
     println!(
-        "  {} {} {} rank={} score={} dte={} delta={} width={} score_bucket={} liquidity={} close={} pnl={} volume={} warnings={}",
+        "  {} {} {} rank={} score={} decision_reason={} action={} selected_reason={} dte={} delta={} width={} score_bucket={} liquidity={} close={} pnl={} volume={} warnings={}",
         record.trade_date,
         record.underlying,
         record.strategy,
@@ -228,6 +229,9 @@ fn print_record(record: &HistoricalReplayRecord) {
         record
             .score
             .map_or_else(|| "n/a".to_string(), |value| format!("{value:.1}")),
+        &record.decision_reason,
+        record.selected_action.as_deref().unwrap_or("n/a"),
+        record.selected_reason.as_deref().unwrap_or("n/a"),
         record
             .dte
             .map_or_else(|| "n/a".to_string(), |value| value.to_string()),

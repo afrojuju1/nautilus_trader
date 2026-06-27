@@ -31,12 +31,29 @@ use crate::{
     common::consts::{ALPACA_OPEN_INTEREST_INFO_KEY, ALPACA_VENUE},
     http::{
         error::{Error, Result},
-        models::AlpacaOptionContract,
+        models::{AlpacaOptionContract, AlpacaOptionType},
     },
 };
 
 const ALPACA_EQUITY_OPTION_EXPIRATION_HOUR_ET: u32 = 16;
 const ALPACA_EQUITY_OPTION_EXPIRATION_MINUTE_ET: u32 = 15;
+
+/// Parsed Alpaca OCC-style option symbol fields.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlpacaOptionSymbolParts {
+    /// Original symbol string.
+    pub symbol: String,
+    /// Symbol without an optional `O:` prefix.
+    pub canonical_symbol: String,
+    /// Underlying root symbol.
+    pub underlying_symbol: String,
+    /// Contract expiration date as `YYYY-MM-DD`.
+    pub expiration_date: String,
+    /// Contract option side.
+    pub option_type: AlpacaOptionType,
+    /// Strike price decoded from OCC thousandths.
+    pub strike: f64,
+}
 
 /// Converts an Alpaca option contract into a Nautilus [`OptionContract`].
 ///
@@ -144,6 +161,107 @@ fn timestamp_nanos(value: &str, expiration: DateTime<Utc>) -> Result<u64> {
     }
 
     Ok(timestamp as u64)
+}
+
+/// Removes the optional `O:` prefix from an Alpaca option symbol.
+#[must_use]
+pub fn canonical_alpaca_option_symbol(symbol: &str) -> String {
+    symbol
+        .trim()
+        .strip_prefix("O:")
+        .unwrap_or(symbol.trim())
+        .to_string()
+}
+
+/// Parses an Alpaca OCC-style option symbol.
+///
+/// # Errors
+///
+/// Returns an error when the symbol is missing an underlying root, expiration, side, or strike.
+pub fn parse_alpaca_option_symbol(symbol: &str) -> Result<AlpacaOptionSymbolParts> {
+    let symbol = symbol.trim();
+    let canonical_symbol = canonical_alpaca_option_symbol(symbol);
+    let first_digit = canonical_symbol
+        .find(|ch: char| ch.is_ascii_digit())
+        .ok_or_else(|| {
+            Error::Parse(format!(
+                "invalid Alpaca option symbol `{symbol}`: missing expiration"
+            ))
+        })?;
+
+    let (underlying_symbol, option_details) = canonical_symbol.split_at(first_digit);
+    let underlying_symbol = underlying_symbol.to_string();
+    if underlying_symbol.is_empty() {
+        return Err(Error::Parse(format!(
+            "invalid Alpaca option symbol `{symbol}`: missing underlying"
+        )));
+    }
+
+    if option_details.len() < 15 {
+        return Err(Error::Parse(format!(
+            "invalid Alpaca option symbol `{symbol}`: expected YYMMDD, option side, and strike"
+        )));
+    }
+
+    let expiration = &option_details[..6];
+    let side = option_details.as_bytes()[6] as char;
+    let strike_raw = &option_details[7..];
+    if !expiration.chars().all(|ch| ch.is_ascii_digit())
+        || strike_raw.is_empty()
+        || !strike_raw.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err(Error::Parse(format!(
+            "invalid Alpaca option symbol `{symbol}`: malformed expiration or strike"
+        )));
+    }
+
+    let option_type = match side {
+        'C' => AlpacaOptionType::Call,
+        'P' => AlpacaOptionType::Put,
+        _ => {
+            return Err(Error::Parse(format!(
+                "invalid Alpaca option symbol `{symbol}`: expected C or P option side"
+            )));
+        }
+    };
+    let strike = strike_raw.parse::<u64>().map_err(|error| {
+        Error::Parse(format!(
+            "invalid Alpaca option symbol `{symbol}` strike `{strike_raw}`: {error}"
+        ))
+    })? as f64
+        / 1_000.0;
+    let expiration_date = format!(
+        "20{}-{}-{}",
+        &expiration[..2],
+        &expiration[2..4],
+        &expiration[4..6]
+    );
+
+    Ok(AlpacaOptionSymbolParts {
+        symbol: symbol.to_string(),
+        canonical_symbol,
+        underlying_symbol,
+        expiration_date,
+        option_type,
+        strike,
+    })
+}
+
+/// Parses an Alpaca option instrument ID.
+///
+/// # Errors
+///
+/// Returns an error when the venue is not Alpaca or the symbol is malformed.
+pub fn parse_alpaca_option_instrument_id(
+    instrument_id: InstrumentId,
+) -> Result<AlpacaOptionSymbolParts> {
+    if instrument_id.venue != Venue::new(ALPACA_VENUE) {
+        return Err(Error::Parse(format!(
+            "expected Alpaca venue {}, got {}",
+            ALPACA_VENUE, instrument_id.venue
+        )));
+    }
+    parse_alpaca_option_symbol(instrument_id.symbol.as_str())
 }
 
 /// Creates an Alpaca option [`OptionSeriesId`] from an underlying and Alpaca expiration date.

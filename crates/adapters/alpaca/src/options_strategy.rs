@@ -43,8 +43,8 @@ use crate::{
     options_lifecycle::OptionLifecycleRiskHandle,
     options_management::{
         AlpacaOptionsManagementConfig, CloseQuote, close_attempts_exhausted,
-        close_quote_from_ticks, close_reason, close_reprice_cooldown_remaining_secs,
-        emit_management_snapshot, management_instrument_ids,
+        close_price_cushion_for_attempt, close_quote_from_ticks, close_reason,
+        close_reprice_cooldown_remaining_secs, emit_management_snapshot, management_instrument_ids,
     },
     options_runtime::{
         AlpacaOptionsRuntimeConfig, OptionsCandidateSet, OptionsScanOutcome, OptionsScanReport,
@@ -809,9 +809,15 @@ impl AlpacaOptionsStrategy {
         }
 
         let close_order_list_id = close_order_list_id(&entry);
-        let submit_quote =
-            close_quote.with_price_cushion(self.config.management.close_price_cushion);
-        self.submit_close_entry(entry, submit_quote, trigger, close_order_list_id)?;
+        let close_price_cushion = close_price_cushion_for_attempt(&self.config.management, &entry);
+        let submit_quote = close_quote.with_price_cushion(close_price_cushion);
+        self.submit_close_entry(
+            entry,
+            submit_quote,
+            trigger,
+            close_order_list_id,
+            close_price_cushion,
+        )?;
         Ok(())
     }
 
@@ -926,6 +932,7 @@ impl AlpacaOptionsStrategy {
         quote: CloseQuote,
         close_reason: String,
         close_order_list_id: String,
+        close_price_cushion: f64,
     ) -> anyhow::Result<()> {
         let orders = self.build_close_orders(&entry, &quote, &close_order_list_id)?;
         let client_order_ids = orders
@@ -936,9 +943,25 @@ impl AlpacaOptionsStrategy {
         self.record_pending_close_submission(
             entry.order_list_id.clone(),
             close_order_list_id.clone(),
-            close_reason,
+            close_reason.clone(),
             order_count,
             client_order_ids,
+        );
+        emit_operator_event(
+            "management_action",
+            json!({
+                "action": "close_submit",
+                "underlying": &entry.underlying,
+                "strategy": &entry.strategy,
+                "order_list_id": &entry.order_list_id,
+                "close_order_list_id": &close_order_list_id,
+                "close_reason": &close_reason,
+                "close_attempt": entry.close_attempts.saturating_add(1),
+                "close_price_cushion": close_price_cushion,
+                "close_reprice_step": self.config.management.close_reprice_step,
+                "max_close_price_cushion": self.config.management.max_close_price_cushion,
+                "close_debit": quote.debit,
+            }),
         );
 
         if let Err(error) = self.submit_close_orders(orders, &close_order_list_id) {
@@ -2602,6 +2625,7 @@ fn state_entry_draft_payload(draft: &StrategyStateEntryDraft) -> serde_json::Val
         "quantity": draft.quantity,
         "credit": draft.credit,
         "debit": draft.debit,
+        "risk_capital_usd": draft.risk_capital_usd,
         "score": draft.score,
         "parent_order_id": draft.parent_order_id,
         "submitted_at_utc": draft.submitted_at_utc,
@@ -2621,6 +2645,7 @@ fn state_entry_payload(entry: &StrategyStateEntry) -> serde_json::Value {
         "quantity": entry.quantity,
         "credit": entry.credit,
         "debit": entry.debit,
+        "risk_capital_usd": entry.risk_capital_usd,
         "score": entry.score,
         "parent_order_id": entry.parent_order_id,
         "submitted_at_utc": entry.submitted_at_utc,

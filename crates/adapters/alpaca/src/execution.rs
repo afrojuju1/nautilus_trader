@@ -72,6 +72,7 @@ use crate::{
         error::{Error, Result},
         models::{AlpacaAccount, AlpacaOrder, AlpacaPosition},
     },
+    parse::parse_alpaca_option_symbol,
 };
 #[cfg(feature = "live")]
 use crate::{
@@ -223,6 +224,10 @@ pub fn account_entry_admission_reasons(account: &AlpacaAccount) -> Vec<String> {
 /// Extracts the OCC-style underlying root from an Alpaca option contract symbol.
 #[must_use]
 pub fn option_underlying_symbol(symbol: &str) -> String {
+    if let Ok(parts) = parse_alpaca_option_symbol(symbol) {
+        return parts.underlying_symbol;
+    }
+
     let mut root = String::new();
     for character in symbol.trim().chars() {
         if character.is_ascii_digit() {

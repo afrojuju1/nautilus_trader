@@ -11,6 +11,8 @@ use crate::{
     },
 };
 
+const OPTION_CONTRACT_MULTIPLIER: f64 = 100.0;
+
 /// Selected credit-spread candidate.
 #[derive(Clone, Debug)]
 pub struct SelectedEntry {
@@ -201,6 +203,24 @@ impl SelectedOptionsEntry {
         self.descriptor().premium
     }
 
+    /// Returns the selected entry risk-capital estimate in USD for the supplied order quantity.
+    ///
+    /// Defined-risk spreads use scanner max loss. Naked options use the scanner buying-power
+    /// estimate because short calls do not have finite maximum loss.
+    #[must_use]
+    pub fn risk_capital_usd(&self, quantity: u64) -> Option<f64> {
+        let quantity = quantity.max(1) as f64;
+        let value = match self {
+            Self::Credit(entry) => entry.candidate.max_loss * OPTION_CONTRACT_MULTIPLIER * quantity,
+            Self::IronCondor(entry) => {
+                entry.candidate.max_loss * OPTION_CONTRACT_MULTIPLIER * quantity
+            }
+            Self::Debit(entry) => entry.candidate.max_loss * OPTION_CONTRACT_MULTIPLIER * quantity,
+            Self::NakedOption(entry) => entry.candidate.estimated_buying_power_requirement,
+        };
+        (value.is_finite() && value > 0.0).then_some(value)
+    }
+
     /// Returns the candidate option symbols.
     #[must_use]
     pub fn option_symbols(&self) -> Vec<&str> {
@@ -244,6 +264,7 @@ impl SelectedOptionsEntry {
                 quantity,
                 credit: entry.candidate.credit,
                 debit: None,
+                risk_capital_usd: self.risk_capital_usd(quantity),
                 score: entry.candidate.score,
                 parent_order_id,
                 submitted_at_utc,
@@ -260,6 +281,7 @@ impl SelectedOptionsEntry {
                 quantity,
                 credit: entry.candidate.credit,
                 debit: None,
+                risk_capital_usd: self.risk_capital_usd(quantity),
                 score: entry.candidate.score,
                 parent_order_id,
                 submitted_at_utc,
@@ -276,6 +298,7 @@ impl SelectedOptionsEntry {
                 quantity,
                 credit: -entry.candidate.debit,
                 debit: Some(entry.candidate.debit),
+                risk_capital_usd: self.risk_capital_usd(quantity),
                 score: entry.candidate.score,
                 parent_order_id,
                 submitted_at_utc,
@@ -292,6 +315,7 @@ impl SelectedOptionsEntry {
                 quantity,
                 credit: entry.candidate.credit,
                 debit: None,
+                risk_capital_usd: self.risk_capital_usd(quantity),
                 score: entry.candidate.score,
                 parent_order_id,
                 submitted_at_utc,

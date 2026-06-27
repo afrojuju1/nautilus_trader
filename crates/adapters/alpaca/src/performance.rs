@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
 
 use crate::{
@@ -242,6 +242,8 @@ pub struct EntryPerformance {
     pub quantity: u64,
     /// Entry record timestamp.
     pub recorded_at_utc: String,
+    /// Timestamp captured before submitting the entry order list.
+    pub submitted_at_utc: Option<String>,
     /// Close record timestamp.
     pub closed_at_utc: Option<String>,
     /// Scanner score at entry.
@@ -256,6 +258,8 @@ pub struct EntryPerformance {
     pub close: FillSummary,
     /// Realized PnL in dollars, when both opening and closing fills are available.
     pub realized_pnl: Option<f64>,
+    /// Opening fill-quality accounting.
+    pub fill_quality: FillQuality,
     /// Broker-reported open unrealized PnL in dollars, when the entry is active.
     pub open_unrealized_pnl: Option<f64>,
     /// Close trigger reason stored in strategy state.
@@ -270,6 +274,25 @@ pub struct EntryPerformance {
     pub close_order_list_id: Option<String>,
     /// Data gaps or accounting warnings for this entry.
     pub warnings: Vec<String>,
+}
+
+/// Fill-quality accounting for one strategy-state entry.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FillQuality {
+    /// Quoted entry cashflow in dollars from scanner/state. Credits are positive; debits negative.
+    pub quoted_entry_cashflow: Option<f64>,
+    /// Actual opening fill cashflow in dollars reconstructed from broker activities.
+    pub actual_entry_cashflow: Option<f64>,
+    /// Actual minus quoted cashflow. Positive means better than quote; negative means worse.
+    pub entry_slippage_usd: Option<f64>,
+    /// Delay from entry submission timestamp to first opening fill.
+    pub open_fill_delay_secs: Option<i64>,
+    /// Whether opening fills cover every tracked leg quantity.
+    pub open_fill_complete: bool,
+    /// Stable quality label for the opening fill.
+    pub label: String,
+    /// Missing inputs that prevented full fill-quality evaluation.
+    pub missing: Vec<String>,
 }
 
 /// Aggregate PnL by strategy.
@@ -293,6 +316,8 @@ pub struct StrategyPerformanceSummary {
     pub open_unrealized_pnl: f64,
     /// Realized plus open unrealized PnL in dollars.
     pub observed_total_pnl: f64,
+    /// Aggregate entry fill-quality summary.
+    pub fill_quality: FillQualitySummary,
 }
 
 /// Aggregate PnL for the report.
@@ -316,8 +341,31 @@ pub struct PerformanceSummary {
     pub open_unrealized_pnl: f64,
     /// Realized plus open unrealized PnL in dollars.
     pub observed_total_pnl: f64,
+    /// Aggregate entry fill-quality summary.
+    pub fill_quality: FillQualitySummary,
     /// Aggregate PnL by strategy.
     pub by_strategy: BTreeMap<String, StrategyPerformanceSummary>,
+}
+
+/// Aggregate entry fill-quality metrics.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FillQualitySummary {
+    /// Entries with quoted and actual opening fill cashflow.
+    pub evaluated_entries: usize,
+    /// Entries filled better than the quoted entry cashflow.
+    pub price_improved_entries: usize,
+    /// Entries filled worse than the quoted entry cashflow.
+    pub price_worse_entries: usize,
+    /// Entries filled at the quoted entry cashflow.
+    pub price_flat_entries: usize,
+    /// Sum of actual-minus-quoted opening cashflow in dollars.
+    pub total_entry_slippage_usd: f64,
+    /// Average actual-minus-quoted opening cashflow in dollars.
+    pub average_entry_slippage_usd: Option<f64>,
+    /// Entries with measured open fill delay.
+    pub fill_delay_entries: usize,
+    /// Average delay from submission to first fill in seconds.
+    pub average_open_fill_delay_secs: Option<f64>,
 }
 
 /// Full Alpaca options performance report.
@@ -426,6 +474,32 @@ fn apply_entry_summary(
     }
 }
 
+impl FillQualitySummary {
+    fn add(&mut self, quality: &FillQuality) {
+        if let Some(slippage) = quality.entry_slippage_usd {
+            self.evaluated_entries += 1;
+            self.total_entry_slippage_usd += slippage;
+            if slippage > 0.005 {
+                self.price_improved_entries += 1;
+            } else if slippage < -0.005 {
+                self.price_worse_entries += 1;
+            } else {
+                self.price_flat_entries += 1;
+            }
+            self.average_entry_slippage_usd =
+                Some(self.total_entry_slippage_usd / self.evaluated_entries as f64);
+        }
+
+        if let Some(delay) = quality.open_fill_delay_secs {
+            let current_total = self.average_open_fill_delay_secs.unwrap_or_default()
+                * self.fill_delay_entries as f64;
+            self.fill_delay_entries += 1;
+            self.average_open_fill_delay_secs =
+                Some((current_total + delay as f64) / self.fill_delay_entries as f64);
+        }
+    }
+}
+
 fn entry_symbols(entry: &StrategyStateEntry) -> BTreeSet<String> {
     entry
         .symbols()
@@ -476,6 +550,75 @@ fn fill_summary(
         }
     }
     summary
+}
+
+fn fill_quality(
+    entry: &StrategyStateEntry,
+    symbols: &BTreeSet<String>,
+    quoted_entry_cashflow: Option<f64>,
+    open: &FillSummary,
+) -> FillQuality {
+    let expected_open_quantity = entry.quantity as f64 * symbols.len().max(1) as f64;
+    let open_fill_complete = open.fills > 0 && open.quantity >= expected_open_quantity;
+    let entry_slippage_usd = open
+        .cashflow
+        .zip(quoted_entry_cashflow)
+        .map(|(actual, quoted)| actual - quoted);
+    let open_fill_delay_secs = fill_delay_secs(
+        entry.submitted_at_utc.as_deref(),
+        open.first_transaction_time.as_deref(),
+    );
+    let mut missing = Vec::new();
+    if quoted_entry_cashflow.is_none() {
+        missing.push("quoted_entry_cashflow".to_string());
+    }
+    if open.cashflow.is_none() {
+        missing.push("actual_entry_cashflow".to_string());
+    }
+    if entry.submitted_at_utc.is_none() {
+        missing.push("submitted_at_utc".to_string());
+    }
+    if open.first_transaction_time.is_none() {
+        missing.push("open_first_transaction_time".to_string());
+    }
+    if !open_fill_complete {
+        missing.push("complete_open_fill".to_string());
+    }
+
+    FillQuality {
+        quoted_entry_cashflow,
+        actual_entry_cashflow: open.cashflow,
+        entry_slippage_usd,
+        open_fill_delay_secs,
+        open_fill_complete,
+        label: fill_quality_label(entry_slippage_usd),
+        missing,
+    }
+}
+
+fn fill_delay_secs(submitted_at: Option<&str>, first_fill_at: Option<&str>) -> Option<i64> {
+    let submitted_at = parse_rfc3339_utc(submitted_at?)?;
+    let first_fill_at = parse_rfc3339_utc(first_fill_at?)?;
+    let delay = first_fill_at
+        .signed_duration_since(submitted_at)
+        .num_seconds();
+    (delay >= 0).then_some(delay)
+}
+
+fn parse_rfc3339_utc(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn fill_quality_label(entry_slippage_usd: Option<f64>) -> String {
+    match entry_slippage_usd {
+        Some(value) if value > 0.005 => "price_improved",
+        Some(value) if value < -0.005 => "price_worse",
+        Some(_) => "at_quote",
+        None => "unknown",
+    }
+    .to_string()
 }
 
 fn activity_matches(
@@ -619,6 +762,10 @@ mod tests {
         assert_close(performance.open.cashflow.unwrap(), 40.0);
         assert_close(performance.close.cashflow.unwrap(), -90.0);
         assert_close(performance.realized_pnl.unwrap(), -50.0);
+        assert_eq!(performance.fill_quality.label, "at_quote");
+        assert_close(performance.fill_quality.entry_slippage_usd.unwrap(), 0.0);
+        assert_eq!(performance.fill_quality.open_fill_delay_secs, Some(0));
+        assert!(performance.fill_quality.open_fill_complete);
         assert!(performance.warnings.is_empty());
     }
 
@@ -713,6 +860,9 @@ mod tests {
         assert_close(performance.realized_pnl.unwrap(), -193.0);
         assert_eq!(performance.quoted_entry_premium, Some(1.94));
         assert_eq!(performance.quoted_entry_cashflow, Some(194.0));
+        assert_eq!(performance.fill_quality.label, "at_quote");
+        assert_close(performance.fill_quality.entry_slippage_usd.unwrap(), 0.0);
+        assert!(performance.fill_quality.open_fill_complete);
         assert!(performance.warnings.is_empty());
     }
 
@@ -729,6 +879,7 @@ mod tests {
             quantity: 1,
             credit: 0.40,
             debit: None,
+            risk_capital_usd: Some(160.0),
             score: 72.5,
             parent_order_id: Some("open-parent".to_string()),
             submitted_at_utc: Some("2026-05-07T14:00:00Z".to_string()),
@@ -758,6 +909,7 @@ mod tests {
             quantity: 1,
             credit: 1.94,
             debit: None,
+            risk_capital_usd: Some(306.0),
             score: 70.4,
             parent_order_id: Some("open-parent".to_string()),
             submitted_at_utc: Some("2026-05-05T15:56:40Z".to_string()),

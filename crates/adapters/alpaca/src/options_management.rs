@@ -49,6 +49,10 @@ pub struct AlpacaOptionsManagementConfig {
     pub entry_timezone: chrono_tz::Tz,
     /// Additional debit allowed on submitted close limits.
     pub close_price_cushion: f64,
+    /// Additional close cushion added per accepted close attempt.
+    pub close_reprice_step: f64,
+    /// Maximum total close cushion after repricing steps.
+    pub max_close_price_cushion: f64,
     /// Maximum accepted close submissions per entry. Zero means unlimited.
     pub max_close_attempts: u32,
     /// Minimum delay after a close submission before another close may be submitted.
@@ -83,6 +87,8 @@ impl AlpacaOptionsManagementConfig {
             close_end: config.close_end,
             entry_timezone: config.entry_timezone,
             close_price_cushion: config.close_price_cushion,
+            close_reprice_step: config.close_reprice_step,
+            max_close_price_cushion: config.max_close_price_cushion,
             max_close_attempts: config.max_close_attempts,
             close_reprice_cooldown_secs: config.close_reprice_cooldown_secs,
             active_risk_candidate_quote_limit: config.active_risk_candidate_quote_limit,
@@ -118,6 +124,8 @@ impl Default for AlpacaOptionsManagementConfig {
             close_end: chrono::NaiveTime::from_hms_opt(16, 0, 0).expect("valid time"),
             entry_timezone: chrono_tz::America::New_York,
             close_price_cushion: 0.0,
+            close_reprice_step: 0.0,
+            max_close_price_cushion: 0.0,
             max_close_attempts: 0,
             close_reprice_cooldown_secs: 0,
             active_risk_candidate_quote_limit: 5,
@@ -326,6 +334,21 @@ pub fn close_reprice_cooldown_remaining_secs(
     (age < config.close_reprice_cooldown_secs).then_some(config.close_reprice_cooldown_secs - age)
 }
 
+/// Returns the bounded close price cushion for the next close submission attempt.
+#[must_use]
+pub fn close_price_cushion_for_attempt(
+    config: &AlpacaOptionsManagementConfig,
+    entry: &StrategyStateEntry,
+) -> f64 {
+    let cushion =
+        config.close_price_cushion + config.close_reprice_step * entry.close_attempts as f64;
+    cushion.max(0.0).min(
+        config
+            .max_close_price_cushion
+            .max(config.close_price_cushion),
+    )
+}
+
 /// Emits a management snapshot operator event.
 pub fn emit_management_snapshot(
     entry: &StrategyStateEntry,
@@ -452,4 +475,58 @@ fn age_secs_from_rfc3339(value: &str) -> Option<u64> {
                 .ok()
         })
         .map(|duration| duration.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_price_cushion_ladder_is_attempt_based_and_capped() {
+        let config = AlpacaOptionsManagementConfig {
+            close_price_cushion: 0.02,
+            close_reprice_step: 0.01,
+            max_close_price_cushion: 0.05,
+            ..AlpacaOptionsManagementConfig::default()
+        };
+        let mut entry = state_entry();
+
+        assert_eq!(close_price_cushion_for_attempt(&config, &entry), 0.02);
+
+        entry.close_attempts = 2;
+        assert_eq!(close_price_cushion_for_attempt(&config, &entry), 0.04);
+
+        entry.close_attempts = 10;
+        assert_eq!(close_price_cushion_for_attempt(&config, &entry), 0.05);
+    }
+
+    fn state_entry() -> StrategyStateEntry {
+        StrategyStateEntry {
+            trade_date: "2026-05-07".to_string(),
+            underlying: "SPY".to_string(),
+            strategy: "call_credit".to_string(),
+            order_list_id: "entry-list".to_string(),
+            short_symbol: "SPY260515C00720000".to_string(),
+            long_symbol: "SPY260515C00722000".to_string(),
+            short_call_symbol: None,
+            long_call_symbol: None,
+            quantity: 1,
+            credit: 0.40,
+            debit: None,
+            risk_capital_usd: Some(160.0),
+            score: 72.5,
+            parent_order_id: Some("open-parent".to_string()),
+            submitted_at_utc: Some("2026-05-07T14:00:00Z".to_string()),
+            close_order_list_id: Some("close-list".to_string()),
+            close_parent_order_id: Some("close-parent".to_string()),
+            close_reason: Some("stop_loss".to_string()),
+            close_attempts: 0,
+            last_close_submitted_at_utc: None,
+            submitted: true,
+            canceled: false,
+            closed: false,
+            recorded_at_utc: "2026-05-07T14:00:00Z".to_string(),
+            closed_at_utc: None,
+        }
+    }
 }

@@ -103,6 +103,8 @@ pub async fn track_candidate_outcomes(
                 "was_dry_run": candidate.was_dry_run,
                 "virtual_trade": candidate.virtual_trade,
                 "selected_action": &candidate.selected_action,
+                "selected_reason": &candidate.selected_reason,
+                "selected_details": &candidate.selected_details,
                 "accepted": candidate.accepted,
                 "rejected": candidate.rejected,
                 "terminal_rejection_recorded": candidate.terminal_rejection_recorded,
@@ -160,6 +162,7 @@ pub fn entry_performance(
     let quoted_entry_premium = quoted_entry_premium(entry);
     let quoted_entry_cashflow = quoted_entry_premium
         .map(|premium| premium * entry.quantity as f64 * OPTION_CONTRACT_MULTIPLIER);
+    let fill_quality = super::fill_quality(entry, &symbols, quoted_entry_cashflow, &open);
 
     let mut warnings = Vec::new();
     if entry.submitted && order_ids.open.is_empty() {
@@ -189,6 +192,7 @@ pub fn entry_performance(
         symbols: symbols.into_iter().collect(),
         quantity: entry.quantity,
         recorded_at_utc: entry.recorded_at_utc.clone(),
+        submitted_at_utc: entry.submitted_at_utc.clone(),
         closed_at_utc: entry.closed_at_utc.clone(),
         score: entry.score,
         quoted_entry_premium,
@@ -196,6 +200,7 @@ pub fn entry_performance(
         open,
         close,
         realized_pnl,
+        fill_quality,
         open_unrealized_pnl,
         close_reason: entry.close_reason.clone(),
         parent_order_id: entry.parent_order_id.clone(),
@@ -227,6 +232,7 @@ pub fn summarize_performance(entries: &[EntryPerformance]) -> PerformanceSummary
         if let Some(open_unrealized_pnl) = entry.open_unrealized_pnl {
             summary.open_unrealized_pnl += open_unrealized_pnl;
         }
+        summary.fill_quality.add(&entry.fill_quality);
 
         let strategy_summary = summary
             .by_strategy
@@ -248,6 +254,7 @@ pub fn summarize_performance(entries: &[EntryPerformance]) -> PerformanceSummary
         if let Some(open_unrealized_pnl) = entry.open_unrealized_pnl {
             strategy_summary.open_unrealized_pnl += open_unrealized_pnl;
         }
+        strategy_summary.fill_quality.add(&entry.fill_quality);
         strategy_summary.observed_total_pnl =
             strategy_summary.realized_pnl + strategy_summary.open_unrealized_pnl;
     }
@@ -328,6 +335,8 @@ pub(super) struct TrackCandidate {
     pub(super) was_dry_run: bool,
     pub(super) virtual_trade: bool,
     pub(super) selected_action: Option<String>,
+    pub(super) selected_reason: Option<String>,
+    pub(super) selected_details: Vec<String>,
     pub(super) accepted: Option<u64>,
     pub(super) rejected: Option<u64>,
     pub(super) terminal_rejection_recorded: Option<bool>,
@@ -343,6 +352,8 @@ pub(super) enum CandidateEntryKind {
 #[derive(Clone, Debug, Default)]
 pub(super) struct CandidateSelection {
     action: Option<String>,
+    reason: Option<String>,
+    details: Vec<String>,
     accepted: Option<u64>,
     rejected: Option<u64>,
     terminal_rejection_recorded: Option<bool>,
@@ -438,6 +449,8 @@ pub(super) fn selected_candidate_actions(
                         .to_string(),
                 );
                 selection.quantity = record_u64(record, "quantity");
+                selection.reason = record_str(record, "reason").map(ToString::to_string);
+                selection.details = string_array(record.get("details"));
             }
             Some("candidate_submit_rejected") => {
                 selection.accepted = record_u64(record, "accepted");
@@ -525,6 +538,8 @@ fn track_candidate_from_record(
     let identity_key = candidate_identity_key(&strategy, &underlying, &symbols);
     let selection = selected.get(&identity_key).cloned().unwrap_or_default();
     let selected_action = selection.action.clone();
+    let selected_reason = selection.reason.clone();
+    let selected_details = selection.details.clone();
     let entry_kind = if candidate_type == "debit_spread" || strategy.contains("debit") {
         CandidateEntryKind::Debit
     } else {
@@ -555,6 +570,8 @@ fn track_candidate_from_record(
         was_dry_run: selection.was_dry_run(),
         virtual_trade: selection.virtual_trade(),
         selected_action,
+        selected_reason,
+        selected_details,
         accepted: selection.accepted,
         rejected: selection.rejected,
         terminal_rejection_recorded: selection.terminal_rejection_recorded,
@@ -592,6 +609,19 @@ fn candidate_symbols(record: &Value) -> Vec<String> {
 
 fn candidate_identity_key(strategy: &str, underlying: &str, symbols: &[String]) -> String {
     format!("{}|{}|{}", strategy, underlying, symbols.join("|"))
+}
+
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn value_candidate_outcome(

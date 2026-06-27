@@ -30,6 +30,7 @@ use crate::{
         PutCreditScannerConfig, annualized_premium_yield,
     },
     config::AlpacaDataClientConfig,
+    earnings::EarningsEvent,
     fleet::ResolvedFleetConfig,
     http::client::AlpacaHttpClient,
     options_lifecycle::OptionLifecycleRiskConfig,
@@ -109,6 +110,18 @@ pub struct AlpacaOptionsRuntimeConfig {
     pub max_active_entries_per_underlying: Option<usize>,
     /// Maximum active entries for one configured sector/correlation group. `None` means unlimited.
     pub max_active_entries_per_sector: Option<usize>,
+    /// Maximum risk-capital estimate for one selected entry in USD. `None` means unlimited.
+    pub max_single_entry_risk_capital_usd: Option<f64>,
+    /// Maximum active plus selected portfolio risk-capital estimate in USD. `None` means unlimited.
+    pub max_portfolio_risk_capital_usd: Option<f64>,
+    /// Whether configured risk-capital limits block entries when risk cannot be estimated.
+    pub block_unestimated_risk_capital: bool,
+    /// Approved earnings events used by the event-shock admission guard.
+    pub event_shock_earnings_events: Vec<EarningsEvent>,
+    /// Calendar days before an earnings report to block new entries.
+    pub event_shock_block_days_before_earnings: i64,
+    /// Calendar days after an earnings report to block new entries.
+    pub event_shock_block_days_after_earnings: i64,
     /// Underlying to sector/correlation-group mapping.
     pub sectors: BTreeMap<String, String>,
     /// Maximum loop iterations. Zero means run continuously.
@@ -141,6 +154,10 @@ pub struct AlpacaOptionsRuntimeConfig {
     pub close_end: NaiveTime,
     /// Additional debit allowed on submitted close limits.
     pub close_price_cushion: f64,
+    /// Additional close cushion added per accepted close attempt.
+    pub close_reprice_step: f64,
+    /// Maximum total close cushion after repricing steps.
+    pub max_close_price_cushion: f64,
     /// Maximum accepted close submissions per entry. Zero means unlimited.
     pub max_close_attempts: u32,
     /// Minimum delay after a close submission before another close may be submitted.

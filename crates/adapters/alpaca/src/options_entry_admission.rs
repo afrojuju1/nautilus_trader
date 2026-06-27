@@ -2,10 +2,11 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, NaiveTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 
 use crate::{
+    earnings::EarningsEvent,
     options_runtime::{
         AlpacaOptionsRuntimeConfig, SelectedOptionsEntry, active_sector_count,
         active_underlying_count,
@@ -103,6 +104,20 @@ pub struct EntryAdmissionConfig {
     pub max_active_entries_per_underlying: Option<usize>,
     /// Maximum active entries for one sector/correlation group.
     pub max_active_entries_per_sector: Option<usize>,
+    /// Strategy quantity for selected-entry risk-capital estimates.
+    pub quantity: u64,
+    /// Maximum risk-capital estimate for one selected entry in USD.
+    pub max_single_entry_risk_capital_usd: Option<f64>,
+    /// Maximum active plus selected portfolio risk-capital estimate in USD.
+    pub max_portfolio_risk_capital_usd: Option<f64>,
+    /// Whether configured risk-capital limits block entries when risk cannot be estimated.
+    pub block_unestimated_risk_capital: bool,
+    /// Approved earnings events used by the event-shock admission guard.
+    pub event_shock_earnings_events: Vec<EarningsEvent>,
+    /// Calendar days before an earnings report to block new entries.
+    pub event_shock_block_days_before_earnings: i64,
+    /// Calendar days after an earnings report to block new entries.
+    pub event_shock_block_days_after_earnings: i64,
     /// Underlying to sector/correlation-group mapping.
     pub sectors: BTreeMap<String, String>,
     /// Fleet-wide maximum active entries.
@@ -146,6 +161,13 @@ impl EntryAdmissionConfig {
             max_open_orders: engine.max_open_orders,
             max_active_entries_per_underlying: engine.max_active_entries_per_underlying,
             max_active_entries_per_sector: engine.max_active_entries_per_sector,
+            quantity: engine.quantity,
+            max_single_entry_risk_capital_usd: engine.max_single_entry_risk_capital_usd,
+            max_portfolio_risk_capital_usd: engine.max_portfolio_risk_capital_usd,
+            block_unestimated_risk_capital: engine.block_unestimated_risk_capital,
+            event_shock_earnings_events: engine.event_shock_earnings_events.clone(),
+            event_shock_block_days_before_earnings: engine.event_shock_block_days_before_earnings,
+            event_shock_block_days_after_earnings: engine.event_shock_block_days_after_earnings,
             sectors: engine.sectors.clone(),
             fleet_max_active_entries: fleet_section.and_then(|fleet| fleet.max_active_entries),
             fleet_active_entries: fleet_exposure
@@ -195,6 +217,13 @@ impl Default for EntryAdmissionConfig {
             max_open_orders: None,
             max_active_entries_per_underlying: None,
             max_active_entries_per_sector: None,
+            quantity: 1,
+            max_single_entry_risk_capital_usd: None,
+            max_portfolio_risk_capital_usd: None,
+            block_unestimated_risk_capital: true,
+            event_shock_earnings_events: Vec::new(),
+            event_shock_block_days_before_earnings: 1,
+            event_shock_block_days_after_earnings: 1,
             sectors: BTreeMap::new(),
             fleet_max_active_entries: None,
             fleet_active_entries: 0,
@@ -256,6 +285,8 @@ pub fn submission_block_for_selected(
 ) -> Option<SubmissionBlock> {
     broker_permission_block_for_selected(state, selected)
         .or_else(|| risk_gate_decision(config, state, trade_date, snapshot).into_submission_block())
+        .or_else(|| event_shock_block(config, trade_date, selected.underlying()))
+        .or_else(|| portfolio_risk_capital_block(config, state, selected))
         .or_else(|| per_underlying_block(config, state, selected.underlying()))
         .or_else(|| per_sector_block(config, state, selected.underlying()))
         .or_else(|| fleet_underlying_limit_block(config, selected.underlying()))
@@ -444,6 +475,137 @@ fn per_underlying_block(
     })
 }
 
+fn portfolio_risk_capital_block(
+    config: &EntryAdmissionConfig,
+    state: &StrategyState,
+    selected: &SelectedOptionsEntry,
+) -> Option<SubmissionBlock> {
+    let has_limit = config.max_single_entry_risk_capital_usd.is_some()
+        || config.max_portfolio_risk_capital_usd.is_some();
+    if !has_limit {
+        return None;
+    }
+
+    let candidate_risk = selected.risk_capital_usd(config.quantity);
+    let Some(candidate_risk) = candidate_risk else {
+        return config
+            .block_unestimated_risk_capital
+            .then(|| SubmissionBlock {
+                reason: "risk_capital_unestimated".to_string(),
+                current: None,
+                limit: None,
+                details: vec![
+                    "scope=selected_entry".to_string(),
+                    format!("strategy={}", selected.strategy_name()),
+                    format!("underlying={}", selected.underlying()),
+                ],
+            });
+    };
+
+    if let Some(limit) = config.max_single_entry_risk_capital_usd
+        && candidate_risk > limit
+    {
+        return Some(SubmissionBlock {
+            reason: "risk_max_single_entry_risk_capital".to_string(),
+            current: None,
+            limit: None,
+            details: vec![
+                format!("candidate_risk_capital_usd={candidate_risk:.2}"),
+                format!("limit_usd={limit:.2}"),
+            ],
+        });
+    }
+
+    let Some(limit) = config.max_portfolio_risk_capital_usd else {
+        return None;
+    };
+
+    let active = active_risk_capital(state);
+    if active.unknown_count > 0 && config.block_unestimated_risk_capital {
+        return Some(SubmissionBlock {
+            reason: "risk_capital_unestimated".to_string(),
+            current: None,
+            limit: None,
+            details: vec![
+                "scope=active_entries".to_string(),
+                format!("unknown_active_entries={}", active.unknown_count),
+                format!("known_active_risk_capital_usd={:.2}", active.known_usd),
+                format!("limit_usd={limit:.2}"),
+            ],
+        });
+    }
+
+    let projected = active.known_usd + candidate_risk;
+    (projected > limit).then(|| SubmissionBlock {
+        reason: "risk_max_portfolio_risk_capital".to_string(),
+        current: None,
+        limit: None,
+        details: vec![
+            format!("active_risk_capital_usd={:.2}", active.known_usd),
+            format!("candidate_risk_capital_usd={candidate_risk:.2}"),
+            format!("projected_risk_capital_usd={projected:.2}"),
+            format!("limit_usd={limit:.2}"),
+        ],
+    })
+}
+
+fn event_shock_block(
+    config: &EntryAdmissionConfig,
+    trade_date: &str,
+    underlying: &str,
+) -> Option<SubmissionBlock> {
+    if config.event_shock_earnings_events.is_empty() {
+        return None;
+    }
+
+    let trade_date = NaiveDate::parse_from_str(trade_date, "%Y-%m-%d").ok()?;
+    let underlying = underlying.to_ascii_uppercase();
+    config
+        .event_shock_earnings_events
+        .iter()
+        .filter(|event| event.underlying == underlying)
+        .find_map(|event| {
+            let days_to_report = event
+                .report_date
+                .signed_duration_since(trade_date)
+                .num_days();
+            (-config.event_shock_block_days_after_earnings <= days_to_report
+                && days_to_report <= config.event_shock_block_days_before_earnings)
+                .then(|| SubmissionBlock {
+                    reason: "event_shock_earnings".to_string(),
+                    current: None,
+                    limit: None,
+                    details: vec![
+                        format!("underlying={}", event.underlying),
+                        format!("report_date={}", event.report_date),
+                        format!("timing={}", event.timing.as_str()),
+                        format!("source={}", event.source),
+                        format!("days_to_report={days_to_report}"),
+                    ],
+                })
+        })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ActiveRiskCapital {
+    known_usd: f64,
+    unknown_count: usize,
+}
+
+fn active_risk_capital(state: &StrategyState) -> ActiveRiskCapital {
+    state.entries.iter().filter(|entry| entry.is_active()).fold(
+        ActiveRiskCapital::default(),
+        |mut active, entry| {
+            if let Some(value) = entry.risk_capital_usd_estimate() {
+                active.known_usd += value;
+            } else {
+                active.unknown_count = active.unknown_count.saturating_add(1);
+            }
+            active
+        },
+    )
+}
+
 fn per_sector_block(
     config: &EntryAdmissionConfig,
     state: &StrategyState,
@@ -527,4 +689,205 @@ fn broker_admission_block(reasons: &[String]) -> Option<SubmissionBlock> {
 fn inside_entry_window_at(config: &EntryAdmissionConfig, now: DateTime<Utc>) -> bool {
     let now = now.with_timezone(&config.entry_timezone).time();
     config.entry_start <= now && now <= config.entry_end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        candidate_engine::{ScoredContract, SpreadCandidate},
+        earnings::{EarningsEvent, EarningsTiming},
+        options_entry::{SelectedEntry, SelectedOptionsEntry},
+        runtime::{StrategyStateEntryDraft, credit_spread_strategy_name},
+    };
+
+    #[test]
+    fn portfolio_risk_capital_blocks_projected_excess() {
+        let config = EntryAdmissionConfig {
+            quantity: 1,
+            max_portfolio_risk_capital_usd: Some(600.0),
+            ..EntryAdmissionConfig::default()
+        };
+        let mut state = StrategyState::default();
+        state.record_entry_submission(active_draft("QQQ", Some(300.0)));
+        let selected = selected_credit_entry("SPY", 3.50);
+
+        let block = submission_block_for_selected(
+            &config,
+            &state,
+            &selected,
+            "2026-05-04",
+            &EntryAdmissionSnapshot::default(),
+        )
+        .expect("projected risk capital should block");
+
+        assert_eq!(block.reason, "risk_max_portfolio_risk_capital");
+        assert!(
+            block
+                .details
+                .contains(&"active_risk_capital_usd=300.00".to_string())
+        );
+        assert!(
+            block
+                .details
+                .contains(&"candidate_risk_capital_usd=350.00".to_string())
+        );
+        assert!(
+            block
+                .details
+                .contains(&"projected_risk_capital_usd=650.00".to_string())
+        );
+    }
+
+    #[test]
+    fn single_entry_risk_capital_blocks_large_candidate() {
+        let config = EntryAdmissionConfig {
+            quantity: 2,
+            max_single_entry_risk_capital_usd: Some(400.0),
+            ..EntryAdmissionConfig::default()
+        };
+        let state = StrategyState::default();
+        let selected = selected_credit_entry("SPY", 2.50);
+
+        let block = submission_block_for_selected(
+            &config,
+            &state,
+            &selected,
+            "2026-05-04",
+            &EntryAdmissionSnapshot::default(),
+        )
+        .expect("single-entry risk capital should block");
+
+        assert_eq!(block.reason, "risk_max_single_entry_risk_capital");
+        assert!(
+            block
+                .details
+                .contains(&"candidate_risk_capital_usd=500.00".to_string())
+        );
+    }
+
+    #[test]
+    fn configured_portfolio_cap_blocks_unknown_active_risk() {
+        let config = EntryAdmissionConfig {
+            quantity: 1,
+            max_portfolio_risk_capital_usd: Some(1_000.0),
+            block_unestimated_risk_capital: true,
+            ..EntryAdmissionConfig::default()
+        };
+        let mut state = StrategyState::default();
+        let mut draft = active_draft("QQQ", None);
+        draft.strategy = "naked_call".to_string();
+        draft.short_symbol = "QQQ260515C00430000".to_string();
+        draft.long_symbol = String::new();
+        state.record_entry_submission(draft);
+        let selected = selected_credit_entry("SPY", 1.00);
+
+        let block = submission_block_for_selected(
+            &config,
+            &state,
+            &selected,
+            "2026-05-04",
+            &EntryAdmissionSnapshot::default(),
+        )
+        .expect("unknown active risk capital should block when configured");
+
+        assert_eq!(block.reason, "risk_capital_unestimated");
+        assert!(block.details.contains(&"scope=active_entries".to_string()));
+        assert!(
+            block
+                .details
+                .contains(&"unknown_active_entries=1".to_string())
+        );
+    }
+
+    #[test]
+    fn configured_earnings_event_blocks_selected_underlying() {
+        let config = EntryAdmissionConfig {
+            event_shock_earnings_events: vec![EarningsEvent {
+                underlying: "SPY".to_string(),
+                report_date: NaiveDate::from_ymd_opt(2026, 5, 5).unwrap(),
+                timing: EarningsTiming::AfterClose,
+                source: "approved_csv".to_string(),
+            }],
+            event_shock_block_days_before_earnings: 2,
+            event_shock_block_days_after_earnings: 1,
+            ..EntryAdmissionConfig::default()
+        };
+        let state = StrategyState::default();
+        let selected = selected_credit_entry("SPY", 1.00);
+
+        let block = submission_block_for_selected(
+            &config,
+            &state,
+            &selected,
+            "2026-05-04",
+            &EntryAdmissionSnapshot::default(),
+        )
+        .expect("configured earnings event should block");
+
+        assert_eq!(block.reason, "event_shock_earnings");
+        assert!(
+            block
+                .details
+                .contains(&"report_date=2026-05-05".to_string())
+        );
+        assert!(block.details.contains(&"timing=after_close".to_string()));
+        assert!(block.details.contains(&"days_to_report=1".to_string()));
+    }
+
+    fn selected_credit_entry(underlying: &str, max_loss: f64) -> SelectedOptionsEntry {
+        SelectedOptionsEntry::Credit(SelectedEntry {
+            underlying: underlying.to_string(),
+            kind: crate::candidate_engine::CreditSpreadKind::Put,
+            candidate: SpreadCandidate {
+                short: scored_contract(&format!("{underlying}260515P00400000"), 400.0),
+                long: scored_contract(&format!("{underlying}260515P00395000"), 395.0),
+                width: 5.0,
+                credit: 5.0 - max_loss,
+                max_loss,
+                return_on_risk: 0.25,
+                score: 70.0,
+            },
+        })
+    }
+
+    fn active_draft(underlying: &str, risk_capital_usd: Option<f64>) -> StrategyStateEntryDraft {
+        StrategyStateEntryDraft {
+            trade_date: "2026-05-03".to_string(),
+            underlying: underlying.to_string(),
+            strategy: credit_spread_strategy_name(crate::candidate_engine::CreditSpreadKind::Put)
+                .to_string(),
+            order_list_id: format!("{underlying}-entry"),
+            short_symbol: format!("{underlying}260515P00400000"),
+            long_symbol: format!("{underlying}260515P00395000"),
+            short_call_symbol: None,
+            long_call_symbol: None,
+            quantity: 1,
+            credit: 1.00,
+            debit: None,
+            risk_capital_usd,
+            score: 70.0,
+            parent_order_id: Some(format!("{underlying}-parent")),
+            submitted_at_utc: Some("2026-05-03T14:00:00Z".to_string()),
+        }
+    }
+
+    fn scored_contract(symbol: &str, strike: f64) -> ScoredContract {
+        ScoredContract {
+            symbol: symbol.to_string(),
+            expiration_date: "2026-05-15".to_string(),
+            dte: 11,
+            strike,
+            bid: 1.0,
+            ask: 1.1,
+            delta_abs: 0.20,
+            spread_pct: 0.05,
+            bid_size: 10,
+            ask_size: 10,
+            volume: 100,
+            open_interest: 1_000,
+            implied_volatility: Some(0.2),
+            metrics: None,
+        }
+    }
 }

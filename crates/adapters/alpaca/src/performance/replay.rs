@@ -98,6 +98,8 @@ pub struct HistoricalReplayReport {
     pub by_spread_width_bucket: BTreeMap<String, HistoricalReplayBucketSummary>,
     /// Replay summary by historical option-bar volume bucket.
     pub by_liquidity_bucket: BTreeMap<String, HistoricalReplayBucketSummary>,
+    /// Replay summary by persisted decision reason.
+    pub by_decision_reason: BTreeMap<String, HistoricalReplayBucketSummary>,
     /// Report-level warnings.
     pub warnings: Vec<String>,
     /// Optional per-candidate replay records.
@@ -170,6 +172,16 @@ pub struct HistoricalReplayRecord {
     pub was_rejected: bool,
     /// Whether this selected candidate was not traded live.
     pub virtual_trade: bool,
+    /// Selected-candidate action from the decision ledger.
+    pub selected_action: Option<String>,
+    /// Stable selected-candidate reason from the decision ledger.
+    pub selected_reason: Option<String>,
+    /// Detailed selected-candidate diagnostics from the decision ledger.
+    pub selected_details: Vec<String>,
+    /// Broker rejection reasons recorded for the selected candidate.
+    pub rejection_reasons: Vec<String>,
+    /// Stable replay decision reason used for explanation bucketing.
+    pub decision_reason: String,
     /// Quoted entry premium from the candidate ledger.
     pub entry_net_premium: f64,
     /// Historical replay close mark.
@@ -256,6 +268,7 @@ pub async fn replay_historical_candidates(
     let mut by_delta_bucket = BTreeMap::<String, ReplayStats>::new();
     let mut by_spread_width_bucket = BTreeMap::<String, ReplayStats>::new();
     let mut by_liquidity_bucket = BTreeMap::<String, ReplayStats>::new();
+    let mut by_decision_reason = BTreeMap::<String, ReplayStats>::new();
     let mut records = Vec::new();
 
     for candidate in &candidates {
@@ -289,6 +302,10 @@ pub async fn replay_historical_candidates(
             .entry(record.liquidity_bucket.clone())
             .or_default()
             .add(&record);
+        by_decision_reason
+            .entry(record.decision_reason.clone())
+            .or_default()
+            .add(&record);
         if request.include_records {
             records.push(record);
         }
@@ -316,6 +333,7 @@ pub async fn replay_historical_candidates(
         by_delta_bucket: into_summary_map(by_delta_bucket),
         by_spread_width_bucket: into_summary_map(by_spread_width_bucket),
         by_liquidity_bucket: into_summary_map(by_liquidity_bucket),
+        by_decision_reason: into_summary_map(by_decision_reason),
         warnings,
         records,
     })
@@ -392,6 +410,7 @@ fn replay_candidate(
     let spread_width_bucket = spread_width_bucket(spread_width).to_string();
     let dte_bucket = dte_bucket(dte).to_string();
     let liquidity_bucket = liquidity_bucket(total_volume, close_net_premium.is_some()).to_string();
+    let decision_reason = replay_decision_reason(candidate);
 
     HistoricalReplayRecord {
         trade_date: candidate.trade_date.clone(),
@@ -407,6 +426,11 @@ fn replay_candidate(
         was_submitted: candidate.was_submitted,
         was_rejected: candidate.was_rejected,
         virtual_trade: candidate.virtual_trade,
+        selected_action: candidate.selected_action.clone(),
+        selected_reason: candidate.selected_reason.clone(),
+        selected_details: candidate.selected_details.clone(),
+        rejection_reasons: candidate.rejection_reasons.clone(),
+        decision_reason,
         entry_net_premium: candidate.entry_net_premium,
         close_net_premium,
         hypothetical_pnl_per_unit,
@@ -579,6 +603,35 @@ fn candidate_spread_width(candidate: &TrackCandidate) -> Option<f64> {
             None
         }
     })
+}
+
+fn replay_decision_reason(candidate: &TrackCandidate) -> String {
+    if candidate.was_rejected {
+        return candidate
+            .rejection_reasons
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "broker_rejected".to_string());
+    }
+    if let Some(reason) = candidate
+        .selected_reason
+        .as_ref()
+        .filter(|reason| !reason.is_empty())
+    {
+        return reason.clone();
+    }
+    if let Some(action) = candidate
+        .selected_action
+        .as_ref()
+        .filter(|action| !action.is_empty())
+    {
+        return action.clone();
+    }
+    if candidate.was_selected {
+        "selected".to_string()
+    } else {
+        "not_selected".to_string()
+    }
 }
 
 fn record_f64(record: &Value, key: &str) -> Option<f64> {

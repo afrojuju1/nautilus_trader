@@ -54,6 +54,9 @@ use crate::{
             OptionSnapshotsRequest, StockSnapshotsRequest,
         },
     },
+    parse::{
+        AlpacaOptionSymbolParts, canonical_alpaca_option_symbol, parse_alpaca_option_instrument_id,
+    },
     providers::AlpacaOptionContractProvider,
 };
 
@@ -85,15 +88,6 @@ impl OptionSnapshotSubscriptions {
     fn should_emit_greeks(&self, instrument_id: &InstrumentId) -> bool {
         self.greeks_instrument_ids.contains(instrument_id)
     }
-}
-
-#[derive(Clone, Debug)]
-struct AlpacaOptionSymbolParts {
-    symbol: String,
-    canonical_symbol: String,
-    underlying_symbol: String,
-    expiration_date: String,
-    option_type: AlpacaOptionType,
 }
 
 #[derive(Clone, Debug)]
@@ -241,7 +235,7 @@ impl AlpacaDataClient {
         provider: &AlpacaOptionContractProvider,
         instrument_id: InstrumentId,
     ) -> anyhow::Result<InstrumentAny> {
-        let parts = parse_alpaca_option_symbol(instrument_id)?;
+        let parts = parse_alpaca_option_instrument_id(instrument_id)?;
         let contracts = provider
             .load_active_contracts(
                 parts.underlying_symbol.clone(),
@@ -1018,78 +1012,5 @@ fn option_contract_matches(
     parts: &AlpacaOptionSymbolParts,
 ) -> bool {
     contract.symbol == parts.symbol
-        || canonical_option_symbol(&contract.symbol) == parts.canonical_symbol
-}
-
-fn canonical_option_symbol(symbol: &str) -> String {
-    symbol.strip_prefix("O:").unwrap_or(symbol).to_string()
-}
-
-fn parse_alpaca_option_symbol(
-    instrument_id: InstrumentId,
-) -> anyhow::Result<AlpacaOptionSymbolParts> {
-    if instrument_id.venue != Venue::new(ALPACA_VENUE) {
-        return Err(anyhow!(
-            "expected Alpaca venue {}, got {}",
-            ALPACA_VENUE,
-            instrument_id.venue
-        ));
-    }
-
-    let symbol = instrument_id.symbol.as_str();
-    let canonical_symbol = canonical_option_symbol(symbol);
-    let first_digit = canonical_symbol
-        .find(|ch: char| ch.is_ascii_digit())
-        .ok_or_else(|| anyhow!("invalid Alpaca option symbol `{symbol}`: missing expiration"))?;
-
-    let (underlying_symbol, option_details) = canonical_symbol.split_at(first_digit);
-    if underlying_symbol.is_empty() {
-        return Err(anyhow!(
-            "invalid Alpaca option symbol `{symbol}`: missing underlying"
-        ));
-    }
-
-    if option_details.len() < 15 {
-        return Err(anyhow!(
-            "invalid Alpaca option symbol `{symbol}`: expected YYMMDD, option side, and strike"
-        ));
-    }
-
-    let expiration = &option_details[..6];
-    let side = option_details.as_bytes()[6] as char;
-    let strike = &option_details[7..];
-    if !expiration.chars().all(|ch| ch.is_ascii_digit())
-        || strike.is_empty()
-        || !strike.chars().all(|ch| ch.is_ascii_digit())
-    {
-        return Err(anyhow!(
-            "invalid Alpaca option symbol `{symbol}`: malformed expiration or strike"
-        ));
-    }
-
-    let option_type = match side {
-        'C' => AlpacaOptionType::Call,
-        'P' => AlpacaOptionType::Put,
-        _ => {
-            return Err(anyhow!(
-                "invalid Alpaca option symbol `{symbol}`: expected C or P option side"
-            ));
-        }
-    };
-
-    let expiration_date = format!(
-        "20{}-{}-{}",
-        &expiration[..2],
-        &expiration[2..4],
-        &expiration[4..6]
-    );
-    let underlying_symbol = underlying_symbol.to_string();
-
-    Ok(AlpacaOptionSymbolParts {
-        symbol: symbol.to_string(),
-        canonical_symbol,
-        underlying_symbol,
-        expiration_date,
-        option_type,
-    })
+        || canonical_alpaca_option_symbol(&contract.symbol) == parts.canonical_symbol
 }

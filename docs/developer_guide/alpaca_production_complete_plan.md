@@ -604,6 +604,9 @@ Required before promoting beyond experimental:
 High-value after the required platform work:
 
 5. Strategy regime router.
+   - Status: architecture remains proposed; implementation intentionally waits for a real
+     read-only feature actor or feature input contract. Do not add fake `neutral` regime metadata
+     to ledgers just to create a router-shaped surface.
    - Build this as a Nautilus-native routing layer, not a standalone scanner. A read-only regime
      feature actor derives features from bars, option-chain state, external signals, and approved
      historical feature sources; a pure regime router returns labels, confidence, explanation codes,
@@ -616,6 +619,11 @@ High-value after the required platform work:
      contracts, storage/evidence boundaries, failure policy, and rollout slices.
 
 6. Portfolio Greek and stress governor.
+   - Status: initial risk-capital stress governor complete in the entry-admission path. It stores
+     per-entry `risk_capital_usd`, derives legacy defined-risk/debit/naked-put estimates where
+     possible, blocks single-entry and projected portfolio risk-capital excess, and fails closed on
+     unknown active exposure when configured. Greek aggregation remains dependent on live Greek
+     feature/storage inputs.
    - Track account and fleet delta, gamma, vega, theta, and buying-power usage from active option
      exposure where data allows.
    - Add scenario stress such as underlying +/-1%, +/-2%, volatility up/down, and gap-open
@@ -624,6 +632,9 @@ High-value after the required platform work:
      exposures that look harmless by entry count alone.
 
 7. Fill-quality intelligence.
+   - Status: initial reporting complete in `alpaca-ops performance`. Performance rows now report
+     quoted-vs-actual entry cashflow, entry slippage, fill delay, fill completeness, and explicit
+     missing inputs; summary and by-strategy aggregates include fill-quality metrics.
    - Measure each submitted order against quote midpoint, bid/ask spread, quote age, fill delay,
      reprice count, and post-fill drift.
    - Summarize fill quality by strategy, underlying, account, time of day, and order type.
@@ -631,6 +642,11 @@ High-value after the required platform work:
      quarantine.
 
 8. Smart MLeg repricing engine.
+   - Status: initial close-side bounded repricing complete on the existing management path.
+     `close_reprice_step` and `max_close_price_cushion` build an attempt-aware close price ladder
+     using persisted `close_attempts`, existing stale-close cancel, max-attempt, and cooldown
+     gates. Entry-side replacement remains blocked by current duplicate-entry safety policy until a
+     deliberate entry-replacement model is designed.
    - Submit entries and closes with a controlled limit ladder instead of one static price.
    - Start near the desired midpoint, improve by configured ticks while edge remains acceptable,
      and cancel when quote quality or expected value decays.
@@ -638,6 +654,10 @@ High-value after the required platform work:
      management gates.
 
 9. Event shock guard.
+   - Status: initial earnings event-shock admission block complete. The guard reads an approved
+     earnings CSV when configured, can fail startup if event data is required but missing, and
+     records `event_shock_earnings` as a first-class decision reason. News and corporate-action
+     sources remain future input contracts.
    - Consume earnings, real-time news, historical news, and corporate-action inputs to pause symbols
      around material events.
    - Add symbol cooldowns for mergers, splits, lawsuit/FDA/headline shocks, unexpected halts, and
@@ -645,6 +665,9 @@ High-value after the required platform work:
    - Record event blocks as first-class decision reasons so skipped trades can be reviewed.
 
 10. Replay lab and decision time machine.
+    - Status: initial decision explanations complete in candidate outcomes and `alpaca-ops replay`.
+      Selected-candidate reason/details are preserved, replay records include decision reasons and
+      broker rejection reasons, and replay reports bucket outcomes by `by_decision_reason`.
     - Reconstruct any trading day from config, account state, market snapshots, candidate ledgers,
       decisions, submissions, fills, and management snapshots.
     - Produce a human-readable explanation for why a trade was selected, blocked, submitted,
@@ -736,9 +759,11 @@ Implement the Phase 7.5 required platform work in this order:
 4. Historical option research and replay harness. Initial read-only `alpaca-ops replay` command is
    done for historical option-bar marks and aggregate summaries; richer historical Greek and
    option-chain evidence depends on warehouse availability.
-5. Strategy regime router with portfolio Greek/stress governor.
-6. Fill-quality intelligence and smart MLeg repricing.
-7. Event shock guard and replay lab.
+5. Portfolio risk-capital stress governor. Initial implementation complete; richer Greek/stress
+   inputs depend on feature storage.
+6. Fill-quality intelligence, close-side MLeg repricing, event shock guard, and replay decision
+   explanations. Initial implementations complete on existing runtime/reporting paths.
+7. Strategy regime router. Still open by design until a real feature actor/input contract exists.
 
 In parallel with that platform work, continue paper-proving the undefined-risk account under strict
 caps. Do not expand undefined-risk symbols or sizing until one naked-option open/management/close

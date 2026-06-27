@@ -550,11 +550,22 @@ fn print_human_report(report: &PerformanceReport) {
         format_money(report.summary.open_unrealized_pnl),
         format_money(report.summary.observed_total_pnl),
     );
+    println!(
+        "fill_quality evaluated={} improved={} worse={} flat={} total_slippage={} avg_slippage={} delay_entries={} avg_delay_secs={}",
+        report.summary.fill_quality.evaluated_entries,
+        report.summary.fill_quality.price_improved_entries,
+        report.summary.fill_quality.price_worse_entries,
+        report.summary.fill_quality.price_flat_entries,
+        format_money(report.summary.fill_quality.total_entry_slippage_usd),
+        format_optional_money(report.summary.fill_quality.average_entry_slippage_usd),
+        report.summary.fill_quality.fill_delay_entries,
+        format_optional_secs(report.summary.fill_quality.average_open_fill_delay_secs),
+    );
     if !report.summary.by_strategy.is_empty() {
         println!("by_strategy:");
         for (strategy, summary) in &report.summary.by_strategy {
             println!(
-                "  strategy={} entries={} active={} closed={} canceled={} realized={} missing_realized={} realized_pnl={} open_unrealized={} observed_total={}",
+                "  strategy={} entries={} active={} closed={} canceled={} realized={} missing_realized={} realized_pnl={} open_unrealized={} observed_total={} fill_eval={} fill_slippage={} avg_delay_secs={}",
                 strategy,
                 summary.entries,
                 summary.active_entries,
@@ -565,6 +576,9 @@ fn print_human_report(report: &PerformanceReport) {
                 format_money(summary.realized_pnl),
                 format_money(summary.open_unrealized_pnl),
                 format_money(summary.observed_total_pnl),
+                summary.fill_quality.evaluated_entries,
+                format_money(summary.fill_quality.total_entry_slippage_usd),
+                format_optional_secs(summary.fill_quality.average_open_fill_delay_secs),
             );
         }
     }
@@ -581,7 +595,7 @@ fn print_human_report(report: &PerformanceReport) {
 
 fn print_entry(entry: &EntryPerformance) {
     println!(
-        "  {} {} {} status={} score={:.1} open={} close={} realized={} open_unrealized={} reason={} warnings={}",
+        "  {} {} {} status={} score={:.1} open={} close={} realized={} open_unrealized={} fill_quality={} entry_slippage={} fill_delay_secs={} reason={} warnings={}",
         entry.trade_date,
         entry.underlying,
         entry.strategy,
@@ -591,6 +605,9 @@ fn print_entry(entry: &EntryPerformance) {
         format_optional_money(entry.close.cashflow),
         format_optional_money(entry.realized_pnl),
         format_optional_money(entry.open_unrealized_pnl),
+        entry.fill_quality.label,
+        format_optional_money(entry.fill_quality.entry_slippage_usd),
+        format_optional_i64(entry.fill_quality.open_fill_delay_secs),
         entry.close_reason.as_deref().unwrap_or("none"),
         if entry.warnings.is_empty() {
             "none".to_string()
@@ -602,6 +619,14 @@ fn print_entry(entry: &EntryPerformance) {
 
 fn format_optional_money(value: Option<f64>) -> String {
     value.map_or_else(|| "n/a".to_string(), format_money)
+}
+
+fn format_optional_secs(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |value| format!("{value:.1}"))
+}
+
+fn format_optional_i64(value: Option<i64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |value| value.to_string())
 }
 
 fn format_money(value: f64) -> String {

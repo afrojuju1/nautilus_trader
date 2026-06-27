@@ -31,8 +31,10 @@ use crate::candidate_engine::{
     CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, IronCondorCandidate,
     NakedOptionCandidate, NakedOptionKind, SpreadCandidate,
 };
+use crate::parse::{AlpacaOptionSymbolParts, parse_alpaca_option_symbol};
 
 const CANCELED_DEBIT_REPLACEMENT_EXEMPTIONS_PER_DAY: usize = 1;
+const OPTION_CONTRACT_MULTIPLIER: f64 = 100.0;
 
 /// Persisted state for the Alpaca index credit runner.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -67,6 +69,8 @@ pub struct StrategyStateEntryDraft {
     pub credit: f64,
     /// Entry debit for long-premium strategies.
     pub debit: Option<f64>,
+    /// Risk-capital estimate in USD for this entry.
+    pub risk_capital_usd: Option<f64>,
     /// Scanner score at entry.
     pub score: f64,
     /// Broker parent order ID.
@@ -188,6 +192,9 @@ impl StrategyState {
             quantity,
             credit: candidate.credit,
             debit: None,
+            risk_capital_usd: Some(
+                candidate.max_loss * OPTION_CONTRACT_MULTIPLIER * quantity as f64,
+            ),
             score: candidate.score,
             parent_order_id,
             submitted_at_utc: None,
@@ -216,6 +223,9 @@ impl StrategyState {
             quantity,
             credit: candidate.credit,
             debit: None,
+            risk_capital_usd: Some(
+                candidate.max_loss * OPTION_CONTRACT_MULTIPLIER * quantity as f64,
+            ),
             score: candidate.score,
             parent_order_id,
             submitted_at_utc: None,
@@ -245,6 +255,9 @@ impl StrategyState {
             quantity,
             credit: -candidate.debit,
             debit: Some(candidate.debit),
+            risk_capital_usd: Some(
+                candidate.max_loss * OPTION_CONTRACT_MULTIPLIER * quantity as f64,
+            ),
             score: candidate.score,
             parent_order_id,
             submitted_at_utc: None,
@@ -274,6 +287,7 @@ impl StrategyState {
             quantity,
             credit: candidate.credit,
             debit: None,
+            risk_capital_usd: Some(candidate.estimated_buying_power_requirement),
             score: candidate.score,
             parent_order_id,
             submitted_at_utc: None,
@@ -297,6 +311,7 @@ impl StrategyState {
             quantity: draft.quantity,
             credit: draft.credit,
             debit: draft.debit,
+            risk_capital_usd: draft.risk_capital_usd,
             score: draft.score,
             parent_order_id: draft.parent_order_id,
             submitted_at_utc: Some(submitted_at_utc),
@@ -344,6 +359,9 @@ pub struct StrategyStateEntry {
     /// Entry debit for long-premium spreads.
     #[serde(default)]
     pub debit: Option<f64>,
+    /// Risk-capital estimate in USD for this entry.
+    #[serde(default)]
+    pub risk_capital_usd: Option<f64>,
     /// Scanner score at entry.
     pub score: f64,
     /// Alpaca parent order ID for the entry.
@@ -408,6 +426,14 @@ impl StrategyStateEntry {
         })
     }
 
+    /// Returns the best available risk-capital estimate in USD for this entry.
+    #[must_use]
+    pub fn risk_capital_usd_estimate(&self) -> Option<f64> {
+        self.risk_capital_usd
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .or_else(|| self.derived_risk_capital_usd())
+    }
+
     /// Returns `true` when this entry can be exempted from one same-day replacement limit.
     #[must_use]
     pub fn is_canceled_debit_replacement_candidate(&self) -> bool {
@@ -434,6 +460,44 @@ impl StrategyStateEntry {
             symbols.push(symbol);
         }
         symbols
+    }
+
+    fn derived_risk_capital_usd(&self) -> Option<f64> {
+        if self.is_debit_spread() {
+            return positive_usd(
+                self.entry_debit()? * OPTION_CONTRACT_MULTIPLIER * self.quantity as f64,
+            );
+        }
+
+        if self.is_naked_option() {
+            if self.strategy.contains("naked_put") {
+                return positive_usd(
+                    option_symbol_parts(&self.short_symbol)?.strike
+                        * OPTION_CONTRACT_MULTIPLIER
+                        * self.quantity as f64,
+                );
+            }
+            return None;
+        }
+
+        if self.is_iron_condor() {
+            let put_width = option_width(&self.short_symbol, &self.long_symbol)?;
+            let call_width = option_width(
+                self.short_call_symbol.as_deref()?,
+                self.long_call_symbol.as_deref()?,
+            )?;
+            return positive_usd(
+                (put_width.max(call_width) - self.credit.max(0.0))
+                    * OPTION_CONTRACT_MULTIPLIER
+                    * self.quantity as f64,
+            );
+        }
+
+        positive_usd(
+            (option_width(&self.short_symbol, &self.long_symbol)? - self.credit.max(0.0))
+                * OPTION_CONTRACT_MULTIPLIER
+                * self.quantity as f64,
+        )
     }
 
     /// Records a submitted close order for this entry.
@@ -607,6 +671,24 @@ fn is_debit_strategy_name(strategy: &str) -> bool {
         || strategy.ends_with("_debit")
 }
 
+fn option_symbol_parts(symbol: &str) -> Option<AlpacaOptionSymbolParts> {
+    parse_alpaca_option_symbol(symbol).ok()
+}
+
+fn option_width(left_symbol: &str, right_symbol: &str) -> Option<f64> {
+    let left = option_symbol_parts(left_symbol)?;
+    let right = option_symbol_parts(right_symbol)?;
+    (left.underlying_symbol == right.underlying_symbol
+        && left.expiration_date == right.expiration_date
+        && left.option_type == right.option_type)
+        .then_some((left.strike - right.strike).abs())
+        .and_then(positive_usd)
+}
+
+fn positive_usd(value: f64) -> Option<f64> {
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -629,6 +711,7 @@ mod tests {
             quantity: 1,
             credit: 0.46,
             debit: None,
+            risk_capital_usd: Some(254.0),
             score: 61.9,
             parent_order_id: Some("parent-1".to_string()),
             submitted_at_utc: Some("2026-05-02T19:30:28Z".to_string()),
@@ -739,6 +822,7 @@ mod tests {
         );
         assert_eq!(entry.symbols(), vec!["SPY260508P00710000"]);
         assert_eq!(entry.credit, 0.72);
+        assert_eq!(entry.risk_capital_usd_estimate(), Some(71_000.0));
         assert!(entry.long_symbol.is_empty());
     }
 
@@ -785,6 +869,7 @@ mod tests {
             quantity: 1,
             credit: 0.50,
             debit: None,
+            risk_capital_usd: None,
             score: 60.0,
             parent_order_id: Some("open-parent-1".to_string()),
             submitted_at_utc: Some("2026-05-04T14:00:00Z".to_string()),
@@ -804,6 +889,41 @@ mod tests {
 
         assert_eq!(state.risk_counted_daily_submits("2026-05-04"), 1);
         assert!(state.has_risk_counted_submitted_underlying_today("2026-05-04", "SPY"));
+    }
+
+    #[test]
+    fn risk_capital_derives_legacy_credit_and_debit_entries() {
+        let credit = StrategyStateEntry {
+            trade_date: "2026-05-04".to_string(),
+            underlying: "SPY".to_string(),
+            strategy: credit_spread_strategy_name(CreditSpreadKind::Put).to_string(),
+            order_list_id: "open-list-1".to_string(),
+            short_symbol: "SPY260512P00708000".to_string(),
+            long_symbol: "SPY260512P00705000".to_string(),
+            short_call_symbol: None,
+            long_call_symbol: None,
+            quantity: 2,
+            credit: 0.50,
+            debit: None,
+            risk_capital_usd: None,
+            score: 60.0,
+            parent_order_id: Some("open-parent-1".to_string()),
+            submitted_at_utc: Some("2026-05-04T14:00:00Z".to_string()),
+            close_order_list_id: None,
+            close_parent_order_id: None,
+            close_reason: None,
+            close_attempts: 0,
+            last_close_submitted_at_utc: None,
+            submitted: true,
+            canceled: false,
+            closed: false,
+            recorded_at_utc: "2026-05-04T14:00:00Z".to_string(),
+            closed_at_utc: None,
+        };
+        let debit = debit_state_entry("open-list-2");
+
+        assert_eq!(credit.risk_capital_usd_estimate(), Some(500.0));
+        assert_eq!(debit.risk_capital_usd_estimate(), Some(88.0));
     }
 
     fn iron_condor_candidate() -> IronCondorCandidate {
@@ -865,6 +985,7 @@ mod tests {
             quantity: 1,
             credit: -0.88,
             debit: Some(0.88),
+            risk_capital_usd: None,
             score: 74.5,
             parent_order_id: Some("open-parent-1".to_string()),
             submitted_at_utc: Some("2026-05-04T14:00:00Z".to_string()),

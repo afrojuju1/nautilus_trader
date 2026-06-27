@@ -11,6 +11,7 @@ use chrono::NaiveTime;
 use chrono_tz::Tz;
 use serde::Deserialize;
 
+use crate::earnings::load_earnings_events_csv;
 use crate::{
     candidate_engine::{
         CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
@@ -45,6 +46,7 @@ pub(super) struct RuntimeConfigFile {
     management: ManagementSection,
     lifecycle: LifecycleSection,
     risk: RiskSection,
+    event_shock: EventShockSection,
 }
 
 impl RuntimeConfigFile {
@@ -63,6 +65,7 @@ impl RuntimeConfigFile {
             management: self.management.merge_parent(parent.management),
             lifecycle: self.lifecycle.merge_parent(parent.lifecycle),
             risk: self.risk.merge_parent(parent.risk),
+            event_shock: self.event_shock.merge_parent(parent.event_shock),
         }
     }
 }
@@ -292,6 +295,8 @@ struct ManagementSection {
     close_start: Option<String>,
     close_end: Option<String>,
     close_price_cushion: Option<f64>,
+    close_reprice_step: Option<f64>,
+    max_close_price_cushion: Option<f64>,
     max_close_attempts: Option<u32>,
     close_reprice_cooldown_secs: Option<u64>,
     active_risk_candidate_quote_limit: Option<usize>,
@@ -313,6 +318,10 @@ impl ManagementSection {
             close_start: self.close_start.or(parent.close_start),
             close_end: self.close_end.or(parent.close_end),
             close_price_cushion: self.close_price_cushion.or(parent.close_price_cushion),
+            close_reprice_step: self.close_reprice_step.or(parent.close_reprice_step),
+            max_close_price_cushion: self
+                .max_close_price_cushion
+                .or(parent.max_close_price_cushion),
             max_close_attempts: self.max_close_attempts.or(parent.max_close_attempts),
             close_reprice_cooldown_secs: self
                 .close_reprice_cooldown_secs
@@ -367,6 +376,9 @@ struct RiskSection {
     max_open_orders: Option<usize>,
     max_active_entries_per_underlying: Option<usize>,
     max_active_entries_per_sector: Option<usize>,
+    max_single_entry_risk_capital_usd: Option<f64>,
+    max_portfolio_risk_capital_usd: Option<f64>,
+    block_unestimated_risk_capital: Option<bool>,
     sectors: BTreeMap<String, String>,
 }
 
@@ -382,7 +394,42 @@ impl RiskSection {
             max_active_entries_per_sector: self
                 .max_active_entries_per_sector
                 .or(parent.max_active_entries_per_sector),
+            max_single_entry_risk_capital_usd: self
+                .max_single_entry_risk_capital_usd
+                .or(parent.max_single_entry_risk_capital_usd),
+            max_portfolio_risk_capital_usd: self
+                .max_portfolio_risk_capital_usd
+                .or(parent.max_portfolio_risk_capital_usd),
+            block_unestimated_risk_capital: self
+                .block_unestimated_risk_capital
+                .or(parent.block_unestimated_risk_capital),
             sectors: merge_map(self.sectors, parent.sectors),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct EventShockSection {
+    earnings_events_path: Option<PathBuf>,
+    require_earnings_events: Option<bool>,
+    block_days_before_earnings: Option<i64>,
+    block_days_after_earnings: Option<i64>,
+}
+
+impl EventShockSection {
+    fn merge_parent(self, parent: Self) -> Self {
+        Self {
+            earnings_events_path: self.earnings_events_path.or(parent.earnings_events_path),
+            require_earnings_events: self
+                .require_earnings_events
+                .or(parent.require_earnings_events),
+            block_days_before_earnings: self
+                .block_days_before_earnings
+                .or(parent.block_days_before_earnings),
+            block_days_after_earnings: self
+                .block_days_after_earnings
+                .or(parent.block_days_after_earnings),
         }
     }
 }
@@ -502,6 +549,11 @@ pub(super) fn build_options_runtime_config(
     let interval_secs = env_parse("ALPACA_INTERVAL_SECS")
         .or(file.runtime.interval_secs)
         .unwrap_or(300);
+    let event_shock_earnings_events = load_event_shock_earnings_events(&file.event_shock)?;
+    let close_price_cushion = env_parse("ALPACA_CLOSE_PRICE_CUSHION")
+        .or(file.management.close_price_cushion)
+        .unwrap_or(0.0)
+        .max(0.0);
     let fleet = load_fleet_config_from_env()?;
     let mut config = AlpacaOptionsRuntimeConfig {
         underlyings: underlyings_from_sources(cli_underlyings, &file.universe),
@@ -520,6 +572,28 @@ pub(super) fn build_options_runtime_config(
             .or(file.risk.max_active_entries_per_underlying),
         max_active_entries_per_sector: env_parse("ALPACA_MAX_ACTIVE_ENTRIES_PER_SECTOR")
             .or(file.risk.max_active_entries_per_sector),
+        max_single_entry_risk_capital_usd: env_parse("ALPACA_MAX_SINGLE_ENTRY_RISK_CAPITAL_USD")
+            .or(file.risk.max_single_entry_risk_capital_usd)
+            .filter(|value| value.is_finite() && *value > 0.0),
+        max_portfolio_risk_capital_usd: env_parse("ALPACA_MAX_PORTFOLIO_RISK_CAPITAL_USD")
+            .or(file.risk.max_portfolio_risk_capital_usd)
+            .filter(|value| value.is_finite() && *value > 0.0),
+        block_unestimated_risk_capital: env_bool("ALPACA_BLOCK_UNESTIMATED_RISK_CAPITAL")
+            .or(file.risk.block_unestimated_risk_capital)
+            .unwrap_or(true),
+        event_shock_earnings_events,
+        event_shock_block_days_before_earnings: env_parse(
+            "ALPACA_EVENT_SHOCK_BLOCK_DAYS_BEFORE_EARNINGS",
+        )
+        .or(file.event_shock.block_days_before_earnings)
+        .unwrap_or(1)
+        .max(0),
+        event_shock_block_days_after_earnings: env_parse(
+            "ALPACA_EVENT_SHOCK_BLOCK_DAYS_AFTER_EARNINGS",
+        )
+        .or(file.event_shock.block_days_after_earnings)
+        .unwrap_or(1)
+        .max(0),
         sectors: sector_map_from_file(file.risk.sectors),
         max_iterations: env_parse("ALPACA_MAX_ITERATIONS")
             .or(file.runtime.max_iterations)
@@ -553,10 +627,15 @@ pub(super) fn build_options_runtime_config(
             .unwrap_or(true),
         close_start: parse_time_value(file.management.close_start.as_deref(), "09:30")?,
         close_end: parse_time_value(file.management.close_end.as_deref(), "16:00")?,
-        close_price_cushion: env_parse("ALPACA_CLOSE_PRICE_CUSHION")
-            .or(file.management.close_price_cushion)
+        close_price_cushion,
+        close_reprice_step: env_parse("ALPACA_CLOSE_REPRICE_STEP")
+            .or(file.management.close_reprice_step)
             .unwrap_or(0.0)
             .max(0.0),
+        max_close_price_cushion: env_parse("ALPACA_MAX_CLOSE_PRICE_CUSHION")
+            .or(file.management.max_close_price_cushion)
+            .unwrap_or(close_price_cushion)
+            .max(close_price_cushion),
         max_close_attempts: env_parse("ALPACA_MAX_CLOSE_ATTEMPTS")
             .or(file.management.max_close_attempts)
             .unwrap_or(3),
@@ -1083,6 +1162,32 @@ fn parse_time_value(value: Option<&str>, default: &str) -> anyhow::Result<NaiveT
     )?)
 }
 
+fn load_event_shock_earnings_events(
+    config: &EventShockSection,
+) -> anyhow::Result<Vec<crate::earnings::EarningsEvent>> {
+    let path = env::var_os("ALPACA_EVENT_SHOCK_EARNINGS_EVENTS_PATH")
+        .map(PathBuf::from)
+        .or_else(|| config.earnings_events_path.clone());
+    let required = env_bool("ALPACA_EVENT_SHOCK_REQUIRE_EARNINGS_EVENTS")
+        .or(config.require_earnings_events)
+        .unwrap_or(false);
+
+    let Some(path) = path else {
+        anyhow::ensure!(
+            !required,
+            "event_shock.require_earnings_events is true but no earnings_events_path is configured"
+        );
+        return Ok(Vec::new());
+    };
+
+    load_earnings_events_csv(&path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to load event-shock earnings events {}: {error}",
+            path.display()
+        )
+    })
+}
+
 fn default_config_path() -> PathBuf {
     if let Some(value) = env::var_os("XDG_CONFIG_HOME") {
         return PathBuf::from(value)
@@ -1169,6 +1274,12 @@ min_score = 70.0
 
 [risk]
 max_active_entries_per_underlying = 1
+max_portfolio_risk_capital_usd = 1000.0
+block_unestimated_risk_capital = true
+
+[event_shock]
+earnings_events_path = "/tmp/earnings_events_approved.csv"
+block_days_before_earnings = 2
 
 [risk.sectors]
 SPY = "broad_index"
@@ -1189,6 +1300,7 @@ max_buying_power_usage_pct = 0.03
 
 [risk]
 max_active_entries = 3
+max_single_entry_risk_capital_usd = 400.0
 
 [risk.sectors]
 GDX = "metals"
@@ -1209,6 +1321,14 @@ GDX = "metals"
         assert_eq!(merged.naked_scanner.min_score, Some(70.0));
         assert_eq!(merged.risk.max_active_entries, Some(3));
         assert_eq!(merged.risk.max_active_entries_per_underlying, Some(1));
+        assert_eq!(merged.risk.max_single_entry_risk_capital_usd, Some(400.0));
+        assert_eq!(merged.risk.max_portfolio_risk_capital_usd, Some(1000.0));
+        assert_eq!(merged.risk.block_unestimated_risk_capital, Some(true));
+        assert_eq!(
+            merged.event_shock.earnings_events_path,
+            Some(PathBuf::from("/tmp/earnings_events_approved.csv")),
+        );
+        assert_eq!(merged.event_shock.block_days_before_earnings, Some(2));
         assert_eq!(
             merged.risk.sectors.get("SPY").map(String::as_str),
             Some("broad_index"),
@@ -1320,6 +1440,9 @@ max_daily_submits = 1
 max_open_orders = 1
 max_active_entries_per_underlying = 1
 max_active_entries_per_sector = 3
+max_single_entry_risk_capital_usd = 500.0
+max_portfolio_risk_capital_usd = 1500.0
+block_unestimated_risk_capital = false
 
 [risk.sectors]
 SPY = "broad_index"
@@ -1332,12 +1455,20 @@ close_regular_hours_only = true
 close_start = "09:30"
 close_end = "16:00"
 close_price_cushion = 0.02
+close_reprice_step = 0.01
+max_close_price_cushion = 0.05
 max_close_attempts = 4
 close_reprice_cooldown_secs = 45
 profit_target_close_fraction = 0.45
 stop_loss_close_multiple = 1.8
 max_hold_secs = 3600
 expiration_exit_days = 2
+
+[event_shock]
+earnings_events_path = "/tmp/earnings_events_approved.csv"
+require_earnings_events = true
+block_days_before_earnings = 3
+block_days_after_earnings = 2
 "#,
         )
         .unwrap();
@@ -1399,6 +1530,9 @@ expiration_exit_days = 2
         assert_eq!(config.risk.max_open_orders, Some(1));
         assert_eq!(config.risk.max_active_entries_per_underlying, Some(1));
         assert_eq!(config.risk.max_active_entries_per_sector, Some(3));
+        assert_eq!(config.risk.max_single_entry_risk_capital_usd, Some(500.0));
+        assert_eq!(config.risk.max_portfolio_risk_capital_usd, Some(1500.0));
+        assert_eq!(config.risk.block_unestimated_risk_capital, Some(false));
         assert_eq!(
             config.risk.sectors.get("SPY").map(String::as_str),
             Some("broad_index"),
@@ -1409,8 +1543,17 @@ expiration_exit_days = 2
         assert_eq!(config.management.close_start.as_deref(), Some("09:30"));
         assert_eq!(config.management.close_end.as_deref(), Some("16:00"));
         assert_eq!(config.management.close_price_cushion, Some(0.02));
+        assert_eq!(config.management.close_reprice_step, Some(0.01));
+        assert_eq!(config.management.max_close_price_cushion, Some(0.05));
         assert_eq!(config.management.max_close_attempts, Some(4));
         assert_eq!(config.management.close_reprice_cooldown_secs, Some(45));
+        assert_eq!(
+            config.event_shock.earnings_events_path,
+            Some(PathBuf::from("/tmp/earnings_events_approved.csv")),
+        );
+        assert_eq!(config.event_shock.require_earnings_events, Some(true));
+        assert_eq!(config.event_shock.block_days_before_earnings, Some(3));
+        assert_eq!(config.event_shock.block_days_after_earnings, Some(2));
     }
 
     #[test]
