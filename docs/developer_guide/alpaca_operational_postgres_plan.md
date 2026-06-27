@@ -46,7 +46,7 @@ lease as part of a transactional persistence contract.
 ```mermaid
 flowchart LR
     subgraph Node ["Nautilus Live Node"]
-        Strategy["AlpacaOptionsEntryStrategy"]
+        Strategy["AlpacaOptionsStrategy"]
         Memory["In-memory StrategyState"]
         StateQueue["Bounded state-mutation queue"]
         EvidenceQueue["Bounded evidence queue"]

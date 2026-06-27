@@ -1,12 +1,12 @@
-# Copy to ~/.config/nautilus-trader/alpaca/configs/paper-put-credit-spy-options-engine.toml.
+# Copy to ~/.config/nautilus-trader/alpaca/configs/paper-put-credit-spy-options.toml.
 # Profile manifest: deploy/alpaca/alpaca-paper-profiles.tsv profile_id=put_credit_spy_strict backtest_profile=put_credit_spy_strict.
 # Isolated paper profile for the SPY put-credit candidate validated by historical sweeps.
 
-extends = "../base-options-engine.toml"
+extends = "../base-options.toml"
 
 [runtime]
-strategies = ["put_credit"]
-dry_run_strategies = []
+strategy_families = ["put_credit"]
+dry_run_families = []
 submit = true
 manage = true
 close = true

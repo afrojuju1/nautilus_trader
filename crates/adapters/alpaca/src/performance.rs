@@ -44,7 +44,7 @@ pub const DEFAULT_CANDIDATE_OUTCOME_MAX_CANDIDATES: usize = 100;
 /// Default maximum candidate rank to include in candidate-outcome tracking.
 pub const DEFAULT_CANDIDATE_OUTCOME_MAX_RANK: u64 = 3;
 
-/// Candidate-ledger counts used to audit opportunity history.
+/// Candidate-ledger counts used to audit candidate history.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CandidateLedgerSummary {
     /// Whether the candidate-ledger storage is missing.
@@ -57,7 +57,7 @@ pub struct CandidateLedgerSummary {
     pub dates: Vec<String>,
     /// Total records across included files.
     pub records: usize,
-    /// Scanner opportunity records.
+    /// Scanner candidate records.
     pub candidates: usize,
     /// Scanner diagnostic records.
     pub scanner_results: usize,
@@ -79,7 +79,7 @@ pub struct CandidateLedgerSummary {
     pub candidates_by_strategy: BTreeMap<String, usize>,
 }
 
-/// Candidate-outcome counts used to evaluate opportunities after observation.
+/// Candidate-outcome counts used to evaluate candidate_ledger after observation.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CandidateOutcomeSummary {
     /// Whether the candidate-outcome storage is missing.
@@ -324,11 +324,11 @@ pub struct PerformanceReport {
     pub account_id: Option<String>,
     /// Strategy state path.
     pub state_path: String,
-    /// Candidate-ledger opportunity summary.
-    pub opportunities: CandidateLedgerSummary,
+    /// Candidate-ledger summary.
+    pub candidate_ledger: CandidateLedgerSummary,
     /// Immutable realized-trade ledger summary.
     pub ledger_summary: PerformanceLedgerSummary,
-    /// Candidate-outcome summary for tracked opportunities.
+    /// Candidate-outcome summary for tracked candidate_ledger.
     pub candidate_outcomes: CandidateOutcomeSummary,
     /// Aggregate PnL summary.
     pub summary: PerformanceSummary,

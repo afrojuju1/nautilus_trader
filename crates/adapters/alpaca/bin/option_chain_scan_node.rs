@@ -2,7 +2,7 @@
 //!
 //! This runs a real `BacktestNode`: catalog quote/Greeks data flows through the Nautilus data
 //! engine, `OptionChainManager` assembles `OptionChainSlice` events, and
-//! `OptionChainOpportunityScanActor` ranks candidates without submitting orders.
+//! `OptionChainCandidateScanActor` ranks candidates without submitting orders.
 
 use std::{collections::BTreeSet, env, path::Path};
 
@@ -10,9 +10,9 @@ use anyhow::{Context, anyhow, bail};
 use chrono::NaiveDate;
 use nautilus_alpaca::{
     candidate_engine::{CreditSpreadKind, DebitSpreadKind, NakedOptionKind},
-    opportunity_scan_actor::{
-        OptionChainOpportunityScanActor, OptionChainOpportunityScanActorConfig,
-        OptionChainOpportunityScanConfig,
+    candidate_scan_actor::{
+        OptionChainCandidateScanActor, OptionChainCandidateScanActorConfig,
+        OptionChainCandidateScanConfig,
     },
 };
 use nautilus_backtest::{
@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
     let mut node = BacktestNode::new(vec![run_config])?;
     node.build()?;
 
-    let actor = OptionChainOpportunityScanActor::new(OptionChainOpportunityScanActorConfig {
+    let actor = OptionChainCandidateScanActor::new(OptionChainCandidateScanActorConfig {
         actor_id: Some(ActorId::from("ALPACA-OPTION-CHAIN-SCAN-NODE")),
         series: vec![selection.series_id],
         strike_range,
@@ -147,7 +147,7 @@ impl Args {
             Some(DEFAULT_SNAPSHOT_INTERVAL_MS),
         )?;
         let chunk_size = optional_usize_env("ALPACA_OPTION_CHAIN_CHUNK_SIZE")?;
-        let strategies = env::var("ALPACA_OPTION_CHAIN_STRATEGIES")
+        let strategies = env::var("ALPACA_OPTION_CHAIN_STRATEGY_FAMILIES")
             .ok()
             .map(split_values)
             .unwrap_or_default();
@@ -268,8 +268,8 @@ fn strike_range_from_env(series_strikes: &[Price]) -> anyhow::Result<StrikeRange
     Ok(StrikeRange::Fixed(series_strikes.to_vec()))
 }
 
-fn scan_config_from_values(values: &[String]) -> anyhow::Result<OptionChainOpportunityScanConfig> {
-    let mut config = OptionChainOpportunityScanConfig::default();
+fn scan_config_from_values(values: &[String]) -> anyhow::Result<OptionChainCandidateScanConfig> {
+    let mut config = OptionChainCandidateScanConfig::default();
     if values.is_empty() {
         apply_scan_env_overrides(&mut config)?;
         return Ok(config);
@@ -311,7 +311,7 @@ fn scan_config_from_values(values: &[String]) -> anyhow::Result<OptionChainOppor
                 config.naked_kinds.push(NakedOptionKind::Call);
                 config.naked_kinds.push(NakedOptionKind::Put);
             }
-            other => bail!("unsupported ALPACA_OPTION_CHAIN_STRATEGIES value {other}"),
+            other => bail!("unsupported ALPACA_OPTION_CHAIN_STRATEGY_FAMILIES value {other}"),
         }
     }
 
@@ -337,7 +337,7 @@ fn scan_config_from_values(values: &[String]) -> anyhow::Result<OptionChainOppor
     Ok(config)
 }
 
-fn apply_scan_env_overrides(config: &mut OptionChainOpportunityScanConfig) -> anyhow::Result<()> {
+fn apply_scan_env_overrides(config: &mut OptionChainCandidateScanConfig) -> anyhow::Result<()> {
     if let Some(value) = optional_f64_env("ALPACA_OPTION_CHAIN_OPTIONS_BUYING_POWER")? {
         config.options_buying_power = Some(value);
     }

@@ -7,7 +7,8 @@ use chrono_tz::Tz;
 
 use crate::{
     options_runtime::{
-        OptionsEngineConfig, SelectedOptionsEntry, active_sector_count, active_underlying_count,
+        AlpacaOptionsRuntimeConfig, SelectedOptionsEntry, active_sector_count,
+        active_underlying_count,
     },
     runtime::StrategyState,
 };
@@ -75,13 +76,13 @@ pub struct EntryAdmissionSnapshot {
     pub broker_admission_reasons: Vec<String>,
 }
 
-/// Strategy-owned entry admission configuration derived from [`OptionsEngineConfig`].
+/// Strategy-owned entry admission configuration derived from [`AlpacaOptionsRuntimeConfig`].
 #[derive(Clone, Debug)]
 pub struct EntryAdmissionConfig {
     /// Whether live submission is globally enabled.
     pub submit_enabled: bool,
     /// Strategy names that are intentionally scanned but not submitted.
-    pub dry_run_strategy_names: BTreeMap<String, ()>,
+    pub dry_run_strategy_family_names: BTreeMap<String, ()>,
     /// Whether new entries are blocked.
     pub kill_switch: bool,
     /// Whether the entry window should be ignored.
@@ -125,13 +126,13 @@ pub struct EntryAdmissionConfig {
 impl EntryAdmissionConfig {
     /// Builds entry-admission config from the Alpaca options runtime config.
     #[must_use]
-    pub fn from_engine_config(engine: &OptionsEngineConfig) -> Self {
+    pub fn from_runtime_config(engine: &AlpacaOptionsRuntimeConfig) -> Self {
         let fleet_exposure = engine.fleet.as_ref().map(|fleet| fleet.exposure());
         let fleet_section = engine.fleet.as_ref().map(|fleet| &fleet.config.fleet);
         Self {
             submit_enabled: engine.submit_enabled,
-            dry_run_strategy_names: engine
-                .dry_run_strategy_names()
+            dry_run_strategy_family_names: engine
+                .dry_run_strategy_family_names()
                 .into_iter()
                 .map(|name| (name.to_string(), ()))
                 .collect(),
@@ -183,7 +184,7 @@ impl Default for EntryAdmissionConfig {
     fn default() -> Self {
         Self {
             submit_enabled: true,
-            dry_run_strategy_names: BTreeMap::new(),
+            dry_run_strategy_family_names: BTreeMap::new(),
             kill_switch: false,
             ignore_entry_window: true,
             entry_start: NaiveTime::MIN,
@@ -215,7 +216,7 @@ pub fn selected_submit_enabled(
 ) -> bool {
     config.submit_enabled
         && !config
-            .dry_run_strategy_names
+            .dry_run_strategy_family_names
             .contains_key(selected.strategy_name())
 }
 

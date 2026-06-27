@@ -29,7 +29,7 @@ use nautilus_alpaca::{
         error::Error,
         models::{AlpacaOrder, ListActivitiesRequest},
     },
-    options_runtime::OptionsEngineConfig,
+    options_runtime::AlpacaOptionsRuntimeConfig,
     performance::{
         CandidateOutcomeTrackingRequest, DEFAULT_CANDIDATE_OUTCOME_MAX_CANDIDATES,
         DEFAULT_CANDIDATE_OUTCOME_MAX_RANK, EntryOrderIds, EntryPerformance, PerformanceReport,
@@ -57,12 +57,11 @@ struct Args {
     until: Option<NaiveDate>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub(crate) async fn run() -> anyhow::Result<()> {
     let args = parse_args()?;
-    let config = OptionsEngineConfig::from_runtime_env_with_storage().await?;
+    let config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_storage().await?;
     if config.storage_repository.is_none() {
-        anyhow::bail!("ALPACA_STORAGE_DATABASE_URL is required for alpaca-performance-report");
+        anyhow::bail!("ALPACA_STORAGE_DATABASE_URL is required for alpaca-ops performance");
     }
     let state = config.load_strategy_state().await?;
     let entries = state
@@ -129,7 +128,8 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     warnings.push(format!("candidate_outcomes_appended={tracked}"));
 
-    let opportunities = summarize_candidate_ledger_records(&config, args.since, args.until).await?;
+    let candidate_ledger =
+        summarize_candidate_ledger_records(&config, args.since, args.until).await?;
     let ledger_summary =
         summarize_performance_ledger_records(&config, args.since, args.until).await?;
     let candidate_outcomes =
@@ -139,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
         checked_at_utc: Utc::now().to_rfc3339(),
         account_id: config.fleet_account_id.clone(),
         state_path: config.state_path.display().to_string(),
-        opportunities,
+        candidate_ledger,
         ledger_summary,
         candidate_outcomes,
         summary,
@@ -166,7 +166,7 @@ fn parse_args() -> anyhow::Result<Args> {
         track_max_rank: DEFAULT_CANDIDATE_OUTCOME_MAX_RANK,
         ..Args::default()
     };
-    let mut iter = env::args().skip(1);
+    let mut iter = crate::ops_args().into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--json" => args.json_output = true,
@@ -222,7 +222,7 @@ fn parse_string_arg(name: &str, value: Option<String>) -> anyhow::Result<String>
 
 fn print_usage() {
     eprintln!(
-        "usage: alpaca-performance-report [--json] [--send-discord] [--since YYYY-MM-DD] [--until YYYY-MM-DD]"
+        "usage: alpaca-ops performance [--json] [--send-discord] [--since YYYY-MM-DD] [--until YYYY-MM-DD]"
     );
 }
 
@@ -307,7 +307,7 @@ fn add_state_order_id(order_id: Option<&str>, order_ids: &mut BTreeSet<String>) 
 }
 
 async fn append_closed_entries_to_performance_ledger(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     entries: &[EntryPerformance],
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<()> {
@@ -334,7 +334,10 @@ async fn append_closed_entries_to_performance_ledger(
     Ok(())
 }
 
-fn performance_ledger_date(entry: &EntryPerformance, config: &OptionsEngineConfig) -> String {
+fn performance_ledger_date(
+    entry: &EntryPerformance,
+    config: &AlpacaOptionsRuntimeConfig,
+) -> String {
     entry
         .closed_at_utc
         .as_deref()
@@ -400,14 +403,14 @@ fn format_discord_digest(report: &PerformanceReport) -> String {
     let ledger = &report.ledger_summary;
     format!(
         "**Alpaca performance digest** `{account}`\n\
-	opportunities={} selected={} submit_results={}\n\
+	candidate_ledger={} selected={} submit_results={}\n\
 	closed={} wins={} losses={} realized={} avg_win={} avg_loss={} largest_loss={}\n\
 	candidate_outcomes={} hypothetical={} selected_outcomes={} selected_hypothetical={}\n\
 	virtual_closes={} virtual_close_pnl={}\n\
 	open_unrealized={} observed_total={}",
-        report.opportunities.candidates,
-        report.opportunities.selected_candidates,
-        report.opportunities.submit_results,
+        report.candidate_ledger.candidates,
+        report.candidate_ledger.selected_candidates,
+        report.candidate_ledger.submit_results,
         ledger.records,
         ledger.wins,
         ledger.losses,
@@ -434,14 +437,14 @@ fn print_human_report(report: &PerformanceReport) {
         report.state_path,
     );
     println!(
-        "opportunities files={} records={} candidates={} selected={} high_score={} submit_results={} parse_errors={}",
-        report.opportunities.files,
-        report.opportunities.records,
-        report.opportunities.candidates,
-        report.opportunities.selected_candidates,
-        report.opportunities.high_score_candidates,
-        report.opportunities.submit_results,
-        report.opportunities.parse_errors,
+        "candidate_ledger files={} records={} candidates={} selected={} high_score={} submit_results={} parse_errors={}",
+        report.candidate_ledger.files,
+        report.candidate_ledger.records,
+        report.candidate_ledger.candidates,
+        report.candidate_ledger.selected_candidates,
+        report.candidate_ledger.high_score_candidates,
+        report.candidate_ledger.submit_results,
+        report.candidate_ledger.parse_errors,
     );
     println!(
         "performance_ledger files={} records={} wins={} losses={} flats={} realized={} avg_win={} avg_loss={} largest_loss={} warnings={}",

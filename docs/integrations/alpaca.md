@@ -34,13 +34,14 @@ The Rust Alpaca runtime currently includes the following implemented components:
   cached instrument replay.
 - `AlpacaExecutionClient`: Rust execution client for simple option limit orders and multi-leg
   option limit orders, with trade-update and REST reconciliation paths.
-- `alpaca-option-chain-scan-live-node`: Account-level options runtime for paper trading with
+- `alpaca-options-node`: Account-level options runtime for paper trading with
   Nautilus strategy hosting, risk gates, management, close handling, candidate ledgers, and
   performance reporting.
-- `alpaca-options-engine --check-config`: Legacy config-check command for deployed options
-  runtime configuration.
-- Operator binaries for read-only account status, option-chain inspection, bounded scan comparison,
-  multi-leg payload validation, fleet status, alerts, and performance reports.
+- `alpaca-options-node --check-config`: Config-check command for deployed options runtime
+  configuration.
+- `alpaca-ops`: Unified operator CLI for read-only account status, fleet status, alerts,
+  performance reports, and strategy-state sync.
+- Separate tooling remains for option-chain scan comparison and multi-leg payload validation.
 
 The Python package exposes config objects, a stock-bar and exact-option snapshot data client, an
 equity plus option multi-leg execution client, and strategy scaffolds.
@@ -82,11 +83,11 @@ variables:
 | API key    | `APCA_API_KEY_ID`        | `ALPACA_API_KEY`                          |
 | API secret | `APCA_API_SECRET_KEY`    | `ALPACA_SECRET_KEY`, `ALPACA_API_SECRET`  |
 
-For deployed options-engine utilities, `NAUTILUS_ALPACA_ENV_FILE` can point to an account-specific
+For deployed options runtime utilities, `NAUTILUS_ALPACA_ENV_FILE` can point to an account-specific
 env file. If unset, the runtime looks for:
 
 ```bash
-~/.config/nautilus-trader/alpaca/options-engine.env
+~/.config/nautilus-trader/alpaca/options.env
 ```
 
 :::warning
@@ -204,7 +205,7 @@ export APCA_API_KEY_ID="YOUR_PAPER_KEY"
 export APCA_API_SECRET_KEY="YOUR_PAPER_SECRET"
 export ALPACA_TRADING_BASE_URL="https://paper-api.alpaca.markets"
 
-cargo run -p nautilus-alpaca --features live --bin alpaca-check-account-orders
+cargo run -p nautilus-alpaca --features live --bin alpaca-ops -- account
 cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-contracts -- SPY QQQ
 cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-snapshots -- SPY
 cargo run -p nautilus-alpaca --features live --bin alpaca-compare-option-chain-scan -- --pretty SPY YYYY-MM-DD
@@ -220,7 +221,7 @@ export ALPACA_MANAGE=false
 export ALPACA_CLOSE=false
 export ALPACA_KILL_SWITCH=true
 
-cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- --check-config
+cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- --check-config
 ```
 
 Paper order smoke tests must be explicit. Use only paper endpoints and keep size small. The standard
@@ -246,7 +247,7 @@ Use the Rust harness only as the operator/runtime diagnostic, then verify open o
 ```bash
 cargo run -p nautilus-alpaca --features live --bin alpaca-paper-execution-harness -- \
   SPY260619P00450000 SPY260619P00445000 4.95 1
-cargo run -p nautilus-alpaca --features live --bin alpaca-check-account-orders
+cargo run -p nautilus-alpaca --features live --bin alpaca-ops -- account
 ```
 
 Both submit paths request cancellation after an accepted non-terminal order. If any smoke order

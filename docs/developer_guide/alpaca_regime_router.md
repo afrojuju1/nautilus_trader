@@ -3,7 +3,7 @@
 Status: proposed focused architecture.
 
 This document defines the target architecture for Alpaca option strategy regime routing. It refines
-the regime-router slice described in the Nautilus-native opportunity scanning architecture and the
+the regime-router slice described in the Nautilus-native candidate scanning architecture and the
 Alpaca production roadmap.
 
 The goal is not to create a generic Nautilus regime framework. The goal is to give the Alpaca
@@ -62,7 +62,7 @@ flowchart LR
         CandidateEngine["CandidateEngine"]
         SelectionPolicy["SelectionPolicy"]
         RiskAdmission["RiskAdmission"]
-        EntryStrategy["OptionsEntryStrategy"]
+        EntryStrategy["AlpacaOptionsStrategy"]
     end
 
     subgraph Storage ["Evidence and Features"]

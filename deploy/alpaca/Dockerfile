@@ -30,8 +30,8 @@ RUN --mount=type=cache,id=nautilus-alpaca-cargo-registry,target=/usr/local/cargo
     --mount=type=cache,id=nautilus-alpaca-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=nautilus-alpaca-target,target=/workspace/target,sharing=locked \
     set -eux; \
-    core_bins="alpaca-options-engine alpaca-operator-status alpaca-check-account-orders alpaca-option-chain-scan-live-node"; \
-    tool_bins="alpaca-fleet-status alpaca-compare-option-chain-scan alpaca-candidate-alerts alpaca-performance-report"; \
+    core_bins="alpaca-options-node alpaca-ops"; \
+    tool_bins="alpaca-compare-option-chain-scan"; \
     bins="$core_bins"; \
     if [ "$ALPACA_BUILD_TOOLS" = "true" ]; then bins="$bins $tool_bins"; fi; \
     cargo_args=""; \
@@ -65,12 +65,12 @@ ENV HOME=/home/nautilus \
     XDG_CONFIG_HOME=/config \
     XDG_STATE_HOME=/state \
     NAUTILUS_ALPACA_REPO=/workspace \
-    NAUTILUS_ALPACA_RUNNER_BIN=/usr/local/bin/alpaca-option-chain-scan-live-node \
-    NAUTILUS_ALPACA_OPERATOR_BIN=/usr/local/bin/alpaca-operator-status \
-    NAUTILUS_ALPACA_FLEET_BIN=/usr/local/bin/alpaca-fleet-status \
-    NAUTILUS_ALPACA_OPTION_CHAIN_LIVE_BIN=/usr/local/bin/alpaca-option-chain-scan-live-node \
+    NAUTILUS_ALPACA_RUNNER_BIN=/usr/local/bin/alpaca-options-node \
+    NAUTILUS_ALPACA_OPERATOR_BIN=/usr/local/bin/alpaca-ops \
+    NAUTILUS_ALPACA_FLEET_BIN=/usr/local/bin/alpaca-ops \
+    NAUTILUS_ALPACA_OPTION_CHAIN_LIVE_BIN=/usr/local/bin/alpaca-options-node \
     NAUTILUS_ALPACA_COMPARE_SCAN_BIN=/usr/local/bin/alpaca-compare-option-chain-scan \
-    NAUTILUS_ALPACA_CANDIDATE_ALERTS_BIN=/usr/local/bin/alpaca-candidate-alerts \
-    NAUTILUS_ALPACA_PERFORMANCE_BIN=/usr/local/bin/alpaca-performance-report
+    NAUTILUS_ALPACA_CANDIDATE_ALERTS_BIN=/usr/local/bin/alpaca-ops \
+    NAUTILUS_ALPACA_PERFORMANCE_BIN=/usr/local/bin/alpaca-ops
 
-CMD ["alpaca-option-chain-scan-live-node", "--help"]
+CMD ["alpaca-options-node", "--help"]

@@ -36,13 +36,13 @@ def test_alpaca_docs_reference_existing_runtime_bins() -> None:
     referenced = _referenced_bins(ALPACA_EXAMPLE_README, ALPACA_INTEGRATION_DOC)
 
     assert {
-        "alpaca-check-account-orders",
         "alpaca-load-option-contracts",
         "alpaca-load-option-snapshots",
         "alpaca-compare-option-chain-scan",
         "alpaca-validate-mleg-order",
         "alpaca-paper-execution-harness",
-        "alpaca-options-engine",
+        "alpaca-options-node",
+        "alpaca-ops",
     } <= referenced
     assert referenced <= _alpaca_bins()
 
@@ -54,9 +54,9 @@ def test_alpaca_paper_smoke_examples_keep_submit_cancel_policy() -> None:
     smoke_section = smoke_section.split("\n## ", maxsplit=1)[0]
 
     assert "alpaca-paper-execution-harness" in smoke_section
-    assert "alpaca-check-account-orders" in smoke_section
+    assert "alpaca-ops -- account" in smoke_section
     assert smoke_section.index("alpaca-paper-execution-harness") < smoke_section.index(
-        "alpaca-check-account-orders",
+        "alpaca-ops -- account",
     )
     assert "Do not leave smoke orders working" in smoke_section
     assert "alpaca-submit-mleg-order" not in examples

@@ -1,11 +1,11 @@
-# Nautilus-Native Opportunity Scanning
+# Nautilus-Native Candidate Scanning
 
 Status: in progress. The Alpaca options account-engine path now produces an explicit
-`OptionsOpportunitySet` through `scan_options_opportunities`; order-capable entry is still hosted
+`OptionsCandidateSet` through `scan_options_candidates`; order-capable entry is still hosted
 by the account engine until the `TradingNode` strategy path is ready. The next implementation slice
 is the pure candidate-engine extraction described below.
 
-This document describes the target architecture for moving Alpaca option opportunity scanning toward
+This document describes the target architecture for moving Alpaca option candidate scanning toward
 standard Nautilus runtime patterns. It is intentionally high level. The goal is to name the system
 shape before we continue moving implementation details.
 
@@ -20,7 +20,7 @@ Nautilus does not have a first-class `Scanner` component. The closest native con
 - `Strategy`: an actor with order-management capabilities.
 - `OptionChainSlice`: the native option-chain view delivered to actors and strategies.
 
-For this project, use **opportunity scanning** to mean the domain process that evaluates available
+For this project, use **candidate scanning** to mean the domain process that evaluates available
 market data and produces ranked trade candidates. Use **candidate selection** for the pure scoring
 and ranking logic. Use **entry strategy** for the Nautilus component that can submit orders.
 
@@ -54,7 +54,7 @@ flowchart LR
         Portfolio["Portfolio"]
     end
 
-    subgraph Decision ["Opportunity Decision Layer"]
+    subgraph Decision ["Candidate Decision Layer"]
         UniversePolicy["Universe policy"]
         RegimeRouter["Regime router"]
         CandidateEngine["Pure candidate engine"]
@@ -64,8 +64,8 @@ flowchart LR
 
     subgraph Runtime ["Runtime Components"]
         RegimeActor["RegimeFeatureActor<br/>read-only"]
-        ScanActor["OpportunityScanActor<br/>read-only"]
-        EntryStrategy["OptionsEntryStrategy<br/>can submit"]
+        ScanActor["CandidateScanActor<br/>read-only"]
+        EntryStrategy["AlpacaOptionsStrategy<br/>can submit"]
         ManagementStrategy["OptionsManagementStrategy"]
     end
 
@@ -131,7 +131,7 @@ sequenceDiagram
     participant Data as DataEngine
     participant Chain as OptionChainManager
     participant Regime as RegimeRouter
-    participant Strategy as OptionsEntryStrategy
+    participant Strategy as AlpacaOptionsStrategy
     participant Candidate as CandidateEngine
     participant Risk as RiskAdmission
     participant Ledger as CandidateLedger
@@ -176,14 +176,14 @@ accepts normalized features, optional external signals, and optional portfolio c
 a regime label plus strategy-family weights or blocks. It should not call Alpaca, query environment
 variables, write ledgers directly from deep scoring code, or submit orders.
 
-`CandidateEngine` owns pure opportunity ranking. It should accept normalized inputs such as
+`CandidateEngine` owns pure candidate ranking. It should accept normalized inputs such as
 `OptionChainSlice`, account-independent strategy config, regime context, and optional external
 signals. It should not read environment variables, call Alpaca, submit orders, or write ledgers.
 
-`OpportunityScanActor` is the read-only runtime surface. It can run scheduled scans, publish alerts,
+`CandidateScanActor` is the read-only runtime surface. It can run scheduled scans, publish alerts,
 and record evidence, but it does not submit orders.
 
-`OptionsEntryStrategy` is the order-capable runtime surface. It consumes the same pure candidate
+`AlpacaOptionsStrategy` is the order-capable runtime surface. It consumes the same pure candidate
 engine, applies strategy state and risk admission, then uses standard Nautilus order submission.
 
 `OptionsManagementStrategy` owns lifecycle management for accepted entries: profit targets, stop
@@ -218,7 +218,7 @@ CandidateContract / CandidateMarketSnapshot
   optional external signals
   optional account/risk context for ranking only
 
-OptionsOpportunitySet / candidate scan result
+OptionsCandidateSet / candidate scan result
   scanner diagnostics
   rejection counts
   ranked candidates
@@ -242,14 +242,14 @@ ownership.
 
 | Slice | Outcome | Work | Done when |
 | --- | --- | --- | --- |
-| 1. Opportunity-set boundary | Strategy input is explicit. | Replace hidden selector calls with `scan_options_opportunities` and `OptionsOpportunitySet` scan reports plus ranked entries. | Current account-engine strategy consumes an opportunity set instead of hidden selector state. Implemented for the Alpaca account-engine path. |
+| 1. Candidate-set boundary | Strategy input is explicit. | Replace hidden selector calls with `scan_options_candidates` and `OptionsCandidateSet` scan reports plus ranked entries. | Current account-engine strategy consumes an candidate set instead of hidden selector state. Implemented for the Alpaca account-engine path. |
 | 2. Candidate engine boundary | Pure reusable scoring core. | Extract filtering, scoring, ranking, rejection counts, and candidate identity into explicit candidate-engine types below the REST scanner adapter. | Implemented in `crates/adapters/alpaca/src/candidate_engine.rs`; current REST scanner behavior routes through the pure engine without changing operator output. |
 | 3. REST input adapter | Current operations use the target input model. | Convert Alpaca contract and snapshot responses into normalized candidate inputs; update existing binaries and the options engine to consume candidate-engine types directly. | Implemented for the current Alpaca REST scanner adapter in `strategy.rs`; dry-run scans and the current options engine keep producing the same candidate and ledger evidence through the target input model. |
-| 4. Option-chain input adapter | Nautilus-native market-state input. | Convert `OptionChainSlice` and cached instruments into the same candidate input model. | The same candidate engine can rank opportunities from REST snapshots or `OptionChainSlice` events. |
+| 4. Option-chain input adapter | Nautilus-native market-state input. | Convert `OptionChainSlice` and cached instruments into the same candidate input model. | The same candidate engine can rank candidates from REST snapshots or `OptionChainSlice` events. |
 | 5. Regime router boundary | Reusable strategy-family routing. | Add pure `RegimeInput`, `RegimeContext`, and routing-policy types with threshold-based labels and explanation codes. | Candidate ranking can accept regime context without calling venue APIs or reading operator config. |
 | 6. Regime feature actor | Native feature surface. | Add a read-only actor or service that computes feature snapshots from Nautilus data, catalog/ClickHouse history, and external signals. | A scan records regime label, feature freshness, and routing decision in the candidate ledger. |
-| 7. Read-only scan actor | Native scan and alert surface. | Add an `OpportunityScanActor` that runs scheduled or event-driven scans, records ledgers, and publishes alerts without order submission. | One-shot and interval scans can run inside a `TradingNode` without the standalone scanner loop. |
-| 8. Entry strategy | Standard order-capable path. | Add an `OptionsEntryStrategy` that consumes candidate sets, applies regime routing, selection, and risk admission, then submits through Nautilus order flow. | Paper dry-run and paper submit paths use the strategy path instead of bespoke scanner submission glue. |
+| 7. Read-only scan actor | Native scan and alert surface. | Add an `CandidateScanActor` that runs scheduled or event-driven scans, records ledgers, and publishes alerts without order submission. | One-shot and interval scans can run inside a `TradingNode` without the standalone scanner loop. |
+| 8. Entry strategy | Standard order-capable path. | Add an `AlpacaOptionsStrategy` that consumes candidate sets, applies regime routing, selection, and risk admission, then submits through Nautilus order flow. | Paper dry-run and paper submit paths use the strategy path instead of bespoke scanner submission glue. |
 | 9. Management and cleanup | Slim runtime with fewer parallel paths. | Move close/flatten lifecycle into an `OptionsManagementStrategy`; retire one-off scanner binaries once operator commands use actor/strategy surfaces. | Active docs and operator commands point at the Nautilus-native path, with REST-only scanners kept only where they remain useful diagnostics. |
 
 Ordering rule: do not build a new order-capable runtime surface before the candidate engine boundary
@@ -266,12 +266,12 @@ REST-shaped scoring dependencies with owned candidate-engine types.
 
 Target model:
 
-- `CandidateEngine` is pure. It ranks option opportunities from normalized inputs and returns
+- `CandidateEngine` is pure. It ranks option candidates from normalized inputs and returns
   scanner diagnostics, rejection counts, and ranked candidates.
 - Alpaca REST contract and snapshot loading is input acquisition, not strategy logic.
 - `OptionChainSlice` support later feeds the same candidate engine without going through Alpaca REST
   types.
-- `OptionsOpportunitySet` remains the strategy-facing output for the current account engine,
+- `OptionsCandidateSet` remains the strategy-facing output for the current account engine,
   read-only actor, and future entry strategy.
 
 Implemented refactor:
@@ -292,7 +292,7 @@ Current code ownership:
 - `crates/adapters/alpaca/src/candidate_engine.rs`: pure scoring and ranking module.
 - `crates/adapters/alpaca/src/strategy.rs`: REST data-acquisition and input-adapter surface.
 - `crates/adapters/alpaca/src/options_runtime.rs`: consume the direct candidate-engine output when
-  building `OptionsOpportunitySet`.
+  building `OptionsCandidateSet`.
 - `crates/adapters/alpaca/src/options_entry.rs`: keep selected-entry metadata aligned with the new
   ranked candidate model.
 
@@ -303,7 +303,7 @@ Acceptance criteria:
 - Current REST scans and the options engine still produce the same candidate selection and ledger
   evidence for the same inputs.
 - Public names describe owned concepts, such as `CandidateContract`, `CandidateMarketSnapshot`,
-  `CandidateQuote`, candidate scan results, and `OptionsOpportunitySet`, not temporary migration
+  `CandidateQuote`, candidate scan results, and `OptionsCandidateSet`, not temporary migration
   mechanics.
 - No compatibility selectors, old-name pass-through functions, or duplicate scoring paths remain.
 - Targeted validation passes with `cargo fmt -p nautilus-alpaca`,
@@ -322,20 +322,20 @@ Next implementation slice:
 Still deferred:
 
 - `OptionChainSlice` adapter.
-- Read-only `OpportunityScanActor`.
-- Order-capable `OptionsEntryStrategy`.
+- Read-only `CandidateScanActor`.
+- Order-capable `AlpacaOptionsStrategy`.
 - Regime routing in live admission.
 - ClickHouse or broader market-data storage changes.
 
 ## Migration Path
 
-1. Make `OptionsOpportunitySet` the target strategy input for the current Alpaca account engine,
+1. Make `OptionsCandidateSet` the target strategy input for the current Alpaca account engine,
    read-only scan actor, and future entry strategy.
 2. Keep the existing Alpaca REST scanners as diagnostics while extracting their scoring and candidate
    builders into a pure candidate engine.
 3. Add adapters from `OptionChainSlice` and cached instruments into the pure candidate input model.
 4. Add the pure regime router and a read-only feature actor before wiring order-capable routing.
-5. Introduce a read-only `OpportunityScanActor` for candidate evidence and alerts.
+5. Introduce a read-only `CandidateScanActor` for candidate evidence and alerts.
 6. Move order-capable entry logic into a Nautilus `Strategy` path that uses standard order factories,
    risk gates, and `ExecutionEngine` submission.
 7. Retire one-off scanner binaries once the actor/strategy path gives equal or better observability.
@@ -343,8 +343,8 @@ Still deferred:
 ## Architecture Decisions
 
 The read-only scan actor and order-capable strategy should be separate runtime components.
-`OpportunityScanActor` owns discovery, diagnostics, alerts, and evidence. `OptionsEntryStrategy`
-owns order-capable decisions. They should share the candidate engine, opportunity-set types, and
+`CandidateScanActor` owns discovery, diagnostics, alerts, and evidence. `AlpacaOptionsStrategy`
+owns order-capable decisions. They should share the candidate engine, candidate-set types, and
 configuration model, but a read-only actor should not become order-capable through a submit-mode
 toggle.
 
@@ -370,7 +370,7 @@ force the runtime architecture.
 - Exact signal delivery contract: whether provider-owned signals should enter strategies as custom
   Nautilus data, catalog-backed feature snapshots, or a small typed provider API.
 - Candidate-ledger migration shape: which schema/version fields are needed so existing analysis can
-  coexist with opportunity-set, regime-routing, and future `TradingNode` strategy records during
+  coexist with candidate-set, regime-routing, and future `TradingNode` strategy records during
   cutover.
 
 ## Design Preference

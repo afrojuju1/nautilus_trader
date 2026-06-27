@@ -14,7 +14,7 @@ use crate::{
             OptionSnapshotsRequest,
         },
     },
-    options_runtime::OptionsEngineConfig,
+    options_runtime::AlpacaOptionsRuntimeConfig,
     runtime::{StrategyState, StrategyStateEntry},
     storage::{
         CandidateLedgerSummaryFilters, append_candidate_outcome, read_candidate_ledger_records,
@@ -30,7 +30,7 @@ use super::{
 pub async fn track_candidate_outcomes(
     client: &AlpacaHttpClient,
     data_config: &AlpacaDataClientConfig,
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     request: &CandidateOutcomeTrackingRequest,
 ) -> anyhow::Result<usize> {
     let trade_date = request.trade_date.unwrap_or_else(|| {
@@ -395,8 +395,8 @@ struct VirtualCloseConfig {
     expiration_exit_days: i64,
 }
 
-impl From<&OptionsEngineConfig> for VirtualCloseConfig {
-    fn from(config: &OptionsEngineConfig) -> Self {
+impl From<&AlpacaOptionsRuntimeConfig> for VirtualCloseConfig {
+    fn from(config: &AlpacaOptionsRuntimeConfig) -> Self {
         Self {
             force_flatten: config.force_flatten,
             profit_target_close_fraction: config.profit_target_close_fraction,
@@ -729,7 +729,7 @@ fn quote_ask(
 
 fn candidate_observation_buckets(
     candidate: &TrackCandidate,
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     outcome: &CandidateOutcomeValue,
 ) -> Vec<&'static str> {
     let mut buckets = Vec::new();

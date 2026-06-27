@@ -46,7 +46,7 @@ use crate::{
         emit_management_snapshot, management_instrument_ids,
     },
     options_runtime::{
-        OptionsEngineConfig, OptionsOpportunitySet, OptionsScanOutcome, OptionsScanReport,
+        AlpacaOptionsRuntimeConfig, OptionsCandidateSet, OptionsScanOutcome, OptionsScanReport,
         SelectedOptionsEntry,
     },
     runtime::{StrategyState, StrategyStateEntry, StrategyStateEntryDraft, emit_operator_event},
@@ -61,31 +61,31 @@ const MANAGEMENT_TIMER: &str = "alpaca_options_management";
 
 /// Custom data type published by option-chain scanner actors for entry strategies.
 #[derive(Clone, Debug)]
-pub struct OptionsOpportunityData {
-    /// Ranked option opportunities discovered by the scanner.
-    pub opportunities: OptionsOpportunitySet,
+pub struct OptionsCandidateData {
+    /// Ranked option candidates discovered by the scanner.
+    pub candidates: OptionsCandidateSet,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 }
 
-impl OptionsOpportunityData {
-    const TYPE_NAME: &'static str = "AlpacaOptionsOpportunityData";
+impl OptionsCandidateData {
+    const TYPE_NAME: &'static str = "AlpacaOptionsCandidateData";
 
-    /// Creates a new custom data payload from an opportunity set.
+    /// Creates a new custom data payload from an candidate set.
     #[must_use]
     pub const fn new(
-        opportunities: OptionsOpportunitySet,
+        candidates: OptionsCandidateSet,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
     ) -> Self {
         Self {
-            opportunities,
+            candidates,
             ts_event,
             ts_init,
         }
     }
 
-    /// Returns the Nautilus custom data type used for routing opportunity payloads.
+    /// Returns the Nautilus custom data type used for routing candidate payloads.
     #[must_use]
     pub fn data_type() -> DataType {
         DataType::new(Self::TYPE_NAME, None, None)
@@ -98,13 +98,13 @@ impl OptionsOpportunityData {
     }
 }
 
-impl HasTsInit for OptionsOpportunityData {
+impl HasTsInit for OptionsCandidateData {
     fn ts_init(&self) -> UnixNanos {
         self.ts_init
     }
 }
 
-impl CustomDataTrait for OptionsOpportunityData {
+impl CustomDataTrait for OptionsCandidateData {
     fn type_name(&self) -> &'static str {
         Self::TYPE_NAME
     }
@@ -119,18 +119,18 @@ impl CustomDataTrait for OptionsOpportunityData {
 
     fn to_json(&self) -> anyhow::Result<String> {
         Ok(serde_json::to_string(&serde_json::json!({
-            "trade_date": self.opportunities.trade_date,
+            "trade_date": self.candidates.trade_date,
             "ts_event": self.ts_event.as_u64(),
             "ts_init": self.ts_init.as_u64(),
             "scans": self
-                .opportunities
+                .candidates
                 .scans
                 .iter()
                 .map(scan_report_payload)
                 .collect::<Vec<_>>(),
-            "ranked_entries": self.opportunities.ranked_entries().len(),
+            "ranked_entries": self.candidates.ranked_entries().len(),
             "selected": self
-                .opportunities
+                .candidates
                 .selected_entry()
                 .map(selected_entry_payload),
         }))?)
@@ -144,9 +144,8 @@ impl CustomDataTrait for OptionsOpportunityData {
         other.as_any().downcast_ref::<Self>().is_some_and(|other| {
             self.ts_event == other.ts_event
                 && self.ts_init == other.ts_init
-                && self.opportunities.trade_date == other.opportunities.trade_date
-                && self.opportunities.ranked_entries().len()
-                    == other.opportunities.ranked_entries().len()
+                && self.candidates.trade_date == other.candidates.trade_date
+                && self.candidates.ranked_entries().len() == other.candidates.ranked_entries().len()
         })
     }
 
@@ -158,9 +157,9 @@ impl CustomDataTrait for OptionsOpportunityData {
     }
 }
 
-/// Configuration for [`AlpacaOptionsEntryStrategy`].
+/// Configuration for [`AlpacaOptionsStrategy`].
 #[derive(Clone, Debug)]
-pub struct AlpacaOptionsEntryStrategyConfig {
+pub struct AlpacaOptionsStrategyConfig {
     /// Nautilus base strategy configuration.
     pub base: StrategyConfig,
     /// Contract quantity per leg.
@@ -179,7 +178,7 @@ pub struct AlpacaOptionsEntryStrategyConfig {
     pub management: AlpacaOptionsManagementConfig,
 }
 
-impl AlpacaOptionsEntryStrategyConfig {
+impl AlpacaOptionsStrategyConfig {
     /// Builds a config from a base strategy config and contract quantity.
     #[must_use]
     pub fn new(base: StrategyConfig, quantity: u64) -> Self {
@@ -197,23 +196,23 @@ impl AlpacaOptionsEntryStrategyConfig {
 
     /// Builds a strategy config from the Alpaca options runtime config.
     #[must_use]
-    pub fn from_engine_config(base: StrategyConfig, engine: &OptionsEngineConfig) -> Self {
+    pub fn from_runtime_config(base: StrategyConfig, engine: &AlpacaOptionsRuntimeConfig) -> Self {
         Self {
             base,
             quantity: engine.quantity,
             client_id: Some(ClientId::from(ALPACA_CLIENT_ID)),
-            admission: EntryAdmissionConfig::from_engine_config(engine),
+            admission: EntryAdmissionConfig::from_runtime_config(engine),
             initial_state: StrategyState::default(),
             state_persistence: None,
             candidate_ledger_persistence: None,
-            management: AlpacaOptionsManagementConfig::from_engine_config(engine),
+            management: AlpacaOptionsManagementConfig::from_runtime_config(engine),
         }
     }
 }
 
 /// Submission result for one selected options entry.
 #[derive(Clone, Debug)]
-pub struct AlpacaOptionsEntrySubmission {
+pub struct AlpacaOptionsSubmission {
     /// Submitted candidate.
     pub entry: SelectedOptionsEntry,
     /// Parent order-list ID, or the single client-order ID for one-leg entries.
@@ -247,11 +246,11 @@ struct PendingCloseSubmission {
     recorded: bool,
 }
 
-/// Nautilus strategy responsible for converting selected option opportunities into orders.
+/// Nautilus strategy responsible for converting selected option candidates into orders.
 #[derive(Debug)]
-pub struct AlpacaOptionsEntryStrategy {
+pub struct AlpacaOptionsStrategy {
     core: StrategyCore,
-    config: AlpacaOptionsEntryStrategyConfig,
+    config: AlpacaOptionsStrategyConfig,
     state: StrategyState,
     pending_submissions: BTreeMap<String, PendingEntrySubmission>,
     pending_client_order_ids: BTreeMap<String, String>,
@@ -262,10 +261,10 @@ pub struct AlpacaOptionsEntryStrategy {
     management_quote_subscriptions: BTreeSet<InstrumentId>,
 }
 
-impl AlpacaOptionsEntryStrategy {
-    /// Creates a new [`AlpacaOptionsEntryStrategy`].
+impl AlpacaOptionsStrategy {
+    /// Creates a new [`AlpacaOptionsStrategy`].
     #[must_use]
-    pub fn new(config: AlpacaOptionsEntryStrategyConfig) -> Self {
+    pub fn new(config: AlpacaOptionsStrategyConfig) -> Self {
         Self {
             core: StrategyCore::new(config.base.clone()),
             state: config.initial_state.clone(),
@@ -280,7 +279,7 @@ impl AlpacaOptionsEntryStrategy {
         }
     }
 
-    /// Handles opportunity data received from scanner actors.
+    /// Handles candidate data received from scanner actors.
     ///
     /// # Errors
     ///
@@ -290,11 +289,11 @@ impl AlpacaOptionsEntryStrategy {
     ///
     /// Panics if submission is enabled and the strategy has not been registered with a Nautilus
     /// runtime.
-    pub fn submit_opportunity_data(
+    pub fn submit_candidate_data(
         &mut self,
-        data: &OptionsOpportunityData,
-    ) -> anyhow::Result<Option<AlpacaOptionsEntrySubmission>> {
-        let Some(entry) = data.opportunities.selected_entry().cloned() else {
+        data: &OptionsCandidateData,
+    ) -> anyhow::Result<Option<AlpacaOptionsSubmission>> {
+        let Some(entry) = data.candidates.selected_entry().cloned() else {
             return Ok(None);
         };
 
@@ -303,7 +302,7 @@ impl AlpacaOptionsEntryStrategy {
             EntryGateDecision::KillSwitch => {
                 log::info!(
                     "Skipping Alpaca options entry: trade_date={} reason=kill_switch_enabled underlying={} strategy={}",
-                    data.opportunities.trade_date,
+                    data.candidates.trade_date,
                     entry.underlying(),
                     entry.strategy_name()
                 );
@@ -312,13 +311,13 @@ impl AlpacaOptionsEntryStrategy {
                     json!({
                         "action": "skipped",
                         "reason": "kill_switch_enabled",
-                        "trade_date": data.opportunities.trade_date,
+                        "trade_date": data.candidates.trade_date,
                         "underlying": entry.underlying(),
                         "strategy": entry.strategy_name(),
                     }),
                 );
                 self.record_selected_candidate_alert(
-                    &data.opportunities.trade_date,
+                    &data.candidates.trade_date,
                     &entry,
                     "skipped",
                     None,
@@ -332,7 +331,7 @@ impl AlpacaOptionsEntryStrategy {
             EntryGateDecision::OutsideEntryWindow => {
                 log::info!(
                     "Skipping Alpaca options entry: trade_date={} reason=outside_entry_window underlying={} strategy={}",
-                    data.opportunities.trade_date,
+                    data.candidates.trade_date,
                     entry.underlying(),
                     entry.strategy_name()
                 );
@@ -341,13 +340,13 @@ impl AlpacaOptionsEntryStrategy {
                     json!({
                         "action": "skipped",
                         "reason": "outside_entry_window",
-                        "trade_date": data.opportunities.trade_date,
+                        "trade_date": data.candidates.trade_date,
                         "underlying": entry.underlying(),
                         "strategy": entry.strategy_name(),
                     }),
                 );
                 self.record_selected_candidate_alert(
-                    &data.opportunities.trade_date,
+                    &data.candidates.trade_date,
                     &entry,
                     "skipped",
                     None,
@@ -373,7 +372,7 @@ impl AlpacaOptionsEntryStrategy {
                 json!({
                     "action": "dry_run",
                     "reason": "submission_disabled",
-                    "trade_date": data.opportunities.trade_date,
+                    "trade_date": data.candidates.trade_date,
                     "underlying": entry.underlying(),
                     "strategy": entry.strategy_name(),
                     "symbols": entry.option_symbols(),
@@ -381,7 +380,7 @@ impl AlpacaOptionsEntryStrategy {
                 }),
             );
             self.record_selected_candidate_alert(
-                &data.opportunities.trade_date,
+                &data.candidates.trade_date,
                 &entry,
                 "dry_run",
                 None,
@@ -396,7 +395,7 @@ impl AlpacaOptionsEntryStrategy {
         if self.config.admission.submit_enabled && !self.candidate_ledger_persistence_ready() {
             log::error!(
                 "Skipping Alpaca options entry: trade_date={} reason=candidate_ledger_unhealthy underlying={} strategy={} symbols={}",
-                data.opportunities.trade_date,
+                data.candidates.trade_date,
                 entry.underlying(),
                 entry.strategy_name(),
                 entry.option_symbols().join(",")
@@ -406,7 +405,7 @@ impl AlpacaOptionsEntryStrategy {
                 json!({
                     "action": "skipped",
                     "reason": "candidate_ledger_unhealthy",
-                    "trade_date": data.opportunities.trade_date,
+                    "trade_date": data.candidates.trade_date,
                     "underlying": entry.underlying(),
                     "strategy": entry.strategy_name(),
                     "symbols": entry.option_symbols(),
@@ -418,7 +417,7 @@ impl AlpacaOptionsEntryStrategy {
         if self.config.admission.submit_enabled && !self.state_persistence_ready() {
             log::error!(
                 "Skipping Alpaca options entry: trade_date={} reason=state_persistence_unhealthy underlying={} strategy={} symbols={}",
-                data.opportunities.trade_date,
+                data.candidates.trade_date,
                 entry.underlying(),
                 entry.strategy_name(),
                 entry.option_symbols().join(",")
@@ -428,14 +427,14 @@ impl AlpacaOptionsEntryStrategy {
                 json!({
                     "action": "skipped",
                     "reason": "state_persistence_unhealthy",
-                    "trade_date": data.opportunities.trade_date,
+                    "trade_date": data.candidates.trade_date,
                     "underlying": entry.underlying(),
                     "strategy": entry.strategy_name(),
                     "symbols": entry.option_symbols(),
                 }),
             );
             self.record_selected_candidate_alert(
-                &data.opportunities.trade_date,
+                &data.candidates.trade_date,
                 &entry,
                 "skipped",
                 None,
@@ -452,14 +451,14 @@ impl AlpacaOptionsEntryStrategy {
             &self.config.admission,
             &self.state,
             &entry,
-            &data.opportunities.trade_date,
+            &data.candidates.trade_date,
             &snapshot,
         ) {
-            self.log_entry_block(&data.opportunities.trade_date, &entry, &block);
+            self.log_entry_block(&data.candidates.trade_date, &entry, &block);
             return Ok(None);
         }
 
-        let underlying_key = submitted_underlying_key(&data.opportunities.trade_date, &entry);
+        let underlying_key = submitted_underlying_key(&data.candidates.trade_date, &entry);
         if !self
             .submitted_underlying_keys
             .insert(underlying_key.clone())
@@ -476,14 +475,14 @@ impl AlpacaOptionsEntryStrategy {
                     "action": "skipped",
                     "reason": "duplicate_pending_submission",
                     "key": underlying_key,
-                    "trade_date": data.opportunities.trade_date,
+                    "trade_date": data.candidates.trade_date,
                     "underlying": entry.underlying(),
                     "strategy": entry.strategy_name(),
                     "symbols": entry.option_symbols(),
                 }),
             );
             self.record_selected_candidate_alert(
-                &data.opportunities.trade_date,
+                &data.candidates.trade_date,
                 &entry,
                 "skipped",
                 None,
@@ -495,10 +494,10 @@ impl AlpacaOptionsEntryStrategy {
             return Ok(None);
         }
 
-        let order_list_id = entry_order_list_id(&data.opportunities.trade_date, entry.underlying());
+        let order_list_id = entry_order_list_id(&data.candidates.trade_date, entry.underlying());
         match self.submit_selected_entry_with_trade_date(
             entry,
-            &data.opportunities.trade_date,
+            &data.candidates.trade_date,
             &order_list_id,
         ) {
             Ok(submission) => Ok(Some(submission)),
@@ -510,7 +509,7 @@ impl AlpacaOptionsEntryStrategy {
         }
     }
 
-    /// Submits the highest-ranked opportunity, if present.
+    /// Submits the highest-ranked candidate, if present.
     ///
     /// # Errors
     ///
@@ -519,12 +518,12 @@ impl AlpacaOptionsEntryStrategy {
     /// # Panics
     ///
     /// Panics if the strategy has not been registered with a Nautilus runtime.
-    pub fn submit_opportunities(
+    pub fn submit_candidates(
         &mut self,
-        opportunities: OptionsOpportunitySet,
+        candidates: OptionsCandidateSet,
         order_list_id: &str,
-    ) -> anyhow::Result<Option<AlpacaOptionsEntrySubmission>> {
-        let Some(entry) = opportunities.into_selected_entry() else {
+    ) -> anyhow::Result<Option<AlpacaOptionsSubmission>> {
+        let Some(entry) = candidates.into_selected_entry() else {
             return Ok(None);
         };
         self.submit_selected_entry(entry, order_list_id).map(Some)
@@ -543,12 +542,12 @@ impl AlpacaOptionsEntryStrategy {
         &mut self,
         entry: SelectedOptionsEntry,
         order_list_id: &str,
-    ) -> anyhow::Result<AlpacaOptionsEntrySubmission> {
+    ) -> anyhow::Result<AlpacaOptionsSubmission> {
         let orders = self.build_entry_orders(&entry, order_list_id)?;
         let order_count = orders.len();
         self.submit_entry_orders(orders, order_list_id)?;
 
-        Ok(AlpacaOptionsEntrySubmission {
+        Ok(AlpacaOptionsSubmission {
             entry,
             order_list_id: order_list_id.to_string(),
             order_count,
@@ -560,7 +559,7 @@ impl AlpacaOptionsEntryStrategy {
         entry: SelectedOptionsEntry,
         trade_date: &str,
         order_list_id: &str,
-    ) -> anyhow::Result<AlpacaOptionsEntrySubmission> {
+    ) -> anyhow::Result<AlpacaOptionsSubmission> {
         let orders = self.build_entry_orders(&entry, order_list_id)?;
         let client_order_ids = orders
             .iter()
@@ -590,7 +589,7 @@ impl AlpacaOptionsEntryStrategy {
             return Err(error);
         }
 
-        Ok(AlpacaOptionsEntrySubmission {
+        Ok(AlpacaOptionsSubmission {
             entry,
             order_list_id: order_list_id.to_string(),
             order_count,
@@ -1795,7 +1794,7 @@ impl AlpacaOptionsEntryStrategy {
     }
 }
 
-nautilus_strategy!(AlpacaOptionsEntryStrategy, {
+nautilus_strategy!(AlpacaOptionsStrategy, {
     fn external_order_claims(&self) -> Option<Vec<InstrumentId>> {
         let claims = self
             .state
@@ -1834,9 +1833,9 @@ nautilus_strategy!(AlpacaOptionsEntryStrategy, {
     }
 });
 
-impl DataActor for AlpacaOptionsEntryStrategy {
+impl DataActor for AlpacaOptionsStrategy {
     fn on_start(&mut self) -> anyhow::Result<()> {
-        self.subscribe_data(OptionsOpportunityData::data_type(), None, None);
+        self.subscribe_data(OptionsCandidateData::data_type(), None, None);
         self.refresh_management_quote_subscriptions();
         if self.config.management.interval_secs > 0 {
             self.clock().set_timer(
@@ -1853,7 +1852,7 @@ impl DataActor for AlpacaOptionsEntryStrategy {
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
-        self.unsubscribe_data(OptionsOpportunityData::data_type(), None, None);
+        self.unsubscribe_data(OptionsCandidateData::data_type(), None, None);
         self.clock().cancel_timer(MANAGEMENT_TIMER);
         for instrument_id in self
             .management_quote_subscriptions
@@ -1875,11 +1874,10 @@ impl DataActor for AlpacaOptionsEntryStrategy {
     }
 
     fn on_data(&mut self, data: &CustomData) -> anyhow::Result<()> {
-        let Some(opportunities) = data.data.as_any().downcast_ref::<OptionsOpportunityData>()
-        else {
+        let Some(candidates) = data.data.as_any().downcast_ref::<OptionsCandidateData>() else {
             return Ok(());
         };
-        self.submit_opportunity_data(opportunities)?;
+        self.submit_candidate_data(candidates)?;
         Ok(())
     }
 
@@ -1978,15 +1976,12 @@ pub fn build_close_entry_orders(
 /// Builds a unique order-list ID for one submitted entry.
 #[must_use]
 pub fn entry_order_list_id(trade_date: &str, underlying: &str) -> String {
-    format!(
-        "options-engine-entry-{trade_date}-{underlying}-{}",
-        UUID4::new()
-    )
+    format!("options-entry-{trade_date}-{underlying}-{}", UUID4::new())
 }
 
 fn close_order_list_id(entry: &StrategyStateEntry) -> String {
     format!(
-        "options-engine-close-{}-{}-{}",
+        "options-close-{}-{}-{}",
         entry.trade_date,
         entry.underlying,
         UUID4::new()

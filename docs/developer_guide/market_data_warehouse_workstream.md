@@ -6,7 +6,7 @@ This document describes a fundamental market-data warehouse architecture for thi
 Alpaca adapter feature: Alpaca is only the first producer and validation consumer. The warehouse
 belongs beside the catalog as a repo-level analytical persistence backend.
 
-The workstream is separate from the Nautilus-native opportunity scanning workstream: scanners and
+The workstream is separate from the Nautilus-native candidate scanning workstream: scanners and
 strategies may consume warehouse features, but this workstream owns market-data persistence,
 backfill, query, and quality concerns.
 

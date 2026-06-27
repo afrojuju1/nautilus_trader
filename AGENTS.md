@@ -55,9 +55,9 @@ Rules:
 
 ## Alpaca Adapter Work
 
-- The order-capable Alpaca runtime is `alpaca-option-chain-scan-live-node`, wired through
-  Nautilus-native actor/strategy/data/execution paths. `alpaca-options-engine` is retained as a
-  config-check utility, not as the trading loop owner.
+- The order-capable Alpaca runtime is `alpaca-options-node`, wired through
+  Nautilus-native actor/strategy/data/execution paths. Use `alpaca-options-node --check-config`
+  for config checks.
 - Do not restore retired handoff or standalone strategy-loop surfaces such as
   `alpaca-submit-order-list-bridge`, `submit_order_list_bridge.rs`, or
   `alpaca-put-credit-strategy-loop` unless Ade explicitly asks for a staged bridge.
@@ -84,8 +84,8 @@ cargo check -p nautilus-alpaca --features live --bins
 
 ```bash
 docker compose -f deploy/alpaca/compose.yml --profile engine ps
-docker exec nautilus-alpaca-alpaca-options-1 alpaca-operator-status --json
-docker exec nautilus-alpaca-alpaca-options-1 alpaca-options-engine --check-config
+docker exec nautilus-alpaca-alpaca-options-1 alpaca-ops status --json
+docker exec nautilus-alpaca-alpaca-options-1 alpaca-options-node --check-config
 ```
 
 - Do not claim live Alpaca proof unless a real broker/account/status/order check was run and the

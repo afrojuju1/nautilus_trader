@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Postgres candidate-ledger Discord notifier for Alpaca scanner opportunities.
+//! Postgres candidate-ledger Discord notifier for Alpaca scanner candidates.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -23,7 +23,7 @@ use std::{
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use nautilus_alpaca::{
-    options_runtime::OptionsEngineConfig,
+    options_runtime::AlpacaOptionsRuntimeConfig,
     storage::{CandidateLedgerSummaryFilters, read_candidate_ledger_records},
 };
 use serde::{Deserialize, Serialize};
@@ -71,13 +71,12 @@ struct AlertState {
     sent: BTreeMap<String, String>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub(crate) async fn run() -> anyhow::Result<()> {
     let args = Args::parse()?;
     load_alerts_env(args.alerts_env_file.as_deref())?;
-    let config = OptionsEngineConfig::from_runtime_env_with_storage().await?;
+    let config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_storage().await?;
     let Some(storage) = &config.storage_repository else {
-        anyhow::bail!("ALPACA_STORAGE_DATABASE_URL is required for alpaca-candidate-alerts");
+        anyhow::bail!("ALPACA_STORAGE_DATABASE_URL is required for alpaca-ops alerts candidates");
     };
     let account_id = config.storage_account_id().to_string();
     let trade_date = args.date.clone().unwrap_or_else(|| {
@@ -169,7 +168,7 @@ impl Args {
             include_submit_rejects: true,
         };
 
-        let mut iter = env::args().skip(1);
+        let mut iter = crate::ops_args().into_iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--date" => args.date = Some(next_arg(&mut iter, "--date")?),
@@ -225,7 +224,7 @@ fn next_arg(iter: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Resu
 
 fn print_usage() {
     println!(
-        "usage: alpaca-candidate-alerts [--send|--dry-run] [--date YYYY-MM-DD] [--lookback-minutes N] [--max-rank N]"
+        "usage: alpaca-ops alerts candidates [--send|--dry-run] [--date YYYY-MM-DD] [--lookback-minutes N] [--max-rank N]"
     );
 }
 

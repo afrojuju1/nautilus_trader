@@ -212,13 +212,13 @@ systemd service
 alpaca-options-runner
         |
         v
-alpaca-options-engine
+alpaca-options-node
         |
         v
 env files + TOML + fleet registry
         |
         v
-OptionsEngineConfig
+AlpacaOptionsRuntimeConfig
         |
         v
 loop:
@@ -241,7 +241,7 @@ The core loop is in `options_engine`. Strategy evaluation returns a
   broker action.
 - `Selected` with `EntryMode::Submit` or `EntryMode::DryRun`.
 
-The runtime configuration is in `OptionsEngineConfig`. It controls:
+The runtime configuration is in `AlpacaOptionsRuntimeConfig`. It controls:
 
 - Underlying universe.
 - Enabled strategy families.

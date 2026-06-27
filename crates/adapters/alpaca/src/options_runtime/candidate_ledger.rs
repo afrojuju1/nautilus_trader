@@ -14,14 +14,13 @@ use crate::{
 };
 
 use super::{
-    CANDIDATE_ALERT_CREDIT_MIN_SCORE, CANDIDATE_ALERT_DEBIT_MIN_SCORE,
+    AlpacaOptionsRuntimeConfig, CANDIDATE_ALERT_CREDIT_MIN_SCORE, CANDIDATE_ALERT_DEBIT_MIN_SCORE,
     CANDIDATE_ALERT_IRON_CONDOR_MIN_SCORE, CANDIDATE_ALERT_NAKED_MIN_SCORE,
     CANDIDATE_ALERT_NAKED_ONE_TO_THREE_DTE_MIN_SCORE, HIGH_SCORE_CANDIDATE_ALERT,
-    OptionsEngineConfig,
 };
 
 pub(super) async fn record_scanner_ledger_result(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     trade_date: &str,
     payload: Value,
 ) {
@@ -31,7 +30,7 @@ pub(super) async fn record_scanner_ledger_result(
 }
 
 pub(super) async fn record_credit_candidate_ledger(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     trade_date: &str,
     underlying: &str,
     strategy: &str,
@@ -62,7 +61,7 @@ pub(super) async fn record_credit_candidate_ledger(
 }
 
 pub(super) async fn record_debit_candidate_ledger(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     trade_date: &str,
     underlying: &str,
     strategy: &str,
@@ -93,7 +92,7 @@ pub(super) async fn record_debit_candidate_ledger(
 }
 
 pub(super) async fn record_iron_condor_candidate_ledger(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     trade_date: &str,
     underlying: &str,
     candidates: &[IronCondorCandidate],
@@ -127,7 +126,7 @@ pub(super) async fn record_iron_condor_candidate_ledger(
 }
 
 pub(super) async fn record_naked_candidate_ledger(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     trade_date: &str,
     underlying: &str,
     strategy: &str,
@@ -164,7 +163,7 @@ pub(super) async fn record_naked_candidate_ledger(
 }
 
 async fn record_high_score_candidate_alert(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     trade_date: &str,
     strategy: &str,
     underlying: &str,

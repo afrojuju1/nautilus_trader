@@ -4,9 +4,9 @@ set -euo pipefail
 REPO="${NAUTILUS_ALPACA_REPO:-$HOME/Projects/nautilus_trader}"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 ALPACA_CONFIG_HOME="${NAUTILUS_ALPACA_CONFIG_HOME:-$CONFIG_HOME/nautilus-trader/alpaca}"
-ENV_FILE="${NAUTILUS_ALPACA_ENV_FILE:-$ALPACA_CONFIG_HOME/options-engine.env}"
-BASE_CONFIG_FILE="${ALPACA_BASE_CONFIG_PATH:-$ALPACA_CONFIG_HOME/base-options-engine.toml}"
-CONFIG_FILE="${ALPACA_CONFIG_PATH:-$ALPACA_CONFIG_HOME/options-engine.toml}"
+ENV_FILE="${NAUTILUS_ALPACA_ENV_FILE:-$ALPACA_CONFIG_HOME/options.env}"
+BASE_CONFIG_FILE="${ALPACA_BASE_CONFIG_PATH:-$ALPACA_CONFIG_HOME/base-options.toml}"
+CONFIG_FILE="${ALPACA_CONFIG_PATH:-$ALPACA_CONFIG_HOME/options.toml}"
 FLEET_CONFIG_FILE="${NAUTILUS_ALPACA_FLEET_CONFIG:-$ALPACA_CONFIG_HOME/fleet.toml}"
 ACCOUNT_ENV_DIR="${NAUTILUS_ALPACA_ACCOUNT_ENV_DIR:-$ALPACA_CONFIG_HOME/accounts}"
 ACCOUNT_CONFIG_DIR="${NAUTILUS_ALPACA_ACCOUNT_CONFIG_DIR:-$ALPACA_CONFIG_HOME/configs}"
@@ -26,25 +26,16 @@ install_runtime_file() {
 cd "$REPO"
 
 cargo build --release -p nautilus-alpaca --features live,warehouse-clickhouse \
-  --bin alpaca-option-chain-scan-live-node \
-  --bin alpaca-options-engine \
-  --bin alpaca-operator-status \
-  --bin alpaca-fleet-status \
-  --bin alpaca-candidate-alerts \
-  --bin alpaca-performance-report
+  --bin alpaca-options-node \
+  --bin alpaca-ops \
+  --bin alpaca-compare-option-chain-scan
 
-install -Dm755 target/release/alpaca-option-chain-scan-live-node \
-  "$HOME/.local/bin/alpaca-option-chain-scan-live-node"
-install -Dm755 target/release/alpaca-options-engine \
-  "$HOME/.local/bin/alpaca-options-engine"
-install -Dm755 target/release/alpaca-operator-status \
-  "$HOME/.local/bin/alpaca-operator-status"
-install -Dm755 target/release/alpaca-fleet-status \
-  "$HOME/.local/bin/alpaca-fleet-status"
-install -Dm755 target/release/alpaca-candidate-alerts \
-  "$HOME/.local/bin/alpaca-candidate-alerts"
-install -Dm755 target/release/alpaca-performance-report \
-  "$HOME/.local/bin/alpaca-performance-report"
+install -Dm755 target/release/alpaca-options-node \
+  "$HOME/.local/bin/alpaca-options-node"
+install -Dm755 target/release/alpaca-ops \
+  "$HOME/.local/bin/alpaca-ops"
+install -Dm755 target/release/alpaca-compare-option-chain-scan \
+  "$HOME/.local/bin/alpaca-compare-option-chain-scan"
 install -Dm755 deploy/alpaca/alpaca-options-runner.sh \
   "$HOME/.local/bin/alpaca-options-runner"
 install -Dm755 deploy/alpaca/alpaca-control.sh \
@@ -62,9 +53,9 @@ install -Dm644 deploy/alpaca/alpaca-performance-digest.service \
 install -Dm644 deploy/alpaca/alpaca-performance-digest.timer \
   "$HOME/.config/systemd/user/alpaca-performance-digest.timer"
 
-install_runtime_file deploy/alpaca/alpaca-options-engine.env.example "$ENV_FILE"
-install_runtime_file deploy/alpaca/alpaca-options-engine.base.toml.example "$BASE_CONFIG_FILE"
-install_runtime_file deploy/alpaca/alpaca-options-engine.toml.example "$CONFIG_FILE"
+install_runtime_file deploy/alpaca/alpaca-options.env.example "$ENV_FILE"
+install_runtime_file deploy/alpaca/alpaca-options.base.toml.example "$BASE_CONFIG_FILE"
+install_runtime_file deploy/alpaca/alpaca-options.toml.example "$CONFIG_FILE"
 if [[ ! -f "$FLEET_CONFIG_FILE" ]]; then
   install -Dm600 deploy/alpaca/alpaca-fleet.toml.example "$FLEET_CONFIG_FILE"
 fi
@@ -73,14 +64,14 @@ if [[ ! -f "$ALERTS_ENV_FILE" ]]; then
   install -Dm600 deploy/alpaca/alpaca-alerts.env.example "$ALERTS_ENV_FILE"
 fi
 install_runtime_file deploy/alpaca/alpaca-paper-profiles.tsv "$PROFILE_MANIFEST_FILE"
-install_runtime_file deploy/alpaca/alpaca-options-engine.account.env.example "$ACCOUNT_ENV_DIR/paper-directional.env"
-install_runtime_file deploy/alpaca/alpaca-options-engine.account.env.example "$ACCOUNT_ENV_DIR/paper-put-credit-spy.env"
-install_runtime_file deploy/alpaca/alpaca-options-engine.account.env.example "$ACCOUNT_ENV_DIR/paper-call-credit-qqq.env"
-install_runtime_file deploy/alpaca/alpaca-options-engine.account.env.example "$ACCOUNT_ENV_DIR/paper-undefined-risk.env"
-install_runtime_file deploy/alpaca/alpaca-options-engine.paper-directional.toml.example "$ACCOUNT_CONFIG_DIR/paper-directional-options-engine.toml"
-install_runtime_file deploy/alpaca/alpaca-options-engine.paper-put-credit-spy.toml.example "$ACCOUNT_CONFIG_DIR/paper-put-credit-spy-options-engine.toml"
-install_runtime_file deploy/alpaca/alpaca-options-engine.paper-call-credit-qqq.toml.example "$ACCOUNT_CONFIG_DIR/paper-call-credit-qqq-options-engine.toml"
-install_runtime_file deploy/alpaca/alpaca-options-engine.paper-undefined-risk.toml.example "$ACCOUNT_CONFIG_DIR/paper-undefined-risk-options-engine.toml"
+install_runtime_file deploy/alpaca/alpaca-options.account.env.example "$ACCOUNT_ENV_DIR/paper-directional.env"
+install_runtime_file deploy/alpaca/alpaca-options.account.env.example "$ACCOUNT_ENV_DIR/paper-put-credit-spy.env"
+install_runtime_file deploy/alpaca/alpaca-options.account.env.example "$ACCOUNT_ENV_DIR/paper-call-credit-qqq.env"
+install_runtime_file deploy/alpaca/alpaca-options.account.env.example "$ACCOUNT_ENV_DIR/paper-undefined-risk.env"
+install_runtime_file deploy/alpaca/alpaca-options.paper-directional.toml.example "$ACCOUNT_CONFIG_DIR/paper-directional-options.toml"
+install_runtime_file deploy/alpaca/alpaca-options.paper-put-credit-spy.toml.example "$ACCOUNT_CONFIG_DIR/paper-put-credit-spy-options.toml"
+install_runtime_file deploy/alpaca/alpaca-options.paper-call-credit-qqq.toml.example "$ACCOUNT_CONFIG_DIR/paper-call-credit-qqq-options.toml"
+install_runtime_file deploy/alpaca/alpaca-options.paper-undefined-risk.toml.example "$ACCOUNT_CONFIG_DIR/paper-undefined-risk-options.toml"
 
 systemctl --user daemon-reload
 
@@ -93,12 +84,12 @@ echo "alerts_env_file=$ALERTS_ENV_FILE"
 echo "profile_manifest_file=$PROFILE_MANIFEST_FILE"
 echo "account_env_dir=$ACCOUNT_ENV_DIR"
 echo "account_config_dir=$ACCOUNT_CONFIG_DIR"
-echo "runner=$HOME/.local/bin/alpaca-option-chain-scan-live-node"
-echo "config_check=$HOME/.local/bin/alpaca-options-engine --check-config"
-echo "operator=$HOME/.local/bin/alpaca-operator-status"
-echo "fleet_operator=$HOME/.local/bin/alpaca-fleet-status"
-echo "candidate_alerts=$HOME/.local/bin/alpaca-candidate-alerts"
-echo "performance_report=$HOME/.local/bin/alpaca-performance-report"
+echo "runner=$HOME/.local/bin/alpaca-options-node"
+echo "config_check=$HOME/.local/bin/alpaca-options-node --check-config"
+echo "operator=$HOME/.local/bin/alpaca-ops status"
+echo "fleet_operator=$HOME/.local/bin/alpaca-ops fleet"
+echo "candidate_alerts=$HOME/.local/bin/alpaca-ops alerts candidates"
+echo "performance_report=$HOME/.local/bin/alpaca-ops performance"
 echo "control=$HOME/.local/bin/alpaca-control"
 echo "candidate_alerts_timer=$HOME/.config/systemd/user/alpaca-candidate-alerts.timer"
 echo "performance_digest_timer=$HOME/.config/systemd/user/alpaca-performance-digest.timer"

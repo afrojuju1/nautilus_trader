@@ -26,8 +26,7 @@ use nautilus_alpaca::{
     runtime_env::load_options_env_file,
 };
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub(crate) async fn run() -> anyhow::Result<()> {
     load_options_env_file()?;
     let mut config = AlpacaDataClientConfig::default();
     config.trading_base_url = env::var("ALPACA_TRADING_BASE_URL").ok();

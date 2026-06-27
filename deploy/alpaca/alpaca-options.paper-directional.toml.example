@@ -1,12 +1,12 @@
-# Copy to ~/.config/nautilus-trader/alpaca/configs/paper-directional-options-engine.toml.
+# Copy to ~/.config/nautilus-trader/alpaca/configs/paper-directional-options.toml.
 # Profile manifest: deploy/alpaca/alpaca-paper-profiles.tsv profile_id=defined_risk_credit_watchlist.
 # Defined-risk watchlist account. Scans approved credit profiles but does not submit.
 
-extends = "../base-options-engine.toml"
+extends = "../base-options.toml"
 
 [runtime]
-strategies = ["put_credit", "call_credit"]
-dry_run_strategies = ["put_credit", "call_credit"]
+strategy_families = ["put_credit", "call_credit"]
+dry_run_families = ["put_credit", "call_credit"]
 submit = true
 manage = true
 close = true

@@ -4,11 +4,25 @@ use chrono::{DateTime, Utc};
 use nautilus_model::{data::QuoteTick, identifiers::InstrumentId};
 
 use crate::{
-    management::{credit_spread_close_reason, days_to_expiration, recorded_age_secs},
-    options_runtime::OptionsEngineConfig,
+    options_runtime::AlpacaOptionsRuntimeConfig,
     runtime::{StrategyStateEntry, emit_operator_event},
 };
 use serde_json::json;
+
+/// Pure management thresholds for one credit-spread strategy runtime.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CreditSpreadManagementConfig {
+    /// Force every active entry to close.
+    pub force_flatten: bool,
+    /// Close when debit is at or below this fraction of entry credit.
+    pub profit_target_close_fraction: f64,
+    /// Close when debit is at or above this multiple of entry credit.
+    pub stop_loss_close_multiple: f64,
+    /// Close after this hold time. Zero disables the trigger.
+    pub max_hold_secs: u64,
+    /// Close when days to expiration are at or below this value. Negative disables the trigger.
+    pub expiration_exit_days: i64,
+}
 
 /// Management settings needed by the Nautilus options strategy.
 #[derive(Clone, Debug, PartialEq)]
@@ -52,7 +66,7 @@ pub struct AlpacaOptionsManagementConfig {
 impl AlpacaOptionsManagementConfig {
     /// Builds management config from the Alpaca options runtime config.
     #[must_use]
-    pub fn from_engine_config(config: &OptionsEngineConfig) -> Self {
+    pub fn from_runtime_config(config: &AlpacaOptionsRuntimeConfig) -> Self {
         Self {
             interval_secs: config.interval_secs,
             manage_enabled: config.manage_enabled,
@@ -217,6 +231,65 @@ pub fn close_reason(
     }
 }
 
+/// Evaluates whether a credit spread should be closed at the current debit.
+#[must_use]
+pub fn credit_spread_close_reason(
+    config: &CreditSpreadManagementConfig,
+    entry: &StrategyStateEntry,
+    close_debit: f64,
+) -> Option<&'static str> {
+    if config.force_flatten {
+        return Some("manual_flatten");
+    }
+    if close_debit <= entry.credit * config.profit_target_close_fraction {
+        return Some("profit_target");
+    }
+    if close_debit >= entry.credit * config.stop_loss_close_multiple {
+        return Some("stop_loss");
+    }
+    if config.max_hold_secs > 0
+        && recorded_age_secs(entry).is_some_and(|age| age >= config.max_hold_secs)
+    {
+        return Some("max_hold");
+    }
+    if config.expiration_exit_days >= 0
+        && days_to_expiration(&entry.short_symbol)
+            .is_some_and(|days| days <= config.expiration_exit_days)
+    {
+        return Some("expiration_risk");
+    }
+    None
+}
+
+/// Returns the age in seconds from the state entry's recorded timestamp.
+#[must_use]
+pub fn recorded_age_secs(entry: &StrategyStateEntry) -> Option<u64> {
+    age_secs_from_rfc3339(&entry.recorded_at_utc)
+}
+
+/// Parses an Alpaca option symbol and returns calendar days to expiration.
+#[must_use]
+pub fn days_to_expiration(symbol: &str) -> Option<i64> {
+    let chars = symbol.as_bytes();
+    for index in 0..chars.len().saturating_sub(6) {
+        let date_slice = &chars[index..index + 6];
+        let put_call = chars.get(index + 6).copied();
+        if date_slice.iter().all(u8::is_ascii_digit) && matches!(put_call, Some(b'P' | b'C')) {
+            let value = std::str::from_utf8(date_slice).ok()?;
+            let year = 2000 + value[0..2].parse::<i32>().ok()?;
+            let month = value[2..4].parse::<u32>().ok()?;
+            let day = value[4..6].parse::<u32>().ok()?;
+            let expiration = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+            return Some(
+                expiration
+                    .signed_duration_since(Utc::now().date_naive())
+                    .num_days(),
+            );
+        }
+    }
+    None
+}
+
 /// Returns `true` when close attempts are exhausted.
 #[must_use]
 pub fn close_attempts_exhausted(
@@ -312,8 +385,8 @@ fn positive_price(value: f64) -> Option<f64> {
 
 fn credit_management_config(
     config: &AlpacaOptionsManagementConfig,
-) -> crate::management::CreditSpreadManagementConfig {
-    crate::management::CreditSpreadManagementConfig {
+) -> CreditSpreadManagementConfig {
+    CreditSpreadManagementConfig {
         force_flatten: config.force_flatten,
         profit_target_close_fraction: config.profit_target_close_fraction,
         stop_loss_close_multiple: config.stop_loss_close_multiple,

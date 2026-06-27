@@ -10,8 +10,8 @@ description: Safely sync Ade's Nautilus Trader fork with the base upstream repos
 Sync `/home/ade/Projects/nautilus_trader` with `nautechsystems/nautilus_trader` by merging
 upstream into the fork, never by resetting the fork to upstream. Preserve fork-only Alpaca adapter,
 runtime, docs, and deployment work unless Ade explicitly decides otherwise. The current Alpaca
-order-capable runtime is `alpaca-option-chain-scan-live-node`; `alpaca-options-engine` is a
-config-check utility, not the trading-loop owner.
+order-capable runtime is `alpaca-options-node`; run `alpaca-options-node --check-config` for
+config checks.
 
 ## Modes
 

@@ -134,19 +134,19 @@ Phase 3:
 
 Initial Phase 3 runner:
 
-- `alpaca-options-engine` scans configured underlyings, applies account/position/open-order
+- `alpaca-options-node` scans configured underlyings, applies account/position/open-order
   admission checks, enforces daily duplicate-entry state, selects one candidate, and can submit a
   Nautilus `SubmitOrderList` through the Alpaca execution client when
   TOML `runtime.submit = true` or `ALPACA_SUBMIT=true`.
 - The same runner can scan Phase 7A `call_credit` candidates by setting
-  `ALPACA_STRATEGIES=call` or scan both vertical-credit directions with `both`.
+  `ALPACA_STRATEGY_FAMILIES=call` or scan both vertical-credit directions with `both`.
 - The runner evaluates stale entry cancellation and close triggers from persisted state. Broker
   management actions are disabled unless TOML `runtime.manage = true` or `ALPACA_MANAGE=true`;
   close order submission also requires TOML `runtime.close = true` or `ALPACA_CLOSE=true`.
 - Management triggers include profit target, stop-loss debit, max hold, expiration-risk exit,
   force-flatten, stale entry cancellation, and a kill switch for blocking new entries.
 - Strategy/scanner/management parameters live in `ALPACA_CONFIG_PATH`, defaulting to
-  `~/.config/nautilus-trader/alpaca/options-engine.toml`; env remains for secrets, endpoints, and
+  `~/.config/nautilus-trader/alpaca/options.toml`; env remains for secrets, endpoints, and
   emergency runtime overrides.
 - Submission is disabled by default so paper soak can run safely before enabling execution.
 - Python strategy submission remains blocked by the current Python `OrderList` invariant that all

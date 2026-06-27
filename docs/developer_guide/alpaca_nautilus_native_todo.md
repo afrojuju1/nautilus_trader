@@ -22,16 +22,16 @@ and strategies.
 
 - `option_chain_candidates` converts Nautilus `OptionChainSlice` snapshots into the normalized
   candidate-engine model and ranks credit spreads, debit spreads, iron condors, and naked options.
-- `opportunity_scan_actor` adds a read-only `DataActor` that subscribes to option-chain slices,
+- `candidate_scan_actor` adds a read-only `DataActor` that subscribes to option-chain slices,
   can bootstrap Alpaca option instruments through the standard data-client request path, produces
-  `OptionsOpportunitySet`, stores the latest result in actor state, and emits structured operator
+  `OptionsCandidateSet`, stores the latest result in actor state, and emits structured operator
   events.
-- `OptionsOpportunitySet` and `OptionsScanReport` now have narrow public constructors/mutators so
+- `OptionsCandidateSet` and `OptionsScanReport` now have narrow public constructors/mutators so
   REST-fed and Nautilus-fed scan paths share the same result shape.
 
 ## Immediate Follow-Ups
 
-- [x] Add a node/example wiring `OptionChainOpportunityScanActor` into a real Nautilus node.
+- [x] Add a node/example wiring `OptionChainCandidateScanActor` into a real Nautilus node.
   - Implemented as `alpaca-option-chain-scan-node`, a `BacktestNode` executable over catalog
     `QuoteTick` and `OptionGreeks` data. This exercises Nautilus' native option-chain manager and
     actor lifecycle without submitting orders.
@@ -51,10 +51,10 @@ and strategies.
     contracts through the legacy REST normalizer and the Nautilus `OptionChainSlice` normalizer,
     then emits JSON parity diagnostics without submitting orders.
 - [x] Add a live Nautilus node for Alpaca option-chain candidate evidence and entry strategy wiring.
-  - Implemented as `alpaca-option-chain-scan-live-node`.
+  - Implemented as `alpaca-options-node`.
   - The node registers `AlpacaDataClientFactory`, `AlpacaExecutionClientFactory`,
-    `OptionChainOpportunityScanActor`, and `AlpacaOptionsEntryStrategy`.
-  - The scan actor publishes typed `AlpacaOptionsOpportunityData`; the strategy subscribes through
+    `OptionChainCandidateScanActor`, and `AlpacaOptionsStrategy`.
+  - The scan actor publishes typed `AlpacaOptionsCandidateData`; the strategy subscribes through
     the Nautilus data bus and submits standard Nautilus orders only when the runtime submit/window
     gates allow it.
   - Entry admission now runs in the strategy path. Live submission uses the normal runtime
@@ -64,18 +64,18 @@ and strategies.
 - [x] Wire scanner and strategy evidence through a persistence sink/consumer after durable
   strategy-state writes are in place; do not write Postgres directly from synchronous strategy
   callbacks.
-- [x] Remove the adapter-local order-plan layer from options-engine submission.
+- [x] Remove the adapter-local order-plan layer from options-runtime submission.
   - Submission now builds standard Nautilus `OrderAny` values through `OrderFactory`, then derives
     `SubmitOrder` or `SubmitOrderList` commands for `AlpacaExecutionClient`.
   - Alpaca-specific code remains at symbol normalization and execution-client payload translation;
     the account engine still owns broker session lifecycle and submit gates until entry admission
     moves behind a real strategy boundary.
 - [x] Add a Nautilus-native entry strategy boundary.
-  - `AlpacaOptionsEntryStrategy` owns conversion from `OptionsOpportunitySet` /
+  - `AlpacaOptionsStrategy` owns conversion from `OptionsCandidateSet` /
     `SelectedOptionsEntry` into standard Nautilus orders and submits through `Strategy::submit_order`
     or `Strategy::submit_order_list`.
   - The live node now owns entry submission and management lifecycle; the legacy
-    `alpaca-options-engine` binary is retained only for `--check-config`.
+    `alpaca-options-node` binary is retained only for `--check-config`.
   - Close, stale-order, force-flatten, and reprice decisions are owned by the same strategy state
     owner that records accepted entries.
 
@@ -98,7 +98,7 @@ validation and operational cleanup, not keeping a second account-engine owner al
   - Required signal: selected candidate and scan diagnostics match, or mismatches are explained by
     stricter Nautilus option-chain quote validity.
   - Required signal: live node logs show Alpaca instruments loaded, option-chain subscription with
-    non-zero cached instruments, and `option_chain_opportunity_scan` events.
+    non-zero cached instruments, and `option_chain_candidate_scan` events.
   - For undefined-risk profiles, set `ALPACA_OPTION_CHAIN_OPTIONS_BUYING_POWER` or allow the live
     node to read paper-account buying power before scanning.
   - Keep `ALPACA_SUBMIT=false` for cutover proof until the persisted admission/state tasks below
@@ -115,14 +115,14 @@ validation and operational cleanup, not keeping a second account-engine owner al
 - [ ] Confirm REST-vs-option-chain selected candidates and scan diagnostics match, or document
   mismatches caused by stricter Nautilus option-chain quote validity.
 - [ ] Confirm live-node logs show Alpaca instrument bootstrap, non-zero cached option instruments,
-  option-chain subscription, and `option_chain_opportunity_scan` events.
+  option-chain subscription, and `option_chain_candidate_scan` events.
 - [ ] Keep `ALPACA_SUBMIT=false` for market-hours cutover proof. Strategy admission, durable state
   recording, and startup reconciliation are code-complete, but live paper submission still needs a
   bounded broker proof.
 
 ### 2. Entry Admission Cutover
 
-Target: `AlpacaOptionsEntryStrategy` owns entry admission before any order is submitted. The old
+Target: `AlpacaOptionsStrategy` owns entry admission before any order is submitted. The old
 account-engine entry owner has been removed; remaining work is market-hours proof that the strategy
 path refuses entries using the same durable state and broker constraints.
 
@@ -132,7 +132,7 @@ path refuses entries using the same durable state and broker constraints.
   - [x] Keep reason strings stable so operator events, alerts, and ledgers remain comparable during
     cutover.
 - [x] Feed admission with durable strategy state.
-  - [x] Load `StrategyState` for the live node before constructing `AlpacaOptionsEntryStrategy`.
+  - [x] Load `StrategyState` for the live node before constructing `AlpacaOptionsStrategy`.
   - [x] Require storage-backed state when `ALPACA_SUBMIT=true`; dry-run
     cutover proof can keep the current no-storage live-node path.
   - [x] Preserve same-day duplicate checks, active-entry limits, daily-submit limits, per-underlying
@@ -150,7 +150,7 @@ path refuses entries using the same durable state and broker constraints.
   - [x] Selected dry-runs must record `submission_disabled`.
   - [x] Blocks must include reason, current, limit, and details where available.
   - [x] The cutover proof showed decision parity before the old entry loop was removed.
-- [ ] Done when `AlpacaOptionsEntryStrategy` refuses every entry the account engine would have
+- [ ] Done when `AlpacaOptionsStrategy` refuses every entry the account engine would have
   refused, using the same persisted state and live broker constraints.
 
 ### 3. Entry State Recording
@@ -226,7 +226,7 @@ loop.
 
 - [x] Move close, flatten, stale-order, and reprice lifecycle into a Nautilus-owned
   strategy/component.
-  - `AlpacaOptionsEntryStrategy` owns active-entry management on a Nautilus timer, subscribes to
+  - `AlpacaOptionsStrategy` owns active-entry management on a Nautilus timer, subscribes to
     close-leg quotes, claims persisted active-entry instruments for reconciliation, and submits
     close orders through `Strategy::submit_order` / `Strategy::submit_order_list`.
 - [x] Keep broker reconciliation, close decisions, and operator events visible during cutover.
@@ -234,8 +234,8 @@ loop.
   - Management emits `management_snapshot` and `management_block` events from the strategy path.
 - [x] Remove direct management behavior from the account-engine loop once the new owner is proven.
   - The legacy `options_engine` library module was removed.
-  - `alpaca-options-engine` no longer runs a management loop and remains a config-check command.
-  - Docker/systemd runner defaults now start `alpaca-option-chain-scan-live-node`.
+  - `alpaca-options-node` no longer runs a management loop and remains a config-check command.
+  - Docker/systemd runner defaults now start `alpaca-options-node`.
 
 ### 8. Diagnostic Cleanup
 

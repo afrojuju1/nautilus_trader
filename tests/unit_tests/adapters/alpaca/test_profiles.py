@@ -30,7 +30,7 @@ def test_alpaca_env_file_for_profile_prefers_account_env(tmp_path) -> None:
 
 
 def test_alpaca_env_file_for_profile_falls_back_to_main_env(tmp_path) -> None:
-    assert alpaca_env_file_for_profile("paper-main", tmp_path) == tmp_path / "options-engine.env"
+    assert alpaca_env_file_for_profile("paper-main", tmp_path) == tmp_path / "options.env"
 
 
 def test_load_alpaca_env_file_does_not_override_existing_by_default(tmp_path, monkeypatch) -> None:

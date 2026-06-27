@@ -1,4 +1,4 @@
-//! Runtime config parsing and building for the Alpaca options engine.
+//! Runtime config parsing and building for the Alpaca options runtime.
 
 use std::{
     collections::BTreeMap,
@@ -21,10 +21,10 @@ use crate::{
     storage::STORAGE_SCHEMA_DEFAULT,
 };
 
-use super::OptionsEngineConfig;
+use super::AlpacaOptionsRuntimeConfig;
 
 #[derive(Clone, Debug)]
-struct StrategyConfig {
+struct StrategyFamilyConfig {
     credit_kinds: Vec<CreditSpreadKind>,
     iron_condor_enabled: bool,
     debit_kinds: Vec<DebitSpreadKind>,
@@ -68,8 +68,8 @@ impl RuntimeConfigFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RuntimeSection {
-    strategies: Vec<String>,
-    dry_run_strategies: Vec<String>,
+    strategy_families: Vec<String>,
+    dry_run_families: Vec<String>,
     max_iterations: Option<u64>,
     interval_secs: Option<u64>,
     submit: Option<bool>,
@@ -87,8 +87,8 @@ struct RuntimeSection {
 impl RuntimeSection {
     fn merge_parent(self, parent: Self) -> Self {
         Self {
-            strategies: merge_vec(self.strategies, parent.strategies),
-            dry_run_strategies: merge_vec(self.dry_run_strategies, parent.dry_run_strategies),
+            strategy_families: merge_vec(self.strategy_families, parent.strategy_families),
+            dry_run_families: merge_vec(self.dry_run_families, parent.dry_run_families),
             max_iterations: self.max_iterations.or(parent.max_iterations),
             interval_secs: self.interval_secs.or(parent.interval_secs),
             submit: self.submit.or(parent.submit),
@@ -440,32 +440,33 @@ fn parse_runtime_config_at_path(raw: &str, path: &Path) -> anyhow::Result<Runtim
     })
 }
 
-pub(super) fn build_options_engine_config(
+pub(super) fn build_options_runtime_config(
     file: RuntimeConfigFile,
     cli_underlyings: Vec<String>,
-) -> anyhow::Result<OptionsEngineConfig> {
-    let strategy_values = env::var("ALPACA_STRATEGIES")
+) -> anyhow::Result<AlpacaOptionsRuntimeConfig> {
+    let strategy_values = env::var("ALPACA_STRATEGY_FAMILIES")
         .ok()
         .map(|value| split_strings([value]))
         .filter(|values| !values.is_empty())
         .unwrap_or_else(|| {
-            if file.runtime.strategies.is_empty() {
+            if file.runtime.strategy_families.is_empty() {
                 vec!["put".to_string()]
             } else {
-                file.runtime.strategies.clone()
+                file.runtime.strategy_families.clone()
             }
         });
-    let strategy_config = strategy_config_from_values(strategy_values)?;
-    let dry_run_strategy_values = env::var("ALPACA_DRY_RUN_STRATEGIES")
+    let strategy_config = strategy_family_config_from_values(strategy_values)?;
+    let dry_run_strategy_values = env::var("ALPACA_DRY_RUN_FAMILIES")
         .ok()
         .map(|value| split_strings([value]))
         .filter(|values| !values.is_empty())
-        .unwrap_or_else(|| file.runtime.dry_run_strategies.clone());
-    let dry_run_strategy_config = dry_run_strategy_config_from_values(dry_run_strategy_values)?;
+        .unwrap_or_else(|| file.runtime.dry_run_families.clone());
+    let dry_run_strategy_config =
+        dry_run_strategy_family_config_from_values(dry_run_strategy_values)?;
     let scanner = scanner_config_from_file(&file.scanner);
     let stale_entry_secs = file.management.stale_entry_secs.unwrap_or(900);
     let fleet = load_fleet_config_from_env()?;
-    let mut config = OptionsEngineConfig {
+    let mut config = AlpacaOptionsRuntimeConfig {
         underlyings: underlyings_from_sources(cli_underlyings, &file.universe),
         spread_kinds: strategy_config.credit_kinds,
         iron_condor_enabled: strategy_config.iron_condor_enabled,
@@ -566,7 +567,7 @@ pub(super) fn build_options_engine_config(
     Ok(config)
 }
 
-fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyConfig> {
+fn strategy_family_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyFamilyConfig> {
     let mut kinds = Vec::new();
     let mut iron_condor_enabled = false;
     let mut debit_kinds = Vec::new();
@@ -625,7 +626,7 @@ fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyCo
                 naked_kinds.push(NakedOptionKind::Call);
                 naked_kinds.push(NakedOptionKind::Put);
             }
-            other => anyhow::bail!("unsupported Alpaca strategy value {other}"),
+            other => anyhow::bail!("unsupported Alpaca strategy family value {other}"),
         }
     }
     if kinds.is_empty() && !iron_condor_enabled && debit_kinds.is_empty() && naked_kinds.is_empty()
@@ -649,7 +650,7 @@ fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyCo
         NakedOptionKind::PutOneToThreeDte => 3,
     });
     naked_kinds.dedup();
-    Ok(StrategyConfig {
+    Ok(StrategyFamilyConfig {
         credit_kinds: kinds,
         iron_condor_enabled,
         debit_kinds,
@@ -657,19 +658,21 @@ fn strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyCo
     })
 }
 
-fn dry_run_strategy_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyConfig> {
+fn dry_run_strategy_family_config_from_values(
+    values: Vec<String>,
+) -> anyhow::Result<StrategyFamilyConfig> {
     if values.is_empty() {
-        return Ok(StrategyConfig {
+        return Ok(StrategyFamilyConfig {
             credit_kinds: Vec::new(),
             iron_condor_enabled: false,
             debit_kinds: Vec::new(),
             naked_kinds: Vec::new(),
         });
     }
-    strategy_config_from_values(values)
+    strategy_family_config_from_values(values)
 }
 
-fn apply_fleet_policy(config: &mut OptionsEngineConfig) {
+fn apply_fleet_policy(config: &mut AlpacaOptionsRuntimeConfig) {
     let Some(fleet) = &config.fleet else {
         return;
     };
@@ -739,11 +742,11 @@ fn apply_fleet_policy(config: &mut OptionsEngineConfig) {
     }
 }
 
-fn has_defined_risk_strategies(config: &OptionsEngineConfig) -> bool {
+fn has_defined_risk_strategies(config: &AlpacaOptionsRuntimeConfig) -> bool {
     !config.spread_kinds.is_empty() || config.iron_condor_enabled
 }
 
-fn has_undefined_risk_strategies(config: &OptionsEngineConfig) -> bool {
+fn has_undefined_risk_strategies(config: &AlpacaOptionsRuntimeConfig) -> bool {
     !config.naked_kinds.is_empty()
 }
 
@@ -1032,32 +1035,32 @@ fn default_config_path() -> PathBuf {
         return PathBuf::from(value)
             .join("nautilus-trader")
             .join("alpaca")
-            .join("options-engine.toml");
+            .join("options.toml");
     }
     if let Some(value) = env::var_os("HOME") {
         return PathBuf::from(value)
             .join(".config")
             .join("nautilus-trader")
             .join("alpaca")
-            .join("options-engine.toml");
+            .join("options.toml");
     }
-    PathBuf::from("options-engine.toml")
+    PathBuf::from("options.toml")
 }
 
 fn default_state_path() -> PathBuf {
     if let Some(value) = env::var_os("XDG_STATE_HOME") {
         return PathBuf::from(value)
             .join("nautilus_trader")
-            .join("alpaca_options_engine_state.json");
+            .join("alpaca_options_state.json");
     }
     if let Some(value) = env::var_os("HOME") {
         return PathBuf::from(value)
             .join(".local")
             .join("state")
             .join("nautilus_trader")
-            .join("alpaca_options_engine_state.json");
+            .join("alpaca_options_state.json");
     }
-    PathBuf::from("alpaca_options_engine_state.json")
+    PathBuf::from("alpaca_options_state.json")
 }
 
 fn env_bool(name: &str) -> Option<bool> {
@@ -1125,7 +1128,7 @@ GLD = "metals"
 extends = "base.toml"
 
 [runtime]
-strategies = ["naked_put"]
+strategy_families = ["naked_put"]
 candidate_ledger_max_candidates = 20
 
 [naked_scanner]
@@ -1143,7 +1146,7 @@ GDX = "metals"
         let merged = child.merge_parent(parent);
 
         assert!(merged.extends.is_none());
-        assert_eq!(merged.runtime.strategies, vec!["naked_put"]);
+        assert_eq!(merged.runtime.strategy_families, vec!["naked_put"]);
         assert_eq!(merged.runtime.max_iterations, Some(0));
         assert_eq!(merged.runtime.candidate_ledger_enabled, Some(true));
         assert_eq!(merged.runtime.candidate_ledger_max_candidates, Some(20));
@@ -1168,8 +1171,8 @@ GDX = "metals"
         let config = parse_runtime_config(
             r#"
 [runtime]
-strategies = ["put", "iron_condor"]
-dry_run_strategies = ["iron_condor"]
+strategy_families = ["put", "iron_condor"]
+dry_run_families = ["iron_condor"]
 max_iterations = 0
 submit = false
 manage = true
@@ -1286,8 +1289,8 @@ expiration_exit_days = 2
         )
         .unwrap();
 
-        assert_eq!(config.runtime.strategies, vec!["put", "iron_condor"]);
-        assert_eq!(config.runtime.dry_run_strategies, vec!["iron_condor"]);
+        assert_eq!(config.runtime.strategy_families, vec!["put", "iron_condor"]);
+        assert_eq!(config.runtime.dry_run_families, vec!["iron_condor"]);
         assert_eq!(config.runtime.candidate_ledger_enabled, Some(true));
         assert_eq!(config.runtime.candidate_ledger_max_candidates, Some(7));
         assert_eq!(config.universe.underlyings, vec!["SPY", "QQQ"]);
@@ -1359,7 +1362,8 @@ expiration_exit_days = 2
 
     #[test]
     fn strategy_config_accepts_combined_four_leg_strategy() {
-        let config = strategy_config_from_values(vec!["both,iron_condor".to_string()]).unwrap();
+        let config =
+            strategy_family_config_from_values(vec!["both,iron_condor".to_string()]).unwrap();
 
         assert_eq!(
             config.credit_kinds,
@@ -1372,7 +1376,8 @@ expiration_exit_days = 2
 
     #[test]
     fn strategy_config_accepts_debit_strategies() {
-        let config = strategy_config_from_values(vec!["call_debit,put_debit".to_string()]).unwrap();
+        let config =
+            strategy_family_config_from_values(vec!["call_debit,put_debit".to_string()]).unwrap();
 
         assert!(config.credit_kinds.is_empty());
         assert!(!config.iron_condor_enabled);
@@ -1385,7 +1390,7 @@ expiration_exit_days = 2
 
     #[test]
     fn strategy_config_accepts_naked_strategies() {
-        let config = strategy_config_from_values(vec![
+        let config = strategy_family_config_from_values(vec![
             "naked_call,naked_put,naked_call_1_3dte,naked_put_1_3dte".to_string(),
         ])
         .unwrap();
@@ -1406,14 +1411,14 @@ expiration_exit_days = 2
 
     #[test]
     fn dry_run_strategy_config_has_no_default_strategy() {
-        let config = dry_run_strategy_config_from_values(Vec::new()).unwrap();
+        let config = dry_run_strategy_family_config_from_values(Vec::new()).unwrap();
 
         assert!(config.credit_kinds.is_empty());
         assert!(!config.iron_condor_enabled);
         assert!(config.debit_kinds.is_empty());
         assert!(config.naked_kinds.is_empty());
 
-        let config = dry_run_strategy_config_from_values(vec!["put".to_string()]).unwrap();
+        let config = dry_run_strategy_family_config_from_values(vec!["put".to_string()]).unwrap();
         assert_eq!(config.credit_kinds, vec![CreditSpreadKind::Put]);
         assert!(!config.iron_condor_enabled);
         assert!(config.debit_kinds.is_empty());

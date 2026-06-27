@@ -29,7 +29,7 @@ use nautilus_alpaca::{
         client::AlpacaHttpClient,
         models::{AlpacaAccount, AlpacaActivity, AlpacaOrder, AlpacaPosition, ListOrdersRequest},
     },
-    options_runtime::OptionsEngineConfig,
+    options_runtime::AlpacaOptionsRuntimeConfig,
     runtime::{StrategyState, read_operator_events},
     storage::{CandidateLedgerSummaryFilters, read_candidate_ledger_records},
 };
@@ -49,7 +49,7 @@ struct OperatorConfig {
     submit_enabled: bool,
     manage_enabled: bool,
     close_enabled: bool,
-    dry_run_strategies: Vec<String>,
+    dry_run_families: Vec<String>,
     max_active_entries: Option<usize>,
     max_daily_submits: Option<usize>,
     max_open_orders: Option<usize>,
@@ -114,7 +114,7 @@ struct ServiceStatus {
     submit_enabled: bool,
     manage_enabled: bool,
     close_enabled: bool,
-    dry_run_strategies: Vec<String>,
+    dry_run_families: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -216,8 +216,7 @@ enum AlertSeverity {
     Critical,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub(crate) async fn run() -> anyhow::Result<()> {
     let config = OperatorConfig::from_env().await?;
     let mut data_config = AlpacaDataClientConfig::default();
     data_config.trading_base_url = env::var("ALPACA_TRADING_BASE_URL").ok();
@@ -258,7 +257,7 @@ async fn main() -> anyhow::Result<()> {
 
 impl OperatorConfig {
     async fn from_env() -> anyhow::Result<Self> {
-        let strategy_config = OptionsEngineConfig::from_runtime_env_with_storage().await?;
+        let strategy_config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_storage().await?;
         let account_defaults = strategy_config.fleet.as_ref().and_then(|fleet| {
             fleet
                 .current_account()
@@ -290,8 +289,8 @@ impl OperatorConfig {
                     .and_then(|defaults| defaults.lock_dir.clone())
             })
             .unwrap_or_else(|| default_state_dir.join("locks"));
-        let dry_run_strategies = strategy_config
-            .dry_run_strategy_names()
+        let dry_run_families = strategy_config
+            .dry_run_strategy_family_names()
             .into_iter()
             .map(ToString::to_string)
             .collect();
@@ -361,7 +360,7 @@ impl OperatorConfig {
             submit_enabled: strategy_config.submit_enabled,
             manage_enabled: strategy_config.manage_enabled,
             close_enabled: strategy_config.close_enabled,
-            dry_run_strategies,
+            dry_run_families,
             max_active_entries: strategy_config.max_active_entries,
             max_daily_submits: strategy_config.max_daily_submits,
             max_open_orders: strategy_config.max_open_orders,
@@ -372,12 +371,12 @@ impl OperatorConfig {
             fleet_policy_blocks: strategy_config.fleet_policy_blocks,
             storage,
             candidate_ledger_records,
-            json_output: env::args().any(|arg| arg == "--json"),
+            json_output: crate::ops_args().iter().any(|arg| arg == "--json"),
         })
     }
 
     async fn options_state(&self) -> anyhow::Result<StrategyState> {
-        let strategy_config = OptionsEngineConfig::from_runtime_env_with_storage().await?;
+        let strategy_config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_storage().await?;
         strategy_config.load_strategy_state().await
     }
 }
@@ -530,10 +529,10 @@ fn build_status(
         submit_enabled: config.submit_enabled,
         manage_enabled: config.manage_enabled,
         close_enabled: config.close_enabled,
-        dry_run_strategies: config.dry_run_strategies.clone(),
+        dry_run_families: config.dry_run_families.clone(),
     };
 
-    let last_scan = latest_event(events, "option_chain_opportunity_scan")
+    let last_scan = latest_event(events, "option_chain_candidate_scan")
         .or_else(|| {
             latest_candidate_ledger_record(&config.candidate_ledger_records, "scanner_result")
         })
@@ -879,14 +878,14 @@ fn print_human_status(status: &OperatorStatus) {
         status.engine_state, status.checked_at_utc
     );
     println!(
-        "service: name={} active={} kill_switch={} submit={} manage={} close={} dry_run_strategies={} lock={} log={}",
+        "service: name={} active={} kill_switch={} submit={} manage={} close={} dry_run_families={} lock={} log={}",
         status.service.name,
         status.service.active_state.as_deref().unwrap_or("unknown"),
         status.service.kill_switch,
         status.service.submit_enabled,
         status.service.manage_enabled,
         status.service.close_enabled,
-        status.service.dry_run_strategies.join(","),
+        status.service.dry_run_families.join(","),
         status.service.lock_file,
         status.service.log_file,
     );

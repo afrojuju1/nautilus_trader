@@ -1,12 +1,12 @@
-# Copy to ~/.config/nautilus-trader/alpaca/configs/paper-undefined-risk-options-engine.toml.
+# Copy to ~/.config/nautilus-trader/alpaca/configs/paper-undefined-risk-options.toml.
 # Profile manifest: deploy/alpaca/alpaca-paper-profiles.tsv profile_id=undefined_risk_short_premium.
 # Isolated undefined-risk paper account. Keep separate from defined-risk profile validation.
 
-extends = "../base-options-engine.toml"
+extends = "../base-options.toml"
 
 [runtime]
-strategies = ["naked_call", "naked_put", "naked_call_1_3dte", "naked_put_1_3dte"]
-dry_run_strategies = []
+strategy_families = ["naked_call", "naked_put", "naked_call_1_3dte", "naked_put_1_3dte"]
+dry_run_families = []
 submit = true
 manage = true
 close = true

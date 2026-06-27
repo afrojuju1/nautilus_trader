@@ -21,7 +21,7 @@ use nautilus_alpaca::{
         },
     },
     options_runtime::{
-        OptionsEngineConfig, SelectedDebitEntry, SelectedEntry, SelectedIronCondorEntry,
+        AlpacaOptionsRuntimeConfig, SelectedDebitEntry, SelectedEntry, SelectedIronCondorEntry,
         SelectedNakedOptionEntry, SelectedOptionsEntry,
     },
     runtime_env::load_options_env_file,
@@ -47,7 +47,7 @@ struct Args {
     entry_time: Option<NaiveTime>,
     exit_time: Option<NaiveTime>,
     underlyings: Option<Vec<String>>,
-    strategies: Option<Vec<String>>,
+    strategy_families: Option<Vec<String>>,
     timeframe: String,
     option_feed: Option<String>,
     stock_feed: Option<String>,
@@ -391,7 +391,7 @@ struct BacktestProfilePatch {
     entry_time: Option<String>,
     exit_time: Option<String>,
     underlyings: Option<Vec<String>>,
-    strategies: Option<Vec<String>>,
+    strategy_families: Option<Vec<String>>,
     timeframe: Option<String>,
     option_feed: Option<String>,
     stock_feed: Option<String>,
@@ -458,7 +458,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<BacktestReport> {
     args.synthetic_spread_pct = variant.synthetic_spread_pct;
-    let mut config = OptionsEngineConfig::from_runtime_env()?;
+    let mut config = AlpacaOptionsRuntimeConfig::from_runtime_env()?;
     apply_backtest_overrides(&mut config, &args)?;
     apply_sweep_variant(&mut config, &variant);
     apply_historical_scanner_overrides(&mut config, &args);
@@ -487,7 +487,7 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
     eprintln!(
         "backtest start variant={} strategies={} underlyings={} trading_days={} underlying_days={}",
         variant.label,
-        enabled_strategy_names(&config).join(","),
+        enabled_strategy_family_names(&config).join(","),
         config.underlyings.join(","),
         trade_dates.len(),
         total_underlying_days,
@@ -531,7 +531,7 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
     }
 
     let summary = summarize(&days, args.breakdown_period, args.unclosed_valuation);
-    let strategies = enabled_strategy_names(&config);
+    let strategies = enabled_strategy_family_names(&config);
     let candidate_card = build_candidate_card(
         &variant.label,
         config.underlyings.clone(),
@@ -566,7 +566,7 @@ async fn run_backtest(mut args: Args, variant: SweepVariant) -> anyhow::Result<B
 
 async fn backtest_underlying_day(
     client: &AlpacaHttpClient,
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     underlying: &str,
     trade_date: NaiveDate,
     entry_time: NaiveTime,
@@ -711,7 +711,7 @@ fn data_quality_rejection(
 }
 
 fn select_historical_entry(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     underlying: &str,
     trade_date: NaiveDate,
     contracts: &[AlpacaOptionContract],
@@ -872,7 +872,7 @@ fn select_historical_entry(
 async fn simulate_selected_entry(
     client: &AlpacaHttpClient,
     entry: SelectedOptionsEntry,
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     trade_date: NaiveDate,
     entry_timestamp: &str,
     exit_timestamp: &str,
@@ -1160,7 +1160,7 @@ fn select_exit_plan(
     fallback_exit_timestamp: &str,
     entry_net_cashflow: f64,
     premium_kind: &str,
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
 ) -> Option<ExitPlan> {
     let mut fallback = None;
     for timestamp in common_bar_timestamps(legs, path_bars) {
@@ -1322,7 +1322,7 @@ fn management_exit_reason(
     entry_net_cashflow: f64,
     exit_net_cashflow: f64,
     premium_kind: &str,
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
 ) -> Option<&'static str> {
     if premium_kind == "credit" && entry_net_cashflow > 0.0 {
         let close_debit = -exit_net_cashflow;
@@ -1968,7 +1968,7 @@ fn timestamp_distance_secs(timestamp: &str, target_timestamp: &str) -> Option<i6
     Some((timestamp - target).num_seconds().abs())
 }
 
-fn scanner_dte_window(config: &OptionsEngineConfig) -> (i64, i64) {
+fn scanner_dte_window(config: &AlpacaOptionsRuntimeConfig) -> (i64, i64) {
     let mut min_dte = Vec::new();
     let mut max_dte = Vec::new();
     if !config.spread_kinds.is_empty() {
@@ -1995,7 +1995,7 @@ fn scanner_dte_window(config: &OptionsEngineConfig) -> (i64, i64) {
 }
 
 fn timestamp_for(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     date: NaiveDate,
     time: NaiveTime,
 ) -> anyhow::Result<String> {
@@ -2009,7 +2009,7 @@ fn timestamp_for(
 }
 
 fn timestamp_plus_minutes(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     date: NaiveDate,
     time: NaiveTime,
     minutes: i64,
@@ -2427,7 +2427,7 @@ fn sweep_variants(args: &Args) -> Vec<SweepVariant> {
     variants
 }
 
-fn apply_historical_scanner_overrides(config: &mut OptionsEngineConfig, args: &Args) {
+fn apply_historical_scanner_overrides(config: &mut AlpacaOptionsRuntimeConfig, args: &Args) {
     config.scanner.min_open_interest = args.historical_min_open_interest;
     config.iron_condor_scanner.credit.min_open_interest = args.historical_min_open_interest;
     config.debit_scanner.min_open_interest = args.historical_min_open_interest;
@@ -2441,7 +2441,7 @@ fn apply_historical_scanner_overrides(config: &mut OptionsEngineConfig, args: &A
     config.naked_1_3dte_scanner.max_spread_pct = args.historical_max_leg_spread_pct;
 }
 
-fn apply_sweep_variant(config: &mut OptionsEngineConfig, variant: &SweepVariant) {
+fn apply_sweep_variant(config: &mut AlpacaOptionsRuntimeConfig, variant: &SweepVariant) {
     if let Some(value) = variant.short_delta_min {
         config.scanner.short_delta_min = value;
         config.iron_condor_scanner.credit.short_delta_min = value;
@@ -2470,7 +2470,10 @@ fn apply_sweep_variant(config: &mut OptionsEngineConfig, variant: &SweepVariant)
     }
 }
 
-fn apply_backtest_overrides(config: &mut OptionsEngineConfig, args: &Args) -> anyhow::Result<()> {
+fn apply_backtest_overrides(
+    config: &mut AlpacaOptionsRuntimeConfig,
+    args: &Args,
+) -> anyhow::Result<()> {
     if let Some(underlyings) = args.underlyings.as_ref() {
         config.underlyings = underlyings.clone();
     }
@@ -2498,7 +2501,7 @@ fn apply_backtest_overrides(config: &mut OptionsEngineConfig, args: &Args) -> an
     if let Some(value) = args.max_hold_secs {
         config.max_hold_secs = value;
     }
-    if let Some(strategies) = args.strategies.as_ref() {
+    if let Some(strategies) = args.strategy_families.as_ref() {
         config.spread_kinds.clear();
         config.iron_condor_enabled = false;
         config.debit_kinds.clear();
@@ -2539,13 +2542,13 @@ fn apply_backtest_overrides(config: &mut OptionsEngineConfig, args: &Args) -> an
         });
         config.naked_kinds.dedup();
     }
-    if enabled_strategy_names(config).is_empty() {
-        bail!("no strategies configured; provide --strategies or ALPACA_STRATEGIES");
+    if enabled_strategy_family_names(config).is_empty() {
+        bail!("no strategies configured; provide --strategy-families or ALPACA_STRATEGY_FAMILIES");
     }
     Ok(())
 }
 
-fn enabled_strategy_names(config: &OptionsEngineConfig) -> Vec<String> {
+fn enabled_strategy_family_names(config: &AlpacaOptionsRuntimeConfig) -> Vec<String> {
     let mut names = Vec::new();
     names.extend(
         config
@@ -2639,35 +2642,35 @@ fn builtin_profile_args(name: &str) -> anyhow::Result<Vec<String>> {
     match name {
         "put_credit_spy_strict" => {
             push_arg(&mut args, "--underlyings", "SPY");
-            push_arg(&mut args, "--strategies", "put_credit");
+            push_arg(&mut args, "--strategy-families", "put_credit");
             push_arg(&mut args, "--synthetic-spread-pct", "0.05");
             push_arg(&mut args, "--sweep-min-return-on-risk", "0.16");
         }
         "call_credit_qqq_strict" => {
             push_arg(&mut args, "--underlyings", "QQQ");
-            push_arg(&mut args, "--strategies", "call_credit");
+            push_arg(&mut args, "--strategy-families", "call_credit");
             push_arg(&mut args, "--synthetic-spread-pct", "0.03");
             push_arg(&mut args, "--sweep-min-return-on-risk", "0.20");
         }
         "iron_condor_spy_sweep" => {
             push_arg(&mut args, "--underlyings", "SPY");
-            push_arg(&mut args, "--strategies", "iron_condor");
+            push_arg(&mut args, "--strategy-families", "iron_condor");
             push_arg(&mut args, "--sweep-synthetic-spread-pct", "0.03,0.05,0.08");
             push_arg(&mut args, "--sweep-min-return-on-risk", "0.13,0.16,0.20");
         }
         "call_debit_spy_sweep" => {
             push_arg(&mut args, "--underlyings", "SPY");
-            push_arg(&mut args, "--strategies", "call_debit");
+            push_arg(&mut args, "--strategy-families", "call_debit");
             push_arg(&mut args, "--sweep-synthetic-spread-pct", "0.03,0.05,0.08");
         }
         "put_debit_spy_sweep" => {
             push_arg(&mut args, "--underlyings", "SPY");
-            push_arg(&mut args, "--strategies", "put_debit");
+            push_arg(&mut args, "--strategy-families", "put_debit");
             push_arg(&mut args, "--sweep-synthetic-spread-pct", "0.03,0.05,0.08");
         }
         "debit_spreads_spy_sweep" => {
             push_arg(&mut args, "--underlyings", "SPY");
-            push_arg(&mut args, "--strategies", "call_debit,put_debit");
+            push_arg(&mut args, "--strategy-families", "call_debit,put_debit");
             push_arg(&mut args, "--sweep-synthetic-spread-pct", "0.03,0.05,0.08");
         }
         other => bail!("unknown backtest profile {other}"),
@@ -2704,7 +2707,7 @@ fn profile_patch_args(profile: BacktestProfilePatch) -> Vec<String> {
     push_opt_arg(&mut args, "--entry-time", profile.entry_time);
     push_opt_arg(&mut args, "--exit-time", profile.exit_time);
     push_opt_csv(&mut args, "--underlyings", profile.underlyings);
-    push_opt_csv(&mut args, "--strategies", profile.strategies);
+    push_opt_csv(&mut args, "--strategy-families", profile.strategy_families);
     push_opt_arg(&mut args, "--timeframe", profile.timeframe);
     push_opt_arg(&mut args, "--option-feed", profile.option_feed);
     push_opt_arg(&mut args, "--stock-feed", profile.stock_feed);
@@ -2911,7 +2914,9 @@ fn parse_args() -> anyhow::Result<Args> {
             "--underlyings" => {
                 underlyings = Some(split_csv(next_value(&mut iter, "--underlyings")?))
             }
-            "--strategies" => strategies = Some(split_csv(next_value(&mut iter, "--strategies")?)),
+            "--strategy-families" => {
+                strategies = Some(split_csv(next_value(&mut iter, "--strategy-families")?))
+            }
             "--timeframe" => timeframe = next_value(&mut iter, "--timeframe")?,
             "--option-feed" => option_feed = Some(next_value(&mut iter, "--option-feed")?),
             "--stock-feed" => stock_feed = Some(next_value(&mut iter, "--stock-feed")?),
@@ -3066,7 +3071,7 @@ fn parse_args() -> anyhow::Result<Args> {
         entry_time,
         exit_time,
         underlyings,
-        strategies,
+        strategy_families: strategies,
         timeframe,
         option_feed,
         stock_feed,
@@ -3515,6 +3520,6 @@ fn print_sweep_report(reports: &[BacktestReport]) {
 
 fn print_usage() {
     println!(
-        "Usage: alpaca-options-backtest [--profile name] [--profile-file profile.json] --start YYYY-MM-DD --end YYYY-MM-DD [--entry-time HH:MM] [--exit-time HH:MM] [--underlyings SPY,QQQ] [--strategies put_credit,call_credit,iron_condor,call_debit,put_debit,naked_call,naked_put] [--timeframe 1Min] [--option-feed indicative] [--stock-feed iex] [--assumed-iv 0.35] [--synthetic-spread-pct 0.05] [--entry-mark-window-mins 10] [--historical-min-open-interest 0] [--missing-open-interest 0] [--historical-max-leg-spread-pct 0.80] [--profit-target-close-fraction 0.50] [--stop-loss-close-multiple 2.00] [--max-hold-mins 180] [--sweep-synthetic-spread-pct 0.03,0.05,0.08] [--sweep-short-delta-min 0.10,0.15] [--sweep-short-delta-max 0.20,0.25] [--sweep-min-return-on-risk 0.04,0.08,0.13] [--sweep-profit-target-close-fraction 0.35,0.50] [--sweep-stop-loss-close-multiple 1.50,2.00] [--sweep-max-hold-mins 120,240] [--breakdown-period day|week|month|quarter|year] [--unclosed-valuation ignore|conservative|worst_observed] [--min-exit-leg-bars 10] [--require-exit-common-timestamp] [--trade-export-csv trades.csv] [--trade-export-json trades.json] [--quantity 1] [--json]"
+        "Usage: alpaca-options-backtest [--profile name] [--profile-file profile.json] --start YYYY-MM-DD --end YYYY-MM-DD [--entry-time HH:MM] [--exit-time HH:MM] [--underlyings SPY,QQQ] [--strategy-families put_credit,call_credit,iron_condor,call_debit,put_debit,naked_call,naked_put] [--timeframe 1Min] [--option-feed indicative] [--stock-feed iex] [--assumed-iv 0.35] [--synthetic-spread-pct 0.05] [--entry-mark-window-mins 10] [--historical-min-open-interest 0] [--missing-open-interest 0] [--historical-max-leg-spread-pct 0.80] [--profit-target-close-fraction 0.50] [--stop-loss-close-multiple 2.00] [--max-hold-mins 180] [--sweep-synthetic-spread-pct 0.03,0.05,0.08] [--sweep-short-delta-min 0.10,0.15] [--sweep-short-delta-max 0.20,0.25] [--sweep-min-return-on-risk 0.04,0.08,0.13] [--sweep-profit-target-close-fraction 0.35,0.50] [--sweep-stop-loss-close-multiple 1.50,2.00] [--sweep-max-hold-mins 120,240] [--breakdown-period day|week|month|quarter|year] [--unclosed-valuation ignore|conservative|worst_observed] [--min-exit-leg-bars 10] [--require-exit-common-timestamp] [--trade-export-csv trades.csv] [--trade-export-json trades.json] [--quantity 1] [--json]"
     );
 }

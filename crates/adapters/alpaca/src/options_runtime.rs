@@ -32,7 +32,7 @@ use crate::{
     config::AlpacaDataClientConfig,
     fleet::ResolvedFleetConfig,
     http::client::AlpacaHttpClient,
-    management::CreditSpreadManagementConfig,
+    options_management::CreditSpreadManagementConfig,
     runtime::{
         StrategyState, credit_spread_strategy_name, debit_spread_strategy_name,
         emit_operator_event, naked_option_strategy_name,
@@ -68,7 +68,7 @@ use config::{
     account_options_buying_power, format_optional_pct, format_rejection_counts, no_candidate_reason,
 };
 pub(crate) use config::{active_sector_count, active_underlying_count};
-use config::{build_options_engine_config, load_runtime_config_file_from_env};
+use config::{build_options_runtime_config, load_runtime_config_file_from_env};
 
 const HIGH_SCORE_CANDIDATE_ALERT: &str = "high_score_candidate";
 const CANDIDATE_ALERT_NAKED_MIN_SCORE: f64 = 95.0;
@@ -79,7 +79,7 @@ const CANDIDATE_ALERT_DEBIT_MIN_SCORE: f64 = 80.0;
 
 /// Runtime config for the Alpaca options slice.
 #[derive(Debug)]
-pub struct OptionsEngineConfig {
+pub struct AlpacaOptionsRuntimeConfig {
     /// Underlyings to scan.
     pub underlyings: Vec<String>,
     /// Enabled spread kinds.
@@ -192,7 +192,7 @@ pub struct OptionsEngineConfig {
     pub storage_account_id: Option<String>,
 }
 
-impl OptionsEngineConfig {
+impl AlpacaOptionsRuntimeConfig {
     /// Builds config from TOML config, short environment overrides, and optional positional
     /// underlyings.
     ///
@@ -201,7 +201,7 @@ impl OptionsEngineConfig {
     /// Returns an error when config, strategy names, times, or timezone values are invalid.
     pub fn from_env() -> anyhow::Result<Self> {
         crate::runtime_env::load_options_env_file()?;
-        let mut config = build_options_engine_config(
+        let mut config = build_options_runtime_config(
             load_runtime_config_file_from_env()?,
             env::args().skip(1).collect::<Vec<_>>(),
         )?;
@@ -220,7 +220,7 @@ impl OptionsEngineConfig {
     pub fn from_runtime_env() -> anyhow::Result<Self> {
         crate::runtime_env::load_options_env_file()?;
         let mut config =
-            build_options_engine_config(load_runtime_config_file_from_env()?, Vec::new())?;
+            build_options_runtime_config(load_runtime_config_file_from_env()?, Vec::new())?;
         config.storage_database_url = None;
         config.storage_repository = None;
         config.storage_schema = storage::STORAGE_SCHEMA_DEFAULT.to_string();
@@ -399,7 +399,7 @@ impl OptionsEngineConfig {
 
     /// Returns enabled strategy names for operator logs.
     #[must_use]
-    pub fn enabled_strategy_names(&self) -> Vec<&'static str> {
+    pub fn enabled_strategy_family_names(&self) -> Vec<&'static str> {
         let mut names = self
             .spread_kinds
             .iter()
@@ -423,7 +423,7 @@ impl OptionsEngineConfig {
 
     /// Returns strategy names which are configured for dry-run selection only.
     #[must_use]
-    pub fn dry_run_strategy_names(&self) -> Vec<&'static str> {
+    pub fn dry_run_strategy_family_names(&self) -> Vec<&'static str> {
         let mut names = self
             .dry_run_spread_kinds
             .iter()
@@ -552,10 +552,10 @@ pub enum OptionsScanOutcome {
     NoCandidate,
 }
 
-/// Opportunity set produced by scanner discovery for one strategy iteration.
+/// Candidate set produced by scanner discovery for one strategy iteration.
 #[derive(Clone, Debug)]
-pub struct OptionsOpportunitySet {
-    /// Market trade date for the opportunity set.
+pub struct OptionsCandidateSet {
+    /// Market trade date for the candidate set.
     pub trade_date: String,
     /// Per-underlying, per-strategy scanner diagnostics.
     pub scans: Vec<OptionsScanReport>,
@@ -563,7 +563,7 @@ pub struct OptionsOpportunitySet {
     pub ranked_entries: Vec<SelectedOptionsEntry>,
 }
 
-impl OptionsOpportunitySet {
+impl OptionsCandidateSet {
     pub fn new(trade_date: &str) -> Self {
         Self {
             trade_date: trade_date.to_string(),
@@ -594,27 +594,27 @@ impl OptionsOpportunitySet {
         self.ranked_entries.first()
     }
 
-    /// Consumes the opportunity set and returns the selected entry candidate.
+    /// Consumes the candidate set and returns the selected entry candidate.
     #[must_use]
     pub fn into_selected_entry(self) -> Option<SelectedOptionsEntry> {
         self.ranked_entries.into_iter().next()
     }
 }
 
-/// Discovers ranked option opportunities for one strategy iteration.
+/// Discovers ranked option candidates for one strategy iteration.
 ///
 /// # Errors
 ///
 /// Returns an error when Alpaca account, position, order, contract, or snapshot requests fail.
-pub async fn scan_options_opportunities(
+pub async fn scan_options_candidates(
     client: &AlpacaHttpClient,
     data_config: &AlpacaDataClientConfig,
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     trade_date: &str,
-) -> anyhow::Result<OptionsOpportunitySet> {
+) -> anyhow::Result<OptionsCandidateSet> {
     let account = client.account().await?;
     let options_buying_power = account_options_buying_power(&account);
-    let mut opportunities = OptionsOpportunitySet::new(trade_date);
+    let mut candidates = OptionsCandidateSet::new(trade_date);
 
     for underlying in &config.underlyings {
         for kind in &config.spread_kinds {
@@ -659,7 +659,7 @@ pub async fn scan_options_opportunities(
                 &result.candidates,
             )
             .await;
-            opportunities.push_scan(OptionsScanReport::new(
+            candidates.push_scan(OptionsScanReport::new(
                 underlying,
                 strategy_name,
                 result.candidates.len(),
@@ -723,7 +723,7 @@ pub async fn scan_options_opportunities(
                 }),
             );
 
-            opportunities.consider_candidate(SelectedOptionsEntry::Credit(SelectedEntry {
+            candidates.consider_candidate(SelectedOptionsEntry::Credit(SelectedEntry {
                 underlying: underlying.clone(),
                 kind: *kind,
                 candidate: best.clone(),
@@ -762,7 +762,7 @@ pub async fn scan_options_opportunities(
             .await;
             record_iron_condor_candidate_ledger(config, trade_date, underlying, &result.candidates)
                 .await;
-            opportunities.push_scan(OptionsScanReport::new(
+            candidates.push_scan(OptionsScanReport::new(
                 underlying,
                 "iron_condor",
                 result.candidates.len(),
@@ -828,7 +828,7 @@ pub async fn scan_options_opportunities(
                 }),
             );
 
-            opportunities.consider_candidate(SelectedOptionsEntry::IronCondor(
+            candidates.consider_candidate(SelectedOptionsEntry::IronCondor(
                 SelectedIronCondorEntry {
                     underlying: underlying.clone(),
                     candidate: best.clone(),
@@ -888,7 +888,7 @@ pub async fn scan_options_opportunities(
                 &result.candidates,
             )
             .await;
-            opportunities.push_scan(OptionsScanReport::new(
+            candidates.push_scan(OptionsScanReport::new(
                 underlying,
                 strategy_name,
                 result.candidates.len(),
@@ -952,7 +952,7 @@ pub async fn scan_options_opportunities(
                 }),
             );
 
-            opportunities.consider_candidate(SelectedOptionsEntry::Debit(SelectedDebitEntry {
+            candidates.consider_candidate(SelectedOptionsEntry::Debit(SelectedDebitEntry {
                 underlying: underlying.clone(),
                 kind: *kind,
                 candidate: best.clone(),
@@ -1004,7 +1004,7 @@ pub async fn scan_options_opportunities(
                 &result.candidates,
             )
             .await;
-            opportunities.push_scan(OptionsScanReport::new(
+            candidates.push_scan(OptionsScanReport::new(
                 underlying,
                 strategy_name,
                 result.candidates.len(),
@@ -1121,7 +1121,7 @@ pub async fn scan_options_opportunities(
                 }),
             );
 
-            opportunities.consider_candidate(SelectedOptionsEntry::NakedOption(
+            candidates.consider_candidate(SelectedOptionsEntry::NakedOption(
                 SelectedNakedOptionEntry {
                     underlying: underlying.clone(),
                     kind: *kind,
@@ -1131,5 +1131,5 @@ pub async fn scan_options_opportunities(
         }
     }
 
-    Ok(opportunities)
+    Ok(candidates)
 }

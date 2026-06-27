@@ -5,7 +5,7 @@ use serde_json::Value;
 use sqlx::{AssertSqlSafe, Row, types::Json};
 
 use crate::{
-    options_runtime::OptionsEngineConfig, performance::CandidateLedgerSummary,
+    options_runtime::AlpacaOptionsRuntimeConfig, performance::CandidateLedgerSummary,
     storage::StorageRepository,
 };
 
@@ -168,7 +168,7 @@ pub async fn summarize_candidate_ledger(
 
 /// Async wrapper that reads from Postgres storage.
 pub async fn summarize_candidate_ledger_records(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     since: Option<chrono::NaiveDate>,
     until: Option<chrono::NaiveDate>,
 ) -> anyhow::Result<CandidateLedgerSummary> {

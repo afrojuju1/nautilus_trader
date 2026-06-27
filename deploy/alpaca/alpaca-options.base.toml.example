@@ -1,4 +1,4 @@
-# Copy to ~/.config/nautilus-trader/alpaca/base-options-engine.toml.
+# Copy to ~/.config/nautilus-trader/alpaca/base-options.toml.
 # Account configs explicitly inherit this file with `extends`.
 
 [runtime]

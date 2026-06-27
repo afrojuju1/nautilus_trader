@@ -43,7 +43,7 @@ const ACCOUNT_COMMAND_PASSTHROUGH_ENV: &[&str] = &[
     "RUST_LOG",
 ];
 
-/// Loads the deployed Alpaca options-engine environment file when present.
+/// Loads the deployed Alpaca options environment file when present.
 ///
 /// The default env file preserves existing process environment values for manual operator
 /// overrides. An explicit `NAUTILUS_ALPACA_ENV_FILE` is treated as an account boundary, so that
@@ -118,7 +118,7 @@ fn default_options_env_path() -> PathBuf {
     default_config_home()
         .join("nautilus-trader")
         .join("alpaca")
-        .join("options-engine.env")
+        .join("options.env")
 }
 
 fn default_config_home() -> PathBuf {

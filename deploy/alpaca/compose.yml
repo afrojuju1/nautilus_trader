@@ -25,8 +25,8 @@ x-alpaca-runtime: &alpaca-runtime
     ALPACA_DATA_BASE_URL: ${ALPACA_DATA_BASE_URL:-}
     ALPACA_STORAGE_DATABASE_URL: postgres://nautilus:${POSTGRES_PASSWORD:-pass}@postgres:5432/${POSTGRES_DB:-nautilus}
     ALPACA_STORAGE_SCHEMA: ${ALPACA_STORAGE_SCHEMA:-alpaca}
-    ALPACA_CONFIG_PATH: /config/options-engine.toml
-    ALPACA_STATE_PATH: /state/alpaca_options_engine_state.json
+    ALPACA_CONFIG_PATH: /config/options.toml
+    ALPACA_STATE_PATH: /state/alpaca_options_state.json
     NAUTILUS_ALPACA_ACCOUNT: ${NAUTILUS_ALPACA_DOCKER_ACCOUNT:-paper-main}
     NAUTILUS_ALPACA_SERVICE: ${NAUTILUS_ALPACA_DOCKER_SERVICE:-alpaca-options-container}
     NAUTILUS_ALPACA_LOG_DIR: /state/logs
@@ -37,8 +37,8 @@ x-alpaca-runtime: &alpaca-runtime
     ALPACA_KILL_SWITCH: ${NAUTILUS_ALPACA_DOCKER_KILL_SWITCH:-true}
     ALPACA_FORCE_FLATTEN: ${NAUTILUS_ALPACA_DOCKER_FORCE_FLATTEN:-false}
     ALPACA_CANCEL_AFTER_ACCEPT: ${NAUTILUS_ALPACA_DOCKER_CANCEL_AFTER_ACCEPT:-false}
-    ALPACA_STRATEGIES: ${ALPACA_STRATEGIES:-}
-    ALPACA_DRY_RUN_STRATEGIES: ${ALPACA_DRY_RUN_STRATEGIES:-}
+    ALPACA_STRATEGY_FAMILIES: ${ALPACA_STRATEGY_FAMILIES:-}
+    ALPACA_DRY_RUN_FAMILIES: ${ALPACA_DRY_RUN_FAMILIES:-}
     ALPACA_MAX_ITERATIONS: ${ALPACA_MAX_ITERATIONS:-}
     ALPACA_INTERVAL_SECS: ${ALPACA_INTERVAL_SECS:-}
     ALPACA_IGNORE_ENTRY_WINDOW: ${ALPACA_IGNORE_ENTRY_WINDOW:-}
@@ -76,8 +76,8 @@ x-alpaca-runtime: &alpaca-runtime
     CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-market}
   volumes:
     - alpaca-state:/state
-    - ${NAUTILUS_ALPACA_DOCKER_BASE_CONFIG:-./alpaca-options-engine.base.toml.example}:/config/base-options-engine.toml:ro
-    - ${NAUTILUS_ALPACA_DOCKER_CONFIG:-./alpaca-options-engine.toml.example}:/config/options-engine.toml:ro
+    - ${NAUTILUS_ALPACA_DOCKER_BASE_CONFIG:-./alpaca-options.base.toml.example}:/config/base-options.toml:ro
+    - ${NAUTILUS_ALPACA_DOCKER_CONFIG:-./alpaca-options.toml.example}:/config/options.toml:ro
 
 x-alpaca-tools-runtime: &alpaca-tools-runtime
   <<: *alpaca-runtime
@@ -115,12 +115,12 @@ services:
   alpaca-check-account:
     <<: *alpaca-runtime
     profiles: ["status"]
-    command: ["alpaca-check-account-orders"]
+    command: ["alpaca-ops", "account"]
 
   alpaca-status:
     <<: *alpaca-runtime
     profiles: ["status"]
-    command: ["alpaca-operator-status", "--json"]
+    command: ["alpaca-ops", "status", "--json"]
 
   alpaca-compare-option-chain-scan:
     <<: *alpaca-tools-runtime
@@ -130,13 +130,13 @@ services:
   alpaca-option-chain-live:
     <<: *alpaca-runtime
     profiles: ["cutover"]
-    command: ["alpaca-option-chain-scan-live-node"]
+    command: ["alpaca-options-node"]
     restart: "no"
 
   alpaca-options:
     <<: *alpaca-runtime
     profiles: ["engine"]
-    command: ["alpaca-option-chain-scan-live-node"]
+    command: ["alpaca-options-node"]
     restart: unless-stopped
 
 volumes:

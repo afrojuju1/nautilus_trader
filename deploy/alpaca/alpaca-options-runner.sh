@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="${NAUTILUS_ALPACA_REPO:-$HOME/Projects/nautilus_trader}"
-RUNNER_BIN="${NAUTILUS_ALPACA_RUNNER_BIN:-$HOME/.local/bin/alpaca-option-chain-scan-live-node}"
+RUNNER_BIN="${NAUTILUS_ALPACA_RUNNER_BIN:-$HOME/.local/bin/alpaca-options-node}"
 LOG_DIR="${NAUTILUS_ALPACA_LOG_DIR:-$HOME/.local/state/nautilus_trader/logs}"
 LOCK_DIR="${NAUTILUS_ALPACA_LOCK_DIR:-$HOME/.local/state/nautilus_trader/locks}"
 LOCK_FILE="$LOCK_DIR/alpaca-options.lock"

@@ -32,7 +32,7 @@ python examples/live/alpaca/gap_down_fragile_rebound_paper.py \
 
 `--alpaca-profile paper-directional` resolves to
 `~/.config/nautilus-trader/alpaca/accounts/paper-directional.env`. Use `--alpaca-profile
-paper-main` for `~/.config/nautilus-trader/alpaca/options-engine.env`, or pass
+paper-main` for `~/.config/nautilus-trader/alpaca/options.env`, or pass
 `--alpaca-env-file <path>` for an explicit env file.
 
 Keep account-specific broker-paper risk gates and strategy sizing in the same profile env file:
@@ -197,7 +197,7 @@ If a smoke order remains open, cancel it in the Alpaca paper dashboard or API be
 This command reads account state, positions, and open orders. It does not submit or cancel orders.
 
 ```bash
-cargo run -p nautilus-alpaca --features live --bin alpaca-check-account-orders
+cargo run -p nautilus-alpaca --features live --bin alpaca-ops -- account
 ```
 
 ## Load option contracts
@@ -264,14 +264,14 @@ export ALPACA_EXECUTION_POST_CANCEL_POLL_ATTEMPTS=3
 cargo run -p nautilus-alpaca --features live --bin alpaca-paper-execution-harness -- \
   SPY260619P00450000 SPY260619P00445000 4.95 1
 
-cargo run -p nautilus-alpaca --features live --bin alpaca-check-account-orders
+cargo run -p nautilus-alpaca --features live --bin alpaca-ops -- account
 ```
 
 If an accepted smoke order remains open after the harness exits, cancel it in the Alpaca paper
 dashboard or API before continuing. Do not leave smoke orders working unless that is the explicit
 test objective.
 
-## Check the options-engine config
+## Check the options runtime config
 
 Keep submission, management, and close handling disabled while checking config:
 
@@ -281,27 +281,27 @@ export ALPACA_MANAGE=false
 export ALPACA_CLOSE=false
 export ALPACA_KILL_SWITCH=true
 
-cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- --check-config
+cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- --check-config
 ```
 
 To use an account-specific env file:
 
 ```bash
-export NAUTILUS_ALPACA_ENV_FILE="$HOME/.config/nautilus-trader/alpaca/options-engine.env"
-cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- --check-config
+export NAUTILUS_ALPACA_ENV_FILE="$HOME/.config/nautilus-trader/alpaca/options.env"
+cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- --check-config
 ```
 
-Copy the sample config files from `deploy/alpaca/` before running the engine as a service:
+Copy the sample config files from `deploy/alpaca/` before running the runtime as a service:
 
 ```bash
 mkdir -p "$HOME/.config/nautilus-trader/alpaca"
-cp deploy/alpaca/alpaca-options-engine.env.example \
-  "$HOME/.config/nautilus-trader/alpaca/options-engine.env"
-cp deploy/alpaca/alpaca-options-engine.base.toml.example \
-  "$HOME/.config/nautilus-trader/alpaca/base-options-engine.toml"
-cp deploy/alpaca/alpaca-options-engine.toml.example \
-  "$HOME/.config/nautilus-trader/alpaca/options-engine.toml"
-chmod 600 "$HOME/.config/nautilus-trader/alpaca/options-engine.env"
+cp deploy/alpaca/alpaca-options.env.example \
+  "$HOME/.config/nautilus-trader/alpaca/options.env"
+cp deploy/alpaca/alpaca-options.base.toml.example \
+  "$HOME/.config/nautilus-trader/alpaca/base-options.toml"
+cp deploy/alpaca/alpaca-options.toml.example \
+  "$HOME/.config/nautilus-trader/alpaca/options.toml"
+chmod 600 "$HOME/.config/nautilus-trader/alpaca/options.env"
 ```
 
 Do not enable `ALPACA_SUBMIT`, `ALPACA_MANAGE`, or `ALPACA_CLOSE` until paper credentials,
@@ -323,9 +323,9 @@ alpaca-control alerts candidates --all --dry-run
 alpaca-control performance --all
 ```
 
-The installed config layers are `options-engine.env`, `base-options-engine.toml`,
-`options-engine.toml`, and `fleet.toml`. `NAUTILUS_ALPACA_ENV_FILE` selects an account env file;
-`ALPACA_CONFIG_PATH` selects the account TOML; `extends = "base-options-engine.toml"` lets account
+The installed config layers are `options.env`, `base-options.toml`,
+`options.toml`, and `fleet.toml`. `NAUTILUS_ALPACA_ENV_FILE` selects an account env file;
+`ALPACA_CONFIG_PATH` selects the account TOML; `extends = "base-options.toml"` lets account
 TOML inherit shared scanner and management defaults. Operational env overrides such as
 `ALPACA_SUBMIT`, `ALPACA_MANAGE`, `ALPACA_CLOSE`, `ALPACA_KILL_SWITCH`, and
 `ALPACA_MAX_ITERATIONS` take precedence over TOML for those supported fields.

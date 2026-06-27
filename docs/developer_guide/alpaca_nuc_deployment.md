@@ -6,22 +6,22 @@ uses a file lock so only one runner can own a given Alpaca account workflow.
 
 ## Files
 
-- `deploy/alpaca/alpaca-options-engine.env.example`: credentials, endpoints, service paths, and
+- `deploy/alpaca/alpaca-options.env.example`: credentials, endpoints, service paths, and
   emergency override template.
-- `deploy/alpaca/alpaca-options-engine.account.env.example`: account-scoped env template for future
+- `deploy/alpaca/alpaca-options.account.env.example`: account-scoped env template for future
   supervised account instances.
 - `deploy/alpaca/alpaca-paper-profiles.tsv`: checked profile manifest linking paper accounts,
   runtime config expectations, and backtest profile IDs.
-- `deploy/alpaca/alpaca-options-engine.base.toml.example`: shared strategy universe, scanner, sector,
+- `deploy/alpaca/alpaca-options.base.toml.example`: shared strategy universe, scanner, sector,
   and management defaults inherited by account configs.
-- `deploy/alpaca/alpaca-options-engine.toml.example`: strategy/scanner/management config template.
-- `deploy/alpaca/alpaca-options-engine.paper-directional.toml.example`: defined-risk watchlist
+- `deploy/alpaca/alpaca-options.toml.example`: strategy/scanner/management config template.
+- `deploy/alpaca/alpaca-options.paper-directional.toml.example`: defined-risk watchlist
   account config template.
-- `deploy/alpaca/alpaca-options-engine.paper-put-credit-spy.toml.example`: isolated SPY
+- `deploy/alpaca/alpaca-options.paper-put-credit-spy.toml.example`: isolated SPY
   put-credit account config template.
-- `deploy/alpaca/alpaca-options-engine.paper-call-credit-qqq.toml.example`: isolated QQQ
+- `deploy/alpaca/alpaca-options.paper-call-credit-qqq.toml.example`: isolated QQQ
   call-credit account config template.
-- `deploy/alpaca/alpaca-options-engine.paper-undefined-risk.toml.example`: isolated undefined-risk
+- `deploy/alpaca/alpaca-options.paper-undefined-risk.toml.example`: isolated undefined-risk
   account config template.
 - `deploy/alpaca/alpaca-fleet.toml.example`: read-only fleet registry template.
 - `deploy/alpaca/alpaca-options-install.sh`: builds release binaries and installs user files.
@@ -42,15 +42,15 @@ From the repo root:
 deploy/alpaca/alpaca-options-install.sh
 ```
 
-Edit `~/.config/nautilus-trader/alpaca/options-engine.env` and add Alpaca paper credentials. Keep
+Edit `~/.config/nautilus-trader/alpaca/options.env` and add Alpaca paper credentials. Keep
 `ALPACA_KILL_SWITCH=true`, `ALPACA_SUBMIT=false`, `ALPACA_MANAGE=false`, and `ALPACA_CLOSE=false`
 until paper proof is intentionally enabled.
 
 The installed engine, operator status command, and account/order probe auto-load
-`~/.config/nautilus-trader/alpaca/options-engine.env` when present. Set
+`~/.config/nautilus-trader/alpaca/options.env` when present. Set
 `NAUTILUS_ALPACA_ENV_FILE` only when intentionally pointing at a different env file.
 
-Edit `~/.config/nautilus-trader/alpaca/base-options-engine.toml` for shared scanner, universe,
+Edit `~/.config/nautilus-trader/alpaca/base-options.toml` for shared scanner, universe,
 sector, and management settings. Account configs can set top-level `extends` to inherit from that
 base, then override only strategy identity, state path, risk caps, or account-specific scanner
 limits. TOML `runtime.max_iterations = 0` is continuous service mode. Set
@@ -88,19 +88,19 @@ The options engine resolves the TOML config in this order:
 - The current fleet account's `config_file`, when the account can be matched from
   `NAUTILUS_ALPACA_ACCOUNT`, `NAUTILUS_ALPACA_SERVICE`, `ALPACA_CONFIG_PATH`, or
   `NAUTILUS_ALPACA_ENV_FILE`.
-- `~/.config/nautilus-trader/alpaca/options-engine.toml`, when present.
+- `~/.config/nautilus-trader/alpaca/options.toml`, when present.
 - Built-in runtime defaults.
 
 TOML `extends` loads the parent file first and then applies the child file. Child scalar values
 override parent scalar values, non-empty child lists override parent lists, and maps such as
 `[risk.sectors]` are merged with child keys replacing parent keys. Keep shared scanner, universe,
-sector, and management defaults in `base-options-engine.toml`; keep account identity, state paths,
+sector, and management defaults in `base-options.toml`; keep account identity, state paths,
 and account-level caps in the account config.
 
 Environment overrides are intentionally narrow and operational. They take precedence over TOML for
 the fields they support:
 
-- Strategy/run controls: `ALPACA_STRATEGIES`, `ALPACA_DRY_RUN_STRATEGIES`,
+- Strategy/run controls: `ALPACA_STRATEGY_FAMILIES`, `ALPACA_DRY_RUN_FAMILIES`,
   `ALPACA_MAX_ITERATIONS`, `ALPACA_INTERVAL_SECS`, `ALPACA_QTY`,
   `ALPACA_IGNORE_ENTRY_WINDOW`.
 - Safety gates: `ALPACA_SUBMIT`, `ALPACA_MANAGE`, `ALPACA_CLOSE`, `ALPACA_KILL_SWITCH`,
@@ -116,7 +116,7 @@ Not every TOML field has an env override. Scanner thresholds, sector maps, and m
 parameters should stay in TOML so the checked config remains reviewable.
 
 Env file loading differs by intent. If `NAUTILUS_ALPACA_ENV_FILE` is unset, the runtime auto-loads
-`~/.config/nautilus-trader/alpaca/options-engine.env` when present but preserves values already in
+`~/.config/nautilus-trader/alpaca/options.env` when present but preserves values already in
 the process environment. If `NAUTILUS_ALPACA_ENV_FILE` is set, that file is an explicit account
 boundary: keys declared in the file override inherited values, and a missing file is an error.
 Fleet status uses an even stricter account boundary by clearing inherited `ALPACA_*` and
@@ -157,7 +157,7 @@ alpaca-control rollout
 alpaca-control fleet --json
 alpaca-control health
 alpaca-control logs
-alpaca-fleet-status --json
+alpaca-ops fleet --json
 ```
 
 ## Dockerized Local Bring-Up
@@ -175,7 +175,7 @@ docker compose -f deploy/alpaca/compose.yml up -d postgres
 
 Avoid running `docker compose config` with a real Alpaca env file because Compose prints resolved
 environment values. Validate the Compose shape without `--env-file`, or use the checked
-`alpaca-options-engine.docker.env.example` template.
+`alpaca-options.docker.env.example` template.
 
 The default Docker build is optimized for local rollouts: it uses the `release-rollout` Cargo
 profile and the normal runtime image includes only the engine, operator status, account check, and
@@ -198,22 +198,22 @@ starting the service. Credentials stay in the external env file and are not copi
 
 ```bash
 install -d -m 755 ~/.local/share/nautilus-alpaca-docker-config
-install -m 644 ~/.config/nautilus-trader/alpaca/base-options-engine.toml \
-  ~/.local/share/nautilus-alpaca-docker-config/base-options-engine.toml
-install -m 644 ~/.config/nautilus-trader/alpaca/options-engine.toml \
-  ~/.local/share/nautilus-alpaca-docker-config/options-engine.toml
+install -m 644 ~/.config/nautilus-trader/alpaca/base-options.toml \
+  ~/.local/share/nautilus-alpaca-docker-config/base-options.toml
+install -m 644 ~/.config/nautilus-trader/alpaca/options.toml \
+  ~/.local/share/nautilus-alpaca-docker-config/options.toml
 ```
 
 Run read-only Alpaca checks with paper credentials from an external env file:
 
 ```bash
 docker compose \
-  --env-file ~/.config/nautilus-trader/alpaca/options-engine.env \
+  --env-file ~/.config/nautilus-trader/alpaca/options.env \
   -f deploy/alpaca/compose.yml \
   run --rm alpaca-check-account
 
 docker compose \
-  --env-file ~/.config/nautilus-trader/alpaca/options-engine.env \
+  --env-file ~/.config/nautilus-trader/alpaca/options.env \
   -f deploy/alpaca/compose.yml \
   run --rm alpaca-status
 ```
@@ -229,14 +229,14 @@ explicit in the env file or shell, point the Docker config mounts at reviewed lo
 paper endpoints in place, and start only the engine profile:
 
 ```bash
-NAUTILUS_ALPACA_DOCKER_BASE_CONFIG=~/.local/share/nautilus-alpaca-docker-config/base-options-engine.toml \
-NAUTILUS_ALPACA_DOCKER_CONFIG=~/.local/share/nautilus-alpaca-docker-config/options-engine.toml \
+NAUTILUS_ALPACA_DOCKER_BASE_CONFIG=~/.local/share/nautilus-alpaca-docker-config/base-options.toml \
+NAUTILUS_ALPACA_DOCKER_CONFIG=~/.local/share/nautilus-alpaca-docker-config/options.toml \
 NAUTILUS_ALPACA_DOCKER_SUBMIT=true \
 NAUTILUS_ALPACA_DOCKER_MANAGE=true \
 NAUTILUS_ALPACA_DOCKER_CLOSE=true \
 NAUTILUS_ALPACA_DOCKER_KILL_SWITCH=false \
 docker compose \
-  --env-file ~/.config/nautilus-trader/alpaca/options-engine.env \
+  --env-file ~/.config/nautilus-trader/alpaca/options.env \
   -f deploy/alpaca/compose.yml \
   --profile engine \
   up -d alpaca-options
@@ -304,7 +304,7 @@ Default state files from the env template:
 
 - Logs: `~/.local/state/nautilus_trader/logs/alpaca-options.log`
 - Lock: `~/.local/state/nautilus_trader/locks/alpaca-options.lock`
-- Strategy state: `~/.local/state/nautilus_trader/alpaca_options_engine_state.json`
+- Strategy state: `~/.local/state/nautilus_trader/alpaca_options_state.json`
 - Candidate ledger: Postgres `alpaca.candidate_ledger`
 - Candidate-alert dedupe state:
   `~/.local/state/nautilus_trader/alpaca/<account-id>/alerts/candidate-discord-state.json`
@@ -316,9 +316,9 @@ the service exits without starting another Alpaca account owner.
 
 The service runs installed release binaries by default:
 
-- Runner: `~/.local/bin/alpaca-option-chain-scan-live-node`
-- Operator status: `~/.local/bin/alpaca-operator-status`
-- Fleet status: `~/.local/bin/alpaca-fleet-status`
+- Runner: `~/.local/bin/alpaca-options-node`
+- Operator status: `~/.local/bin/alpaca-ops status`
+- Fleet status: `~/.local/bin/alpaca-ops fleet`
 
 Override with `NAUTILUS_ALPACA_RUNNER_BIN` or `NAUTILUS_ALPACA_OPERATOR_BIN` only for diagnostics.
 
@@ -346,8 +346,8 @@ Ledger meanings:
 
 The existing paper account remains `alpaca-options.service` and continues to use:
 
-- Env: `~/.config/nautilus-trader/alpaca/options-engine.env`
-- Config: `~/.config/nautilus-trader/alpaca/options-engine.toml`
+- Env: `~/.config/nautilus-trader/alpaca/options.env`
+- Config: `~/.config/nautilus-trader/alpaca/options.toml`
 
 Additional accounts are represented in `~/.config/nautilus-trader/alpaca/fleet.toml` with explicit
 roles, permissions, risk budgets, service names, env files, config files, state files, log
@@ -406,7 +406,7 @@ Future account env files should live under:
 Future account configs should live under:
 
 ```text
-~/.config/nautilus-trader/alpaca/configs/<account-id>-options-engine.toml
+~/.config/nautilus-trader/alpaca/configs/<account-id>-options.toml
 ```
 
 Keep extra accounts disabled in the fleet registry and keep their env gates inert until credentials,
@@ -437,7 +437,7 @@ account's role and strategy set.
 - `ALPACA_MANAGE=true` allows stale-entry cancellation and management actions.
 - `ALPACA_CLOSE=true` allows close order submission when management is enabled.
 - `ALPACA_FORCE_FLATTEN=true` treats every tracked open spread as a close candidate.
-- TOML `runtime.dry_run_strategies = ["iron_condor"]` lets a strategy scan and emit decisions
+- TOML `runtime.dry_run_families = ["iron_condor"]` lets a strategy scan and emit decisions
   without submitting while other enabled strategies can remain live.
 - TOML `management.close_regular_hours_only = true` blocks non-forced close submissions outside the
   configured close window. `ALPACA_FORCE_FLATTEN=true` bypasses this guard for explicit flattening.
@@ -492,7 +492,7 @@ tiny live canary.
 
 ## Operator Status
 
-`alpaca-control operator` runs the `alpaca-operator-status` binary and summarizes service state,
+`alpaca-control operator` runs the `alpaca-ops status` binary and summarizes service state,
 account status, open orders, positions, strategy state, the last structured scan/decision event, the
 latest broker event, and operator alerts. Use `--json` for machine-readable output.
 
@@ -505,7 +505,7 @@ alpaca-control --account paper-main health
 alpaca-control today
 ```
 
-`alpaca-control fleet` runs `alpaca-fleet-status`, reads the fleet registry, and executes
+`alpaca-control fleet` runs `alpaca-ops fleet`, reads the fleet registry, and executes
 per-account operator status with each account's env file. It is a read-only fleet summary; it does
 not start services, submit orders, or change account state.
 
@@ -516,7 +516,7 @@ alpaca-control accounts
 alpaca-control fleet
 alpaca-control fleet --json
 alpaca-control fleet --include-disabled
-alpaca-fleet-status --json
+alpaca-ops fleet --json
 ```
 
 `alpaca-control validate` runs the targeted Alpaca formatting, shell syntax, library test, and binary
@@ -604,9 +604,9 @@ realized-trade records.
 Normal overnight monitoring:
 
 ```bash
-alpaca-operator-status --json
-alpaca-fleet-status --json
-cargo run -p nautilus-alpaca --features live --bin alpaca-check-account-orders
+alpaca-ops status --json
+alpaca-ops fleet --json
+cargo run -p nautilus-alpaca --features live --bin alpaca-ops -- account
 ```
 
 Expected overnight state with an open managed spread is service `active`, open orders `0`, unmanaged
@@ -616,9 +616,9 @@ Force flatten:
 
 ```bash
 sed -i 's/^ALPACA_FORCE_FLATTEN=.*/ALPACA_FORCE_FLATTEN=true/' \
-  ~/.config/nautilus-trader/alpaca/options-engine.env
+  ~/.config/nautilus-trader/alpaca/options.env
 systemctl --user restart alpaca-options.service
-alpaca-operator-status --json
+alpaca-ops status --json
 ```
 
 After the account is flat, set `ALPACA_FORCE_FLATTEN=false` and restart the service.
@@ -636,7 +636,7 @@ Unmanaged position:
 
 - Treat `unmanaged_positions` as critical.
 - Do not enable more entries.
-- Compare `alpaca-check-account-orders` against the strategy state file, then either restore state
+- Compare `alpaca-ops account` against the strategy state file, then either restore state
   from a known-good copy or flatten the unmanaged broker exposure.
 
 Rejected MLeg:

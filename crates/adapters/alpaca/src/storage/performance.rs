@@ -5,7 +5,7 @@ use serde_json::Value;
 use sqlx::{AssertSqlSafe, Row as _, types::Json};
 
 use crate::{
-    options_runtime::OptionsEngineConfig,
+    options_runtime::AlpacaOptionsRuntimeConfig,
     performance::{
         CandidateOutcomeSummary, EntryPerformance, PerformanceLedgerAppend,
         PerformanceLedgerSummary,
@@ -582,7 +582,7 @@ impl From<OutcomeStats> for crate::performance::CandidateOutcomeBucketSummary {
 }
 
 pub async fn summarize_performance_ledger_records(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     since: Option<chrono::NaiveDate>,
     until: Option<chrono::NaiveDate>,
 ) -> anyhow::Result<PerformanceLedgerSummary> {
@@ -595,7 +595,7 @@ pub async fn summarize_performance_ledger_records(
 }
 
 pub async fn summarize_candidate_outcomes_records(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     since: Option<chrono::NaiveDate>,
     until: Option<chrono::NaiveDate>,
 ) -> anyhow::Result<CandidateOutcomeSummary> {

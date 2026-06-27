@@ -23,8 +23,7 @@ use nautilus_alpaca::{
     storage::{STORAGE_SCHEMA_DEFAULT, StorageRepository, load_strategy_state_record},
 };
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub(crate) async fn run() -> anyhow::Result<()> {
     let database_url = env::var("ALPACA_STORAGE_DATABASE_URL")
         .map_err(|_| anyhow::anyhow!("ALPACA_STORAGE_DATABASE_URL is required"))?;
     let schema =

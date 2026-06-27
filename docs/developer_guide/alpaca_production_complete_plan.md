@@ -53,7 +53,7 @@ Completed foundation:
 
 Known gaps:
 
-- The `alpaca-options-engine` binary is now a thin entrypoint over library account-engine
+- The `alpaca-options-node` binary is now a thin entrypoint over library account-engine
   code, but the account engine still needs a clean strategy-hosting abstraction. Additional
   strategies should plug into one account engine rather than becoming separate account-owning
   runners.
@@ -143,12 +143,12 @@ Goal: run the first strategy fully inside Nautilus.
 Work:
 
 - Build a Nautilus-native put-credit strategy or strategy runner. (Initial
-  `alpaca-options-engine` Rust runner complete; it scans, applies broker/state admission,
+  `alpaca-options-node` Rust runner complete; it scans, applies broker/state admission,
   selects one entry, and can submit through the Alpaca `SubmitOrderList` execution path when
   explicitly enabled.)
 - Port scanner parameters for underlyings, DTE, width, delta, open interest, leg spread, minimum
   return-on-risk, and credit/debit-to-width floors. (Runner reads these from `ALPACA_CONFIG_PATH`,
-  defaulting to `~/.config/nautilus-trader/alpaca/options-engine.toml`; ranking favors centered DTE
+  defaulting to `~/.config/nautilus-trader/alpaca/options.toml`; ranking favors centered DTE
   and stronger minimum-leg open interest.)
 - Add account/position/open-order admission checks. (Runner uses the Alpaca adapter admission gate.)
 - Add deterministic sizing and daily duplicate-entry controls. (Runner uses TOML `index.quantity`
@@ -156,8 +156,8 @@ Work:
 - Build and submit Nautilus `SubmitOrderList` entries directly. (Submission is disabled by default;
   set TOML `runtime.submit = true` or emergency override `ALPACA_SUBMIT=true` for paper execution.)
 - Persist enough local strategy state to avoid duplicate submits after restart. (Default state path
-  is `$XDG_STATE_HOME/nautilus_trader/alpaca_options_engine_state.json` or
-  `$HOME/.local/state/nautilus_trader/alpaca_options_engine_state.json`.)
+  is `$XDG_STATE_HOME/nautilus_trader/alpaca_options_state.json` or
+  `$HOME/.local/state/nautilus_trader/alpaca_options_state.json`.)
 - Remove any dependency on `spreads` execution intents, workers, or Docker runtime.
 
 Exit criteria:
@@ -171,16 +171,16 @@ Runner commands:
 
 ```bash
 # Validate TOML/env config without scanning or submitting.
-cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- --check-config
+cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- --check-config
 
 # Dry-run scan, no order submission.
 ALPACA_IGNORE_ENTRY_WINDOW=true \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- SPY,QQQ,IWM
+  cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- SPY,QQQ,IWM
 
 # Paper submission path; use cancel-after-accept only for smoke testing.
 ALPACA_SUBMIT=true \
 ALPACA_CANCEL_AFTER_ACCEPT=true \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- SPY,QQQ,IWM
+  cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- SPY,QQQ,IWM
 ```
 
 Phase 7A call-credit mode:
@@ -188,8 +188,8 @@ Phase 7A call-credit mode:
 ```bash
 # Scan both index put-credit and index call-credit candidates; submission still disabled.
 ALPACA_IGNORE_ENTRY_WINDOW=true \
-ALPACA_STRATEGIES=both \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine -- SPY,QQQ,IWM
+ALPACA_STRATEGY_FAMILIES=both \
+  cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- SPY,QQQ,IWM
 ```
 
 Implementation note:
@@ -240,12 +240,12 @@ Management controls:
 ```bash
 # Evaluate management without broker actions.
 ALPACA_MANAGE=false \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine
+  cargo run -p nautilus-alpaca --features live --bin alpaca-options-node
 
 # Allow stale-order cancel and close submission when triggers fire.
 ALPACA_MANAGE=true \
 ALPACA_CLOSE=true \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-options-engine
+  cargo run -p nautilus-alpaca --features live --bin alpaca-options-node
 ```
 
 Key controls:
@@ -302,10 +302,10 @@ Goal: operate the engine without reading raw logs as the primary interface.
 Work:
 
 - Add CLI/status output for account, orders, positions, strategy state, last scan, last decision, and
-  last broker event. (Initial `alpaca-operator-status` binary complete with human and JSON output.)
+  last broker event. (Initial `alpaca-ops status` binary complete with human and JSON output.)
 - Add alerts for rejected orders, websocket disconnect, stale working orders, unmanaged positions,
   reconciliation mismatches, kill-switch activation, and service restart. (Initial alert summary is
-  implemented in `alpaca-operator-status`; websocket disconnect alerts consume structured disconnect
+  implemented in `alpaca-ops status`; websocket disconnect alerts consume structured disconnect
   events when the live engine emits them.)
 - Add structured event logs for strategy decisions and broker state transitions. (Runner emits
   structured `operator_event=` JSON for start, iteration, decision, and submit result events.)
@@ -337,8 +337,8 @@ Goal: turn the proven runner/deployment slice into a maintainable single account
 
 Work:
 
-- Build and install release binaries for `alpaca-options-engine` and
-  `alpaca-operator-status`; stop using `cargo run` from systemd and control scripts. (Complete:
+- Build and install release binaries for `alpaca-options-node` and
+  `alpaca-ops status`; stop using `cargo run` from systemd and control scripts. (Complete:
   installer builds release binaries and service/control scripts execute installed binaries.)
 - Move strategy state structs, atomic state persistence, operator-event emission, and credit-spread
   management helpers from the runner binary into reusable `src/` modules. (State schema,
@@ -366,10 +366,10 @@ Exit criteria:
 Current status:
 
 - Release binaries were built and installed on `ade-nucbox-k8-plus` on 2026-05-02.
-- `alpaca-options.service` was verified running `~/.local/bin/alpaca-options-engine`
+- `alpaca-options.service` was verified running `~/.local/bin/alpaca-options-node`
   instead of `cargo run`.
 - `alpaca-control.sh operator|health` was verified running
-  `~/.local/bin/alpaca-operator-status`.
+  `~/.local/bin/alpaca-ops status`.
 - Strategy state persistence is atomic and shared between runner and operator status through the
   `runtime` module.
 - Credit-spread close decisions are shared through the `management` module with direct unit tests.
@@ -383,17 +383,17 @@ strategies, not a one-off strategy runner.
 Work:
 
 - Split the remaining runner logic into library modules:
-  - `runtime/config.rs`: environment/config parsing and validation. (Initial options-engine config
+  - `runtime/config.rs`: environment/config parsing and validation. (Initial options-runtime config
     moved to `options_runtime`.)
   - `runtime/engine.rs`: account-engine loop, lifecycle, iteration cadence, shutdown behavior.
-    (Initial options-engine account-engine loop moved to `options_engine`.)
-  - `runtime/selection.rs`: scan, admission, and candidate selection. (Initial options-engine
+    (Initial options-runtime account-engine loop moved to `options_engine`.)
+  - `runtime/selection.rs`: scan, admission, and candidate selection. (Initial options-runtime
     selection moved to `options_runtime`.)
   - `runtime/broker.rs`: submit, cancel, lookup, and reconciliation helper orchestration. (Initial
-    options-engine submit/cancel/lookup orchestration moved to `options_engine`.)
+    options-runtime submit/cancel/lookup orchestration moved to `options_engine`.)
 - Define an account context that owns broker connectivity, account snapshots, orders, positions,
   strategy state, operator events, and account-level risk controls. (Initial
-  `AccountEngineContext` complete for hosted options-engine decisions.)
+  `AccountEngineContext` complete for hosted options-runtime decisions.)
 - Define a strategy runtime trait or equivalent interface so strategies produce decisions against
   the account context instead of directly owning broker I/O. (Initial `StrategyRuntime` trait
   complete.)
@@ -420,11 +420,11 @@ Exit criteria:
 
 Current status:
 
-- `OptionsEngineConfig` now lives in library code and owns environment parsing/validation for the
-  options-engine runtime.
-- Options opportunity discovery now lives in library code as `scan_options_opportunities`, which
-  returns an explicit opportunity set for hosted strategies to evaluate.
-- The installed `alpaca-options-engine` binary is now a thin Tokio entrypoint over
+- `AlpacaOptionsRuntimeConfig` now lives in library code and owns environment parsing/validation for the
+  options-runtime runtime.
+- Options opportunity discovery now lives in library code as `scan_options_candidates`, which
+  returns an explicit candidate set for hosted strategies to evaluate.
+- The installed `alpaca-options-node` binary is now a thin Tokio entrypoint over
   `options_engine::run_options_engine`.
 - The account-engine loop, management orchestration, and broker submit/cancel/lookup helpers now
   live in library code.
@@ -437,7 +437,7 @@ Current status:
 - Installed release binary was rebuilt and service health-checked after extraction on 2026-05-02.
 - Remaining Phase 6.6 work: paper-observe the extracted hosted engine during market hours.
 
-Status: engineering complete for options-engine account-engine hosting; market-hours paper proof
+Status: engineering complete for options-runtime account-engine hosting; market-hours paper proof
 remains.
 
 ## Phase 6.7: Multi-Account Foundation
@@ -478,7 +478,7 @@ policy blocks in operator status. This is not yet a full allocator.
 Migration order:
 
 1. `put_credit` (initial native runner complete)
-2. `call_credit` (Phase 7A scanner path complete through `ALPACA_STRATEGIES=call|both`)
+2. `call_credit` (Phase 7A scanner path complete through `ALPACA_STRATEGY_FAMILIES=call|both`)
 3. `call_debit` / `put_debit` for the directional paper account (hosted
    scanner, submit, state, and debit-spread close-management path complete; paper proof pending)
 4. `earnings_call_debit_entry` / `earnings_put_debit_entry` (debit-spread Alpaca MLeg order payload
@@ -538,7 +538,7 @@ Phase 7 blockers:
   skipped for the current scanner expansion.
 - Iron condors now have native candidate construction, four-leg Alpaca MLeg open/close payload
   builders, hosted account-engine selection, dry-run decision emission, persisted four-leg state,
-  four-leg close construction, and `runtime.dry_run_strategies` gating so iron condors can scan
+  four-leg close construction, and `runtime.dry_run_families` gating so iron condors can scan
   without submitting while other strategies submit. On 2026-05-03, a real Alpaca dry-run scan
   selected an SPY iron condor with submission disabled and the follow-up broker check showed zero
   positions and zero open orders. They still need management-rule review, submit-with-cancel paper
@@ -690,7 +690,7 @@ Rollout order:
 Pre-rollout gates:
 
 - Phase 6.5 is complete.
-- Phase 6.6 is complete for the options-engine account engine.
+- Phase 6.6 is complete for the options-runtime account engine.
 - Paper account starts clean: active account, zero unmanaged positions, zero open orders unless the
   test intentionally creates them.
 - Operator status reports `idle`, `blocked`, or `trading` accurately during the whole paper run and

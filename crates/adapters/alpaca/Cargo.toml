@@ -121,13 +121,6 @@ doc = false
 test = false
 
 [[bin]]
-name = "alpaca-options-engine"
-path = "bin/options_engine.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
 name = "alpaca-options-backtest"
 path = "bin/options_backtest.rs"
 required-features = ["live"]
@@ -142,8 +135,8 @@ doc = false
 test = false
 
 [[bin]]
-name = "alpaca-option-chain-scan-live-node"
-path = "bin/option_chain_scan_live_node.rs"
+name = "alpaca-options-node"
+path = "bin/options_node.rs"
 required-features = ["live"]
 doc = false
 test = false
@@ -156,13 +149,6 @@ doc = false
 test = false
 
 [[bin]]
-name = "alpaca-check-account-orders"
-path = "bin/check_account_orders.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
 name = "earnings-sync"
 path = "bin/earnings_sync.rs"
 required-features = ["live"]
@@ -170,36 +156,8 @@ doc = false
 test = false
 
 [[bin]]
-name = "alpaca-operator-status"
-path = "bin/operator_status.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
-name = "alpaca-fleet-status"
-path = "bin/fleet_status.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
-name = "alpaca-candidate-alerts"
-path = "bin/candidate_alerts.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
-name = "alpaca-performance-report"
-path = "bin/performance_report.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
-name = "alpaca-sync-strategy-state"
-path = "bin/sync_strategy_state.rs"
+name = "alpaca-ops"
+path = "bin/ops.rs"
 required-features = ["live"]
 doc = false
 test = false

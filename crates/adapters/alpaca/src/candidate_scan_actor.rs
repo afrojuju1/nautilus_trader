@@ -33,10 +33,10 @@ use crate::{
         SelectedDebitEntry, SelectedEntry, SelectedIronCondorEntry, SelectedNakedOptionEntry,
         SelectedOptionsEntry,
     },
-    options_entry_strategy::OptionsOpportunityData,
     options_runtime::{
-        OptionsEngineConfig, OptionsOpportunitySet, OptionsScanOutcome, OptionsScanReport,
+        AlpacaOptionsRuntimeConfig, OptionsCandidateSet, OptionsScanOutcome, OptionsScanReport,
     },
+    options_strategy::OptionsCandidateData,
     runtime::{
         credit_spread_strategy_name, debit_spread_strategy_name, emit_operator_event,
         naked_option_strategy_name,
@@ -45,7 +45,7 @@ use crate::{
 
 /// Read-only scan settings for candidate discovery from option-chain slices.
 #[derive(Clone, Debug, PartialEq)]
-pub struct OptionChainOpportunityScanConfig {
+pub struct OptionChainCandidateScanConfig {
     /// Enabled credit-spread kinds.
     pub spread_kinds: Vec<CreditSpreadKind>,
     /// Whether to scan iron-condor candidates.
@@ -74,7 +74,7 @@ pub struct OptionChainOpportunityScanConfig {
     pub trade_date_timezone: Tz,
 }
 
-impl Default for OptionChainOpportunityScanConfig {
+impl Default for OptionChainCandidateScanConfig {
     fn default() -> Self {
         Self {
             spread_kinds: vec![CreditSpreadKind::Put],
@@ -110,9 +110,9 @@ impl Default for OptionChainOpportunityScanConfig {
     }
 }
 
-/// Actor configuration for read-only option-chain opportunity scans.
+/// Actor configuration for read-only option-chain candidate scans.
 #[derive(Clone, Debug, PartialEq)]
-pub struct OptionChainOpportunityScanActorConfig {
+pub struct OptionChainCandidateScanActorConfig {
     /// Actor ID.
     pub actor_id: Option<ActorId>,
     /// Option series subscriptions.
@@ -126,10 +126,10 @@ pub struct OptionChainOpportunityScanActorConfig {
     /// Whether to request Alpaca option instruments before subscribing to option-chain slices.
     pub bootstrap_instruments: bool,
     /// Candidate scan settings.
-    pub scan: OptionChainOpportunityScanConfig,
+    pub scan: OptionChainCandidateScanConfig,
 }
 
-impl Default for OptionChainOpportunityScanActorConfig {
+impl Default for OptionChainCandidateScanActorConfig {
     fn default() -> Self {
         Self {
             actor_id: Some(ActorId::from("ALPACA-OPPORTUNITY-SCAN")),
@@ -141,27 +141,27 @@ impl Default for OptionChainOpportunityScanActorConfig {
             snapshot_interval_ms: Some(5_000),
             client_id: None,
             bootstrap_instruments: false,
-            scan: OptionChainOpportunityScanConfig::default(),
+            scan: OptionChainCandidateScanConfig::default(),
         }
     }
 }
 
 /// Read-only actor that ranks option-chain candidates and emits operator evidence.
 #[derive(Debug)]
-pub struct OptionChainOpportunityScanActor {
+pub struct OptionChainCandidateScanActor {
     core: DataActorCore,
-    config: OptionChainOpportunityScanActorConfig,
+    config: OptionChainCandidateScanActorConfig,
     candidate_ledger_persistence: Option<CandidateLedgerPersistenceHandle>,
     subscribed_series: BTreeSet<OptionSeriesId>,
-    latest_opportunities: Option<OptionsOpportunitySet>,
+    latest_candidates: Option<OptionsCandidateSet>,
 }
 
-nautilus_actor!(OptionChainOpportunityScanActor);
+nautilus_actor!(OptionChainCandidateScanActor);
 
-impl OptionChainOpportunityScanActor {
-    /// Creates a new read-only option-chain opportunity scan actor.
+impl OptionChainCandidateScanActor {
+    /// Creates a new read-only option-chain candidate scan actor.
     #[must_use]
-    pub fn new(config: OptionChainOpportunityScanActorConfig) -> Self {
+    pub fn new(config: OptionChainCandidateScanActorConfig) -> Self {
         let core = DataActorCore::new(DataActorConfig {
             actor_id: config.actor_id.clone(),
             ..Default::default()
@@ -171,7 +171,7 @@ impl OptionChainOpportunityScanActor {
             config,
             candidate_ledger_persistence: None,
             subscribed_series: BTreeSet::new(),
-            latest_opportunities: None,
+            latest_candidates: None,
         }
     }
 
@@ -185,10 +185,10 @@ impl OptionChainOpportunityScanActor {
         self
     }
 
-    /// Returns the most recent opportunity set produced by this actor.
+    /// Returns the most recent candidate set produced by this actor.
     #[must_use]
-    pub fn latest_opportunities(&self) -> Option<&OptionsOpportunitySet> {
-        self.latest_opportunities.as_ref()
+    pub fn latest_candidates(&self) -> Option<&OptionsCandidateSet> {
+        self.latest_candidates.as_ref()
     }
 
     fn subscribe_series(&mut self, series_id: OptionSeriesId) {
@@ -244,10 +244,10 @@ impl OptionChainOpportunityScanActor {
         Ok(())
     }
 
-    fn record_opportunity_evidence(
+    fn record_candidate_evidence(
         &self,
         trade_date: &str,
-        opportunities: &OptionsOpportunitySet,
+        candidates: &OptionsCandidateSet,
         scan_payload: Value,
     ) {
         let Some(persistence) = &self.candidate_ledger_persistence else {
@@ -259,9 +259,9 @@ impl OptionChainOpportunityScanActor {
 
         let candidate_limit = candidate_ledger_candidate_limit(
             self.config.scan.candidate_ledger_max_candidates,
-            opportunities.ranked_entries().len(),
+            candidates.ranked_entries().len(),
         );
-        for (index, entry) in opportunities
+        for (index, entry) in candidates
             .ranked_entries()
             .iter()
             .take(candidate_limit)
@@ -280,10 +280,10 @@ impl OptionChainOpportunityScanActor {
     }
 }
 
-impl DataActor for OptionChainOpportunityScanActor {
+impl DataActor for OptionChainCandidateScanActor {
     fn on_start(&mut self) -> anyhow::Result<()> {
         if self.config.series.is_empty() {
-            log::warn!("Option-chain opportunity scan actor has no series subscriptions");
+            log::warn!("Option-chain candidate scan actor has no series subscriptions");
             return Ok(());
         }
 
@@ -312,18 +312,15 @@ impl DataActor for OptionChainOpportunityScanActor {
 
     fn on_option_chain(&mut self, slice: &OptionChainSlice) -> anyhow::Result<()> {
         let trade_date = market_trade_date(self.config.scan.trade_date_timezone);
-        let opportunities = scan_option_chain_opportunities(slice, &self.config.scan, &trade_date);
-        let evidence_payload = opportunity_event_payload(slice, &opportunities);
-        emit_operator_event("option_chain_opportunity_scan", evidence_payload.clone());
-        self.record_opportunity_evidence(&trade_date, &opportunities, evidence_payload);
-        let data = OptionsOpportunityData::new(
-            opportunities.clone(),
-            slice.ts_event,
-            self.core.timestamp_ns(),
-        )
-        .into_custom_data();
+        let candidates = scan_option_chain_candidates(slice, &self.config.scan, &trade_date);
+        let evidence_payload = candidate_event_payload(slice, &candidates);
+        emit_operator_event("option_chain_candidate_scan", evidence_payload.clone());
+        self.record_candidate_evidence(&trade_date, &candidates, evidence_payload);
+        let data =
+            OptionsCandidateData::new(candidates.clone(), slice.ts_event, self.core.timestamp_ns())
+                .into_custom_data();
         self.publish_data(&data.data_type, &data);
-        self.latest_opportunities = Some(opportunities);
+        self.latest_candidates = Some(candidates);
         Ok(())
     }
 
@@ -338,11 +335,11 @@ impl DataActor for OptionChainOpportunityScanActor {
 
 /// Builds read-only option-chain scanner settings from the Alpaca options runtime config.
 #[must_use]
-pub fn option_chain_scan_config_from_engine(
-    config: &OptionsEngineConfig,
+pub fn candidate_scan_config_from_runtime(
+    config: &AlpacaOptionsRuntimeConfig,
     options_buying_power: Option<f64>,
-) -> OptionChainOpportunityScanConfig {
-    OptionChainOpportunityScanConfig {
+) -> OptionChainCandidateScanConfig {
+    OptionChainCandidateScanConfig {
         spread_kinds: config.spread_kinds.clone(),
         iron_condor_enabled: config.iron_condor_enabled,
         debit_kinds: config.debit_kinds.clone(),
@@ -367,22 +364,22 @@ fn candidate_ledger_candidate_limit(max_candidates: usize, candidate_count: usiz
     }
 }
 
-/// Discovers ranked option opportunities from one Nautilus option-chain slice.
+/// Discovers ranked option candidates from one Nautilus option-chain slice.
 #[must_use]
-pub fn scan_option_chain_opportunities(
+pub fn scan_option_chain_candidates(
     slice: &OptionChainSlice,
-    config: &OptionChainOpportunityScanConfig,
+    config: &OptionChainCandidateScanConfig,
     trade_date: &str,
-) -> OptionsOpportunitySet {
+) -> OptionsCandidateSet {
     let input = option_chain_candidate_input(slice);
     let scan_date = scan_date_from_timestamp(slice.ts_event);
-    let mut opportunities = OptionsOpportunitySet::new(trade_date);
+    let mut candidates = OptionsCandidateSet::new(trade_date);
 
     for kind in &config.spread_kinds {
         let result =
             scan_credit_spread_option_chain(&input, &config.credit_scanner, *kind, scan_date);
         let strategy_name = credit_spread_strategy_name(*kind);
-        opportunities.push_scan(OptionsScanReport::new(
+        candidates.push_scan(OptionsScanReport::new(
             &input.underlying,
             strategy_name,
             result.candidates.len(),
@@ -392,7 +389,7 @@ pub fn scan_option_chain_opportunities(
             result.rejection_counts.clone(),
         ));
         if let Some(best) = result.candidates.first() {
-            opportunities.consider_candidate(SelectedOptionsEntry::Credit(SelectedEntry {
+            candidates.consider_candidate(SelectedOptionsEntry::Credit(SelectedEntry {
                 underlying: input.underlying.clone(),
                 kind: *kind,
                 candidate: best.clone(),
@@ -402,7 +399,7 @@ pub fn scan_option_chain_opportunities(
 
     if config.iron_condor_enabled {
         let result = scan_iron_condor_option_chain(&input, &config.iron_condor_scanner, scan_date);
-        opportunities.push_scan(OptionsScanReport::new(
+        candidates.push_scan(OptionsScanReport::new(
             &input.underlying,
             "iron_condor",
             result.candidates.len(),
@@ -412,7 +409,7 @@ pub fn scan_option_chain_opportunities(
             result.rejection_counts.clone(),
         ));
         if let Some(best) = result.candidates.first() {
-            opportunities.consider_candidate(SelectedOptionsEntry::IronCondor(
+            candidates.consider_candidate(SelectedOptionsEntry::IronCondor(
                 SelectedIronCondorEntry {
                     underlying: input.underlying.clone(),
                     candidate: best.clone(),
@@ -425,7 +422,7 @@ pub fn scan_option_chain_opportunities(
         let result =
             scan_debit_spread_option_chain(&input, &config.debit_scanner, *kind, scan_date);
         let strategy_name = debit_spread_strategy_name(*kind);
-        opportunities.push_scan(OptionsScanReport::new(
+        candidates.push_scan(OptionsScanReport::new(
             &input.underlying,
             strategy_name,
             result.candidates.len(),
@@ -435,7 +432,7 @@ pub fn scan_option_chain_opportunities(
             result.rejection_counts.clone(),
         ));
         if let Some(best) = result.candidates.first() {
-            opportunities.consider_candidate(SelectedOptionsEntry::Debit(SelectedDebitEntry {
+            candidates.consider_candidate(SelectedOptionsEntry::Debit(SelectedDebitEntry {
                 underlying: input.underlying.clone(),
                 kind: *kind,
                 candidate: best.clone(),
@@ -455,7 +452,7 @@ pub fn scan_option_chain_opportunities(
             scan_date,
         );
         let strategy_name = naked_option_strategy_name(*kind);
-        opportunities.push_scan(OptionsScanReport::new(
+        candidates.push_scan(OptionsScanReport::new(
             &input.underlying,
             strategy_name,
             result.candidates.len(),
@@ -465,7 +462,7 @@ pub fn scan_option_chain_opportunities(
             result.rejection_counts.clone(),
         ));
         if let Some(best) = result.candidates.first() {
-            opportunities.consider_candidate(SelectedOptionsEntry::NakedOption(
+            candidates.consider_candidate(SelectedOptionsEntry::NakedOption(
                 SelectedNakedOptionEntry {
                     underlying: input.underlying.clone(),
                     kind: *kind,
@@ -475,11 +472,11 @@ pub fn scan_option_chain_opportunities(
         }
     }
 
-    opportunities
+    candidates
 }
 
 fn naked_scanner_for(
-    config: &OptionChainOpportunityScanConfig,
+    config: &OptionChainCandidateScanConfig,
     kind: NakedOptionKind,
 ) -> &NakedOptionScannerConfig {
     if kind.is_one_to_three_dte() {
@@ -489,23 +486,20 @@ fn naked_scanner_for(
     }
 }
 
-fn opportunity_event_payload(
-    slice: &OptionChainSlice,
-    opportunities: &OptionsOpportunitySet,
-) -> Value {
+fn candidate_event_payload(slice: &OptionChainSlice, candidates: &OptionsCandidateSet) -> Value {
     let input = option_chain_candidate_input(slice);
     json!({
         "source": "option_chain",
         "series_id": slice.series_id.to_string(),
         "underlying": input.underlying,
-        "trade_date": opportunities.trade_date,
+        "trade_date": candidates.trade_date,
         "expiration_date": input.expiration_date,
         "underlying_price": input.underlying_price,
         "call_contracts": input.calls.contract_count(),
         "put_contracts": input.puts.contract_count(),
-        "scans": opportunities.scans.iter().map(scan_report_payload).collect::<Vec<_>>(),
-        "ranked_entries": opportunities.ranked_entries().len(),
-        "selected": opportunities.selected_entry().map(selected_entry_payload),
+        "scans": candidates.scans.iter().map(scan_report_payload).collect::<Vec<_>>(),
+        "ranked_entries": candidates.ranked_entries().len(),
+        "selected": candidates.selected_entry().map(selected_entry_payload),
     })
 }
 

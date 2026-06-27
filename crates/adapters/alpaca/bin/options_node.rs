@@ -5,17 +5,17 @@ use std::{env, sync::Arc, time::Duration};
 use anyhow::{Context, bail};
 use nautilus_alpaca::{
     candidate_ledger_persistence::CandidateLedgerPersistenceHandle,
+    candidate_scan_actor::{
+        OptionChainCandidateScanActor, OptionChainCandidateScanActorConfig,
+        candidate_scan_config_from_runtime,
+    },
     common::consts::ALPACA_CLIENT_ID,
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
     execution::account_entry_admission_reasons,
     factories::{AlpacaDataClientFactory, AlpacaExecutionClientFactory},
     http::{client::AlpacaHttpClient, models::AlpacaAccount},
-    opportunity_scan_actor::{
-        OptionChainOpportunityScanActor, OptionChainOpportunityScanActorConfig,
-        option_chain_scan_config_from_engine,
-    },
-    options_entry_strategy::{AlpacaOptionsEntryStrategy, AlpacaOptionsEntryStrategyConfig},
-    options_runtime::OptionsEngineConfig,
+    options_runtime::AlpacaOptionsRuntimeConfig,
+    options_strategy::{AlpacaOptionsStrategy, AlpacaOptionsStrategyConfig},
     parse::parse_option_series_id,
     runtime::{StrategyState, emit_operator_event},
     state_persistence::{StrategyStatePersistenceHandle, start_runtime_lease_heartbeat},
@@ -108,11 +108,15 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     nautilus_common::logging::ensure_logging_initialized();
 
-    let runtime_config = OptionsEngineConfig::from_runtime_env()?;
+    let runtime_config = AlpacaOptionsRuntimeConfig::from_runtime_env()?;
+    if env::args().skip(1).any(|arg| arg == "--check-config") {
+        print_config_check(&runtime_config);
+        return Ok(());
+    }
     let args = Args::from_env(&runtime_config)?;
     let live_submit_requested = runtime_config.submit_enabled;
     let runtime_config = if live_submit_requested {
-        OptionsEngineConfig::from_runtime_env_with_storage()
+        AlpacaOptionsRuntimeConfig::from_runtime_env_with_storage()
             .await
             .context("live submit requires Alpaca Postgres storage readiness")?
     } else {
@@ -128,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
     let options_buying_power = load_options_buying_power_if_needed(&runtime_config, &data_config)
         .await
         .context("failed to load options buying-power context")?;
-    let scan_config = option_chain_scan_config_from_engine(&runtime_config, options_buying_power);
+    let scan_config = candidate_scan_config_from_runtime(&runtime_config, options_buying_power);
     let mut strategy_state = runtime_config
         .load_strategy_state()
         .await
@@ -156,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
         series_id,
         args.snapshot_interval_ms,
         args.max_runtime_secs,
-        runtime_config.enabled_strategy_names(),
+        runtime_config.enabled_strategy_family_names(),
         runtime_config.submit_enabled,
         live_submit_requested,
         strategy_state_entry_count,
@@ -181,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
         .with_delay_post_stop_secs(5)
         .build()?;
 
-    let mut actor = OptionChainOpportunityScanActor::new(OptionChainOpportunityScanActorConfig {
+    let mut actor = OptionChainCandidateScanActor::new(OptionChainCandidateScanActorConfig {
         actor_id: Some(args.actor_id),
         series: vec![series_id],
         strike_range: args.strike_range,
@@ -201,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let mut entry_config =
-        AlpacaOptionsEntryStrategyConfig::from_engine_config(strategy_config, &runtime_config);
+        AlpacaOptionsStrategyConfig::from_runtime_config(strategy_config, &runtime_config);
     entry_config.admission.account_admission_reasons = startup_account_admission_reasons;
     entry_config.initial_state = strategy_state;
     entry_config.state_persistence = live_submit_persistence
@@ -210,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
     entry_config.candidate_ledger_persistence = live_submit_persistence
         .as_ref()
         .map(|persistence| persistence.candidate_ledger.clone());
-    let strategy = AlpacaOptionsEntryStrategy::new(entry_config);
+    let strategy = AlpacaOptionsStrategy::new(entry_config);
     node.add_strategy(strategy)?;
 
     if let Some(max_runtime_secs) = args.max_runtime_secs {
@@ -231,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn prepare_state_persistence(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     args: &Args,
 ) -> anyhow::Result<LiveSubmitPersistence> {
     let storage = config
@@ -314,7 +318,7 @@ async fn prepare_state_persistence(
 }
 
 async fn prepare_live_submit_broker_state(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     data_config: &AlpacaDataClientConfig,
     strategy_state: &mut StrategyState,
 ) -> anyhow::Result<Vec<String>> {
@@ -377,7 +381,7 @@ fn emit_unmanaged_broker_state_block(report: &StrategyStateReconciliationReport)
 }
 
 impl Args {
-    fn from_env(config: &OptionsEngineConfig) -> anyhow::Result<Self> {
+    fn from_env(config: &AlpacaOptionsRuntimeConfig) -> anyhow::Result<Self> {
         let mut values = Vec::new();
         for arg in env::args().skip(1) {
             match arg.as_str() {
@@ -518,7 +522,7 @@ fn optional_raw_env(name: &str) -> Option<String> {
 }
 
 async fn load_options_buying_power_if_needed(
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
     data_config: &AlpacaDataClientConfig,
 ) -> anyhow::Result<Option<f64>> {
     if let Some(value) = optional_f64_env("ALPACA_OPTION_CHAIN_OPTIONS_BUYING_POWER")? {
@@ -552,8 +556,49 @@ fn split_values(raw: String) -> Vec<String> {
 
 fn print_usage() {
     println!(
-        "usage: alpaca-option-chain-scan-live-node UNDERLYING EXPIRY\n\
+        "usage: alpaca-options-node [--check-config] [UNDERLYING EXPIRY]\n\
          example: ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS=60 \
-         alpaca-option-chain-scan-live-node SPY 2026-07-02"
+         alpaca-options-node SPY 2026-07-02"
     );
+}
+
+fn print_config_check(config: &AlpacaOptionsRuntimeConfig) {
+    println!(
+        "alpaca_options_runtime_config: underlyings={} strategy_families={} dry_run_families={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_max_candidates={}",
+        config.underlyings.join(","),
+        config.enabled_strategy_family_names().join(","),
+        config.dry_run_strategy_family_names().join(","),
+        config.submit_enabled,
+        config.manage_enabled,
+        config.close_enabled,
+        config.kill_switch,
+        config.quantity,
+        format_limit(config.max_active_entries),
+        format_limit(config.max_daily_submits),
+        format_limit(config.max_open_orders),
+        format_limit(config.max_active_entries_per_underlying),
+        format_limit(config.max_active_entries_per_sector),
+        config.fleet_account_id.as_deref().unwrap_or("none"),
+        if config.fleet_policy_blocks.is_empty() {
+            "none".to_string()
+        } else {
+            config.fleet_policy_blocks.join(",")
+        },
+        config.stale_close_secs,
+        config.close_regular_hours_only,
+        config.close_start,
+        config.close_end,
+        config.close_price_cushion,
+        config.max_close_attempts,
+        config.close_reprice_cooldown_secs,
+        config.max_iterations,
+        config.interval_secs,
+        config.state_path.display(),
+        config.candidate_ledger_enabled,
+        config.candidate_ledger_max_candidates,
+    );
+}
+
+fn format_limit(limit: Option<usize>) -> String {
+    limit.map_or_else(|| "unlimited".to_string(), |value| value.to_string())
 }

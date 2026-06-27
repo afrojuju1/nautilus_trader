@@ -9,6 +9,7 @@ use anyhow::{Context, bail};
 use chrono::{NaiveDate, Utc};
 use nautilus_alpaca::{
     candidate_engine::{CreditSpreadKind, NakedOptionCapitalContext, NakedOptionKind},
+    candidate_scan_actor::{candidate_scan_config_from_runtime, scan_option_chain_candidates},
     config::AlpacaDataClientConfig,
     http::{
         client::AlpacaHttpClient,
@@ -17,11 +18,8 @@ use nautilus_alpaca::{
             AlpacaOptionType, OptionSnapshotsRequest, StockSnapshotsRequest,
         },
     },
-    opportunity_scan_actor::{
-        option_chain_scan_config_from_engine, scan_option_chain_opportunities,
-    },
     options_runtime::{
-        OptionsEngineConfig, OptionsOpportunitySet, OptionsScanOutcome, OptionsScanReport,
+        AlpacaOptionsRuntimeConfig, OptionsCandidateSet, OptionsScanOutcome, OptionsScanReport,
         SelectedDebitEntry, SelectedEntry, SelectedIronCondorEntry, SelectedNakedOptionEntry,
         SelectedOptionsEntry,
     },
@@ -65,7 +63,7 @@ struct RestOptionChainSnapshot {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = OptionsEngineConfig::from_runtime_env()?;
+    let config = AlpacaOptionsRuntimeConfig::from_runtime_env()?;
     let args = Args::from_env(&config)?;
     let data_config = AlpacaDataClientConfig::default();
     let client = AlpacaHttpClient::from_data_config(&data_config)?;
@@ -80,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
     let underlying_price = load_underlying_price(&client, &data_config, &args.underlying).await?;
     let options_buying_power = load_options_buying_power_if_needed(&client, &config).await?;
 
-    let rest = rest_scan_opportunities(
+    let rest = rest_scan_candidates(
         &config,
         &chain,
         &args.underlying,
@@ -91,9 +89,9 @@ async fn main() -> anyhow::Result<()> {
     );
     let option_chain_slice =
         option_chain_slice_from_rest(&chain, &args.underlying, args.expiry, underlying_price, ts)?;
-    let option_chain_config = option_chain_scan_config_from_engine(&config, options_buying_power);
+    let option_chain_config = candidate_scan_config_from_runtime(&config, options_buying_power);
     let option_chain =
-        scan_option_chain_opportunities(&option_chain_slice, &option_chain_config, &trade_date);
+        scan_option_chain_candidates(&option_chain_slice, &option_chain_config, &trade_date);
 
     let report = json!({
         "type": "alpaca_option_chain_scan_comparison",
@@ -103,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
         "scan_date": scan_date.to_string(),
         "option_feed": data_config.option_feed.as_str(),
         "stock_feed": data_config.stock_feed.as_str(),
-        "enabled_strategies": config.enabled_strategy_names(),
+        "enabled_strategies": config.enabled_strategy_family_names(),
         "inputs": {
             "rest_call_contracts": chain.call_contracts.len(),
             "rest_call_snapshots": chain.call_snapshots.len(),
@@ -116,8 +114,8 @@ async fn main() -> anyhow::Result<()> {
             "underlying_price": underlying_price,
             "options_buying_power": options_buying_power,
         },
-        "rest": opportunity_payload(&rest),
-        "option_chain": opportunity_payload(&option_chain),
+        "rest": candidate_payload(&rest),
+        "option_chain": candidate_payload(&option_chain),
         "comparison": comparison_payload(&rest, &option_chain),
     });
 
@@ -131,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 impl Args {
-    fn from_env(config: &OptionsEngineConfig) -> anyhow::Result<Self> {
+    fn from_env(config: &AlpacaOptionsRuntimeConfig) -> anyhow::Result<Self> {
         let mut pretty = false;
         let mut values = Vec::new();
         for arg in env::args().skip(1) {
@@ -267,7 +265,7 @@ async fn load_underlying_price(
 
 async fn load_options_buying_power_if_needed(
     client: &AlpacaHttpClient,
-    config: &OptionsEngineConfig,
+    config: &AlpacaOptionsRuntimeConfig,
 ) -> anyhow::Result<Option<f64>> {
     if config.naked_kinds.is_empty() {
         return Ok(None);
@@ -286,16 +284,16 @@ fn account_options_buying_power(account: &AlpacaAccount) -> Option<f64> {
         .filter(|value| value.is_finite() && *value > 0.0)
 }
 
-fn rest_scan_opportunities(
-    config: &OptionsEngineConfig,
+fn rest_scan_candidates(
+    config: &AlpacaOptionsRuntimeConfig,
     chain: &RestOptionChainSnapshot,
     underlying: &str,
     scan_date: NaiveDate,
     underlying_price: f64,
     options_buying_power: Option<f64>,
     trade_date: &str,
-) -> OptionsOpportunitySet {
-    let mut opportunities = OptionsOpportunitySet::new(trade_date);
+) -> OptionsCandidateSet {
+    let mut candidates = OptionsCandidateSet::new(trade_date);
 
     for kind in &config.spread_kinds {
         let (contracts, snapshots) = credit_side(chain, *kind);
@@ -307,7 +305,7 @@ fn rest_scan_opportunities(
             *kind,
             scan_date,
         );
-        opportunities.push_scan(scan_report(
+        candidates.push_scan(scan_report(
             underlying,
             credit_spread_strategy_name(*kind),
             result.candidates.len(),
@@ -317,7 +315,7 @@ fn rest_scan_opportunities(
             result.rejection_counts.clone(),
         ));
         if let Some(best) = result.candidates.first() {
-            opportunities.consider_candidate(SelectedOptionsEntry::Credit(SelectedEntry {
+            candidates.consider_candidate(SelectedOptionsEntry::Credit(SelectedEntry {
                 underlying: underlying.to_string(),
                 kind: *kind,
                 candidate: best.clone(),
@@ -335,7 +333,7 @@ fn rest_scan_opportunities(
             &config.iron_condor_scanner,
             scan_date,
         );
-        opportunities.push_scan(scan_report(
+        candidates.push_scan(scan_report(
             underlying,
             "iron_condor",
             result.candidates.len(),
@@ -345,7 +343,7 @@ fn rest_scan_opportunities(
             result.rejection_counts.clone(),
         ));
         if let Some(best) = result.candidates.first() {
-            opportunities.consider_candidate(SelectedOptionsEntry::IronCondor(
+            candidates.consider_candidate(SelectedOptionsEntry::IronCondor(
                 SelectedIronCondorEntry {
                     underlying: underlying.to_string(),
                     candidate: best.clone(),
@@ -364,7 +362,7 @@ fn rest_scan_opportunities(
             *kind,
             scan_date,
         );
-        opportunities.push_scan(scan_report(
+        candidates.push_scan(scan_report(
             underlying,
             debit_spread_strategy_name(*kind),
             result.candidates.len(),
@@ -374,7 +372,7 @@ fn rest_scan_opportunities(
             result.rejection_counts.clone(),
         ));
         if let Some(best) = result.candidates.first() {
-            opportunities.consider_candidate(SelectedOptionsEntry::Debit(SelectedDebitEntry {
+            candidates.consider_candidate(SelectedOptionsEntry::Debit(SelectedDebitEntry {
                 underlying: underlying.to_string(),
                 kind: *kind,
                 candidate: best.clone(),
@@ -397,7 +395,7 @@ fn rest_scan_opportunities(
             }),
             scan_date,
         );
-        opportunities.push_scan(scan_report(
+        candidates.push_scan(scan_report(
             underlying,
             naked_option_strategy_name(*kind),
             result.candidates.len(),
@@ -407,7 +405,7 @@ fn rest_scan_opportunities(
             result.rejection_counts.clone(),
         ));
         if let Some(best) = result.candidates.first() {
-            opportunities.consider_candidate(SelectedOptionsEntry::NakedOption(
+            candidates.consider_candidate(SelectedOptionsEntry::NakedOption(
                 SelectedNakedOptionEntry {
                     underlying: underlying.to_string(),
                     kind: *kind,
@@ -417,7 +415,7 @@ fn rest_scan_opportunities(
         }
     }
 
-    opportunities
+    candidates
 }
 
 fn credit_side(
@@ -655,12 +653,12 @@ fn nearest_strike(slice: &OptionChainSlice, underlying_price: f64) -> Option<Pri
     })
 }
 
-fn opportunity_payload(opportunities: &OptionsOpportunitySet) -> Value {
+fn candidate_payload(candidates: &OptionsCandidateSet) -> Value {
     json!({
-        "trade_date": opportunities.trade_date,
-        "scans": opportunities.scans.iter().map(scan_payload).collect::<Vec<_>>(),
-        "ranked_entries": opportunities.ranked_entries().iter().map(selected_payload).collect::<Vec<_>>(),
-        "selected": opportunities.selected_entry().map(selected_payload),
+        "trade_date": candidates.trade_date,
+        "scans": candidates.scans.iter().map(scan_payload).collect::<Vec<_>>(),
+        "ranked_entries": candidates.ranked_entries().iter().map(selected_payload).collect::<Vec<_>>(),
+        "selected": candidates.selected_entry().map(selected_payload),
     })
 }
 
@@ -701,7 +699,7 @@ fn selected_payload(entry: &SelectedOptionsEntry) -> Value {
     })
 }
 
-fn comparison_payload(rest: &OptionsOpportunitySet, option_chain: &OptionsOpportunitySet) -> Value {
+fn comparison_payload(rest: &OptionsCandidateSet, option_chain: &OptionsCandidateSet) -> Value {
     let scan_mismatches = scan_mismatches(rest, option_chain);
     let rest_selected = rest.selected_entry().map(selected_key);
     let option_chain_selected = option_chain.selected_entry().map(selected_key);
@@ -720,10 +718,7 @@ fn comparison_payload(rest: &OptionsOpportunitySet, option_chain: &OptionsOpport
     })
 }
 
-fn scan_mismatches(
-    rest: &OptionsOpportunitySet,
-    option_chain: &OptionsOpportunitySet,
-) -> Vec<Value> {
+fn scan_mismatches(rest: &OptionsCandidateSet, option_chain: &OptionsCandidateSet) -> Vec<Value> {
     let rest_scans = rest
         .scans
         .iter()

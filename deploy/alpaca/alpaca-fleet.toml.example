@@ -4,7 +4,7 @@
 # account env file and are never stored here.
 
 [fleet]
-operator_bin = "/home/ade/.local/bin/alpaca-operator-status"
+operator_bin = "/home/ade/.local/bin/alpaca-ops"
 kill_switch = false
 max_active_entries = 18
 max_active_entries_per_underlying = 2
@@ -39,11 +39,11 @@ id = "paper-main"
 role = "defined_risk_short_premium"
 enabled = true
 service = "alpaca-options.service"
-env_file = "/home/ade/.config/nautilus-trader/alpaca/options-engine.env"
-config_file = "/home/ade/.config/nautilus-trader/alpaca/options-engine.toml"
+env_file = "/home/ade/.config/nautilus-trader/alpaca/options.env"
+config_file = "/home/ade/.config/nautilus-trader/alpaca/options.toml"
 log_dir = "/home/ade/.local/state/nautilus_trader/logs"
 lock_dir = "/home/ade/.local/state/nautilus_trader/locks"
-state_path = "/home/ade/.local/state/nautilus_trader/alpaca_options_engine_state.json"
+state_path = "/home/ade/.local/state/nautilus_trader/alpaca_options_state.json"
 
 [accounts.permissions]
 defined_risk = true
@@ -63,7 +63,7 @@ role = "defined_risk_watchlist"
 enabled = true
 service = "alpaca-options@paper-directional.service"
 env_file = "/home/ade/.config/nautilus-trader/alpaca/accounts/paper-directional.env"
-config_file = "/home/ade/.config/nautilus-trader/alpaca/configs/paper-directional-options-engine.toml"
+config_file = "/home/ade/.config/nautilus-trader/alpaca/configs/paper-directional-options.toml"
 log_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-directional/logs"
 lock_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-directional/locks"
 state_path = "/home/ade/.local/state/nautilus_trader/alpaca/paper-directional/strategy_state.json"
@@ -86,7 +86,7 @@ role = "defined_risk_put_credit_spy"
 enabled = true
 service = "alpaca-options@paper-put-credit-spy.service"
 env_file = "/home/ade/.config/nautilus-trader/alpaca/accounts/paper-put-credit-spy.env"
-config_file = "/home/ade/.config/nautilus-trader/alpaca/configs/paper-put-credit-spy-options-engine.toml"
+config_file = "/home/ade/.config/nautilus-trader/alpaca/configs/paper-put-credit-spy-options.toml"
 log_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-put-credit-spy/logs"
 lock_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-put-credit-spy/locks"
 state_path = "/home/ade/.local/state/nautilus_trader/alpaca/paper-put-credit-spy/strategy_state.json"
@@ -109,7 +109,7 @@ role = "defined_risk_call_credit_qqq"
 enabled = true
 service = "alpaca-options@paper-call-credit-qqq.service"
 env_file = "/home/ade/.config/nautilus-trader/alpaca/accounts/paper-call-credit-qqq.env"
-config_file = "/home/ade/.config/nautilus-trader/alpaca/configs/paper-call-credit-qqq-options-engine.toml"
+config_file = "/home/ade/.config/nautilus-trader/alpaca/configs/paper-call-credit-qqq-options.toml"
 log_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-call-credit-qqq/logs"
 lock_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-call-credit-qqq/locks"
 state_path = "/home/ade/.local/state/nautilus_trader/alpaca/paper-call-credit-qqq/strategy_state.json"
@@ -132,7 +132,7 @@ role = "undefined_risk_short_premium"
 enabled = true
 service = "alpaca-options@paper-undefined-risk.service"
 env_file = "/home/ade/.config/nautilus-trader/alpaca/accounts/paper-undefined-risk.env"
-config_file = "/home/ade/.config/nautilus-trader/alpaca/configs/paper-undefined-risk-options-engine.toml"
+config_file = "/home/ade/.config/nautilus-trader/alpaca/configs/paper-undefined-risk-options.toml"
 log_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-undefined-risk/logs"
 lock_dir = "/home/ade/.local/state/nautilus_trader/alpaca/paper-undefined-risk/locks"
 state_path = "/home/ade/.local/state/nautilus_trader/alpaca/paper-undefined-risk/strategy_state.json"

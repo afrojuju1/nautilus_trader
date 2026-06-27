@@ -90,8 +90,7 @@ enum AccountStatusKind {
     OperatorError,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub(crate) async fn run() -> anyhow::Result<()> {
     let args = Args::parse()?;
     let registry_path = args.registry_path();
     let fleet = load_fleet_config(&registry_path)?;
@@ -139,7 +138,7 @@ impl Args {
         let mut json_output = false;
         let mut include_disabled = false;
         let mut registry = None;
-        let mut args = env::args().skip(1);
+        let mut args = crate::ops_args().into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--json" => json_output = true,
@@ -152,7 +151,7 @@ impl Args {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: alpaca-fleet-status [--json] [--include-disabled] [--registry PATH]"
+                        "usage: alpaca-ops fleet [--json] [--include-disabled] [--registry PATH]"
                     );
                     std::process::exit(0);
                 }
@@ -227,6 +226,7 @@ fn check_account(
         );
     }
     command
+        .arg("status")
         .arg("--json")
         .env("NAUTILUS_ALPACA_SERVICE", &account.service);
     if let Some(config_file) = &config_file {
@@ -454,12 +454,9 @@ fn nested_usize(value: Option<&Value>, path: &[&str]) -> Option<usize> {
 fn default_operator_bin() -> PathBuf {
     env::current_exe()
         .ok()
-        .and_then(|path| {
-            path.parent()
-                .map(|parent| parent.join("alpaca-operator-status"))
-        })
+        .and_then(|path| path.parent().map(|parent| parent.join("alpaca-ops")))
         .filter(|path| path.exists())
-        .unwrap_or_else(|| home_dir().join(".local/bin/alpaca-operator-status"))
+        .unwrap_or_else(|| home_dir().join(".local/bin/alpaca-ops"))
 }
 
 fn home_dir() -> PathBuf {

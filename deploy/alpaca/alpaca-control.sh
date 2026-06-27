@@ -6,17 +6,17 @@ STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 ALPACA_CONFIG_HOME="${NAUTILUS_ALPACA_CONFIG_HOME:-$CONFIG_HOME/nautilus-trader/alpaca}"
 ALPACA_STATE_HOME="${NAUTILUS_ALPACA_STATE_HOME:-$STATE_HOME/nautilus_trader/alpaca}"
 DEFAULT_ACCOUNT="${NAUTILUS_ALPACA_DEFAULT_ACCOUNT:-paper-main}"
-DEFAULT_ENV_FILE="${NAUTILUS_ALPACA_DEFAULT_ENV_FILE:-$ALPACA_CONFIG_HOME/options-engine.env}"
+DEFAULT_ENV_FILE="${NAUTILUS_ALPACA_DEFAULT_ENV_FILE:-$ALPACA_CONFIG_HOME/options.env}"
 ACCOUNT_ENV_DIR="${NAUTILUS_ALPACA_ACCOUNT_ENV_DIR:-$ALPACA_CONFIG_HOME/accounts}"
 ACCOUNT_CONFIG_DIR="${NAUTILUS_ALPACA_ACCOUNT_CONFIG_DIR:-$ALPACA_CONFIG_HOME/configs}"
 REPO="${NAUTILUS_ALPACA_REPO:-$HOME/Projects/nautilus_trader}"
-ENGINE_BIN="${NAUTILUS_ALPACA_RUNNER_BIN:-$HOME/.local/bin/alpaca-option-chain-scan-live-node}"
-OPERATOR_BIN="${NAUTILUS_ALPACA_OPERATOR_BIN:-$HOME/.local/bin/alpaca-operator-status}"
-FLEET_BIN="${NAUTILUS_ALPACA_FLEET_BIN:-$HOME/.local/bin/alpaca-fleet-status}"
-OPTION_CHAIN_LIVE_BIN="${NAUTILUS_ALPACA_OPTION_CHAIN_LIVE_BIN:-$HOME/.local/bin/alpaca-option-chain-scan-live-node}"
+ENGINE_BIN="${NAUTILUS_ALPACA_RUNNER_BIN:-$HOME/.local/bin/alpaca-options-node}"
+OPERATOR_BIN="${NAUTILUS_ALPACA_OPERATOR_BIN:-$HOME/.local/bin/alpaca-ops}"
+FLEET_BIN="${NAUTILUS_ALPACA_FLEET_BIN:-$HOME/.local/bin/alpaca-ops}"
+OPTION_CHAIN_LIVE_BIN="${NAUTILUS_ALPACA_OPTION_CHAIN_LIVE_BIN:-$HOME/.local/bin/alpaca-options-node}"
 COMPARE_SCAN_BIN="${NAUTILUS_ALPACA_COMPARE_SCAN_BIN:-$HOME/.local/bin/alpaca-compare-option-chain-scan}"
-CANDIDATE_ALERTS_BIN="${NAUTILUS_ALPACA_CANDIDATE_ALERTS_BIN:-$HOME/.local/bin/alpaca-candidate-alerts}"
-PERFORMANCE_BIN="${NAUTILUS_ALPACA_PERFORMANCE_BIN:-$HOME/.local/bin/alpaca-performance-report}"
+CANDIDATE_ALERTS_BIN="${NAUTILUS_ALPACA_CANDIDATE_ALERTS_BIN:-$HOME/.local/bin/alpaca-ops}"
+PERFORMANCE_BIN="${NAUTILUS_ALPACA_PERFORMANCE_BIN:-$HOME/.local/bin/alpaca-ops}"
 ALERTS_ENV_FILE="${NAUTILUS_ALPACA_ALERTS_ENV_FILE:-$ALPACA_CONFIG_HOME/alerts.env}"
 FLEET_CONFIG_FILE="${NAUTILUS_ALPACA_FLEET_CONFIG:-$ALPACA_CONFIG_HOME/fleet.toml}"
 PROFILE_MANIFEST_FILE="${NAUTILUS_ALPACA_PROFILE_MANIFEST:-}"
@@ -41,12 +41,12 @@ Account aliases:
 Commands:
   accounts                       list known local account ids
   status                         systemd status plus operator summary for one account
-  operator [ARGS...]             run alpaca-operator-status for one account
-  fleet [ARGS...]                run alpaca-fleet-status
+  operator [ARGS...]             run alpaca-ops status for one account
+  fleet [ARGS...]                run alpaca-ops fleet
   health                         lightweight service/account health check
   today                          compact fleet status
   strategy-report [ARGS...]      DB-backed strategy attribution and profile alignment report
-  performance [--all] [ARGS...]  summarize opportunity history and broker-fill PnL
+  performance [--all] [ARGS...]  summarize candidate history and broker-fill PnL
   alerts candidates [ARGS...]    send or dry-run Discord candidate alerts from Postgres
   alerts performance [ARGS...]   send post-market Discord performance digest
   alerts enable|disable|status   control automatic Discord candidate alerts timer
@@ -114,9 +114,9 @@ account_config_file() {
   local account
   account="$(normalize_account "$1")"
   if [[ "$account" == "paper-main" ]]; then
-    printf '%s\n' "$ALPACA_CONFIG_HOME/options-engine.toml"
+    printf '%s\n' "$ALPACA_CONFIG_HOME/options.toml"
   else
-    printf '%s\n' "$ACCOUNT_CONFIG_DIR/$account-options-engine.toml"
+    printf '%s\n' "$ACCOUNT_CONFIG_DIR/$account-options.toml"
   fi
 }
 
@@ -257,7 +257,7 @@ make_account_env_overlay() {
   base_env="$NAUTILUS_ALPACA_ENV_FILE"
   OVERRIDE_ENV_FILE="$(mktemp "${TMPDIR:-/tmp}/nautilus-alpaca-env.XXXXXX")"
   chmod 600 "$OVERRIDE_ENV_FILE"
-  skip_keys=" ALPACA_SUBMIT ALPACA_MANAGE ALPACA_CLOSE ALPACA_KILL_SWITCH ALPACA_FORCE_FLATTEN ALPACA_CANCEL_AFTER_ACCEPT ALPACA_STRATEGIES ALPACA_DRY_RUN_STRATEGIES ALPACA_MAX_ITERATIONS ALPACA_INTERVAL_SECS ALPACA_IGNORE_ENTRY_WINDOW ALPACA_MAX_ACTIVE_ENTRIES ALPACA_MAX_DAILY_SUBMITS ALPACA_MAX_OPEN_ORDERS ALPACA_MAX_ACTIVE_ENTRIES_PER_UNDERLYING ALPACA_MAX_ACTIVE_ENTRIES_PER_SECTOR NAUTILUS_ALPACA_ACCOUNT NAUTILUS_ALPACA_SERVICE NAUTILUS_ALPACA_REPO NAUTILUS_ALPACA_RUNNER_BIN NAUTILUS_ALPACA_OPERATOR_BIN NAUTILUS_ALPACA_LOG_DIR NAUTILUS_ALPACA_LOCK_DIR ALPACA_CONFIG_PATH "
+  skip_keys=" ALPACA_SUBMIT ALPACA_MANAGE ALPACA_CLOSE ALPACA_KILL_SWITCH ALPACA_FORCE_FLATTEN ALPACA_CANCEL_AFTER_ACCEPT ALPACA_STRATEGY_FAMILIES ALPACA_DRY_RUN_FAMILIES ALPACA_MAX_ITERATIONS ALPACA_INTERVAL_SECS ALPACA_IGNORE_ENTRY_WINDOW ALPACA_MAX_ACTIVE_ENTRIES ALPACA_MAX_DAILY_SUBMITS ALPACA_MAX_OPEN_ORDERS ALPACA_MAX_ACTIVE_ENTRIES_PER_UNDERLYING ALPACA_MAX_ACTIVE_ENTRIES_PER_SECTOR NAUTILUS_ALPACA_ACCOUNT NAUTILUS_ALPACA_SERVICE NAUTILUS_ALPACA_REPO NAUTILUS_ALPACA_RUNNER_BIN NAUTILUS_ALPACA_OPERATOR_BIN NAUTILUS_ALPACA_LOG_DIR NAUTILUS_ALPACA_LOCK_DIR ALPACA_CONFIG_PATH "
   awk -v skip_keys="$skip_keys" '
     /^[[:space:]]*($|#)/ { print; next }
     {
@@ -350,7 +350,7 @@ run_operator_status() {
   shift
   setup_account_env "$account"
   require_executable "$OPERATOR_BIN" "operator binary"
-  "$OPERATOR_BIN" "$@"
+  "$OPERATOR_BIN" status "$@"
 }
 
 run_check_config() {
@@ -467,8 +467,8 @@ run_scan() {
       "ALPACA_MANAGE=false"
       "ALPACA_CLOSE=false"
       "ALPACA_KILL_SWITCH=false"
-      "ALPACA_STRATEGIES=$strategies"
-      "ALPACA_DRY_RUN_STRATEGIES=$strategies"
+      "ALPACA_STRATEGY_FAMILIES=$strategies"
+      "ALPACA_DRY_RUN_FAMILIES=$strategies"
       "ALPACA_MAX_ITERATIONS=$iterations"
       "ALPACA_IGNORE_ENTRY_WINDOW=$ignore_entry_window"
     )
@@ -484,7 +484,7 @@ run_scan() {
     make_account_env_overlay "$account" "${scan_overrides[@]}"
   else
     make_account_env_overlay "$account" \
-      "ALPACA_STRATEGIES=$strategies" \
+      "ALPACA_STRATEGY_FAMILIES=$strategies" \
       "ALPACA_MAX_ITERATIONS=$iterations" \
       "ALPACA_IGNORE_ENTRY_WINDOW=$ignore_entry_window"
   fi
@@ -551,7 +551,7 @@ run_once() {
   overrides=("ALPACA_MAX_ITERATIONS=$iterations")
   if [[ -n "$profile" ]]; then
     strategies="$(strategies_for_profile "$profile")"
-    overrides+=("ALPACA_STRATEGIES=$strategies")
+    overrides+=("ALPACA_STRATEGY_FAMILIES=$strategies")
   fi
   if [[ -n "$ignore_entry_window" ]]; then
     overrides+=("ALPACA_IGNORE_ENTRY_WINDOW=$ignore_entry_window")
@@ -571,7 +571,7 @@ run_today() {
   require_command jq
   require_executable "$FLEET_BIN" "fleet status binary"
   fleet_json="$(mktemp "${TMPDIR:-/tmp}/nautilus-alpaca-fleet.XXXXXX")"
-  "$FLEET_BIN" --json > "$fleet_json"
+  "$FLEET_BIN" fleet --json > "$fleet_json"
   jq -r '
     "fleet checked_at=\(.checked_at_utc) configured=\(.summary.configured) enabled=\(.summary.enabled) ok=\(.summary.ok) broken=\(.summary.broken) open_orders=\(.summary.open_orders) positions=\(.summary.positions) unmanaged=\(.summary.unmanaged_positions) active_entries=\(.summary.active_entries)"
   ' "$fleet_json"
@@ -630,7 +630,7 @@ run_performance_for_account() {
   if [[ "$json_output" != "true" ]]; then
     echo "performance account=$account"
   fi
-  "$PERFORMANCE_BIN" "$@"
+  "$PERFORMANCE_BIN" performance "$@"
 }
 
 env_value_from_file() {
@@ -745,9 +745,9 @@ def compare_float(name, expected_value, actual, issues):
 def config_path_for(row):
     account = row["account_id"]
     if account == "paper-main":
-        live = config_home / "options-engine.toml"
+        live = config_home / "options.toml"
     else:
-        live = account_config_dir / f"{account}-options-engine.toml"
+        live = account_config_dir / f"{account}-options.toml"
     if live.exists():
         return live, "live"
     template = repo / "deploy" / "alpaca" / row["template"]
@@ -804,11 +804,16 @@ for row in rows:
         continue
 
     issues = []
-    compare_list("strategies", row["strategies"], field_path(config, "runtime", "strategies"), issues)
     compare_list(
-        "dry_run_strategies",
-        row["dry_run_strategies"],
-        field_path(config, "runtime", "dry_run_strategies"),
+        "strategy_families",
+        row["strategy_families"],
+        field_path(config, "runtime", "strategy_families"),
+        issues,
+    )
+    compare_list(
+        "dry_run_families",
+        row["dry_run_families"],
+        field_path(config, "runtime", "dry_run_families"),
         issues,
     )
     compare_bool("submit", row["submit"], field_path(config, "runtime", "submit"), issues)
@@ -1137,7 +1142,7 @@ run_candidate_alerts_for_account() {
   setup_account_env "$account"
   export NAUTILUS_ALPACA_ALERTS_ENV_FILE="$ALERTS_ENV_FILE"
   echo "candidate_alerts account=$account alerts_env=$ALERTS_ENV_FILE"
-  "$CANDIDATE_ALERTS_BIN" "$@"
+  "$CANDIDATE_ALERTS_BIN" alerts candidates "$@"
 }
 
 run_validate() {
@@ -1226,7 +1231,7 @@ case "$COMMAND" in
     ;;
   fleet)
     require_executable "$FLEET_BIN" "fleet status binary"
-    "$FLEET_BIN" "$@"
+    "$FLEET_BIN" fleet "$@"
     ;;
   health)
     setup_account_env "$ACCOUNT"
