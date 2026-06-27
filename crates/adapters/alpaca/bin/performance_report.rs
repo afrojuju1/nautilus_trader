@@ -31,8 +31,7 @@ use nautilus_alpaca::{
     },
     options_runtime::AlpacaOptionsRuntimeConfig,
     performance::{
-        CandidateOutcomeTrackingRequest, DEFAULT_CANDIDATE_OUTCOME_MAX_CANDIDATES,
-        DEFAULT_CANDIDATE_OUTCOME_MAX_RANK, EntryOrderIds, EntryPerformance, PerformanceReport,
+        CandidateOutcomeTrackingRequest, EntryOrderIds, EntryPerformance, PerformanceReport,
         collect_order_ids, earliest_entry_timestamp, entry_in_date_range, entry_performance,
         summarize_performance, track_candidate_outcomes,
     },
@@ -45,7 +44,7 @@ use nautilus_alpaca::{
 };
 use serde_json::json;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Args {
     json_output: bool,
     send_discord: bool,
@@ -53,8 +52,31 @@ struct Args {
     track_date: Option<NaiveDate>,
     track_max_candidates: usize,
     track_max_rank: u64,
+    track_historical_fill_missing: bool,
+    track_historical_fill_lookahead_minutes: i64,
+    track_historical_fill_timeframe: String,
     since: Option<NaiveDate>,
     until: Option<NaiveDate>,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        let tracking_defaults = CandidateOutcomeTrackingRequest::default();
+        Self {
+            json_output: false,
+            send_discord: false,
+            alerts_env_file: None,
+            track_date: tracking_defaults.trade_date,
+            track_max_candidates: tracking_defaults.max_candidates,
+            track_max_rank: tracking_defaults.max_rank,
+            track_historical_fill_missing: tracking_defaults.historical_fill_missing,
+            track_historical_fill_lookahead_minutes: tracking_defaults
+                .historical_fill_lookahead_minutes,
+            track_historical_fill_timeframe: tracking_defaults.historical_fill_timeframe,
+            since: None,
+            until: None,
+        }
+    }
 }
 
 pub(crate) async fn run() -> anyhow::Result<()> {
@@ -123,10 +145,25 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             trade_date: args.track_date,
             max_candidates: args.track_max_candidates,
             max_rank: args.track_max_rank,
+            historical_fill_missing: args.track_historical_fill_missing,
+            historical_fill_lookahead_minutes: args.track_historical_fill_lookahead_minutes,
+            historical_fill_timeframe: args.track_historical_fill_timeframe,
         },
     )
     .await?;
-    warnings.push(format!("candidate_outcomes_appended={tracked}"));
+    warnings.push(format!(
+        "candidate_outcomes_appended={} snapshot_candidates={} historical_bar_candidates={} missing_mark_candidates={}",
+        tracked.appended,
+        tracked.snapshot_candidates,
+        tracked.historical_bar_candidates,
+        tracked.missing_mark_candidates,
+    ));
+    warnings.extend(
+        tracked
+            .warnings
+            .into_iter()
+            .map(|warning| format!("candidate_outcomes_{warning}")),
+    );
 
     let candidate_ledger =
         summarize_candidate_ledger_records(&config, args.since, args.until).await?;
@@ -161,11 +198,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 }
 
 fn parse_args() -> anyhow::Result<Args> {
-    let mut args = Args {
-        track_max_candidates: DEFAULT_CANDIDATE_OUTCOME_MAX_CANDIDATES,
-        track_max_rank: DEFAULT_CANDIDATE_OUTCOME_MAX_RANK,
-        ..Args::default()
-    };
+    let mut args = Args::default();
     let mut iter = crate::ops_args().into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -187,6 +220,18 @@ fn parse_args() -> anyhow::Result<Args> {
             "--track-max-rank" => {
                 args.track_max_rank = parse_string_arg("--track-max-rank", iter.next())?.parse()?;
             }
+            "--no-track-historical-fill" => {
+                args.track_historical_fill_missing = false;
+            }
+            "--track-historical-fill-lookahead-minutes" => {
+                args.track_historical_fill_lookahead_minutes =
+                    parse_string_arg("--track-historical-fill-lookahead-minutes", iter.next())?
+                        .parse()?;
+            }
+            "--track-historical-fill-timeframe" => {
+                args.track_historical_fill_timeframe =
+                    parse_string_arg("--track-historical-fill-timeframe", iter.next())?;
+            }
             "--since" => {
                 args.since = Some(parse_date_arg("--since", iter.next())?);
             }
@@ -205,6 +250,9 @@ fn parse_args() -> anyhow::Result<Args> {
     {
         anyhow::bail!("--since must be before or equal to --until");
     }
+    if args.track_historical_fill_missing && args.track_historical_fill_lookahead_minutes <= 0 {
+        anyhow::bail!("--track-historical-fill-lookahead-minutes must be positive");
+    }
     Ok(args)
 }
 
@@ -222,7 +270,7 @@ fn parse_string_arg(name: &str, value: Option<String>) -> anyhow::Result<String>
 
 fn print_usage() {
     eprintln!(
-        "usage: alpaca-ops performance [--json] [--send-discord] [--since YYYY-MM-DD] [--until YYYY-MM-DD]"
+        "usage: alpaca-ops performance [--json] [--send-discord] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--track-date YYYY-MM-DD] [--track-max-candidates N] [--track-max-rank N] [--no-track-historical-fill] [--track-historical-fill-lookahead-minutes N] [--track-historical-fill-timeframe 1Min]"
     );
 }
 
@@ -507,6 +555,26 @@ fn print_human_report(report: &PerformanceReport) {
             println!(
                 "  bucket={} records={} selected={} submitted={} traded={} rejected={} virtual={} virtual_closes={} wins={} losses={} flats={} hypothetical={}",
                 bucket,
+                summary.records,
+                summary.selected_records,
+                summary.submitted_records,
+                summary.traded_records,
+                summary.rejected_records,
+                summary.virtual_records,
+                summary.virtual_close_records,
+                summary.wins,
+                summary.losses,
+                summary.flats,
+                format_money(summary.hypothetical_pnl),
+            );
+        }
+    }
+    if !report.candidate_outcomes.by_mark_source.is_empty() {
+        println!("candidate_outcomes_by_mark_source:");
+        for (source, summary) in &report.candidate_outcomes.by_mark_source {
+            println!(
+                "  source={} records={} selected={} submitted={} traded={} rejected={} virtual={} virtual_closes={} wins={} losses={} flats={} hypothetical={}",
+                source,
                 summary.records,
                 summary.selected_records,
                 summary.submitted_records,

@@ -287,6 +287,7 @@ pub async fn summarize_candidate_outcomes(
     let mut bucket_stats = std::collections::BTreeMap::<String, OutcomeStats>::new();
     let mut strategy_stats = std::collections::BTreeMap::<String, OutcomeStats>::new();
     let mut close_reason_stats = std::collections::BTreeMap::<String, OutcomeStats>::new();
+    let mut mark_source_stats = std::collections::BTreeMap::<String, OutcomeStats>::new();
 
     for record in records_by_key.into_values() {
         let Some(hypothetical_pnl) = record.get("hypothetical_pnl").and_then(Value::as_f64) else {
@@ -331,6 +332,14 @@ pub async fn summarize_candidate_outcomes(
                 .or_default()
                 .add(hypothetical_pnl, flags);
         }
+        let mark_source = record
+            .get("mark_source")
+            .and_then(Value::as_str)
+            .unwrap_or("snapshot");
+        mark_source_stats
+            .entry(mark_source.to_string())
+            .or_default()
+            .add(hypothetical_pnl, flags);
 
         if record
             .get("quote_warnings")
@@ -370,6 +379,10 @@ pub async fn summarize_candidate_outcomes(
     summary.by_strategy = strategy_stats
         .into_iter()
         .map(|(strategy, stats)| (strategy, stats.into()))
+        .collect();
+    summary.by_mark_source = mark_source_stats
+        .into_iter()
+        .map(|(source, stats)| (source, stats.into()))
         .collect();
     summary.by_virtual_close_reason = close_reason_stats
         .into_iter()

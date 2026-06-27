@@ -10,7 +10,7 @@ use crate::{
     http::{
         client::AlpacaHttpClient,
         models::{
-            AlpacaActivity, AlpacaOptionSnapshot, AlpacaOrder, AlpacaPosition,
+            AlpacaActivity, AlpacaOptionBar, AlpacaOptionSnapshot, AlpacaOrder, AlpacaPosition,
             OptionSnapshotsRequest,
         },
     },
@@ -22,9 +22,10 @@ use crate::{
 };
 
 use super::{
-    CandidateOutcomeTrackingRequest, EntryOrderIds, EntryPerformance, OPTION_CONTRACT_MULTIPLIER,
-    PerformanceSummary, apply_entry_summary, entry_status, entry_symbols, fill_summary,
-    open_unrealized_pnl, quoted_entry_premium,
+    CandidateOutcomeTrackingRequest, CandidateOutcomeTrackingResult, EntryOrderIds,
+    EntryPerformance, OPTION_CONTRACT_MULTIPLIER, PerformanceSummary, apply_entry_summary,
+    entry_status, entry_symbols, fill_summary, historical_marks, open_unrealized_pnl,
+    quoted_entry_premium,
 };
 
 pub async fn track_candidate_outcomes(
@@ -32,7 +33,13 @@ pub async fn track_candidate_outcomes(
     data_config: &AlpacaDataClientConfig,
     config: &AlpacaOptionsRuntimeConfig,
     request: &CandidateOutcomeTrackingRequest,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<CandidateOutcomeTrackingResult> {
+    if request.historical_fill_missing {
+        anyhow::ensure!(
+            request.historical_fill_lookahead_minutes > 0,
+            "historical_fill_lookahead_minutes must be positive"
+        );
+    }
     let trade_date = request.trade_date.unwrap_or_else(|| {
         Utc::now()
             .with_timezone(&config.entry_timezone)
@@ -51,14 +58,14 @@ pub async fn track_candidate_outcomes(
     )
     .await?;
     let selected = selected_candidate_actions(&records);
-    let mut candidates = collect_track_candidates(
+    let candidates = collect_track_candidates(
         &records,
         &selected,
         request.max_rank,
         request.max_candidates,
     );
     if candidates.is_empty() {
-        return Ok(0);
+        return Ok(CandidateOutcomeTrackingResult::default());
     }
 
     let symbols = candidates
@@ -70,18 +77,72 @@ pub async fn track_candidate_outcomes(
     let snapshots = client.option_snapshots(&snapshot_request).await?.snapshots;
     let payload_account_id = Some(config.storage_account_id().to_string());
     let close_config = VirtualCloseConfig::from(config);
-    let mut appended = 0;
-    for candidate in &mut candidates {
-        let Some(outcome) = value_candidate_outcome(candidate, &snapshots, close_config) else {
+    let mut snapshot_outcomes = BTreeMap::<String, CandidateOutcomeValue>::new();
+    let mut historical_fill_candidates = Vec::new();
+    for candidate in &candidates {
+        if let Some(outcome) = value_candidate_outcome(candidate, &snapshots, close_config) {
+            snapshot_outcomes.insert(candidate.identity_key.clone(), outcome);
+        } else if request.historical_fill_missing {
+            historical_fill_candidates.push(candidate.clone());
+        }
+    }
+    let mut result = CandidateOutcomeTrackingResult::default();
+    let historical_bars = if historical_fill_candidates.is_empty() {
+        None
+    } else {
+        let mut warnings = Vec::new();
+        let bars = historical_marks::fetch_candidate_bars(
+            client,
+            &historical_fill_candidates,
+            &request.historical_fill_timeframe,
+            request.historical_fill_lookahead_minutes,
+            Some(data_config.option_feed.as_str()),
+            &mut warnings,
+        )
+        .await?;
+        result.warnings.extend(warnings);
+        Some(bars)
+    };
+
+    for candidate in &candidates {
+        let outcome = snapshot_outcomes
+            .remove(&candidate.identity_key)
+            .or_else(|| {
+                historical_bars.as_ref().and_then(|bars| {
+                    let mut warnings = Vec::new();
+                    let outcome = value_candidate_outcome_from_historical_bars(
+                        candidate,
+                        bars,
+                        request.historical_fill_lookahead_minutes,
+                        close_config,
+                        &mut warnings,
+                    );
+                    if outcome.is_none() && !warnings.is_empty() {
+                        result.warnings.push(format!(
+                            "candidate_outcome_missing_mark identity={} warnings={}",
+                            candidate.identity_key,
+                            warnings.join(",")
+                        ));
+                    }
+                    outcome
+                })
+            });
+        let Some(outcome) = outcome else {
+            result.missing_mark_candidates += 1;
             continue;
         };
+        if outcome.mark_source == "historical_bar" {
+            result.historical_bar_candidates += 1;
+        } else {
+            result.snapshot_candidates += 1;
+        }
         for bucket in candidate_observation_buckets(candidate, config, &outcome) {
             let record_key = format!(
                 "{}|{}|{bucket}",
                 candidate.trade_date, candidate.identity_key
             );
             let payload = json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "ts_utc": Utc::now().to_rfc3339(),
                 "type": "candidate_outcome",
                 "trade_date": &candidate.trade_date,
@@ -111,6 +172,9 @@ pub async fn track_candidate_outcomes(
                 "rejection_reasons": &candidate.rejection_reasons,
                 "entry_net_premium": candidate.entry_net_premium,
                 "close_net_premium": outcome.close_net_premium,
+                "mark_source": &outcome.mark_source,
+                "mark_ts_utc": &outcome.mark_ts_utc,
+                "historical_bar_volume": outcome.historical_bar_volume,
                 "hypothetical_pnl_per_unit": outcome.hypothetical_pnl_per_unit,
                 "hypothetical_pnl": outcome.hypothetical_pnl,
                 "hypothetical_pnl_fraction": outcome.hypothetical_pnl_fraction,
@@ -129,11 +193,11 @@ pub async fn track_candidate_outcomes(
             )
             .await?;
             if appended_record {
-                appended += 1;
+                result.appended += 1;
             }
         }
     }
-    Ok(appended)
+    Ok(result)
 }
 
 /// Builds one performance row from a state entry, matched fill activities, and open positions.
@@ -420,6 +484,9 @@ impl From<&AlpacaOptionsRuntimeConfig> for VirtualCloseConfig {
 
 #[derive(Clone, Debug)]
 struct CandidateOutcomeValue {
+    mark_source: String,
+    mark_ts_utc: Option<String>,
+    historical_bar_volume: Option<u64>,
     close_net_premium: f64,
     hypothetical_pnl_per_unit: f64,
     hypothetical_pnl: f64,
@@ -650,6 +717,46 @@ fn value_candidate_outcome(
         let long = candidate.symbols.get(1)?;
         quote_ask(snapshots, short, &mut warnings)? - quote_bid(snapshots, long, &mut warnings)?
     };
+    Some(candidate_outcome_value(
+        candidate,
+        close_net_premium,
+        close_config,
+        "snapshot",
+        None,
+        None,
+        warnings,
+    ))
+}
+
+fn value_candidate_outcome_from_historical_bars(
+    candidate: &TrackCandidate,
+    bars: &BTreeMap<String, Vec<AlpacaOptionBar>>,
+    lookahead_minutes: i64,
+    close_config: VirtualCloseConfig,
+    warnings: &mut Vec<String>,
+) -> Option<CandidateOutcomeValue> {
+    let mark =
+        historical_marks::historical_candidate_mark(candidate, bars, lookahead_minutes, warnings)?;
+    Some(candidate_outcome_value(
+        candidate,
+        mark.net_premium,
+        close_config,
+        "historical_bar",
+        mark.mark_ts_utc,
+        Some(mark.total_volume),
+        std::mem::take(warnings),
+    ))
+}
+
+fn candidate_outcome_value(
+    candidate: &TrackCandidate,
+    close_net_premium: f64,
+    close_config: VirtualCloseConfig,
+    mark_source: &str,
+    mark_ts_utc: Option<String>,
+    historical_bar_volume: Option<u64>,
+    warnings: Vec<String>,
+) -> CandidateOutcomeValue {
     let pnl_per_contract = match candidate.entry_kind {
         CandidateEntryKind::Credit => candidate.entry_net_premium - close_net_premium,
         CandidateEntryKind::Debit => close_net_premium - candidate.entry_net_premium,
@@ -663,7 +770,10 @@ fn value_candidate_outcome(
         .virtual_trade
         .then(|| management_close_reason.clone())
         .flatten();
-    Some(CandidateOutcomeValue {
+    CandidateOutcomeValue {
+        mark_source: mark_source.to_string(),
+        mark_ts_utc,
+        historical_bar_volume,
         close_net_premium,
         hypothetical_pnl_per_unit,
         hypothetical_pnl,
@@ -671,7 +781,7 @@ fn value_candidate_outcome(
         management_close_reason,
         virtual_close_reason,
         warnings,
-    })
+    }
 }
 
 fn virtual_close_reason(

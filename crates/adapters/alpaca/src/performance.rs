@@ -26,6 +26,7 @@ use crate::{
 };
 
 mod candidate_outcomes;
+mod historical_marks;
 mod replay;
 
 pub use candidate_outcomes::{
@@ -48,6 +49,12 @@ pub const DEFAULT_CANDIDATE_OUTCOME_MAX_CANDIDATES: usize = 100;
 
 /// Default maximum candidate rank to include in candidate-outcome tracking.
 pub const DEFAULT_CANDIDATE_OUTCOME_MAX_RANK: u64 = 3;
+
+/// Default minutes after candidate timestamp used for historical candidate-outcome fill marks.
+pub const DEFAULT_CANDIDATE_OUTCOME_HISTORICAL_FILL_LOOKAHEAD_MINUTES: i64 = 390;
+
+/// Default Alpaca historical option-bar timeframe for candidate-outcome fill marks.
+pub const DEFAULT_CANDIDATE_OUTCOME_HISTORICAL_FILL_TIMEFRAME: &str = "1Min";
 
 /// Candidate-ledger counts used to audit candidate history.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -127,6 +134,8 @@ pub struct CandidateOutcomeSummary {
     pub parse_errors: usize,
     /// Records containing quote warnings.
     pub records_with_warnings: usize,
+    /// Summaries by mark source.
+    pub by_mark_source: BTreeMap<String, CandidateOutcomeBucketSummary>,
     /// Selected-candidate outcome summary.
     pub selected: CandidateOutcomeBucketSummary,
     /// Submitted-candidate outcome summary.
@@ -187,6 +196,12 @@ pub struct CandidateOutcomeTrackingRequest {
     pub max_candidates: usize,
     /// Maximum candidate rank to include.
     pub max_rank: u64,
+    /// Whether missing snapshot marks should be filled from historical option bars.
+    pub historical_fill_missing: bool,
+    /// Minutes after candidate timestamp used for the historical fill mark.
+    pub historical_fill_lookahead_minutes: i64,
+    /// Alpaca historical option bar timeframe used for fill marks.
+    pub historical_fill_timeframe: String,
 }
 
 impl Default for CandidateOutcomeTrackingRequest {
@@ -195,8 +210,28 @@ impl Default for CandidateOutcomeTrackingRequest {
             trade_date: None,
             max_candidates: DEFAULT_CANDIDATE_OUTCOME_MAX_CANDIDATES,
             max_rank: DEFAULT_CANDIDATE_OUTCOME_MAX_RANK,
+            historical_fill_missing: true,
+            historical_fill_lookahead_minutes:
+                DEFAULT_CANDIDATE_OUTCOME_HISTORICAL_FILL_LOOKAHEAD_MINUTES,
+            historical_fill_timeframe: DEFAULT_CANDIDATE_OUTCOME_HISTORICAL_FILL_TIMEFRAME
+                .to_string(),
         }
     }
+}
+
+/// Result from tracking candidate outcomes.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CandidateOutcomeTrackingResult {
+    /// Candidate-outcome records appended or updated.
+    pub appended: usize,
+    /// Candidates valued from current option snapshots.
+    pub snapshot_candidates: usize,
+    /// Candidates valued from historical option bars.
+    pub historical_bar_candidates: usize,
+    /// Candidates that could not be valued from any configured mark source.
+    pub missing_mark_candidates: usize,
+    /// Tracking warnings.
+    pub warnings: Vec<String>,
 }
 
 /// Order identifiers associated with one strategy entry.
