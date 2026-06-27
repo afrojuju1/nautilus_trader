@@ -100,9 +100,47 @@ normalize_account() {
   esac
 }
 
-account_env_file() {
-  local account
+fleet_account_field() {
+  local account field
   account="$(normalize_account "$1")"
+  field="$2"
+  [[ -f "$FLEET_CONFIG_FILE" ]] || return 0
+  awk -v account="$account" -v field="$field" '
+    /^[[:space:]]*\[\[accounts\]\][[:space:]]*$/ {
+      in_account = 1
+      matched = 0
+      next
+    }
+    /^[[:space:]]*\[/ && $0 !~ /^[[:space:]]*\[accounts\./ && $0 !~ /^[[:space:]]*\[\[accounts\]\]/ {
+      in_account = 0
+      matched = 0
+      next
+    }
+    in_account && /^[[:space:]]*id[[:space:]]*=/ {
+      value = $0
+      sub(/^[^=]*=/, "", value)
+      gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", value)
+      matched = (value == account)
+      next
+    }
+    in_account && matched && $0 ~ "^[[:space:]]*" field "[[:space:]]*=" {
+      value = $0
+      sub(/^[^=]*=/, "", value)
+      gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", value)
+      print value
+      exit
+    }
+  ' "$FLEET_CONFIG_FILE"
+}
+
+account_env_file() {
+  local account configured
+  account="$(normalize_account "$1")"
+  configured="$(fleet_account_field "$account" "env_file")"
+  if [[ -n "$configured" ]]; then
+    printf '%s\n' "$configured"
+    return
+  fi
   if [[ "$account" == "paper-main" ]]; then
     printf '%s\n' "$DEFAULT_ENV_FILE"
   else
@@ -111,8 +149,13 @@ account_env_file() {
 }
 
 account_config_file() {
-  local account
+  local account configured
   account="$(normalize_account "$1")"
+  configured="$(fleet_account_field "$account" "config_file")"
+  if [[ -n "$configured" ]]; then
+    printf '%s\n' "$configured"
+    return
+  fi
   if [[ "$account" == "paper-main" ]]; then
     printf '%s\n' "$ALPACA_CONFIG_HOME/options.toml"
   else
@@ -121,8 +164,13 @@ account_config_file() {
 }
 
 account_service() {
-  local account
+  local account configured
   account="$(normalize_account "$1")"
+  configured="$(fleet_account_field "$account" "service")"
+  if [[ -n "$configured" ]]; then
+    printf '%s\n' "$configured"
+    return
+  fi
   if [[ "$account" == "paper-main" ]]; then
     printf '%s\n' "alpaca-options.service"
   else
@@ -142,8 +190,13 @@ active_account_service() {
 }
 
 account_log_dir() {
-  local account
+  local account configured
   account="$(normalize_account "$1")"
+  configured="$(fleet_account_field "$account" "log_dir")"
+  if [[ -n "$configured" ]]; then
+    printf '%s\n' "$configured"
+    return
+  fi
   if [[ "$account" == "paper-main" ]]; then
     printf '%s\n' "$STATE_HOME/nautilus_trader/logs"
   else
@@ -152,8 +205,13 @@ account_log_dir() {
 }
 
 account_lock_dir() {
-  local account
+  local account configured
   account="$(normalize_account "$1")"
+  configured="$(fleet_account_field "$account" "lock_dir")"
+  if [[ -n "$configured" ]]; then
+    printf '%s\n' "$configured"
+    return
+  fi
   if [[ "$account" == "paper-main" ]]; then
     printf '%s\n' "$STATE_HOME/nautilus_trader/locks"
   else
