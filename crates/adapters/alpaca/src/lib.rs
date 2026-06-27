@@ -42,6 +42,8 @@
 #[cfg(feature = "live")]
 pub mod candidate_engine;
 #[cfg(feature = "live")]
+pub mod candidate_ledger_persistence;
+#[cfg(feature = "live")]
 pub mod candidate_payloads;
 pub mod common;
 pub mod config;

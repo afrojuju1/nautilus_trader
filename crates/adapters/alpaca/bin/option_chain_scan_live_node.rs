@@ -4,6 +4,7 @@ use std::{env, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use nautilus_alpaca::{
+    candidate_ledger_persistence::CandidateLedgerPersistenceHandle,
     common::consts::ALPACA_CLIENT_ID,
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
     execution::account_entry_admission_reasons,
@@ -41,7 +42,8 @@ const DEFAULT_STRIKES_BELOW: usize = 10;
 const DEFAULT_RUNTIME_LEASE_TTL_SECS: u64 = 300;
 
 struct LiveSubmitPersistence {
-    handle: StrategyStatePersistenceHandle,
+    state: StrategyStatePersistenceHandle,
+    candidate_ledger: CandidateLedgerPersistenceHandle,
     storage: Arc<StorageRepository>,
     account_id: String,
     run_id: Uuid,
@@ -49,6 +51,22 @@ struct LiveSubmitPersistence {
 
 impl LiveSubmitPersistence {
     async fn release(self) {
+        if let Err(error) = self.candidate_ledger.flush().await {
+            log::error!(
+                "Failed to flush Alpaca candidate-ledger evidence before lease release: account_id={} run_id={} error={error:#}",
+                self.account_id,
+                self.run_id
+            );
+            emit_operator_event(
+                "candidate_ledger_error",
+                json!({
+                    "reason": "flush_failed",
+                    "account_id": self.account_id.clone(),
+                    "run_id": self.run_id.to_string(),
+                    "error": error.to_string(),
+                }),
+            );
+        }
         match release_runtime_lease(&self.storage, &self.account_id, self.run_id).await {
             Ok(true) => emit_operator_event(
                 "runtime_lease_released",
@@ -163,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
         .with_delay_post_stop_secs(5)
         .build()?;
 
-    let actor = OptionChainOpportunityScanActor::new(OptionChainOpportunityScanActorConfig {
+    let mut actor = OptionChainOpportunityScanActor::new(OptionChainOpportunityScanActorConfig {
         actor_id: Some(args.actor_id),
         series: vec![series_id],
         strike_range: args.strike_range,
@@ -172,6 +190,9 @@ async fn main() -> anyhow::Result<()> {
         bootstrap_instruments: true,
         scan: scan_config,
     });
+    if let Some(persistence) = &live_submit_persistence {
+        actor = actor.with_candidate_ledger_persistence(persistence.candidate_ledger.clone());
+    }
     node.add_actor(actor)?;
 
     let strategy_config = StrategyConfig {
@@ -185,7 +206,10 @@ async fn main() -> anyhow::Result<()> {
     entry_config.initial_state = strategy_state;
     entry_config.state_persistence = live_submit_persistence
         .as_ref()
-        .map(|persistence| persistence.handle.clone());
+        .map(|persistence| persistence.state.clone());
+    entry_config.candidate_ledger_persistence = live_submit_persistence
+        .as_ref()
+        .map(|persistence| persistence.candidate_ledger.clone());
     let strategy = AlpacaOptionsEntryStrategy::new(entry_config);
     node.add_strategy(strategy)?;
 
@@ -268,17 +292,21 @@ async fn prepare_state_persistence(
         lease.expires_at
     );
     let heartbeat_storage = storage.clone();
-    let persistence =
+    let state_persistence =
         StrategyStatePersistenceHandle::spawn(storage, account_id.clone(), holder_id, run_id);
+    let candidate_ledger_persistence =
+        CandidateLedgerPersistenceHandle::spawn(heartbeat_storage.clone(), account_id.clone());
     start_runtime_lease_heartbeat(
         heartbeat_storage.clone(),
         account_id.clone(),
         run_id,
         ttl,
-        Some(persistence.clone()),
+        Some(state_persistence.clone()),
+        Some(candidate_ledger_persistence.clone()),
     );
     Ok(LiveSubmitPersistence {
-        handle: persistence,
+        state: state_persistence,
+        candidate_ledger: candidate_ledger_persistence,
         storage: heartbeat_storage,
         account_id,
         run_id,

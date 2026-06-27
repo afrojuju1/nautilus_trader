@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
+    candidate_ledger_persistence::CandidateLedgerPersistenceHandle,
     runtime::{StrategyState, emit_operator_event},
     storage::{StorageRepository, StrategyStateMutation, persist_strategy_state_mutation},
 };
@@ -142,6 +143,7 @@ pub fn start_runtime_lease_heartbeat(
     run_id: Uuid,
     ttl: Duration,
     state_persistence: Option<StrategyStatePersistenceHandle>,
+    candidate_ledger_persistence: Option<CandidateLedgerPersistenceHandle>,
 ) {
     let interval = Duration::from_secs((ttl.as_secs() / 3).max(5));
     tokio::spawn(async move {
@@ -151,9 +153,10 @@ pub fn start_runtime_lease_heartbeat(
             {
                 Ok(true) => {}
                 Ok(false) => {
-                    if let Some(state_persistence) = &state_persistence {
-                        state_persistence.mark_unhealthy();
-                    }
+                    mark_persistence_unhealthy(
+                        state_persistence.as_ref(),
+                        candidate_ledger_persistence.as_ref(),
+                    );
                     log::error!(
                         "Alpaca runtime lease heartbeat lost ownership: account_id={} run_id={}",
                         account_id,
@@ -169,9 +172,10 @@ pub fn start_runtime_lease_heartbeat(
                     break;
                 }
                 Err(error) => {
-                    if let Some(state_persistence) = &state_persistence {
-                        state_persistence.mark_unhealthy();
-                    }
+                    mark_persistence_unhealthy(
+                        state_persistence.as_ref(),
+                        candidate_ledger_persistence.as_ref(),
+                    );
                     log::error!(
                         "Alpaca runtime lease heartbeat failed: account_id={} run_id={} error={error:#}",
                         account_id,
@@ -190,4 +194,16 @@ pub fn start_runtime_lease_heartbeat(
             }
         }
     });
+}
+
+fn mark_persistence_unhealthy(
+    state_persistence: Option<&StrategyStatePersistenceHandle>,
+    candidate_ledger_persistence: Option<&CandidateLedgerPersistenceHandle>,
+) {
+    if let Some(state_persistence) = state_persistence {
+        state_persistence.mark_unhealthy();
+    }
+    if let Some(candidate_ledger_persistence) = candidate_ledger_persistence {
+        candidate_ledger_persistence.mark_unhealthy();
+    }
 }

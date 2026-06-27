@@ -22,6 +22,8 @@ use crate::{
         NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig,
         PutCreditScannerConfig,
     },
+    candidate_ledger_persistence::CandidateLedgerPersistenceHandle,
+    candidate_payloads::selected_entry_candidate_ledger_payload,
     common::consts::{ALPACA_OPTION_CHAIN_EXPIRATION_PARAM, ALPACA_OPTION_CHAIN_UNDERLYING_PARAM},
     option_chain_candidates::{
         option_chain_candidate_input, scan_credit_spread_option_chain,
@@ -66,6 +68,8 @@ pub struct OptionChainOpportunityScanConfig {
     pub options_buying_power: Option<f64>,
     /// Quantity used for buying-power estimates.
     pub quantity: u64,
+    /// Maximum ranked candidates to write per scanner result. `0` means all candidates.
+    pub candidate_ledger_max_candidates: usize,
     /// Timezone used to derive the strategy trade date for daily risk limits.
     pub trade_date_timezone: Tz,
 }
@@ -100,6 +104,7 @@ impl Default for OptionChainOpportunityScanConfig {
             },
             options_buying_power: None,
             quantity: 1,
+            candidate_ledger_max_candidates: 10,
             trade_date_timezone: chrono_tz::UTC,
         }
     }
@@ -146,6 +151,7 @@ impl Default for OptionChainOpportunityScanActorConfig {
 pub struct OptionChainOpportunityScanActor {
     core: DataActorCore,
     config: OptionChainOpportunityScanActorConfig,
+    candidate_ledger_persistence: Option<CandidateLedgerPersistenceHandle>,
     subscribed_series: BTreeSet<OptionSeriesId>,
     latest_opportunities: Option<OptionsOpportunitySet>,
 }
@@ -163,9 +169,20 @@ impl OptionChainOpportunityScanActor {
         Self {
             core,
             config,
+            candidate_ledger_persistence: None,
             subscribed_series: BTreeSet::new(),
             latest_opportunities: None,
         }
+    }
+
+    /// Adds a bounded candidate-ledger persistence sink for operator evidence.
+    #[must_use]
+    pub fn with_candidate_ledger_persistence(
+        mut self,
+        persistence: CandidateLedgerPersistenceHandle,
+    ) -> Self {
+        self.candidate_ledger_persistence = Some(persistence);
+        self
     }
 
     /// Returns the most recent opportunity set produced by this actor.
@@ -226,6 +243,41 @@ impl OptionChainOpportunityScanActor {
         )?;
         Ok(())
     }
+
+    fn record_opportunity_evidence(
+        &self,
+        trade_date: &str,
+        opportunities: &OptionsOpportunitySet,
+        scan_payload: Value,
+    ) {
+        let Some(persistence) = &self.candidate_ledger_persistence else {
+            return;
+        };
+        if let Err(error) = persistence.append(trade_date, "scanner_result", scan_payload) {
+            log::error!("Failed to enqueue Alpaca option-chain scanner evidence: {error:#}");
+        }
+
+        let candidate_limit = candidate_ledger_candidate_limit(
+            self.config.scan.candidate_ledger_max_candidates,
+            opportunities.ranked_entries().len(),
+        );
+        for (index, entry) in opportunities
+            .ranked_entries()
+            .iter()
+            .take(candidate_limit)
+            .enumerate()
+        {
+            let payload = selected_entry_candidate_ledger_payload(
+                entry,
+                self.config.scan.options_buying_power,
+                Some(index + 1),
+            );
+            if let Err(error) = persistence.append(trade_date, "candidate", payload) {
+                log::error!("Failed to enqueue Alpaca option-chain candidate evidence: {error:#}");
+                break;
+            }
+        }
+    }
 }
 
 impl DataActor for OptionChainOpportunityScanActor {
@@ -261,10 +313,9 @@ impl DataActor for OptionChainOpportunityScanActor {
     fn on_option_chain(&mut self, slice: &OptionChainSlice) -> anyhow::Result<()> {
         let trade_date = market_trade_date(self.config.scan.trade_date_timezone);
         let opportunities = scan_option_chain_opportunities(slice, &self.config.scan, &trade_date);
-        emit_operator_event(
-            "option_chain_opportunity_scan",
-            opportunity_event_payload(slice, &opportunities),
-        );
+        let evidence_payload = opportunity_event_payload(slice, &opportunities);
+        emit_operator_event("option_chain_opportunity_scan", evidence_payload.clone());
+        self.record_opportunity_evidence(&trade_date, &opportunities, evidence_payload);
         let data = OptionsOpportunityData::new(
             opportunities.clone(),
             slice.ts_event,
@@ -303,7 +354,16 @@ pub fn option_chain_scan_config_from_engine(
         naked_1_3dte_scanner: config.naked_1_3dte_scanner.clone(),
         options_buying_power,
         quantity: config.quantity,
+        candidate_ledger_max_candidates: config.candidate_ledger_max_candidates,
         trade_date_timezone: config.entry_timezone,
+    }
+}
+
+fn candidate_ledger_candidate_limit(max_candidates: usize, candidate_count: usize) -> usize {
+    if max_candidates == 0 {
+        candidate_count
+    } else {
+        candidate_count.min(max_candidates)
     }
 }
 

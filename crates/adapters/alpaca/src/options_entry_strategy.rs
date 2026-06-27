@@ -27,6 +27,10 @@ use nautilus_trading::{
 use uuid::Uuid;
 
 use crate::{
+    candidate_ledger_persistence::CandidateLedgerPersistenceHandle,
+    candidate_payloads::{
+        candidate_alert_key, insert_string_field, insert_value_field, selected_entry_alert_payload,
+    },
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
     options_entry_admission::{
         EntryAdmissionConfig, EntryAdmissionSnapshot, EntryGateDecision, SubmissionBlock,
@@ -42,7 +46,10 @@ use crate::{
     state_persistence::StrategyStatePersistenceHandle,
     storage::StrategyStateMutation,
 };
-use serde_json::json;
+use serde_json::{Value, json};
+
+const SELECTED_CANDIDATE_ALERT: &str = "selected_candidate";
+const CANDIDATE_SUBMIT_REJECTED_ALERT: &str = "candidate_submit_rejected";
 
 /// Custom data type published by option-chain scanner actors for entry strategies.
 #[derive(Clone, Debug)]
@@ -158,6 +165,8 @@ pub struct AlpacaOptionsEntryStrategyConfig {
     pub initial_state: StrategyState,
     /// Async state persistence boundary used when live submit is enabled.
     pub state_persistence: Option<StrategyStatePersistenceHandle>,
+    /// Async candidate-ledger persistence boundary used for scanner and strategy evidence.
+    pub candidate_ledger_persistence: Option<CandidateLedgerPersistenceHandle>,
 }
 
 impl AlpacaOptionsEntryStrategyConfig {
@@ -171,6 +180,7 @@ impl AlpacaOptionsEntryStrategyConfig {
             admission: EntryAdmissionConfig::default(),
             initial_state: StrategyState::default(),
             state_persistence: None,
+            candidate_ledger_persistence: None,
         }
     }
 
@@ -184,6 +194,7 @@ impl AlpacaOptionsEntryStrategyConfig {
             admission: EntryAdmissionConfig::from_engine_config(engine),
             initial_state: StrategyState::default(),
             state_persistence: None,
+            candidate_ledger_persistence: None,
         }
     }
 }
@@ -221,6 +232,7 @@ pub struct AlpacaOptionsEntryStrategy {
     pending_submissions: BTreeMap<String, PendingEntrySubmission>,
     pending_client_order_ids: BTreeMap<String, String>,
     submitted_underlying_keys: BTreeSet<String>,
+    recorded_candidate_alert_keys: BTreeSet<String>,
 }
 
 impl AlpacaOptionsEntryStrategy {
@@ -234,6 +246,7 @@ impl AlpacaOptionsEntryStrategy {
             pending_submissions: BTreeMap::new(),
             pending_client_order_ids: BTreeMap::new(),
             submitted_underlying_keys: BTreeSet::new(),
+            recorded_candidate_alert_keys: BTreeSet::new(),
         }
     }
 
@@ -259,7 +272,8 @@ impl AlpacaOptionsEntryStrategy {
             EntryGateDecision::Continue => {}
             EntryGateDecision::KillSwitch => {
                 log::info!(
-                    "Skipping Alpaca options entry: reason=kill_switch_enabled underlying={} strategy={}",
+                    "Skipping Alpaca options entry: trade_date={} reason=kill_switch_enabled underlying={} strategy={}",
+                    data.opportunities.trade_date,
                     entry.underlying(),
                     entry.strategy_name()
                 );
@@ -268,15 +282,27 @@ impl AlpacaOptionsEntryStrategy {
                     json!({
                         "action": "skipped",
                         "reason": "kill_switch_enabled",
+                        "trade_date": data.opportunities.trade_date,
                         "underlying": entry.underlying(),
                         "strategy": entry.strategy_name(),
                     }),
+                );
+                self.record_selected_candidate_alert(
+                    &data.opportunities.trade_date,
+                    &entry,
+                    "skipped",
+                    None,
+                    Some("kill_switch_enabled"),
+                    None,
+                    None,
+                    &[],
                 );
                 return Ok(None);
             }
             EntryGateDecision::OutsideEntryWindow => {
                 log::info!(
-                    "Skipping Alpaca options entry: reason=outside_entry_window underlying={} strategy={}",
+                    "Skipping Alpaca options entry: trade_date={} reason=outside_entry_window underlying={} strategy={}",
+                    data.opportunities.trade_date,
                     entry.underlying(),
                     entry.strategy_name()
                 );
@@ -285,9 +311,20 @@ impl AlpacaOptionsEntryStrategy {
                     json!({
                         "action": "skipped",
                         "reason": "outside_entry_window",
+                        "trade_date": data.opportunities.trade_date,
                         "underlying": entry.underlying(),
                         "strategy": entry.strategy_name(),
                     }),
+                );
+                self.record_selected_candidate_alert(
+                    &data.opportunities.trade_date,
+                    &entry,
+                    "skipped",
+                    None,
+                    Some("outside_entry_window"),
+                    None,
+                    None,
+                    &[],
                 );
                 return Ok(None);
             }
@@ -306,10 +343,43 @@ impl AlpacaOptionsEntryStrategy {
                 json!({
                     "action": "dry_run",
                     "reason": "submission_disabled",
+                    "trade_date": data.opportunities.trade_date,
                     "underlying": entry.underlying(),
                     "strategy": entry.strategy_name(),
                     "symbols": entry.option_symbols(),
                     "score": entry.score(),
+                }),
+            );
+            self.record_selected_candidate_alert(
+                &data.opportunities.trade_date,
+                &entry,
+                "dry_run",
+                None,
+                Some("submission_disabled"),
+                None,
+                None,
+                &[],
+            );
+            return Ok(None);
+        }
+
+        if self.config.admission.submit_enabled && !self.candidate_ledger_persistence_ready() {
+            log::error!(
+                "Skipping Alpaca options entry: trade_date={} reason=candidate_ledger_unhealthy underlying={} strategy={} symbols={}",
+                data.opportunities.trade_date,
+                entry.underlying(),
+                entry.strategy_name(),
+                entry.option_symbols().join(",")
+            );
+            emit_operator_event(
+                "entry_decision",
+                json!({
+                    "action": "skipped",
+                    "reason": "candidate_ledger_unhealthy",
+                    "trade_date": data.opportunities.trade_date,
+                    "underlying": entry.underlying(),
+                    "strategy": entry.strategy_name(),
+                    "symbols": entry.option_symbols(),
                 }),
             );
             return Ok(None);
@@ -317,7 +387,8 @@ impl AlpacaOptionsEntryStrategy {
 
         if self.config.admission.submit_enabled && !self.state_persistence_ready() {
             log::error!(
-                "Skipping Alpaca options entry: reason=state_persistence_unhealthy underlying={} strategy={} symbols={}",
+                "Skipping Alpaca options entry: trade_date={} reason=state_persistence_unhealthy underlying={} strategy={} symbols={}",
+                data.opportunities.trade_date,
                 entry.underlying(),
                 entry.strategy_name(),
                 entry.option_symbols().join(",")
@@ -327,10 +398,21 @@ impl AlpacaOptionsEntryStrategy {
                 json!({
                     "action": "skipped",
                     "reason": "state_persistence_unhealthy",
+                    "trade_date": data.opportunities.trade_date,
                     "underlying": entry.underlying(),
                     "strategy": entry.strategy_name(),
                     "symbols": entry.option_symbols(),
                 }),
+            );
+            self.record_selected_candidate_alert(
+                &data.opportunities.trade_date,
+                &entry,
+                "skipped",
+                None,
+                Some("state_persistence_unhealthy"),
+                None,
+                None,
+                &[],
             );
             return Ok(None);
         }
@@ -364,10 +446,21 @@ impl AlpacaOptionsEntryStrategy {
                     "action": "skipped",
                     "reason": "duplicate_pending_submission",
                     "key": underlying_key,
+                    "trade_date": data.opportunities.trade_date,
                     "underlying": entry.underlying(),
                     "strategy": entry.strategy_name(),
                     "symbols": entry.option_symbols(),
                 }),
+            );
+            self.record_selected_candidate_alert(
+                &data.opportunities.trade_date,
+                &entry,
+                "skipped",
+                None,
+                Some("duplicate_pending_submission"),
+                None,
+                None,
+                &[],
             );
             return Ok(None);
         }
@@ -450,6 +543,16 @@ impl AlpacaOptionsEntryStrategy {
             order_list_id.to_string(),
             order_count,
             client_order_ids,
+        );
+        self.record_selected_candidate_alert(
+            trade_date,
+            &entry,
+            "submitted",
+            Some(order_list_id),
+            None,
+            None,
+            None,
+            &[],
         );
 
         if let Err(error) = self.submit_entry_orders(orders, order_list_id) {
@@ -572,6 +675,8 @@ impl AlpacaOptionsEntryStrategy {
 
         let mut rejected_state = None;
         let mut should_remove = false;
+        let mut terminal_rejection_recorded = false;
+        let mut submit_rejected_alert = None;
         if let Some(pending) = self.pending_submissions.get_mut(&order_list_id) {
             pending.rejected = pending.rejected.saturating_add(1);
             pending.rejection_reasons.push(reason.to_string());
@@ -595,8 +700,21 @@ impl AlpacaOptionsEntryStrategy {
                     close_reason.to_string(),
                 ));
                 pending.recorded = true;
+                terminal_rejection_recorded = true;
             }
             should_remove = pending.accepted + pending.rejected >= pending.order_count;
+            if should_remove && pending.rejected > 0 {
+                submit_rejected_alert = Some((
+                    pending.trade_date.clone(),
+                    pending.entry.clone(),
+                    pending.order_list_id.clone(),
+                    pending.quantity,
+                    pending.accepted,
+                    pending.rejected,
+                    pending.rejection_reasons.clone(),
+                    terminal_rejection_recorded,
+                ));
+            }
         }
 
         if let Some((draft, close_reason)) = rejected_state {
@@ -622,6 +740,29 @@ impl AlpacaOptionsEntryStrategy {
                 entry.close_reason = Some(close_reason);
             }
             self.persist_strategy_state_mutation(mutation);
+        }
+
+        if let Some((
+            trade_date,
+            entry,
+            order_list_id,
+            quantity,
+            accepted,
+            rejected,
+            rejection_reasons,
+            terminal_rejection_recorded,
+        )) = submit_rejected_alert
+        {
+            self.record_submit_rejected_candidate_alert(
+                &trade_date,
+                &entry,
+                &order_list_id,
+                quantity,
+                accepted,
+                rejected,
+                &rejection_reasons,
+                terminal_rejection_recorded,
+            );
         }
 
         if should_remove {
@@ -694,7 +835,7 @@ impl AlpacaOptionsEntryStrategy {
     }
 
     fn log_entry_block(
-        &self,
+        &mut self,
         trade_date: &str,
         entry: &SelectedOptionsEntry,
         block: &SubmissionBlock,
@@ -725,6 +866,114 @@ impl AlpacaOptionsEntryStrategy {
                 "score": entry.score(),
             }),
         );
+        self.record_selected_candidate_alert(
+            trade_date,
+            entry,
+            "selected_but_blocked",
+            None,
+            Some(&block.reason),
+            block.current,
+            block.limit,
+            &block.details,
+        );
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn record_selected_candidate_alert(
+        &mut self,
+        trade_date: &str,
+        entry: &SelectedOptionsEntry,
+        action: &str,
+        order_list_id: Option<&str>,
+        reason: Option<&str>,
+        current: Option<usize>,
+        limit: Option<usize>,
+        details: &[String],
+    ) {
+        let Some(persistence) = &self.config.candidate_ledger_persistence else {
+            return;
+        };
+        let (identity_key, mut payload) = selected_entry_alert_payload(
+            entry,
+            None,
+            trade_date,
+            action,
+            order_list_id,
+            self.config.quantity,
+        );
+        let alert_key = candidate_alert_key(SELECTED_CANDIDATE_ALERT, &identity_key);
+        if !self
+            .recorded_candidate_alert_keys
+            .insert(format!("{trade_date}|{alert_key}"))
+        {
+            return;
+        }
+        if let Some(reason) = reason {
+            insert_string_field(&mut payload, "reason", reason.to_string());
+        }
+        insert_optional_usize(&mut payload, "current", current);
+        insert_optional_usize(&mut payload, "limit", limit);
+        if !details.is_empty() {
+            insert_value_field(&mut payload, "details", json!(details));
+        }
+        if let Err(error) = persistence.append_candidate_alert(
+            trade_date,
+            SELECTED_CANDIDATE_ALERT,
+            "info",
+            alert_key,
+            payload,
+        ) {
+            log::error!("Failed to enqueue Alpaca selected-candidate evidence: {error:#}");
+        }
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn record_submit_rejected_candidate_alert(
+        &mut self,
+        trade_date: &str,
+        entry: &SelectedOptionsEntry,
+        order_list_id: &str,
+        quantity: u64,
+        accepted: usize,
+        rejected: usize,
+        rejection_reasons: &[String],
+        terminal_rejection_recorded: bool,
+    ) {
+        let Some(persistence) = &self.config.candidate_ledger_persistence else {
+            return;
+        };
+        let (identity_key, mut payload) = selected_entry_alert_payload(
+            entry,
+            None,
+            trade_date,
+            "submitted",
+            Some(order_list_id),
+            quantity,
+        );
+        let alert_key = candidate_alert_key(CANDIDATE_SUBMIT_REJECTED_ALERT, &identity_key);
+        if !self
+            .recorded_candidate_alert_keys
+            .insert(format!("{trade_date}|{alert_key}"))
+        {
+            return;
+        }
+        insert_value_field(&mut payload, "accepted", Value::from(accepted));
+        insert_value_field(&mut payload, "rejected", Value::from(rejected));
+        insert_value_field(&mut payload, "rejection_reasons", json!(rejection_reasons));
+        insert_value_field(
+            &mut payload,
+            "terminal_rejection_recorded",
+            Value::Bool(terminal_rejection_recorded),
+        );
+        if let Err(error) = persistence.append_candidate_alert(
+            trade_date,
+            CANDIDATE_SUBMIT_REJECTED_ALERT,
+            "warning",
+            alert_key,
+            payload,
+        ) {
+            log::error!("Failed to enqueue Alpaca submit-rejected evidence: {error:#}");
+        }
     }
 
     fn state_persistence_ready(&self) -> bool {
@@ -732,6 +981,13 @@ impl AlpacaOptionsEntryStrategy {
             .state_persistence
             .as_ref()
             .is_some_and(StrategyStatePersistenceHandle::is_healthy)
+    }
+
+    fn candidate_ledger_persistence_ready(&self) -> bool {
+        self.config
+            .candidate_ledger_persistence
+            .as_ref()
+            .is_some_and(CandidateLedgerPersistenceHandle::is_healthy)
     }
 
     fn persist_strategy_state_mutation(&self, mutation: anyhow::Result<StrategyStateMutation>) {
@@ -1077,6 +1333,12 @@ fn open_broker_order_intent_count(cache: &CacheApi<'_>) -> usize {
         }
     }
     intent_ids.len()
+}
+
+fn insert_optional_usize(payload: &mut Value, key: &str, value: Option<usize>) {
+    if let Some(value) = value {
+        insert_value_field(payload, key, Value::from(value));
+    }
 }
 
 fn accepted_state_mutation(

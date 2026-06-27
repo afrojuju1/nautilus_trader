@@ -2,9 +2,12 @@
 
 use serde_json::{Value, json};
 
-use crate::candidate_engine::{
-    DebitSpreadCandidate, IronCondorCandidate, NakedOptionCandidate, OptionCandidateMetrics,
-    ScoredContract, SpreadCandidate, annualized_premium_yield,
+use crate::{
+    candidate_engine::{
+        DebitSpreadCandidate, IronCondorCandidate, NakedOptionCandidate, OptionCandidateMetrics,
+        ScoredContract, SpreadCandidate, annualized_premium_yield,
+    },
+    options_entry::SelectedOptionsEntry,
 };
 
 /// Builds the shared candidate-ledger payload for a credit-spread candidate.
@@ -116,6 +119,67 @@ pub fn naked_candidate_ledger_payload(
     });
     insert_optional_rank(&mut payload, rank);
     payload
+}
+
+/// Builds the shared candidate-ledger payload for a selected options entry.
+#[must_use]
+pub fn selected_entry_candidate_ledger_payload(
+    entry: &SelectedOptionsEntry,
+    options_buying_power: Option<f64>,
+    rank: Option<usize>,
+) -> Value {
+    let descriptor = entry.descriptor();
+    match entry {
+        SelectedOptionsEntry::Credit(entry) => credit_candidate_ledger_payload(
+            &entry.underlying,
+            descriptor.strategy,
+            rank,
+            &entry.candidate,
+        ),
+        SelectedOptionsEntry::IronCondor(entry) => {
+            iron_condor_candidate_ledger_payload(&entry.underlying, rank, &entry.candidate)
+        }
+        SelectedOptionsEntry::Debit(entry) => debit_candidate_ledger_payload(
+            &entry.underlying,
+            descriptor.strategy,
+            rank,
+            &entry.candidate,
+        ),
+        SelectedOptionsEntry::NakedOption(entry) => naked_candidate_ledger_payload(
+            &entry.underlying,
+            descriptor.strategy,
+            options_buying_power,
+            rank,
+            &entry.candidate,
+        ),
+    }
+}
+
+/// Builds selected-entry candidate-alert identity and payload.
+#[must_use]
+pub fn selected_entry_alert_payload(
+    entry: &SelectedOptionsEntry,
+    options_buying_power: Option<f64>,
+    trade_date: &str,
+    action: &str,
+    order_list_id: Option<&str>,
+    quantity: u64,
+) -> (String, Value) {
+    let descriptor = entry.descriptor();
+    let identity_key = candidate_alert_identity_key_from_strings(
+        descriptor.strategy,
+        &descriptor.underlying,
+        &descriptor.symbols,
+    );
+    let mut payload = selected_entry_candidate_ledger_payload(entry, options_buying_power, None);
+    insert_string_field(&mut payload, "candidate_identity_key", identity_key.clone());
+    insert_string_field(&mut payload, "action", action.to_string());
+    insert_string_field(&mut payload, "trade_date", trade_date.to_string());
+    insert_value_field(&mut payload, "quantity", Value::from(quantity));
+    if let Some(order_list_id) = order_list_id {
+        insert_string_field(&mut payload, "order_list_id", order_list_id.to_string());
+    }
+    (identity_key, payload)
 }
 
 /// Returns a stable key for one candidate independent of account and trade date.

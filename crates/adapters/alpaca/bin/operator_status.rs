@@ -31,6 +31,7 @@ use nautilus_alpaca::{
     },
     options_runtime::OptionsEngineConfig,
     runtime::{StrategyState, read_operator_events},
+    storage::{CandidateLedgerSummaryFilters, read_candidate_ledger_records},
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -58,6 +59,7 @@ struct OperatorConfig {
     fleet_account_id: Option<String>,
     fleet_policy_blocks: Vec<String>,
     storage: StorageStatus,
+    candidate_ledger_records: Vec<Value>,
     json_output: bool,
 }
 
@@ -293,25 +295,52 @@ impl OperatorConfig {
             .into_iter()
             .map(ToString::to_string)
             .collect();
+        let trade_date = Utc::now()
+            .with_timezone(&strategy_config.entry_timezone)
+            .date_naive();
 
-        let storage = if let Some(repository) = &strategy_config.storage_repository {
-            let status = repository.migration_status().await?;
-            StorageStatus {
-                enabled: true,
-                schema: repository.schema().to_string(),
-                applied_migrations: Some(status.applied_count),
-                latest_migration_version: status.latest_version,
-                dirty_migration_version: status.dirty_version,
-            }
-        } else {
-            StorageStatus {
-                enabled: false,
-                schema: strategy_config.storage_schema.clone(),
-                applied_migrations: None,
-                latest_migration_version: None,
-                dirty_migration_version: None,
-            }
-        };
+        let (storage, candidate_ledger_records) =
+            if let Some(repository) = &strategy_config.storage_repository {
+                let status = repository.migration_status().await?;
+                let filters = CandidateLedgerSummaryFilters {
+                    since: trade_date.checked_sub_signed(Duration::days(7)),
+                    until: None,
+                };
+                let records = match read_candidate_ledger_records(
+                    repository,
+                    strategy_config.storage_account_id(),
+                    filters,
+                )
+                .await
+                {
+                    Ok(records) => records,
+                    Err(error) => {
+                        log::warn!("Failed to read Alpaca candidate-ledger records: {error:#}");
+                        Vec::new()
+                    }
+                };
+                (
+                    StorageStatus {
+                        enabled: true,
+                        schema: repository.schema().to_string(),
+                        applied_migrations: Some(status.applied_count),
+                        latest_migration_version: status.latest_version,
+                        dirty_migration_version: status.dirty_version,
+                    },
+                    records,
+                )
+            } else {
+                (
+                    StorageStatus {
+                        enabled: false,
+                        schema: strategy_config.storage_schema.clone(),
+                        applied_migrations: None,
+                        latest_migration_version: None,
+                        dirty_migration_version: None,
+                    },
+                    Vec::new(),
+                )
+            };
 
         Ok(Self {
             service_name: env::var("NAUTILUS_ALPACA_SERVICE")
@@ -327,10 +356,7 @@ impl OperatorConfig {
             lock_path: lock_dir.join("alpaca-options.lock"),
             stale_order_secs: strategy_config.stale_entry_secs as i64,
             max_close_attempts: strategy_config.max_close_attempts,
-            trade_date: Utc::now()
-                .with_timezone(&strategy_config.entry_timezone)
-                .date_naive()
-                .to_string(),
+            trade_date: trade_date.to_string(),
             kill_switch: strategy_config.kill_switch,
             submit_enabled: strategy_config.submit_enabled,
             manage_enabled: strategy_config.manage_enabled,
@@ -345,6 +371,7 @@ impl OperatorConfig {
             fleet_account_id: strategy_config.fleet_account_id,
             fleet_policy_blocks: strategy_config.fleet_policy_blocks,
             storage,
+            candidate_ledger_records,
             json_output: env::args().any(|arg| arg == "--json"),
         })
     }
@@ -507,9 +534,16 @@ fn build_status(
     };
 
     let last_scan = latest_event(events, "option_chain_opportunity_scan")
+        .or_else(|| {
+            latest_candidate_ledger_record(&config.candidate_ledger_records, "scanner_result")
+        })
         .or_else(|| latest_event(events, "management_iteration"));
     let last_scanner_diagnostic = latest_event(events, "scanner_diagnostic");
-    let last_decision = latest_event(events, "decision");
+    let last_decision = latest_event(events, "entry_decision")
+        .or_else(|| {
+            latest_candidate_ledger_alert(&config.candidate_ledger_records, "selected_candidate")
+        })
+        .or_else(|| latest_event(events, "decision"));
     let last_management_snapshot = latest_event(events, "management_snapshot");
     let last_management_block = latest_event(events, "management_block");
     let last_broker_event = latest_broker_event(recent_orders, activities);
@@ -1026,6 +1060,25 @@ fn latest_event(events: &[Value], event_type: &str) -> Option<Value> {
         .iter()
         .rev()
         .find(|event| event.get("type").and_then(Value::as_str) == Some(event_type))
+        .cloned()
+}
+
+fn latest_candidate_ledger_record(records: &[Value], record_type: &str) -> Option<Value> {
+    records
+        .iter()
+        .rev()
+        .find(|record| record.get("type").and_then(Value::as_str) == Some(record_type))
+        .cloned()
+}
+
+fn latest_candidate_ledger_alert(records: &[Value], alert_type: &str) -> Option<Value> {
+    records
+        .iter()
+        .rev()
+        .find(|record| {
+            record.get("type").and_then(Value::as_str) == Some("candidate_alert")
+                && record.get("alert_type").and_then(Value::as_str) == Some(alert_type)
+        })
         .cloned()
 }
 
