@@ -117,8 +117,6 @@ pub struct AlpacaDataClientConfig {
     pub stock_feed: AlpacaStockFeed,
     /// Option market data feed.
     pub option_feed: AlpacaOptionFeed,
-    /// Maximum number of option symbols to subscribe in one WebSocket request.
-    pub max_option_subscriptions: usize,
     /// HTTP request timeout in seconds.
     pub request_timeout_secs: u64,
     /// Optional interval for polling option snapshot Greeks and IV.
@@ -135,7 +133,6 @@ impl Default for AlpacaDataClientConfig {
             trading_base_url: None,
             stock_feed: AlpacaStockFeed::default(),
             option_feed: AlpacaOptionFeed::default(),
-            max_option_subscriptions: 1_000,
             request_timeout_secs: 30,
             snapshot_greeks_poll_secs: None,
         }

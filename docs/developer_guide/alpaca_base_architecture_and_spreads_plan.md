@@ -343,19 +343,17 @@ The current system has important truth boundaries:
 | Market capture | `services/market_recorder.py` | Should remain the sole option websocket owner in normal runtime. |
 | Operator truth | API/web read models | Should stay thin and projection-based. |
 
-The existing Nautilus integration point is also in the right place:
+The earlier Nautilus integration point has been retired in this repo:
 
-- `packages/core/services/execution/runtimes.py` builds a Nautilus handoff.
-- `packages/core/services/execution/nautilus_bridge.py` runs
-  `alpaca-submit-order-list-bridge`.
-- `packages/core/services/execution/__init__.py` chooses `NAUTILUS_RUNTIME` in
-  `run_execution_submit`.
-- Failures are fail-closed and recorded onto the execution attempt and linked
-  execution intent.
+- The external handoff bridge binary was removed.
+- Current Alpaca order-capable work should flow through Nautilus-owned adapter paths and standard
+  `TradingNode`/execution-client factories, not a repo-local bridge invoked by another runtime.
+- If `spreads` is integrated later, it should produce standard orders or order-list requests through
+  the adapter boundary rather than own broker submission mechanics.
 
-That means `spreads` does not need a broad rewrite. It needs the bridge contract
-made canonical, then duplicated broker mechanics removed one strategy family at
-a time.
+That means `spreads` should not drive a separate bridge contract from this repo. The clean target is
+to keep Nautilus as the order owner and remove duplicated broker mechanics one strategy family at a
+time if a product-level integration is still needed.
 
 ## Source Of Truth Rules
 
@@ -625,7 +623,7 @@ execution_attempt with runtime=nautilus
 versioned Nautilus handoff
         |
         v
-alpaca-submit-order-list-bridge
+standard Nautilus Alpaca execution path
         |
         v
 Alpaca

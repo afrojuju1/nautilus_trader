@@ -9,7 +9,9 @@ description: Safely sync Ade's Nautilus Trader fork with the base upstream repos
 
 Sync `/home/ade/Projects/nautilus_trader` with `nautechsystems/nautilus_trader` by merging
 upstream into the fork, never by resetting the fork to upstream. Preserve fork-only Alpaca adapter,
-runtime, docs, and deployment work unless Ade explicitly decides otherwise.
+runtime, docs, and deployment work unless Ade explicitly decides otherwise. The current Alpaca
+order-capable runtime is `alpaca-option-chain-scan-live-node`; `alpaca-options-engine` is a
+config-check utility, not the trading-loop owner.
 
 ## Modes
 
@@ -27,6 +29,7 @@ From the repo root:
 ```bash
 git status --short --branch
 git remote -v
+old_upstream=$(git rev-parse upstream/develop 2>/dev/null || true)
 git fetch origin
 git fetch upstream
 git log --oneline --decorate --graph --left-right --cherry-pick origin/develop...upstream/develop
@@ -65,12 +68,24 @@ Prefer:
 - Fork-owned Alpaca adapter/runtime behavior where it is Ade's migration target.
 - Removing stale compatibility paths when Ade has asked for cleanup or replacement.
 - Keeping active docs and examples aligned with the current architecture.
+- Preserving the Nautilus-native Alpaca runtime path over repo-local bridges, wrappers, or old
+  account-engine loops.
+
+Do not resurrect retired Alpaca artifacts during conflict resolution unless Ade explicitly asks for a
+new staged bridge:
+
+- `alpaca-submit-order-list-bridge` / `submit_order_list_bridge.rs`
+- `alpaca-put-credit-strategy-loop` / `put_credit_strategy_loop.rs`
+- `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED`
+
+Use `ALPACA_SUBMIT` as the runtime submit gate.
 
 After resolving conflicts:
 
 ```bash
 git status --short
 git diff --check
+rg -n "alpaca-submit-order-list-bridge|submit_order_list_bridge|alpaca-put-credit-strategy-loop|put_credit_strategy_loop|ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED" crates/adapters/alpaca deploy/alpaca nautilus_trader/adapters/alpaca
 git log --oneline upstream/develop..develop
 ```
 
@@ -106,4 +121,48 @@ Push only when Ade asks:
 git push origin develop
 ```
 
-Report the merge commit, validation performed, push result, and any remaining risks.
+## Upstream Improvement Summary
+
+After a completed sync, include a short operator-facing summary of upstream improvements that the
+fork can build on for Alpaca work. Keep it concise and grouped by practical relevance, not by every
+commit.
+
+Use the previous upstream ref captured during preflight when available:
+
+```bash
+git log --oneline "${old_upstream}..upstream/develop"
+```
+
+If `old_upstream` was unavailable, summarize from the fetched graph or from the merge commit range.
+
+Classify improvements with Alpaca impact in mind:
+
+- **Direct Alpaca impact**: mention only if upstream changed Alpaca-owned files or APIs used by the
+  Alpaca adapter.
+- **Useful foundation**: live/runtime, timers, strategy/order cache, execution, msgbus, data,
+  persistence, ClickHouse/catalog, Python node/examples, build/CI/dependency/security changes that
+  can improve or simplify Alpaca work.
+- **Cleanup opportunities**: upstream abstractions that let us delete fork-local Alpaca code,
+  wrapper paths, or duplicated runtime logic.
+- **Background upstream changes**: adapters, docs, tests, or examples that landed but do not affect
+  Alpaca directly.
+
+Prefer this shape in the final response:
+
+```text
+Pushed. Worktree clean.
+
+New upstream/base improvements now available to build on for Alpaca:
+- Live/runtime: ...
+- Strategy/execution: ...
+- Data/persistence: ...
+- Build/CI/deps: ...
+
+Direct Alpaca changes: none found / <brief note>.
+```
+
+Do not overstate impact. Say "relevant foundation" when the change helps the platform Alpaca runs on,
+and reserve "direct Alpaca" for changes that actually touch Alpaca code or contracts.
+
+Report the merge commit, validation performed, push result, remaining risks, and the upstream
+improvement summary.

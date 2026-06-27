@@ -312,7 +312,7 @@ This can come after durable state, because durable state is the submit cutover b
 
 ## Readiness Gate For Paper Submit
 
-`ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED=true` should require all of the following:
+`ALPACA_SUBMIT=true` should require all of the following:
 
 - Postgres storage configured and reachable.
 - Required `sqlx` migrations applied.
@@ -352,7 +352,7 @@ blocking synchronous strategy callbacks.
 
 - The option-chain live node checks storage readiness when live entry submit is requested.
 - Storage-backed state and a healthy persistence handle are required when
-  `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED=true` and runtime submit is enabled.
+  `ALPACA_SUBMIT=true`.
 - The node acquires a Postgres runtime lease before live submission and heartbeats it while running.
 - Strategy admission refuses live entries when persistence is missing or unhealthy.
 

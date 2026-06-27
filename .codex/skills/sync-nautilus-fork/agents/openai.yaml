@@ -1,4 +1,4 @@
 interface:
   display_name: "Sync Nautilus Fork"
-  short_description: "Merge upstream safely into the fork"
-  default_prompt: "Use $sync-nautilus-fork to sync my Nautilus fork with the base upstream repo."
+  short_description: "Merge upstream while preserving Alpaca runtime"
+  default_prompt: "Use $sync-nautilus-fork to sync my Nautilus fork with upstream while preserving our Alpaca runtime."

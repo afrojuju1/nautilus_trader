@@ -12,8 +12,9 @@ implemented surface focuses on US equity option workflows:
 - Diagnostic and operator binaries for paper-trading account checks, option-chain inspection,
   dry-run scanning, multi-leg validation, candidate alerts, and performance reporting.
 
-The Python `TradingNode` data and execution factories are still placeholders. Until those factories
-are wired to live clients, document this work as an experimental Rust Alpaca options runtime rather
-than a full Python live adapter.
+The Python `TradingNode` path exposes Alpaca data and execution factories for stock bars, exact
+option snapshot quotes/Greeks, simple equity DAY limit orders, and option multi-leg DAY limit order
+lists. This remains narrower than a full Alpaca adapter; document it as an experimental Alpaca
+surface until paper/live proof is broader.
 
 The implementation plan is tracked in `docs/developer_guide/alpaca_adapter_runtime_plan.md`.

@@ -252,25 +252,8 @@ doc = false
 test = false
 
 [[bin]]
-# Internal bridge used by external handoff runtimes.
-name = "alpaca-submit-order-list-bridge"
-path = "bin/submit_order_list_bridge.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
 name = "alpaca-watch-trade-updates"
 path = "bin/watch_trade_updates.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
-# Diagnostic loop for the put-credit leg only. Production entries are owned by
-# `alpaca-option-chain-scan-live-node`.
-name = "alpaca-put-credit-strategy-loop"
-path = "bin/put_credit_strategy_loop.rs"
 required-features = ["live"]
 doc = false
 test = false

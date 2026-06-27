@@ -55,6 +55,14 @@ Rules:
 
 ## Alpaca Adapter Work
 
+- The order-capable Alpaca runtime is `alpaca-option-chain-scan-live-node`, wired through
+  Nautilus-native actor/strategy/data/execution paths. `alpaca-options-engine` is retained as a
+  config-check utility, not as the trading loop owner.
+- Do not restore retired handoff or standalone strategy-loop surfaces such as
+  `alpaca-submit-order-list-bridge`, `submit_order_list_bridge.rs`, or
+  `alpaca-put-credit-strategy-loop` unless Ade explicitly asks for a staged bridge.
+- Use the normal runtime submission gate `ALPACA_SUBMIT`; do not reintroduce
+  `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED`.
 - For Alpaca execution changes, run targeted checks before commit:
 
 ```bash

@@ -59,8 +59,6 @@ class AlpacaDataClientConfig(LiveDataClientConfig, frozen=True):
     option_symbols : list[str], default []
         Exact Alpaca/OCC option symbols to model as option instruments for the Python
         ``TradingNode`` data client.
-    max_option_subscriptions : PositiveInt, default 1000
-        Maximum option symbols to subscribe in one WebSocket request.
     request_timeout_secs : PositiveInt, default 30
         HTTP request timeout in seconds.
     bar_poll_interval_secs : PositiveInt, default 300
@@ -81,7 +79,6 @@ class AlpacaDataClientConfig(LiveDataClientConfig, frozen=True):
     option_feed: AlpacaOptionFeed = "indicative"
     equity_symbols: list[str] = msgspec.field(default_factory=list)
     option_symbols: list[str] = msgspec.field(default_factory=list)
-    max_option_subscriptions: PositiveInt = 1_000
     request_timeout_secs: PositiveInt = 30
     bar_poll_interval_secs: PositiveInt = 300
     bars_timestamp_on_close: bool = True
