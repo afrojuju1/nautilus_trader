@@ -319,22 +319,19 @@ Next implementation slices:
 
 1. Run the deferred market-hours cutover proof: non-submit parity first, then bounded paper submit
    through `AlpacaOptionsStrategy`.
-2. Define and implement the candidate-outcome analytics read model so historical opportunity
-   records are not double-counted across observation buckets.
-3. Expose Alpaca historical option bars through the standard Nautilus historical data request path
+2. Expose Alpaca historical option bars through the standard Nautilus historical data request path
    if Alpaca is promoted toward a full official adapter.
-4. Replace snapshot-backed quote freshness with true Alpaca option quote/trade streaming before
+3. Replace snapshot-backed quote freshness with true Alpaca option quote/trade streaming before
    increasing live-trading dependence on quote freshness.
-5. Add a real regime feature input contract before wiring regime routing metadata into live
-   decisions.
+4. Implement the regime router types and read-only feature actor from the focused v1 input contract
+   before wiring regime metadata into live decisions.
 
 Still deferred:
 
 - Market-hours Nautilus strategy submit proof.
-- Candidate-outcome analytics read model.
 - Standard historical option bar request path.
 - True option quote/trade streaming transport.
-- Regime feature input contract and live routing.
+- Regime router type implementation, feature actor, validation, and live routing.
 - Broader ClickHouse-derived scanner features.
 
 ## Migration Path

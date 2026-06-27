@@ -604,9 +604,9 @@ Required before promoting beyond experimental:
 High-value after the required platform work:
 
 5. Strategy regime router.
-   - Status: architecture remains proposed; implementation intentionally waits for a real
-     read-only feature actor or feature input contract. Do not add fake `neutral` regime metadata
-     to ledgers just to create a router-shaped surface.
+   - Status: v1 feature input contract is defined; implementation intentionally waits for pure
+     router types and a real read-only feature actor. Do not add fake `neutral` regime metadata to
+     ledgers just to create a router-shaped surface.
    - Build this as a Nautilus-native routing layer, not a standalone scanner. A read-only regime
      feature actor derives features from bars, option-chain state, external signals, and approved
      historical feature sources; a pure regime router returns labels, confidence, explanation codes,
@@ -615,8 +615,9 @@ High-value after the required platform work:
      router must not submit orders, mutate strategy state, or call Alpaca directly.
    - Record regime label, confidence, feature freshness, feature version, routing action, and
      explanation codes in the candidate ledger for every scan.
-   - Use the focused [Alpaca Regime Router](alpaca_regime_router.md) design for v1 labels, feature
-     contracts, storage/evidence boundaries, failure policy, and rollout slices.
+   - Use the focused [Alpaca Regime Router](alpaca_regime_router.md) design for v1 labels, approved
+     feature sources, freshness rules, confidence semantics, storage/evidence boundaries, failure
+     policy, validation ranges, and rollout slices.
 
 6. Portfolio Greek and stress governor.
    - Status: initial risk-capital stress governor complete in the entry-admission path. It stores
@@ -763,7 +764,8 @@ Implement the Phase 7.5 required platform work in this order:
    inputs depend on feature storage.
 6. Fill-quality intelligence, close-side MLeg repricing, event shock guard, and replay decision
    explanations. Initial implementations complete on existing runtime/reporting paths.
-7. Strategy regime router. Still open by design until a real feature actor/input contract exists.
+7. Strategy regime router. Still open by design until pure router types and a real feature actor
+   exist.
 
 In parallel with that platform work, continue paper-proving the undefined-risk account under strict
 caps. Do not expand undefined-risk symbols or sizing until one naked-option open/management/close

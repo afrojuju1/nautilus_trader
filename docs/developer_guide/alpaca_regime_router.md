@@ -1,6 +1,6 @@
 # Alpaca Regime Router
 
-Status: proposed focused architecture; not yet implemented.
+Status: v1 feature input contract defined; router not yet implemented.
 
 This document defines the target architecture for Alpaca option strategy regime routing. It refines
 the regime-router slice described in the Nautilus-native candidate scanning architecture and the
@@ -16,9 +16,9 @@ Current implementation boundary:
   reprice laddering, and replay decision explanations now exist in the Alpaca runtime/reporting
   paths.
 - Those are prerequisite signals and safety gates, not a regime router.
-- Do not stamp default or `neutral` regime metadata into candidate ledgers until a real
-  `RegimeFeatureActor` or equivalent feature input contract exists. Misleading regime labels are
-  worse than missing labels.
+- This document now defines the v1 `RegimeInput` contract. Runtime code still must not stamp regime
+  metadata until a real feature snapshot is produced from these inputs. Misleading labels are worse
+  than missing labels.
 
 ## Boundary
 
@@ -141,37 +141,112 @@ outcome analysis.
 The router may carry secondary tags such as `earnings_window`, `iv_spike`, `wide_quotes`,
 `gap_open`, or `trend_reversal`, but the primary label should remain one of the stable values above.
 
-## Inputs
+## V1 Feature Input Contract
 
-Keep inputs explicit and small. The router should receive a complete input object rather than
-querying services internally.
+Keep inputs explicit and small. The router receives a complete `RegimeInput` value and must not
+query services internally.
+
+V1 is intentionally deterministic and source-limited. The approved inputs are:
+
+| Group | Required for v1 | Approved source | Freshness rule |
+| --- | --- | --- | --- |
+| Underlying bars | Yes | Nautilus bar cache/stream, `ParquetDataCatalog`, or ClickHouse market-data warehouse. | Live: last complete bar no older than two configured bar intervals. Replay: bar timestamp must be at or before decision time. |
+| Underlying trend/vol features | Yes | Derived by the feature actor from approved bars. | Computed from the same fresh bar snapshot as the underlying bars. |
+| Option liquidity snapshot | Yes for families under consideration | `OptionChainSlice`, Nautilus quote cache, Alpaca option snapshot adapter, or future option quote stream. | Quote age must be no older than `management.active_risk_quote_stale_secs` for selected legs when available; chain-level summaries must name their source timestamp. |
+| Event load | Yes | Normalized earnings feed and event cache used by Alpaca admission. | Earnings data must cover the trade date and next configured event-block window. Unknown timing remains blocking unless explicitly allowed by the event policy. |
+| Portfolio stress summary | Optional in v1 | Existing risk-capital state, strategy state, broker positions, and future Greek/stress governor output. | Must be produced in the same decision pass as risk admission if used for routing. |
+| Breadth/proxy instruments | Optional in v1 | Configured ETF/index proxies from approved bar sources. | Use only when every configured proxy passes the bar freshness rule; otherwise mark the feature group unavailable. |
+| Historical feature snapshot | Optional in v1 | ClickHouse or catalog-derived feature snapshots. | Replay: as-of timestamp must be no later than decision time. Live: snapshot must be current for the configured session. |
+
+Disallowed v1 inputs:
+
+- Ad hoc environment reads inside the router.
+- Direct Alpaca HTTP calls from the router.
+- Raw CSV parsing by the router.
+- Placeholder, default, or hand-filled `neutral` labels.
+- Model outputs without deterministic feature values and explanation codes.
+
+### RegimeInput
 
 ```text
 RegimeInput
-  as_of_ts
-  underlying_symbol
-  underlying bars and returns
-  realized volatility and gap metrics
-  trend and mean-reversion indicators
-  market breadth or proxy instruments
-  option-implied volatility and skew proxies
-  option liquidity and quote freshness
-  external event load, such as earnings and known news
-  optional portfolio Greek/stress summary
+  schema_version = 1
+  feature_version
+  as_of_ts_utc
+  trade_date
+  account_id
+  underlyings
+  bar_interval
+  bar_source
+  underlying_features
+    return_5m
+    return_30m
+    return_1d
+    realized_vol_30m
+    realized_vol_1d
+    intraday_range_pct
+    gap_open_pct
+    trend_score
+    mean_reversion_score
+  option_liquidity
+    source
+    quote_age_secs_max
+    median_spread_pct
+    wide_quote_ratio
+    min_open_interest
+    min_volume
+    iv_rank_proxy
+    skew_proxy
+  event_load
+    earnings_blocked_underlyings
+    unknown_timing_underlyings
+    market_event_codes
+  portfolio_context
+    risk_capital_used_pct
+    active_entries
+    net_delta_proxy
+    stress_loss_pct
+  feature_freshness
+    group
+    source
+    latest_ts_utc
+    age_secs
+    status
+  unavailable_features
 ```
 
-Feature groups:
+`underlyings` should be the enabled option-underlying set for the current Alpaca runtime config, not
+a hard-coded SPY-only universe. The feature actor may also compute aggregate context from configured
+proxy instruments, but missing proxy data must not be silently treated as neutral breadth.
 
-| Group | Examples | Source |
+`trend_score` and `mean_reversion_score` are normalized deterministic scores in `[-1.0, 1.0]`.
+Positive `trend_score` means directional persistence; positive `mean_reversion_score` means
+contained range behavior. V1 can derive these from moving-average slope, return persistence,
+range compression/expansion, and Hurst-style bar features. The exact formula belongs in the feature
+actor implementation and must be recorded in `feature_version`.
+
+`iv_rank_proxy` and `skew_proxy` are optional until the option-chain/warehouse data is complete
+enough for consistent calculation. If unavailable, the feature group must be listed in
+`unavailable_features` and the router must lower confidence or choose `unknown` when the configured
+policy requires those fields.
+
+### Freshness Status
+
+Each feature group reports one freshness status:
+
+| Status | Meaning | Routing effect |
 | --- | --- | --- |
-| Trend | Hurst, moving-average slope, return persistence, directional breadth proxy. | Nautilus indicators, bars, catalog, ClickHouse. |
-| Volatility | Realized volatility, ATR/range, gap size, intraday range expansion. | Bars, quote history, catalog, ClickHouse. |
-| Option vol | IV level, IV change, skew, term proxy, IV versus realized proxy. | `OptionGreeks`, option snapshots, ClickHouse. |
-| Liquidity | Quote age, spread width, quote depth proxy, volume, open interest, fill-quality proxy. | Option chain, quote stream, ledgers, ClickHouse. |
-| Event load | Earnings timing, known events, market-wide shock signals. | External signals, earnings cache/feed. |
-| Portfolio | Net delta, gamma, vega, theta, stress scenarios, buying-power pressure. | Portfolio, performance state, risk layer. |
+| `fresh` | Source timestamp satisfies the freshness rule. | Feature can contribute normally. |
+| `degraded` | Source is usable but partial, delayed, or derived from a fallback. | Lower confidence and add an explanation code. |
+| `stale` | Source exists but violates the freshness rule. | Required groups force `unknown`; optional groups are ignored with evidence. |
+| `missing` | Source was not produced. | Required groups force `unknown`; optional groups are ignored with evidence. |
 
 ## Outputs
+
+### RegimeContext
+
+`RegimeContext` is the only router output that downstream candidate ranking and selection may
+consume.
 
 ```text
 RegimeContext
@@ -186,6 +261,16 @@ RegimeContext
   dry_run_only
   explanation_codes
 ```
+
+`confidence` is a deterministic input-quality and signal-agreement score in `[0.0, 1.0]`. It is not
+a probability of profit. Use these bands:
+
+| Confidence | Meaning | Typical routing |
+| --- | --- | --- |
+| `0.00 - 0.24` | Required features missing, stale, or contradictory. | `unknown`; dry-run only or block routed families. |
+| `0.25 - 0.49` | Features are degraded or mixed. | Down-rank, tighten thresholds, or block undefined-risk strategies. |
+| `0.50 - 0.74` | Required features fresh with moderate agreement. | Normal routing with recorded adjustments. |
+| `0.75 - 1.00` | Required features fresh and strongly aligned. | Allow stronger family preference, still subject to risk admission. |
 
 `strategy_family_weights` should adjust opportunity ranking. `blocked_strategy_families` should
 remove strategy families before selection. `threshold_adjustments` can tighten minimum edge,
@@ -216,6 +301,8 @@ Use the same clean storage boundary as the warehouse workstream:
 - Postgres candidate ledgers are the operational source of truth for decisions.
 - ClickHouse stores high-volume feature snapshots and analytical mirrors once available.
 - `ParquetDataCatalog` remains the replay/backtest market-data authority.
+- Candidate records should carry only compact regime evidence. Do not store raw feature series,
+  quote series, or bar windows in Postgres.
 
 Every scan should record:
 
@@ -226,6 +313,7 @@ Every scan should record:
 - Explanation codes.
 - Strategy-family weights and blocks.
 - Candidate identifiers affected by the regime decision.
+- Required, optional, stale, missing, and degraded feature groups.
 
 Example evidence shape:
 
@@ -234,16 +322,42 @@ regime_decision
   account_id
   scan_id
   ts_utc
+  trade_date
   underlying
   label
   confidence
   feature_version
   feature_freshness
+  unavailable_features
+  required_features_missing
   strategy_family_weights
   blocked_strategy_families
   threshold_adjustments
+  dry_run_only
+  routing_action
   explanation_codes
+  candidate_identity_keys
 ```
+
+`feature_freshness` should be a compact array of `{group, source, latest_ts_utc, age_secs, status}`
+objects. `candidate_identity_keys` should use the same stable candidate identity key already used by
+candidate ledgers and candidate outcomes.
+
+Recommended explanation codes:
+
+| Code | Meaning |
+| --- | --- |
+| `trend_persistence_high` | Trend features favor directional routing. |
+| `range_contained` | Range and realized volatility favor neutral/mean-reverting routing. |
+| `realized_vol_high` | Realized volatility is elevated for the configured lookback. |
+| `gap_open_large` | Gap metric exceeded the v1 threshold. |
+| `liquidity_wide_quotes` | Option quote width or quote age degraded liquidity confidence. |
+| `event_earnings_window` | Earnings timing blocks or degrades routing for at least one underlying. |
+| `event_timing_unknown` | Event timing is unknown and policy treats it as blocking. |
+| `required_feature_missing` | A required feature group was not produced. |
+| `required_feature_stale` | A required feature group violated freshness policy. |
+| `signals_conflicting` | Trend, volatility, event, or liquidity signals conflict. |
+| `portfolio_stress_elevated` | Optional portfolio stress summary recommends lower exposure. |
 
 ## Failure Policy
 
@@ -251,30 +365,70 @@ Regime failures should fail conservative.
 
 | Condition | Behavior |
 | --- | --- |
-| Missing required features | Label `unknown`; block undefined-risk strategies. |
-| Stale feature snapshot | Label `unknown` or keep previous label only if freshness policy allows it; record stale evidence. |
+| Missing required features | Label `unknown`; set `dry_run_only = true` for order-capable routing and block undefined-risk strategies. |
+| Stale feature snapshot | Label `unknown`; do not carry forward a previous live label in v1. Record stale evidence. |
 | Conflicting signals | Prefer `high_vol_chop` or `unknown`; reduce size and demand stronger edge. |
 | ClickHouse unavailable | Use live/cache/catalog features that are available; do not block trading solely because analytics storage is down unless the configured strategy requires those features. |
 | Event feed unavailable | Treat event load as unknown and block strategies that require event clearance. |
+
+If the regime feature actor is disabled, the runtime should omit regime metadata entirely. If the
+actor is enabled and runs, it may produce `unknown` with evidence. That distinction matters:
+missing metadata means "router was not active"; `unknown` means "router was active and could not
+classify safely."
+
+## Validation Data Ranges
+
+Before routing affects live order-capable decisions, validate the feature contract over fixed
+ranges:
+
+| Range | Use |
+| --- | --- |
+| Last 20 trading sessions for enabled underlyings | Basic feature coverage, freshness, and label distribution. |
+| Days with recorded Alpaca candidate ledgers | Join regime decisions to candidate outcomes and replay reports. |
+| Known earnings/event days in the local approved earnings feed | Verify `event_shock`, unknown timing, and event-block evidence. |
+| High-volatility market days visible in underlying bars | Verify `high_vol_chop`, large gap, and conflicting-signal behavior. |
+| Low-range sessions with normal liquidity | Verify `quiet_mean_reverting` does not fire only by default. |
+
+Minimum validation reports:
+
+- Feature coverage by group and source.
+- Label counts and confidence distribution.
+- Stale/missing/degraded feature rates.
+- Candidate outcome summaries by label, strategy family, and explanation code.
+- Realized performance ledger summaries remain separate from candidate outcome analytics.
+- Examples of every fail-conservative path with evidence.
 
 ## Implementation Slices
 
 | Slice | Outcome | Work | Done when |
 | --- | --- | --- | --- |
-| 1. Contracts | Pure router API. | Add `RegimeInput`, `RegimeContext`, labels, explanation codes, and routing policy types. | Unit-level callers can classify synthetic feature snapshots without venue I/O. |
+| 0. Input contract | Done in this document. | Define approved feature groups, freshness, labels, confidence, evidence shape, and validation ranges. | Implementation can start without stamping fake labels. |
+| 1. Types and pure router | Pure router API. | Add `RegimeInput`, `RegimeContext`, labels, explanation codes, and routing policy types. | Unit-level callers can classify synthetic feature snapshots without venue I/O. |
 | 2. Feature snapshot | Read-only feature production. | Build a `RegimeFeatureActor` or service that computes v1 feature snapshots from bars, option-chain state, external signals, and optional ClickHouse/catalog history. | Operator diagnostics can display feature freshness and current regime. |
 | 3. Candidate integration | Ranking receives regime context. | Add regime context to candidate input and selection policy. | Dry-run scans record regime decisions without changing order behavior. |
 | 4. Family routing | Strategy families are weighted or blocked. | Apply v1 routing policy to iron condors, credit/debit spreads, and undefined-risk strategies. | Candidate ledgers show which families were allowed, down-ranked, or blocked. |
 | 5. Replay validation | Outcome analysis by regime. | Replay candidate ledgers against historical market data and feature snapshots. | Reports show performance by regime, strategy family, and explanation code. |
 | 6. Live enablement | Controlled production use. | Enable routing in paper mode, then promote specific blocks/weights once evidence supports them. | Live/paper operator status reports regime, freshness, and routing action. |
 
-## Open Questions
+## V1 Decisions
 
-- Which underlying universe is v1: SPY only, index ETFs, or all enabled option underlyings?
-- Which breadth proxy should v1 use before a broader market-data universe exists?
-- How much portfolio Greek/stress context belongs in the router versus only in risk admission?
-- Should `unknown` mean dry-run only or hard block for defined-risk strategies?
-- Which feature snapshots are small enough for Postgres evidence versus ClickHouse-only analytics?
+- Underlying universe: all enabled option underlyings from the Alpaca runtime config.
+- Breadth proxy: optional only. Use configured ETF/index proxies when complete; otherwise mark
+  breadth unavailable and do not treat it as neutral.
+- Portfolio context: optional coarse stress input only. Hard portfolio caps remain in risk
+  admission.
+- `unknown` policy: when the router is enabled and required features fail, produce `unknown`,
+  `dry_run_only = true`, and block undefined-risk families. Omit regime metadata entirely when the
+  router is disabled.
+- Storage boundary: candidate ledgers receive compact `RegimeContext` and freshness evidence;
+  ClickHouse/catalog own high-volume feature snapshots and series.
+
+## Truly Open Questions
+
+- Exact v1 threshold values for trend, range, volatility, and gap labels need calibration from the
+  validation ranges above.
+- Whether paper mode should start with route-only evidence or immediately apply dry-run family
+  blocks should be decided when the first feature actor output is available.
 
 ## Design Preference
 
