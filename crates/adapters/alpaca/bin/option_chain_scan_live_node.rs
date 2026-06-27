@@ -1,11 +1,12 @@
 //! Live Nautilus option-chain scan and entry node for Alpaca.
 
-use std::{env, time::Duration};
+use std::{env, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use nautilus_alpaca::{
     common::consts::ALPACA_CLIENT_ID,
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
+    execution::account_entry_admission_reasons,
     factories::{AlpacaDataClientFactory, AlpacaExecutionClientFactory},
     http::{client::AlpacaHttpClient, models::AlpacaAccount},
     opportunity_scan_actor::{
@@ -15,8 +16,13 @@ use nautilus_alpaca::{
     options_entry_strategy::{AlpacaOptionsEntryStrategy, AlpacaOptionsEntryStrategyConfig},
     options_runtime::OptionsEngineConfig,
     parse::parse_option_series_id,
+    runtime::{StrategyState, emit_operator_event},
     state_persistence::{StrategyStatePersistenceHandle, start_runtime_lease_heartbeat},
-    storage::{RuntimeLeaseRequest, STATE_PERSISTENCE_MIGRATION_VERSION, acquire_runtime_lease},
+    state_reconciliation::{StrategyStateReconciliationReport, reconcile_strategy_state},
+    storage::{
+        RuntimeLeaseRequest, STATE_PERSISTENCE_MIGRATION_VERSION, StorageRepository,
+        acquire_runtime_lease, release_runtime_lease,
+    },
 };
 use nautilus_common::enums::Environment;
 use nautilus_live::node::LiveNode;
@@ -26,12 +32,44 @@ use nautilus_model::{
     types::Price,
 };
 use nautilus_trading::strategy::StrategyConfig;
+use serde_json::json;
 use uuid::Uuid;
 
 const DEFAULT_SNAPSHOT_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_STRIKES_ABOVE: usize = 10;
 const DEFAULT_STRIKES_BELOW: usize = 10;
 const DEFAULT_RUNTIME_LEASE_TTL_SECS: u64 = 300;
+
+struct LiveSubmitPersistence {
+    handle: StrategyStatePersistenceHandle,
+    storage: Arc<StorageRepository>,
+    account_id: String,
+    run_id: Uuid,
+}
+
+impl LiveSubmitPersistence {
+    async fn release(self) {
+        match release_runtime_lease(&self.storage, &self.account_id, self.run_id).await {
+            Ok(true) => emit_operator_event(
+                "runtime_lease_released",
+                json!({
+                    "account_id": self.account_id,
+                    "run_id": self.run_id.to_string(),
+                }),
+            ),
+            Ok(false) => log::warn!(
+                "Alpaca runtime lease was not released because ownership was already gone: account_id={} run_id={}",
+                self.account_id,
+                self.run_id
+            ),
+            Err(error) => log::warn!(
+                "Failed to release Alpaca runtime lease: account_id={} run_id={} error={error:#}",
+                self.account_id,
+                self.run_id
+            ),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct Args {
@@ -74,12 +112,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to load options buying-power context")?;
     let scan_config = option_chain_scan_config_from_engine(&runtime_config, options_buying_power);
-    let strategy_state = runtime_config
+    let mut strategy_state = runtime_config
         .load_strategy_state()
         .await
         .context("failed to load Alpaca options strategy state")?;
-    let strategy_state_entry_count = strategy_state.entries.len();
-    let state_persistence = if live_submit_requested {
+    let live_submit_persistence = if live_submit_requested {
         Some(
             prepare_state_persistence(&runtime_config, &args)
                 .await
@@ -88,6 +125,14 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let startup_account_admission_reasons = if live_submit_requested {
+        prepare_live_submit_broker_state(&runtime_config, &data_config, &mut strategy_state)
+            .await
+            .context("failed to prepare Alpaca live-submit broker state")?
+    } else {
+        Vec::new()
+    };
+    let strategy_state_entry_count = strategy_state.entries.len();
 
     log::info!(
         "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategies={:?} runtime_submit_enabled={} node_entry_submit_enabled={} storage_required={} strategy_state_entries={}",
@@ -140,8 +185,11 @@ async fn main() -> anyhow::Result<()> {
         AlpacaOptionsEntryStrategyConfig::from_engine_config(strategy_config, &runtime_config);
     entry_config.admission.submit_enabled =
         entry_config.admission.submit_enabled && args.entry_submit_enabled;
+    entry_config.admission.account_admission_reasons = startup_account_admission_reasons;
     entry_config.initial_state = strategy_state;
-    entry_config.state_persistence = state_persistence;
+    entry_config.state_persistence = live_submit_persistence
+        .as_ref()
+        .map(|persistence| persistence.handle.clone());
     let strategy = AlpacaOptionsEntryStrategy::new(entry_config);
     node.add_strategy(strategy)?;
 
@@ -154,14 +202,18 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    node.run().await?;
+    let run_result = node.run().await;
+    if let Some(persistence) = live_submit_persistence {
+        persistence.release().await;
+    }
+    run_result?;
     Ok(())
 }
 
 async fn prepare_state_persistence(
     config: &OptionsEngineConfig,
     args: &Args,
-) -> anyhow::Result<StrategyStatePersistenceHandle> {
+) -> anyhow::Result<LiveSubmitPersistence> {
     let storage = config
         .storage_repository
         .as_ref()
@@ -219,10 +271,85 @@ async fn prepare_state_persistence(
         lease.run_id,
         lease.expires_at
     );
-    start_runtime_lease_heartbeat(storage.clone(), account_id.clone(), run_id, ttl);
-    Ok(StrategyStatePersistenceHandle::spawn(
-        storage, account_id, holder_id, run_id,
-    ))
+    let heartbeat_storage = storage.clone();
+    let persistence =
+        StrategyStatePersistenceHandle::spawn(storage, account_id.clone(), holder_id, run_id);
+    start_runtime_lease_heartbeat(
+        heartbeat_storage.clone(),
+        account_id.clone(),
+        run_id,
+        ttl,
+        Some(persistence.clone()),
+    );
+    Ok(LiveSubmitPersistence {
+        handle: persistence,
+        storage: heartbeat_storage,
+        account_id,
+        run_id,
+    })
+}
+
+async fn prepare_live_submit_broker_state(
+    config: &OptionsEngineConfig,
+    data_config: &AlpacaDataClientConfig,
+    strategy_state: &mut StrategyState,
+) -> anyhow::Result<Vec<String>> {
+    let client = AlpacaHttpClient::from_data_config(data_config)?;
+    let account = client.account().await?;
+    let account_reasons = account_entry_admission_reasons(&account);
+    if !account_reasons.is_empty() {
+        emit_operator_event(
+            "live_submit_readiness_block",
+            json!({
+                "reason": "account_not_tradable",
+                "details": account_reasons.clone(),
+            }),
+        );
+        bail!(
+            "live submit blocked by Alpaca account admission: {}",
+            account_reasons.join("; ")
+        );
+    }
+
+    let report = reconcile_strategy_state(&client, strategy_state).await?;
+    if report.changed {
+        config
+            .save_strategy_state(strategy_state)
+            .await
+            .context("failed to persist startup strategy-state reconciliation repair")?;
+    }
+    if report.has_unmanaged_broker_state() {
+        emit_unmanaged_broker_state_block(&report);
+        bail!(
+            "live submit blocked by unmanaged broker state: positions=[{}] open_orders=[{}] partial_positions=[{}]",
+            report.unmanaged_position_symbols.join(","),
+            report.unmanaged_open_order_symbols.join(","),
+            report.partial_position_symbols.join(","),
+        );
+    }
+
+    emit_operator_event(
+        "live_submit_readiness",
+        json!({
+            "storage_ready": true,
+            "lease_held": true,
+            "broker_state_reconciled": true,
+            "state_repaired": report.changed,
+        }),
+    );
+    Ok(account_reasons)
+}
+
+fn emit_unmanaged_broker_state_block(report: &StrategyStateReconciliationReport) {
+    emit_operator_event(
+        "live_submit_readiness_block",
+        json!({
+            "reason": "unmanaged_broker_state",
+            "unmanaged_position_symbols": report.unmanaged_position_symbols.clone(),
+            "unmanaged_open_order_symbols": report.unmanaged_open_order_symbols.clone(),
+            "partial_position_symbols": report.partial_position_symbols.clone(),
+        }),
+    );
 }
 
 impl Args {

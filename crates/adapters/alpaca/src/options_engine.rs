@@ -45,6 +45,7 @@ use crate::{
     runtime::{
         StrategyState, StrategyStateEntry, credit_spread_strategy_name, emit_operator_event,
     },
+    state_reconciliation::reconcile_strategy_state,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use nautilus_core::UUID4;
@@ -52,17 +53,15 @@ use serde_json::{Value, json};
 use tokio::time::sleep;
 
 mod events;
-mod reconciliation;
 mod submission;
 
+#[cfg(test)]
+use crate::state_reconciliation::{ReconciliationAction, reconciliation_action};
 use events::{
     insert_string_field, insert_value_field, record_decision_event,
     record_selected_candidate_alert, record_submit_rejected_candidate_alert,
     record_submit_result_event, selected_entry_alert_payload,
 };
-use reconciliation::reconcile_strategy_state;
-#[cfg(test)]
-use reconciliation::{ReconciliationAction, reconciliation_action};
 use submission::{
     cancel_parent_order_by_id, lookup_parent_order_snapshot, submit_close_entry,
     submit_selected_entry,
@@ -349,7 +348,10 @@ pub async fn run_options_engine() -> anyhow::Result<()> {
     data_config.data_base_url = env::var("ALPACA_DATA_BASE_URL").ok();
     let http_client = AlpacaHttpClient::from_data_config(&data_config)?;
 
-    if reconcile_strategy_state(&http_client, &mut state).await? {
+    if reconcile_strategy_state(&http_client, &mut state)
+        .await?
+        .changed
+    {
         config.save_strategy_state(&state).await?;
     }
 

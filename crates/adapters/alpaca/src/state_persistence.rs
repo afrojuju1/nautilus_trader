@@ -12,9 +12,10 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-    runtime::StrategyState,
+    runtime::{StrategyState, emit_operator_event},
     storage::{StorageRepository, StrategyStateMutation, persist_strategy_state_mutation},
 };
+use serde_json::json;
 
 const STATE_PERSISTENCE_QUEUE_CAPACITY: usize = 64;
 
@@ -68,6 +69,17 @@ impl StrategyStatePersistenceHandle {
                             request.mutation.event_type,
                             request.mutation.event_id
                         );
+                        emit_operator_event(
+                            "strategy_state_persistence_error",
+                            json!({
+                                "reason": "write_failed",
+                                "account_id": account_id.clone(),
+                                "writer_id": sink_writer_id.clone(),
+                                "event_type": request.mutation.event_type.clone(),
+                                "event_id": request.mutation.event_id.to_string(),
+                                "error": error.to_string(),
+                            }),
+                        );
                     }
                 }
             }
@@ -87,6 +99,10 @@ impl StrategyStatePersistenceHandle {
         self.healthy.load(Ordering::Acquire)
     }
 
+    pub fn mark_unhealthy(&self) {
+        self.healthy.store(false, Ordering::Release);
+    }
+
     pub fn persist(
         &self,
         mut mutation: StrategyStateMutation,
@@ -100,6 +116,15 @@ impl StrategyStatePersistenceHandle {
             .try_send(StrategyStatePersistenceRequest { mutation, state })
             .map_err(|error| {
                 self.healthy.store(false, Ordering::Release);
+                emit_operator_event(
+                    "strategy_state_persistence_error",
+                    json!({
+                        "reason": "queue_unavailable",
+                        "writer_id": self.writer_id.as_ref(),
+                        "run_id": self.run_id.to_string(),
+                        "error": error.to_string(),
+                    }),
+                );
                 anyhow::anyhow!("strategy-state persistence queue unavailable: {error}")
             })
     }
@@ -116,6 +141,7 @@ pub fn start_runtime_lease_heartbeat(
     account_id: String,
     run_id: Uuid,
     ttl: Duration,
+    state_persistence: Option<StrategyStatePersistenceHandle>,
 ) {
     let interval = Duration::from_secs((ttl.as_secs() / 3).max(5));
     tokio::spawn(async move {
@@ -125,18 +151,39 @@ pub fn start_runtime_lease_heartbeat(
             {
                 Ok(true) => {}
                 Ok(false) => {
+                    if let Some(state_persistence) = &state_persistence {
+                        state_persistence.mark_unhealthy();
+                    }
                     log::error!(
                         "Alpaca runtime lease heartbeat lost ownership: account_id={} run_id={}",
                         account_id,
                         run_id
                     );
+                    emit_operator_event(
+                        "runtime_lease_lost",
+                        json!({
+                            "account_id": account_id.clone(),
+                            "run_id": run_id.to_string(),
+                        }),
+                    );
                     break;
                 }
                 Err(error) => {
+                    if let Some(state_persistence) = &state_persistence {
+                        state_persistence.mark_unhealthy();
+                    }
                     log::error!(
                         "Alpaca runtime lease heartbeat failed: account_id={} run_id={} error={error:#}",
                         account_id,
                         run_id
+                    );
+                    emit_operator_event(
+                        "runtime_lease_error",
+                        json!({
+                            "account_id": account_id.clone(),
+                            "run_id": run_id.to_string(),
+                            "error": error.to_string(),
+                        }),
                     );
                     break;
                 }

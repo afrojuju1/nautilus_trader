@@ -94,6 +94,23 @@ pub async fn heartbeat_runtime_lease(
     Ok(result.rows_affected() == 1)
 }
 
+pub async fn release_runtime_lease(
+    storage: &StorageRepository,
+    account_id: &str,
+    run_id: Uuid,
+) -> anyhow::Result<bool> {
+    let query = format!(
+        "DELETE FROM \"{}\".runtime_lease WHERE account_id = $1 AND run_id = $2::uuid",
+        storage.schema()
+    );
+    let result = sqlx::query(AssertSqlSafe(query))
+        .bind(account_id)
+        .bind(run_id.to_string())
+        .execute(storage.pool())
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 async fn load_runtime_lease(
     storage: &StorageRepository,
     account_id: &str,

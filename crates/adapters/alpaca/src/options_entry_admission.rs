@@ -118,6 +118,8 @@ pub struct EntryAdmissionConfig {
     pub fleet_sectors: BTreeMap<String, String>,
     /// Fleet current active entries by sector/correlation group.
     pub fleet_active_entries_by_sector: BTreeMap<String, usize>,
+    /// Broker account-level reasons captured before live submit is enabled.
+    pub account_admission_reasons: Vec<String>,
 }
 
 impl EntryAdmissionConfig {
@@ -163,6 +165,7 @@ impl EntryAdmissionConfig {
                 .map_or_else(BTreeMap::new, |exposure| {
                     exposure.active_entries_by_sector.clone()
                 }),
+            account_admission_reasons: Vec::new(),
         }
     }
 
@@ -199,6 +202,7 @@ impl Default for EntryAdmissionConfig {
             fleet_max_active_entries_per_sector: None,
             fleet_sectors: BTreeMap::new(),
             fleet_active_entries_by_sector: BTreeMap::new(),
+            account_admission_reasons: Vec::new(),
         }
     }
 }

@@ -76,7 +76,7 @@ use crate::{
 #[cfg(feature = "live")]
 use crate::{
     config::AlpacaExecClientConfig,
-    http::models::{AlpacaActivity, ListActivitiesRequest, ReplaceOrderRequest},
+    http::models::{AlpacaActivity, ListActivitiesRequest, ListOrdersRequest, ReplaceOrderRequest},
     orders::{
         AlpacaPositionIntent, EquityOrderPayload, MlegOrderLeg, MlegOrderPayload,
         SimpleOrderPayload,
@@ -88,6 +88,9 @@ use crate::{
         messages::{AlpacaTradeUpdate, AlpacaTradeUpdateLeg, AlpacaWsMessage},
     },
 };
+
+#[cfg(feature = "live")]
+const DEFAULT_RECONCILIATION_LOOKBACK_MINS: u64 = 60;
 
 /// Admission result for a candidate option spread.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -143,8 +146,7 @@ pub fn check_option_spread_entry_admission(
     open_orders: &[AlpacaOrder],
     candidate_symbols: &[&str],
 ) -> AdmissionDecision {
-    let mut reasons = Vec::new();
-    check_account(account, &mut reasons);
+    let mut reasons = account_entry_admission_reasons(account);
 
     let candidate_underlyings = candidate_symbols
         .iter()
@@ -206,6 +208,16 @@ pub fn check_option_spread_entry_admission(
         reasons.dedup();
         AdmissionDecision::reject(reasons)
     }
+}
+
+/// Returns broker account-level reasons that block new Alpaca option entries.
+#[must_use]
+pub fn account_entry_admission_reasons(account: &AlpacaAccount) -> Vec<String> {
+    let mut reasons = Vec::new();
+    check_account(account, &mut reasons);
+    reasons.sort();
+    reasons.dedup();
+    reasons
 }
 
 /// Extracts the OCC-style underlying root from an Alpaca option contract symbol.
@@ -1742,26 +1754,27 @@ impl ExecutionClient for AlpacaExecutionClient {
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let ts_now = self.clock.get_time_ns();
-        let start = lookback_mins
-            .map(|mins| ts_now.as_u64().saturating_sub(mins * 60 * 1_000_000_000))
-            .map(UnixNanos::from);
-        let order_cmd = GenerateOrderStatusReports::new(
+        let start = reconciliation_start(ts_now, lookback_mins);
+        let fill_cmd = GenerateFillReports::new(
             UUID4::new(),
             ts_now,
-            false,
             None,
-            start,
+            None,
+            Some(start),
             None,
             None,
             None,
         );
-        let fill_cmd =
-            GenerateFillReports::new(UUID4::new(), ts_now, None, None, start, None, None, None);
         let position_cmd =
-            GeneratePositionStatusReports::new(UUID4::new(), ts_now, None, start, None, None, None);
+            GeneratePositionStatusReports::new(UUID4::new(), ts_now, None, None, None, None, None);
 
         let (order_reports, fill_reports, position_reports) = tokio::try_join!(
-            self.generate_order_status_reports(&order_cmd),
+            reconciliation_order_status_reports(
+                &self.http_client,
+                self.core.account_id.as_str(),
+                ts_now,
+                start,
+            ),
             self.generate_fill_reports(fill_cmd),
             self.generate_position_status_reports(&position_cmd),
         )?;
@@ -1781,6 +1794,54 @@ impl ExecutionClient for AlpacaExecutionClient {
 }
 
 #[cfg(feature = "live")]
+fn reconciliation_start(ts_now: UnixNanos, lookback_mins: Option<u64>) -> UnixNanos {
+    let lookback_mins = lookback_mins.unwrap_or(DEFAULT_RECONCILIATION_LOOKBACK_MINS);
+    UnixNanos::from(
+        ts_now.as_u64().saturating_sub(
+            lookback_mins
+                .saturating_mul(60)
+                .saturating_mul(1_000_000_000),
+        ),
+    )
+}
+
+#[cfg(feature = "live")]
+async fn reconciliation_order_status_reports(
+    http_client: &AlpacaHttpClient,
+    account_id: &str,
+    ts_init: UnixNanos,
+    start: UnixNanos,
+) -> anyhow::Result<Vec<OrderStatusReport>> {
+    let recent_request = ListOrdersRequest {
+        status: "all".to_string(),
+        nested: true,
+        limit: 500,
+        after: Some(unix_nanos_to_rfc3339(start)),
+        ..Default::default()
+    };
+    let open_request = ListOrdersRequest {
+        status: "open".to_string(),
+        nested: true,
+        limit: 500,
+        ..Default::default()
+    };
+
+    let (recent_orders, open_orders) = tokio::try_join!(
+        http_client.orders(&recent_request),
+        http_client.orders(&open_request),
+    )?;
+
+    let mut reports_by_order = BTreeMap::new();
+    for order in recent_orders.iter().chain(open_orders.iter()) {
+        for report in order_status_reports_from_alpaca(order, account_id, ts_init)? {
+            reports_by_order.insert(report.venue_order_id, report);
+        }
+    }
+
+    Ok(reports_by_order.into_values().collect())
+}
+
+#[cfg(feature = "live")]
 async fn emit_reconciliation_snapshot(
     http_client: &AlpacaHttpClient,
     account_id: AccountId,
@@ -1790,9 +1851,7 @@ async fn emit_reconciliation_snapshot(
     seen_activity_trade_ids: Option<&Arc<Mutex<BTreeSet<String>>>>,
 ) -> anyhow::Result<()> {
     let ts_now = clock.get_time_ns();
-    let start = lookback_mins
-        .map(|mins| ts_now.as_u64().saturating_sub(mins * 60 * 1_000_000_000))
-        .map(UnixNanos::from);
+    let start = reconciliation_start(ts_now, lookback_mins);
 
     let account = http_client.account().await?;
     emitter.emit_account_state(
@@ -1802,22 +1861,15 @@ async fn emit_reconciliation_snapshot(
         ts_now,
     );
 
-    let order_request = crate::http::models::ListOrdersRequest {
-        status: "all".to_string(),
-        nested: true,
-        limit: 500,
-        after: start.map(unix_nanos_to_rfc3339),
-        ..Default::default()
-    };
-    for order in http_client.orders(&order_request).await? {
-        for report in order_status_reports_from_alpaca(&order, account_id.as_str(), ts_now)? {
-            emitter.send_order_status_report(report);
-        }
+    for report in
+        reconciliation_order_status_reports(http_client, account_id.as_str(), ts_now, start).await?
+    {
+        emitter.send_order_status_report(report);
     }
 
     let mut activity_request = ListActivitiesRequest::option_reconciliation();
     activity_request.direction = Some("asc".to_string());
-    activity_request.after = start.map(unix_nanos_to_rfc3339);
+    activity_request.after = Some(unix_nanos_to_rfc3339(start));
     let activities = http_client
         .account_activities_all(&activity_request)
         .await?;

@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use chrono::{Datelike, NaiveDate, Utc};
+use chrono_tz::Tz;
 use nautilus_common::{
     actor::{DataActor, DataActorConfig, DataActorCore},
     nautilus_actor,
@@ -65,6 +66,8 @@ pub struct OptionChainOpportunityScanConfig {
     pub options_buying_power: Option<f64>,
     /// Quantity used for buying-power estimates.
     pub quantity: u64,
+    /// Timezone used to derive the strategy trade date for daily risk limits.
+    pub trade_date_timezone: Tz,
 }
 
 impl Default for OptionChainOpportunityScanConfig {
@@ -97,6 +100,7 @@ impl Default for OptionChainOpportunityScanConfig {
             },
             options_buying_power: None,
             quantity: 1,
+            trade_date_timezone: chrono_tz::UTC,
         }
     }
 }
@@ -255,8 +259,7 @@ impl DataActor for OptionChainOpportunityScanActor {
     }
 
     fn on_option_chain(&mut self, slice: &OptionChainSlice) -> anyhow::Result<()> {
-        let scan_date = scan_date_from_timestamp(slice.ts_event);
-        let trade_date = scan_date.format("%Y-%m-%d").to_string();
+        let trade_date = market_trade_date(self.config.scan.trade_date_timezone);
         let opportunities = scan_option_chain_opportunities(slice, &self.config.scan, &trade_date);
         emit_operator_event(
             "option_chain_opportunity_scan",
@@ -300,6 +303,7 @@ pub fn option_chain_scan_config_from_engine(
         naked_1_3dte_scanner: config.naked_1_3dte_scanner.clone(),
         options_buying_power,
         quantity: config.quantity,
+        trade_date_timezone: config.entry_timezone,
     }
 }
 
@@ -434,6 +438,7 @@ fn opportunity_event_payload(
         "source": "option_chain",
         "series_id": slice.series_id.to_string(),
         "underlying": input.underlying,
+        "trade_date": opportunities.trade_date,
         "expiration_date": input.expiration_date,
         "underlying_price": input.underlying_price,
         "call_contracts": input.calls.contract_count(),
@@ -472,6 +477,14 @@ fn selected_entry_payload(entry: &SelectedOptionsEntry) -> Value {
         "premium_kind": descriptor.premium_kind.as_str(),
         "premium": descriptor.premium,
     })
+}
+
+fn market_trade_date(timezone: Tz) -> String {
+    Utc::now()
+        .with_timezone(&timezone)
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 fn scan_date_from_timestamp(ts_event: UnixNanos) -> NaiveDate {

@@ -84,6 +84,8 @@ pub mod runtime_env;
 #[cfg(feature = "live")]
 pub mod state_persistence;
 #[cfg(feature = "live")]
+pub mod state_reconciliation;
+#[cfg(feature = "live")]
 pub mod storage;
 pub mod strategy;
 #[cfg(feature = "live")]

@@ -1,4 +1,4 @@
-//! Broker/state reconciliation helpers for the options engine.
+//! Broker/state reconciliation helpers for Alpaca option strategy state.
 
 use std::collections::BTreeSet;
 
@@ -7,41 +7,90 @@ use serde_json::json;
 use crate::{
     http::{
         client::AlpacaHttpClient,
+        error::Error,
         models::{AlpacaOrder, AlpacaPosition, ListOrdersRequest},
     },
     runtime::{StrategyState, StrategyStateEntry, emit_operator_event},
 };
 
-use super::lookup_parent_order_snapshot;
+/// Summary of one broker/state reconciliation pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StrategyStateReconciliationReport {
+    /// Whether persisted strategy state was changed.
+    pub changed: bool,
+    /// Open broker position symbols not represented by active strategy state.
+    pub unmanaged_position_symbols: Vec<String>,
+    /// Open broker order symbols not represented by active strategy state.
+    pub unmanaged_open_order_symbols: Vec<String>,
+    /// Active state entry symbols with only a partial broker-position match.
+    pub partial_position_symbols: Vec<String>,
+}
 
-pub(super) async fn reconcile_strategy_state(
+impl StrategyStateReconciliationReport {
+    /// Returns `true` when broker state is not fully represented by active strategy state.
+    #[must_use]
+    pub fn has_unmanaged_broker_state(&self) -> bool {
+        !self.unmanaged_position_symbols.is_empty()
+            || !self.unmanaged_open_order_symbols.is_empty()
+            || !self.partial_position_symbols.is_empty()
+    }
+}
+
+/// Reconciles persisted strategy state against current Alpaca broker orders and positions.
+///
+/// # Errors
+///
+/// Returns an error if Alpaca broker reads fail.
+pub async fn reconcile_strategy_state(
     client: &AlpacaHttpClient,
     state: &mut StrategyState,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<StrategyStateReconciliationReport> {
     let positions = client.positions().await?;
     let open_orders = client.orders(&ListOrdersRequest::open_nested()).await?;
     let position_symbols = position_symbols(&positions);
     let open_order_symbols = order_symbols(&open_orders);
     let active_symbols = active_state_symbols(state);
-    let unmanaged_symbols = position_symbols
+    let unmanaged_position_symbols = position_symbols
         .difference(&active_symbols)
         .cloned()
         .collect::<Vec<_>>();
-    if !unmanaged_symbols.is_empty() {
+    let unmanaged_open_order_symbols = open_order_symbols
+        .difference(&active_symbols)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if !unmanaged_position_symbols.is_empty() {
         println!(
             "reconcile: unmanaged_positions symbols={}",
-            unmanaged_symbols.join(","),
+            unmanaged_position_symbols.join(","),
         );
         emit_operator_event(
             "reconciliation_warning",
             json!({
                 "reason": "unmanaged_positions",
-                "symbols": unmanaged_symbols,
+                "symbols": unmanaged_position_symbols.clone(),
+            }),
+        );
+    }
+    if !unmanaged_open_order_symbols.is_empty() {
+        println!(
+            "reconcile: unmanaged_open_orders symbols={}",
+            unmanaged_open_order_symbols.join(","),
+        );
+        emit_operator_event(
+            "reconciliation_warning",
+            json!({
+                "reason": "unmanaged_open_orders",
+                "symbols": unmanaged_open_order_symbols.clone(),
             }),
         );
     }
 
-    let mut changed = false;
+    let mut report = StrategyStateReconciliationReport {
+        unmanaged_position_symbols,
+        unmanaged_open_order_symbols,
+        ..Default::default()
+    };
     for entry in state.entries.iter_mut().filter(|entry| entry.is_active()) {
         let mut action = reconciliation_action(entry, &position_symbols, &open_order_symbols, None);
         if action == ReconciliationAction::MarkClosed {
@@ -73,7 +122,7 @@ pub(super) async fn reconcile_strategy_state(
                     }),
                 );
                 entry.mark_closed(None);
-                changed = true;
+                report.changed = true;
             }
             ReconciliationAction::MarkCanceled => {
                 println!(
@@ -90,38 +139,46 @@ pub(super) async fn reconcile_strategy_state(
                     }),
                 );
                 entry.mark_canceled();
-                changed = true;
+                report.changed = true;
             }
             ReconciliationAction::PartialPosition => {
+                let symbols = entry
+                    .symbols()
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
                 println!(
                     "reconcile: partial_position underlying={} symbols={}",
                     entry.underlying,
-                    entry.symbols().join(","),
+                    symbols.join(","),
                 );
                 emit_operator_event(
                     "reconciliation_warning",
                     json!({
                         "reason": "partial_position",
                         "underlying": entry.underlying,
-                        "symbols": entry.symbols(),
+                        "symbols": symbols.clone(),
                     }),
                 );
+                report.partial_position_symbols.extend(symbols);
             }
         }
     }
 
-    Ok(changed)
+    report.partial_position_symbols.sort();
+    report.partial_position_symbols.dedup();
+    Ok(report)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ReconciliationAction {
+pub(crate) enum ReconciliationAction {
     None,
     MarkClosed,
     MarkCanceled,
     PartialPosition,
 }
 
-pub(super) fn reconciliation_action(
+pub(crate) fn reconciliation_action(
     entry: &StrategyStateEntry,
     position_symbols: &BTreeSet<String>,
     open_order_symbols: &BTreeSet<String>,
@@ -158,6 +215,17 @@ pub(super) fn reconciliation_action(
         ReconciliationAction::PartialPosition
     } else {
         ReconciliationAction::None
+    }
+}
+
+async fn lookup_parent_order_snapshot(
+    client: &AlpacaHttpClient,
+    order_list_id: &str,
+) -> anyhow::Result<Option<AlpacaOrder>> {
+    match client.order_by_client_order_id(order_list_id, true).await {
+        Ok(order) => Ok(Some(order)),
+        Err(Error::HttpStatus { status, .. }) if status == 404 => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 

@@ -34,6 +34,7 @@ pub use candidate_ledger::{
 #[cfg(feature = "live")]
 pub use lease::{
     RuntimeLeaseRequest, RuntimeLeaseStatus, acquire_runtime_lease, heartbeat_runtime_lease,
+    release_runtime_lease,
 };
 
 #[cfg(feature = "live")]

@@ -38,10 +38,11 @@ use crate::{
         OptionsEngineConfig, OptionsOpportunitySet, OptionsScanOutcome, OptionsScanReport,
         SelectedOptionsEntry,
     },
-    runtime::{StrategyState, StrategyStateEntryDraft},
+    runtime::{StrategyState, StrategyStateEntryDraft, emit_operator_event},
     state_persistence::StrategyStatePersistenceHandle,
     storage::StrategyStateMutation,
 };
+use serde_json::json;
 
 /// Custom data type published by option-chain scanner actors for entry strategies.
 #[derive(Clone, Debug)]
@@ -262,6 +263,15 @@ impl AlpacaOptionsEntryStrategy {
                     entry.underlying(),
                     entry.strategy_name()
                 );
+                emit_operator_event(
+                    "entry_decision",
+                    json!({
+                        "action": "skipped",
+                        "reason": "kill_switch_enabled",
+                        "underlying": entry.underlying(),
+                        "strategy": entry.strategy_name(),
+                    }),
+                );
                 return Ok(None);
             }
             EntryGateDecision::OutsideEntryWindow => {
@@ -269,6 +279,15 @@ impl AlpacaOptionsEntryStrategy {
                     "Skipping Alpaca options entry: reason=outside_entry_window underlying={} strategy={}",
                     entry.underlying(),
                     entry.strategy_name()
+                );
+                emit_operator_event(
+                    "entry_decision",
+                    json!({
+                        "action": "skipped",
+                        "reason": "outside_entry_window",
+                        "underlying": entry.underlying(),
+                        "strategy": entry.strategy_name(),
+                    }),
                 );
                 return Ok(None);
             }
@@ -282,6 +301,17 @@ impl AlpacaOptionsEntryStrategy {
                 entry.option_symbols().join(","),
                 entry.score()
             );
+            emit_operator_event(
+                "entry_decision",
+                json!({
+                    "action": "dry_run",
+                    "reason": "submission_disabled",
+                    "underlying": entry.underlying(),
+                    "strategy": entry.strategy_name(),
+                    "symbols": entry.option_symbols(),
+                    "score": entry.score(),
+                }),
+            );
             return Ok(None);
         }
 
@@ -291,6 +321,16 @@ impl AlpacaOptionsEntryStrategy {
                 entry.underlying(),
                 entry.strategy_name(),
                 entry.option_symbols().join(",")
+            );
+            emit_operator_event(
+                "entry_decision",
+                json!({
+                    "action": "skipped",
+                    "reason": "state_persistence_unhealthy",
+                    "underlying": entry.underlying(),
+                    "strategy": entry.strategy_name(),
+                    "symbols": entry.option_symbols(),
+                }),
             );
             return Ok(None);
         }
@@ -317,6 +357,17 @@ impl AlpacaOptionsEntryStrategy {
                 underlying_key,
                 entry.strategy_name(),
                 entry.option_symbols().join(",")
+            );
+            emit_operator_event(
+                "entry_decision",
+                json!({
+                    "action": "skipped",
+                    "reason": "duplicate_pending_submission",
+                    "key": underlying_key,
+                    "underlying": entry.underlying(),
+                    "strategy": entry.strategy_name(),
+                    "symbols": entry.option_symbols(),
+                }),
             );
             return Ok(None);
         }
@@ -589,8 +640,8 @@ impl AlpacaOptionsEntryStrategy {
         entry: &SelectedOptionsEntry,
     ) -> anyhow::Result<EntryAdmissionSnapshot> {
         let cache = self.cache();
-        let open_order_count = cache.orders_open_count(None, None, None, None, None);
-        let mut broker_admission_reasons = Vec::new();
+        let open_order_count = open_broker_order_intent_count(&cache);
+        let mut broker_admission_reasons = self.config.admission.account_admission_reasons.clone();
         let symbols = entry.option_symbols();
         let candidate_ids = symbols
             .iter()
@@ -659,6 +710,21 @@ impl AlpacaOptionsEntryStrategy {
             entry.strategy_name(),
             entry.option_symbols().join(",")
         );
+        emit_operator_event(
+            "entry_decision",
+            json!({
+                "action": "selected_but_blocked",
+                "trade_date": trade_date,
+                "reason": block.reason.clone(),
+                "current": block.current,
+                "limit": block.limit,
+                "details": block.details.clone(),
+                "underlying": entry.underlying(),
+                "strategy": entry.strategy_name(),
+                "symbols": entry.option_symbols(),
+                "score": entry.score(),
+            }),
+        );
     }
 
     fn state_persistence_ready(&self) -> bool {
@@ -684,6 +750,13 @@ impl AlpacaOptionsEntryStrategy {
         };
         if let Err(error) = persistence.persist(mutation, self.state.clone()) {
             log::error!("Failed to enqueue Alpaca strategy-state mutation: {error:#}");
+            emit_operator_event(
+                "strategy_state_persistence_error",
+                json!({
+                    "reason": "enqueue_failed",
+                    "error": error.to_string(),
+                }),
+            );
         }
     }
 }
@@ -992,6 +1065,18 @@ fn instrument_underlying_matches(
                 .as_str()
                 .eq_ignore_ascii_case(underlying)
         })
+}
+
+fn open_broker_order_intent_count(cache: &CacheApi<'_>) -> usize {
+    let mut intent_ids = BTreeSet::new();
+    for order in cache.orders_open(None, None, None, None, None) {
+        if let Some(order_list_id) = order.order_list_id() {
+            intent_ids.insert(format!("list:{order_list_id}"));
+        } else {
+            intent_ids.insert(format!("client:{}", order.client_order_id()));
+        }
+    }
+    intent_ids.len()
 }
 
 fn accepted_state_mutation(
