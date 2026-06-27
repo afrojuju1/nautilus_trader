@@ -564,8 +564,16 @@ alpaca-control alerts performance-disable
 ```
 
 When Postgres storage is configured, performance commands automatically append missing closed-entry
-performance records and track candidate outcomes using current option snapshots and the configured
-observation buckets.
+performance records and track candidate outcomes. Candidate outcomes use current option snapshots
+first. When snapshots cannot value a candidate and the candidate has a timestamp, the performance
+path can fill the mark from Alpaca historical option bars. Historical fills are enabled by default
+and can be disabled or tuned with:
+
+```bash
+alpaca-control performance --no-track-historical-fill
+alpaca-control performance --track-historical-fill-lookahead-minutes 390
+alpaca-control performance --track-historical-fill-timeframe 1Min
+```
 
 The command reports one engine state:
 
@@ -582,9 +590,17 @@ ranked `candidate` records plus a `scanner_result`; selected or high-score candi
 `alpaca-control performance --all --json` audits those records by account and trade date.
 
 `alpaca-control performance` replays candidate-ledger records and values the same option symbols
-from current snapshots. It writes Postgres `candidate_outcome` records for observation buckets such
-as `plus_1h`, `same_day_close`, `next_day`, and `expiration_risk`. These records are analytical
-opportunity tracking; they are not broker fills and should not be counted as realized trading PnL.
+from current snapshots or, when needed, Alpaca historical option bars. It writes Postgres
+`candidate_outcome` records for observation buckets such as `plus_1h`, `same_day_close`,
+`next_day`, and `expiration_risk`. Each record includes `mark_source`, currently `snapshot` or
+`historical_bar`, so reports can separate current bid/ask-derived marks from historical bar-close
+marks.
+
+Candidate outcomes are analytical opportunity tracking; they are not broker fills and should not be
+counted as realized trading PnL. Raw `candidate_outcome` record counts are observation counts, not
+unique candidate counts: one candidate can appear in multiple buckets. Use the candidate outcome
+analytics contract before tuning strategy thresholds from these records:
+[Alpaca Candidate Outcome Analytics](alpaca_candidate_outcome_analytics.md).
 
 Realized close PnL comes from broker activity reconstruction. The performance report matches each
 strategy-state entry to opening and closing parent/leg order IDs, reads option activity cashflows,

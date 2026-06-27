@@ -100,14 +100,16 @@ for official NautilusTrader documentation.
   - [ ] Bars.
   - [ ] Greeks and implied volatility.
   - [ ] Underlying snapshots.
-- [ ] Add a real-time option quote/trade stream cache or explicitly document why REST snapshots are
-      the supported quote path for the release.
+- [x] Add an active-risk option quote cache or explicitly document why REST snapshots are the
+      supported quote path for the release.
+- [ ] Add true real-time Alpaca option quote/trade streaming transport before treating quote
+      freshness as a stronger live-trading dependency.
 - [ ] Add entitlement-aware feed behavior for indicative versus OPRA option data.
 - [x] Wire exact Alpaca option instrument loading into a standard Rust Nautilus data-client path.
 - [x] Add exact option loading and snapshot/quote refresh to the standard node path if publishing
       as a normal adapter.
 - [x] Document option data entitlement requirements.
-- [ ] Document any quote staleness, feed, or market-hours constraints.
+- [x] Document current quote staleness, feed, and market-hours constraints.
 
 ## Examples
 
@@ -136,8 +138,8 @@ for official NautilusTrader documentation.
 - [x] Document how to cancel accepted smoke-test orders.
 - [x] Document ledger locations and meanings.
 - [x] Document historical opportunity tracking and close-PnL accounting.
-- [ ] Document account capability preflight and options-level strategy gating.
-- [ ] Document assignment, exercise, expiry, and option non-trade activity polling once implemented.
+- [x] Document account capability preflight and options-level strategy gating.
+- [x] Document assignment, exercise, expiry, and option non-trade activity polling once implemented.
 - [x] Document historical option replay outputs once implemented.
 
 ## Strategy runtime documentation
@@ -230,8 +232,8 @@ for official NautilusTrader documentation.
 - [ ] Phase 2: finish standard node option data and multi-leg execution parity.
 - [ ] Phase 2: wire standard data/instrument provider behavior.
 - [x] Phase 2: add adapter integration fixtures and example smoke tests.
-- [ ] Phase 3: add account capability preflight.
-- [ ] Phase 3: add assignment/exercise/expiry polling and lifecycle-risk handling.
-- [ ] Phase 3: add real-time option quote/trade cache or explicitly defer it.
+- [x] Phase 3: add account capability preflight.
+- [x] Phase 3: add assignment/exercise/expiry polling and lifecycle-risk handling.
+- [x] Phase 3: add active-risk option quote cache and explicitly defer true streaming transport.
 - [x] Phase 3: add historical option replay/research harness.
 - [ ] Phase 3: broaden remaining data, order, and historical-data support.

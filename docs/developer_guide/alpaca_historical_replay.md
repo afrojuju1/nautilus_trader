@@ -64,6 +64,9 @@ Output summary fields:
 
 Historical replay uses bar close prices as a research mark. It is not an execution-quality fill
 simulator and should not be used as proof that a live close would have filled at that price.
+The candidate outcome tracker uses the same historical option-bar mark semantics only as a fallback
+when current snapshots cannot value an older candidate. Those persisted outcome rows are marked with
+`mark_source = historical_bar`.
 
 Credit entries compute replay PnL as `entry_credit - close_mark`. Debit entries compute replay PnL
 as `close_mark - entry_debit`. PnL is multiplied by the standard option contract multiplier and the
@@ -71,6 +74,10 @@ candidate quantity.
 
 Liquidity buckets are based on the total historical option-bar volume across legs used for the mark.
 Missing bars are reported separately and excluded from win/loss/flats.
+
+Candidate-outcome reports can contain multiple observation buckets for the same candidate. Use
+[Alpaca Candidate Outcome Analytics](alpaca_candidate_outcome_analytics.md) for aggregation rules
+before comparing strategy families or tuning thresholds.
 
 ## Validation
 
