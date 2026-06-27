@@ -3,7 +3,7 @@
 use std::{env, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, NaiveDate, Utc};
 use nautilus_alpaca::{
     account_capabilities::{account_capability_preflight, emit_account_capability_preflight},
     candidate_ledger_persistence::CandidateLedgerPersistenceHandle,
@@ -24,12 +24,16 @@ use nautilus_alpaca::{
     options_runtime::AlpacaOptionsRuntimeConfig,
     options_strategy::{AlpacaOptionsStrategy, AlpacaOptionsStrategyConfig},
     parse::parse_option_series_id,
-    runtime::{StrategyState, emit_operator_event},
+    runtime::{StrategyState, emit_operator_event, save_strategy_state_atomic},
     state_persistence::{StrategyStatePersistenceHandle, start_runtime_lease_heartbeat},
-    state_reconciliation::{StrategyStateReconciliationReport, reconcile_strategy_state},
+    state_reconciliation::{
+        StrategyStateReconciliationRepair, StrategyStateReconciliationReport,
+        reconcile_strategy_state,
+    },
     storage::{
         RuntimeLeaseRequest, STATE_PERSISTENCE_MIGRATION_VERSION, StorageRepository,
-        acquire_runtime_lease, release_runtime_lease,
+        StrategyStateMutation, acquire_runtime_lease, persist_strategy_state_mutation,
+        release_runtime_lease,
     },
 };
 use nautilus_common::enums::Environment;
@@ -53,11 +57,29 @@ struct LiveSubmitPersistence {
     candidate_ledger: CandidateLedgerPersistenceHandle,
     storage: Arc<StorageRepository>,
     account_id: String,
+    writer_id: String,
     run_id: Uuid,
+    migration_latest_version: i64,
 }
 
 impl LiveSubmitPersistence {
     async fn release(self) {
+        if let Err(error) = self.state.flush().await {
+            log::error!(
+                "Failed to flush Alpaca strategy-state mutations before lease release: account_id={} run_id={} error={error:#}",
+                self.account_id,
+                self.run_id
+            );
+            emit_operator_event(
+                "strategy_state_persistence_error",
+                json!({
+                    "reason": "flush_failed",
+                    "account_id": self.account_id.clone(),
+                    "run_id": self.run_id.to_string(),
+                    "error": error.to_string(),
+                }),
+            );
+        }
         if let Err(error) = self.candidate_ledger.flush().await {
             log::error!(
                 "Failed to flush Alpaca candidate-ledger evidence before lease release: account_id={} run_id={} error={error:#}",
@@ -146,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
         .load_strategy_state()
         .await
         .context("failed to load Alpaca options strategy state")?;
-    let live_submit_persistence = if live_submit_requested {
+    let mut live_submit_persistence = if live_submit_requested {
         Some(
             prepare_state_persistence(&runtime_config, &args)
                 .await
@@ -156,19 +178,36 @@ async fn main() -> anyhow::Result<()> {
         None
     };
     let startup_account_admission_reasons = if live_submit_requested {
-        prepare_live_submit_broker_state(&runtime_config, &data_config, &mut strategy_state)
+        let result = async {
+            let persistence = live_submit_persistence
+                .as_ref()
+                .context("live submit storage persistence was not prepared")?;
+            prepare_live_submit_broker_state(
+                &runtime_config,
+                &data_config,
+                &mut strategy_state,
+                persistence,
+            )
             .await
-            .context("failed to prepare Alpaca live-submit broker state")?
+            .context("failed to prepare Alpaca live-submit broker state")
+        }
+        .await;
+        release_live_submit_persistence_on_error(result, &mut live_submit_persistence).await?
     } else {
         Vec::new()
     };
-    let _lifecycle_daemon = if live_submit_requested || runtime_config.manage_enabled {
+    let lifecycle_daemon_result = if live_submit_requested || runtime_config.manage_enabled {
         start_lifecycle_risk_daemon(&data_config, lifecycle_risk.clone(), lifecycle_config)
             .await
-            .context("failed to start Alpaca option lifecycle risk daemon")?
+            .context("failed to start Alpaca option lifecycle risk daemon")
     } else {
-        None
+        Ok(None)
     };
+    let _lifecycle_daemon = release_live_submit_persistence_on_error(
+        lifecycle_daemon_result,
+        &mut live_submit_persistence,
+    )
+    .await?;
     let strategy_state_entry_count = strategy_state.entries.len();
 
     log::info!(
@@ -183,23 +222,28 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let account_id = account_id_from_env();
-    let mut node = LiveNode::builder(args.trader_id, Environment::Live)?
-        .with_name(args.node_name)
-        .add_data_client(
-            Some(ALPACA_CLIENT_ID.to_string()),
-            Box::new(AlpacaDataClientFactory::new()),
-            Box::new(data_config),
-        )?
-        .add_exec_client(
-            Some(ALPACA_CLIENT_ID.to_string()),
-            Box::new(AlpacaExecutionClientFactory::new(
-                args.trader_id,
-                account_id,
-            )),
-            Box::new(AlpacaExecClientConfig::default()),
-        )?
-        .with_delay_post_stop_secs(5)
-        .build()?;
+    let node_result = LiveNode::builder(args.trader_id, Environment::Live)
+        .and_then(|builder| {
+            builder.with_name(args.node_name).add_data_client(
+                Some(ALPACA_CLIENT_ID.to_string()),
+                Box::new(AlpacaDataClientFactory::new()),
+                Box::new(data_config),
+            )
+        })
+        .and_then(|builder| {
+            builder.add_exec_client(
+                Some(ALPACA_CLIENT_ID.to_string()),
+                Box::new(AlpacaExecutionClientFactory::new(
+                    args.trader_id,
+                    account_id,
+                )),
+                Box::new(AlpacaExecClientConfig::default()),
+            )
+        })
+        .and_then(|builder| builder.with_delay_post_stop_secs(5).build())
+        .map_err(anyhow::Error::from);
+    let mut node =
+        release_live_submit_persistence_on_error(node_result, &mut live_submit_persistence).await?;
 
     let mut actor = OptionChainCandidateScanActor::new(OptionChainCandidateScanActorConfig {
         actor_id: Some(args.actor_id),
@@ -213,7 +257,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(persistence) = &live_submit_persistence {
         actor = actor.with_candidate_ledger_persistence(persistence.candidate_ledger.clone());
     }
-    node.add_actor(actor)?;
+    release_live_submit_persistence_on_error(
+        node.add_actor(actor).map_err(anyhow::Error::from),
+        &mut live_submit_persistence,
+    )
+    .await?;
 
     let strategy_config = StrategyConfig {
         strategy_id: Some(StrategyId::from("ALPACA-OPTIONS-ENTRY")),
@@ -232,7 +280,11 @@ async fn main() -> anyhow::Result<()> {
         .map(|persistence| persistence.candidate_ledger.clone());
     entry_config.lifecycle_risk = Some(lifecycle_risk);
     let strategy = AlpacaOptionsStrategy::new(entry_config);
-    node.add_strategy(strategy)?;
+    release_live_submit_persistence_on_error(
+        node.add_strategy(strategy).map_err(anyhow::Error::from),
+        &mut live_submit_persistence,
+    )
+    .await?;
 
     if let Some(max_runtime_secs) = args.max_runtime_secs {
         let handle = node.handle();
@@ -249,6 +301,21 @@ async fn main() -> anyhow::Result<()> {
     }
     run_result?;
     Ok(())
+}
+
+async fn release_live_submit_persistence_on_error<T>(
+    result: anyhow::Result<T>,
+    persistence: &mut Option<LiveSubmitPersistence>,
+) -> anyhow::Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if let Some(persistence) = persistence.take() {
+                persistence.release().await;
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn prepare_state_persistence(
@@ -313,8 +380,12 @@ async fn prepare_state_persistence(
         lease.expires_at
     );
     let heartbeat_storage = storage.clone();
-    let state_persistence =
-        StrategyStatePersistenceHandle::spawn(storage, account_id.clone(), holder_id, run_id);
+    let state_persistence = StrategyStatePersistenceHandle::spawn(
+        storage,
+        account_id.clone(),
+        holder_id.clone(),
+        run_id,
+    );
     let candidate_ledger_persistence =
         CandidateLedgerPersistenceHandle::spawn(heartbeat_storage.clone(), account_id.clone());
     start_runtime_lease_heartbeat(
@@ -330,7 +401,9 @@ async fn prepare_state_persistence(
         candidate_ledger: candidate_ledger_persistence,
         storage: heartbeat_storage,
         account_id,
+        writer_id: holder_id,
         run_id,
+        migration_latest_version: latest_version,
     })
 }
 
@@ -338,6 +411,7 @@ async fn prepare_live_submit_broker_state(
     config: &AlpacaOptionsRuntimeConfig,
     data_config: &AlpacaDataClientConfig,
     strategy_state: &mut StrategyState,
+    persistence: &LiveSubmitPersistence,
 ) -> anyhow::Result<Vec<String>> {
     let client = AlpacaHttpClient::from_data_config(data_config)?;
     let account = client.account().await?;
@@ -381,10 +455,9 @@ async fn prepare_live_submit_broker_state(
 
     let report = reconcile_strategy_state(&client, strategy_state).await?;
     if report.changed {
-        config
-            .save_strategy_state(strategy_state)
+        persist_reconciliation_repairs(config, persistence, &report, strategy_state)
             .await
-            .context("failed to persist startup strategy-state reconciliation repair")?;
+            .context("failed to persist startup strategy-state reconciliation events")?;
     }
     if report.has_unmanaged_broker_state() {
         emit_unmanaged_broker_state_block(&report);
@@ -402,10 +475,81 @@ async fn prepare_live_submit_broker_state(
             "storage_ready": true,
             "lease_held": true,
             "broker_state_reconciled": true,
+            "required_migration_version": STATE_PERSISTENCE_MIGRATION_VERSION,
+            "latest_migration_version": persistence.migration_latest_version,
+            "state_persistence_healthy": persistence.state.is_healthy(),
+            "candidate_ledger_persistence_healthy": persistence.candidate_ledger.is_healthy(),
+            "storage_account_id": persistence.account_id,
+            "run_id": persistence.run_id.to_string(),
+            "reconciliation_events": report.repairs.len(),
             "state_repaired": report.changed,
         }),
     );
     Ok(account_reasons)
+}
+
+async fn persist_reconciliation_repairs(
+    config: &AlpacaOptionsRuntimeConfig,
+    persistence: &LiveSubmitPersistence,
+    report: &StrategyStateReconciliationReport,
+    strategy_state: &StrategyState,
+) -> anyhow::Result<()> {
+    if report.repairs.is_empty() {
+        anyhow::bail!("strategy-state reconciliation changed state without repair events");
+    }
+
+    for repair in &report.repairs {
+        let mutation = reconciliation_state_mutation(repair, persistence)?;
+        persist_strategy_state_mutation(
+            &persistence.storage,
+            &persistence.account_id,
+            &mutation,
+            strategy_state,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to persist reconciliation repair {} for order_list_id={}",
+                repair.action, repair.order_list_id
+            )
+        })?;
+    }
+
+    save_strategy_state_atomic(&config.state_path, strategy_state)
+        .context("failed to update local strategy-state mirror after reconciliation")?;
+    Ok(())
+}
+
+fn reconciliation_state_mutation(
+    repair: &StrategyStateReconciliationRepair,
+    persistence: &LiveSubmitPersistence,
+) -> anyhow::Result<StrategyStateMutation> {
+    let mut mutation = StrategyStateMutation::new(
+        Uuid::new_v4(),
+        "entry_reconciled",
+        json!({
+            "action": repair.action,
+            "reason": repair.reason,
+            "trade_date": repair.trade_date,
+            "underlying": repair.underlying,
+            "strategy": repair.strategy,
+            "order_list_id": repair.order_list_id,
+            "close_order_list_id": repair.close_order_list_id,
+            "parent_order_id": repair.parent_order_id,
+            "symbols": repair.symbols,
+            "closed": repair.closed,
+            "canceled": repair.canceled,
+        }),
+    );
+    mutation.strategy = Some(repair.strategy.clone());
+    mutation.underlying = Some(repair.underlying.clone());
+    mutation.trade_date = NaiveDate::parse_from_str(&repair.trade_date, "%Y-%m-%d").ok();
+    mutation.order_list_id = Some(repair.order_list_id.clone());
+    mutation.venue_order_id = repair.parent_order_id.clone();
+    mutation.ts_event = Some(Utc::now());
+    mutation.writer_id = Some(persistence.writer_id.clone());
+    mutation.run_id = Some(persistence.run_id);
+    Ok(mutation)
 }
 
 async fn start_lifecycle_risk_daemon(

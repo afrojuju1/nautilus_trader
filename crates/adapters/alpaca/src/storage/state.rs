@@ -2,10 +2,18 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
-use sqlx::{AssertSqlSafe, types::Json};
+use sqlx::{AssertSqlSafe, Row as _, types::Json};
 use uuid::Uuid;
 
 use crate::{runtime::StrategyState, storage::StorageRepository};
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StrategyStateMetadata {
+    pub version: i64,
+    pub writer_id: Option<String>,
+    pub run_id: Option<String>,
+    pub last_event_id: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct StrategyStateMutation {
@@ -85,6 +93,32 @@ pub async fn load_strategy_state_record(
     };
 
     Ok(Some(serde_json::from_value(row.0)?))
+}
+
+pub async fn load_strategy_state_metadata(
+    storage: &StorageRepository,
+    account_id: &str,
+) -> anyhow::Result<Option<StrategyStateMetadata>> {
+    let query = format!(
+        "SELECT version, writer_id, run_id::text AS run_id, last_event_id::text AS last_event_id \
+         FROM \"{}\".strategy_state WHERE account_id = $1",
+        storage.schema()
+    );
+
+    let Some(row) = sqlx::query(AssertSqlSafe(query))
+        .bind(account_id)
+        .fetch_optional(storage.pool())
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(StrategyStateMetadata {
+        version: row.try_get("version")?,
+        writer_id: row.try_get("writer_id")?,
+        run_id: row.try_get("run_id")?,
+        last_event_id: row.try_get("last_event_id")?,
+    }))
 }
 
 pub async fn save_strategy_state(

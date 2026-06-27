@@ -61,6 +61,8 @@ Live runtime state, candidate ledgers, performance ledgers, and candidate outcom
 Postgres through `ALPACA_STORAGE_DATABASE_URL`.
 If an account has no Postgres `strategy_state` row yet, the runtime bootstraps that row from the
 configured local strategy-state JSON file once, then continues from Postgres.
+State mutations are recorded in Postgres `strategy_state_events`; `strategy_state` remains the
+current JSONB snapshot with version, writer, run, and last-event metadata.
 `runtime.candidate_ledger_max_candidates` controls how many ranked candidates per scanner result
 are persisted; `0` records all ranked candidates.
 
@@ -306,6 +308,8 @@ Default state files from the env template:
 - Lock: `~/.local/state/nautilus_trader/locks/alpaca-options.lock`
 - Strategy state: `~/.local/state/nautilus_trader/alpaca_options_state.json`
 - Candidate ledger: Postgres `alpaca.candidate_ledger`
+- Strategy-state events: Postgres `alpaca.strategy_state_events`
+- Runtime lease: Postgres `alpaca.runtime_lease`
 - Candidate-alert dedupe state:
   `~/.local/state/nautilus_trader/alpaca/<account-id>/alerts/candidate-discord-state.json`
 - Performance ledger: Postgres `alpaca.performance_ledger`

@@ -31,7 +31,10 @@ use nautilus_alpaca::{
     },
     options_runtime::AlpacaOptionsRuntimeConfig,
     runtime::{StrategyState, read_operator_events},
-    storage::{CandidateLedgerSummaryFilters, read_candidate_ledger_records},
+    storage::{
+        CandidateLedgerSummaryFilters, StrategyStateMetadata, load_strategy_state_metadata,
+        read_candidate_ledger_records,
+    },
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -59,6 +62,7 @@ struct OperatorConfig {
     fleet_account_id: Option<String>,
     fleet_policy_blocks: Vec<String>,
     storage: StorageStatus,
+    strategy_state_metadata: Option<StrategyStateMetadata>,
     candidate_ledger_records: Vec<Value>,
     json_output: bool,
 }
@@ -167,6 +171,10 @@ struct PositionsStatus {
 struct StrategyStateStatus {
     path: String,
     exists: bool,
+    db_version: Option<i64>,
+    db_writer_id: Option<String>,
+    db_run_id: Option<String>,
+    db_last_event_id: Option<String>,
     entries: usize,
     active_entries: usize,
     closed_entries: usize,
@@ -302,9 +310,12 @@ impl OperatorConfig {
             .with_timezone(&strategy_config.entry_timezone)
             .date_naive();
 
-        let (storage, candidate_ledger_records) =
+        let (storage, strategy_state_metadata, candidate_ledger_records) =
             if let Some(repository) = &strategy_config.storage_repository {
                 let status = repository.migration_status().await?;
+                let metadata =
+                    load_strategy_state_metadata(repository, strategy_config.storage_account_id())
+                        .await?;
                 let filters = CandidateLedgerSummaryFilters {
                     since: trade_date.checked_sub_signed(Duration::days(7)),
                     until: None,
@@ -330,6 +341,7 @@ impl OperatorConfig {
                         latest_migration_version: status.latest_version,
                         dirty_migration_version: status.dirty_version,
                     },
+                    metadata,
                     records,
                 )
             } else {
@@ -341,6 +353,7 @@ impl OperatorConfig {
                         latest_migration_version: None,
                         dirty_migration_version: None,
                     },
+                    None,
                     Vec::new(),
                 )
             };
@@ -374,6 +387,7 @@ impl OperatorConfig {
             fleet_account_id: strategy_config.fleet_account_id,
             fleet_policy_blocks: strategy_config.fleet_policy_blocks,
             storage,
+            strategy_state_metadata,
             candidate_ledger_records,
             json_output: crate::ops_args().iter().any(|arg| arg == "--json"),
         })
@@ -491,6 +505,22 @@ fn build_status(
     let strategy_state = StrategyStateStatus {
         path: config.state_path.display().to_string(),
         exists: config.storage.enabled || config.state_path.exists(),
+        db_version: config
+            .strategy_state_metadata
+            .as_ref()
+            .map(|metadata| metadata.version),
+        db_writer_id: config
+            .strategy_state_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.writer_id.clone()),
+        db_run_id: config
+            .strategy_state_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.run_id.clone()),
+        db_last_event_id: config
+            .strategy_state_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.last_event_id.clone()),
         entries: state.entries.len(),
         active_entries: state
             .entries
@@ -977,8 +1007,17 @@ fn print_human_status(status: &OperatorStatus) {
         status.positions.unmanaged,
     );
     println!(
-        "strategy_state: exists={} entries={} active={} closed={} canceled={} path={}",
+        "strategy_state: exists={} db_version={} db_last_event_id={} entries={} active={} closed={} canceled={} path={}",
         status.strategy_state.exists,
+        status
+            .strategy_state
+            .db_version
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        status
+            .strategy_state
+            .db_last_event_id
+            .as_deref()
+            .unwrap_or("none"),
         status.strategy_state.entries,
         status.strategy_state.active_entries,
         status.strategy_state.closed_entries,

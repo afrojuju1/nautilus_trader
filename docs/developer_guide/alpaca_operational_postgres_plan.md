@@ -1,6 +1,7 @@
 # Alpaca Operational Postgres Plan
 
-Status: planned.
+Status: implemented for Alpaca live-submit durability; market-hours submit proof remains tracked by
+the Nautilus-native order cutover Beads.
 
 This document refines the Postgres side of the Alpaca runtime after the Nautilus-native entry
 strategy cutover work. It covers operational state, evidence ledgers, migrations, and live-submit
@@ -37,9 +38,9 @@ Existing tables are initialized by SQLx migrations under
 - `candidate_outcome`: upserted candidate outcome records.
 - `runtime_lease`: DB-visible live-submit writer guard.
 
-This is acceptable for the current account-engine loop, but it is not enough for live strategy
-cutover until runtime writes use the snapshot metadata, append-only state-event ledger, and runtime
-lease as part of a transactional persistence contract.
+The live strategy path now uses the snapshot metadata, append-only state-event ledger, runtime
+lease, and transactional mutation writes as the operational persistence contract. Startup
+reconciliation repairs are persisted as `entry_reconciled` events before live submit proceeds.
 
 ## Target Architecture
 
@@ -134,7 +135,10 @@ Postgres schema evolution should use the existing Rust dependency path:
   `schema_migrations` table to the Alpaca domain schema.
 
 The readiness check should report the applied migration version from `sqlx` metadata alongside
-normal storage health.
+normal storage health. `alpaca-options-node` emits `live_submit_readiness` with the required and
+latest migration versions, runtime lease status, persistence-sink health, storage account ID, run ID,
+and startup reconciliation event count. `alpaca-ops status` reports the current strategy-state
+snapshot version and last event ID.
 
 ### Strategy State Snapshot
 
@@ -329,6 +333,8 @@ If any item fails, the node may continue scanning, but it must not submit entrie
 
 ### Phase 1: Migrations And Repository Contract
 
+Status: implemented.
+
 - SQLx migration support is enabled for the Alpaca operational Postgres store.
 - The existing inline DDL lives in versioned SQL migrations.
 - Add state metadata columns, `strategy_state_events`, and `runtime_lease`.
@@ -340,6 +346,8 @@ version, load existing state rows, and persist one synthetic state event idempot
 
 ### Phase 2: Strategy-State Persistence Sink
 
+Status: implemented.
+
 - The live entry strategy has a focused async handle for Alpaca strategy-state mutations.
 - Accepted and terminal rejected order callbacks update memory immediately and enqueue mutations.
 - The handle serializes writes per account.
@@ -349,6 +357,8 @@ Done when accepted/rejected strategy order events persist an event row and updat
 blocking synchronous strategy callbacks.
 
 ### Phase 3: Submit Readiness Gate
+
+Status: implemented.
 
 - The option-chain live node checks storage readiness when live entry submit is requested.
 - Storage-backed state and a healthy persistence handle are required when
@@ -361,6 +371,8 @@ unhealthy sink.
 
 ### Phase 4: Startup Reconciliation
 
+Status: implemented.
+
 - Load persisted state.
 - Query broker orders/positions/account state.
 - Reconcile pending, partially accepted, terminally rejected, and externally closed entries.
@@ -370,6 +382,8 @@ Done when restart cannot double-submit an entry that was accepted before a crash
 
 ### Phase 5: Candidate Evidence Sink
 
+Status: implemented.
+
 - Move Nautilus strategy decision/dry-run/block evidence into a persistence sink.
 - Preserve the current `candidate_ledger` payload contract.
 - Ensure dry-runs still record `submission_disabled`.
@@ -378,6 +392,8 @@ Done when the strategy path emits decision evidence equivalent to the account-en
 direct SQL in strategy callbacks.
 
 ### Phase 6: Postgres Slimming
+
+Status: implemented for the removed market-data cache path.
 
 - `backtest_market_cache` has been retired with a forward SQLx migration.
 - Alpaca backtests no longer require Postgres storage for market-data-shaped cache payloads.
@@ -398,13 +414,7 @@ Done when Postgres contains operational state, evidence, reports, outcomes, and 
 
 ## Recommended Next Step
 
-Implement Phase 1 first. It is the smallest safe step and gives later strategy work a durable
-contract:
-
-1. Add `sqlx` migration files for the existing Alpaca operational schema.
-2. Wire the `sqlx` migrator into startup/readiness.
-3. Add `strategy_state_events`.
-4. Add snapshot version metadata.
-5. Add a transactional repository method for one state event plus one snapshot update.
-
-Only after that should the strategy persistence sink be wired into the live node.
+Use this document as the active contract for future Postgres changes. The remaining proof is
+runtime validation: run the market-hours non-submit cutover proof, then the bounded paper-submit
+validation. Any future state mutation type should write through `persist_strategy_state_mutation`
+or a deliberately equivalent transactional event-plus-snapshot boundary.

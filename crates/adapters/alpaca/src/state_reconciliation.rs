@@ -18,6 +18,8 @@ use crate::{
 pub struct StrategyStateReconciliationReport {
     /// Whether persisted strategy state was changed.
     pub changed: bool,
+    /// Strategy-state repairs applied during reconciliation and requiring durable event records.
+    pub repairs: Vec<StrategyStateReconciliationRepair>,
     /// Open broker position symbols not represented by active strategy state.
     pub unmanaged_position_symbols: Vec<String>,
     /// Open broker order symbols not represented by active strategy state.
@@ -33,6 +35,58 @@ impl StrategyStateReconciliationReport {
         !self.unmanaged_position_symbols.is_empty()
             || !self.unmanaged_open_order_symbols.is_empty()
             || !self.partial_position_symbols.is_empty()
+    }
+}
+
+/// One startup reconciliation repair applied to [`StrategyState`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrategyStateReconciliationRepair {
+    /// Repair action applied to the state entry.
+    pub action: String,
+    /// Reason for the repair.
+    pub reason: String,
+    /// Market trade date from the state entry.
+    pub trade_date: String,
+    /// Underlying symbol from the state entry.
+    pub underlying: String,
+    /// Strategy name from the state entry.
+    pub strategy: String,
+    /// Entry order-list ID.
+    pub order_list_id: String,
+    /// Close order-list ID, if present.
+    pub close_order_list_id: Option<String>,
+    /// Entry or close parent venue order ID, if present.
+    pub parent_order_id: Option<String>,
+    /// Option symbols tracked by the state entry.
+    pub symbols: Vec<String>,
+    /// Whether the repaired state entry is closed.
+    pub closed: bool,
+    /// Whether the repaired state entry is canceled.
+    pub canceled: bool,
+}
+
+impl StrategyStateReconciliationRepair {
+    fn from_entry(action: &str, reason: &str, entry: &StrategyStateEntry) -> Self {
+        Self {
+            action: action.to_string(),
+            reason: reason.to_string(),
+            trade_date: entry.trade_date.clone(),
+            underlying: entry.underlying.clone(),
+            strategy: entry.strategy.clone(),
+            order_list_id: entry.order_list_id.clone(),
+            close_order_list_id: entry.close_order_list_id.clone(),
+            parent_order_id: entry
+                .close_parent_order_id
+                .clone()
+                .or_else(|| entry.parent_order_id.clone()),
+            symbols: entry
+                .symbols()
+                .into_iter()
+                .map(ToString::to_string)
+                .collect(),
+            closed: entry.closed,
+            canceled: entry.canceled,
+        }
     }
 }
 
@@ -123,6 +177,13 @@ pub async fn reconcile_strategy_state(
                 );
                 entry.mark_closed(None);
                 report.changed = true;
+                report
+                    .repairs
+                    .push(StrategyStateReconciliationRepair::from_entry(
+                        "mark_closed",
+                        "broker_flat",
+                        entry,
+                    ));
             }
             ReconciliationAction::MarkCanceled => {
                 println!(
@@ -140,6 +201,13 @@ pub async fn reconcile_strategy_state(
                 );
                 entry.mark_canceled();
                 report.changed = true;
+                report
+                    .repairs
+                    .push(StrategyStateReconciliationRepair::from_entry(
+                        "mark_canceled",
+                        "entry_terminal_without_position",
+                        entry,
+                    ));
             }
             ReconciliationAction::PartialPosition => {
                 let symbols = entry

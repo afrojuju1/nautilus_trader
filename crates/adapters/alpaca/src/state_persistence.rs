@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::{
@@ -19,6 +19,7 @@ use crate::{
 use serde_json::json;
 
 const STATE_PERSISTENCE_QUEUE_CAPACITY: usize = 64;
+const STATE_PERSISTENCE_FLUSH_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Clone, Debug)]
 pub struct StrategyStatePersistenceHandle {
@@ -43,44 +44,51 @@ impl StrategyStatePersistenceHandle {
         let sink_writer_id = writer_id.clone();
         tokio::spawn(async move {
             while let Some(request) = receiver.recv().await {
-                match persist_strategy_state_mutation(
-                    &storage,
-                    &account_id,
-                    &request.mutation,
-                    &request.state,
-                )
-                .await
-                {
-                    Ok(result) => {
-                        log::debug!(
-                            "Persisted Alpaca strategy state mutation: account_id={} event_type={} event_id={} status={:?} version={}",
-                            account_id,
-                            request.mutation.event_type,
-                            request.mutation.event_id,
-                            result.status,
-                            result.snapshot_version
-                        );
+                match request {
+                    StrategyStatePersistenceRequest::Persist { mutation, state } => {
+                        match persist_strategy_state_mutation(
+                            &storage,
+                            &account_id,
+                            &mutation,
+                            &state,
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                log::debug!(
+                                    "Persisted Alpaca strategy state mutation: account_id={} event_type={} event_id={} status={:?} version={}",
+                                    account_id,
+                                    mutation.event_type,
+                                    mutation.event_id,
+                                    result.status,
+                                    result.snapshot_version
+                                );
+                            }
+                            Err(error) => {
+                                sink_healthy.store(false, Ordering::Release);
+                                log::error!(
+                                    "Alpaca strategy-state persistence failed: account_id={} writer_id={} event_type={} event_id={} error={error:#}",
+                                    account_id,
+                                    sink_writer_id,
+                                    mutation.event_type,
+                                    mutation.event_id
+                                );
+                                emit_operator_event(
+                                    "strategy_state_persistence_error",
+                                    json!({
+                                        "reason": "write_failed",
+                                        "account_id": account_id.clone(),
+                                        "writer_id": sink_writer_id.clone(),
+                                        "event_type": mutation.event_type.clone(),
+                                        "event_id": mutation.event_id.to_string(),
+                                        "error": error.to_string(),
+                                    }),
+                                );
+                            }
+                        }
                     }
-                    Err(error) => {
-                        sink_healthy.store(false, Ordering::Release);
-                        log::error!(
-                            "Alpaca strategy-state persistence failed: account_id={} writer_id={} event_type={} event_id={} error={error:#}",
-                            account_id,
-                            sink_writer_id,
-                            request.mutation.event_type,
-                            request.mutation.event_id
-                        );
-                        emit_operator_event(
-                            "strategy_state_persistence_error",
-                            json!({
-                                "reason": "write_failed",
-                                "account_id": account_id.clone(),
-                                "writer_id": sink_writer_id.clone(),
-                                "event_type": request.mutation.event_type.clone(),
-                                "event_id": request.mutation.event_id.to_string(),
-                                "error": error.to_string(),
-                            }),
-                        );
+                    StrategyStatePersistenceRequest::Flush { ack } => {
+                        let _ = ack.send(());
                     }
                 }
             }
@@ -114,7 +122,7 @@ impl StrategyStatePersistenceHandle {
             .get_or_insert_with(|| self.writer_id.to_string());
         mutation.run_id.get_or_insert(self.run_id);
         self.sender
-            .try_send(StrategyStatePersistenceRequest { mutation, state })
+            .try_send(StrategyStatePersistenceRequest::Persist { mutation, state })
             .map_err(|error| {
                 self.healthy.store(false, Ordering::Release);
                 emit_operator_event(
@@ -129,12 +137,35 @@ impl StrategyStatePersistenceHandle {
                 anyhow::anyhow!("strategy-state persistence queue unavailable: {error}")
             })
     }
+
+    pub async fn flush(&self) -> anyhow::Result<()> {
+        let (ack, receiver) = oneshot::channel();
+        self.sender
+            .send(StrategyStatePersistenceRequest::Flush { ack })
+            .await
+            .map_err(|error| {
+                self.healthy.store(false, Ordering::Release);
+                anyhow::anyhow!("strategy-state persistence queue closed before flush: {error}")
+            })?;
+        tokio::time::timeout(
+            Duration::from_secs(STATE_PERSISTENCE_FLUSH_TIMEOUT_SECS),
+            receiver,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("strategy-state persistence flush timed out"))?
+        .map_err(|error| anyhow::anyhow!("strategy-state persistence flush failed: {error}"))
+    }
 }
 
 #[derive(Debug)]
-struct StrategyStatePersistenceRequest {
-    mutation: StrategyStateMutation,
-    state: StrategyState,
+enum StrategyStatePersistenceRequest {
+    Persist {
+        mutation: StrategyStateMutation,
+        state: StrategyState,
+    },
+    Flush {
+        ack: oneshot::Sender<()>,
+    },
 }
 
 pub fn start_runtime_lease_heartbeat(

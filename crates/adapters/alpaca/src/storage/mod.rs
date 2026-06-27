@@ -47,7 +47,8 @@ pub use performance::{
 
 #[cfg(feature = "live")]
 pub use state::{
-    StrategyStateMutation, StrategyStateWriteResult, StrategyStateWriteStatus, load_strategy_state,
+    StrategyStateMetadata, StrategyStateMutation, StrategyStateWriteResult,
+    StrategyStateWriteStatus, load_strategy_state, load_strategy_state_metadata,
     load_strategy_state_record, persist_strategy_state_mutation, save_strategy_state,
 };
 
