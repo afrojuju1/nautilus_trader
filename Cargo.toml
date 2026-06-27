@@ -201,6 +201,7 @@ object_store = { version = "0.13.2", default-features = false, features = [
 parquet = { version = "58.3.0", default-features = false, features = [
   "arrow",
   "async",
+  "snap",
 ] }
 pem = "3.0.6"
 pyo3 = { version = "0.29.0", default-features = false, features = [
