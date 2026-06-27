@@ -48,9 +48,9 @@ from `APCA_API_KEY_ID`/`APCA_API_SECRET_KEY`, then from the existing deployment 
 The contract provider can also convert Alpaca option contract payloads into Nautilus
 `OptionContract` instruments on venue `ALPACA`.
 The Rust `AlpacaDataClient` and factory can exact-load those option instruments through the standard
-Nautilus live data-client request/subscription surface.
-An initial diagnostic scanner (`alpaca-dry-run-put-credit`) screens active 5-10 DTE put
-credit spreads without submitting orders.
+Nautilus live data-client request/subscription surface. The active scanner path is the
+Nautilus-native option-chain actor and bounded comparison command; the old REST-only put-credit
+dry-run binary has been retired.
 The next runtime slice adds account, position, and open-order polling through Alpaca Trading REST
 plus a non-submitting multi-leg order payload builder/validator for paper put credit spread
 payloads.

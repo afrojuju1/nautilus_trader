@@ -71,6 +71,8 @@ pub struct StrategyStateEntryDraft {
     pub score: f64,
     /// Broker parent order ID.
     pub parent_order_id: Option<String>,
+    /// Timestamp captured immediately before handing the entry order(s) to Nautilus.
+    pub submitted_at_utc: Option<String>,
 }
 
 impl StrategyState {
@@ -188,6 +190,7 @@ impl StrategyState {
             debit: None,
             score: candidate.score,
             parent_order_id,
+            submitted_at_utc: None,
         });
     }
 
@@ -215,6 +218,7 @@ impl StrategyState {
             debit: None,
             score: candidate.score,
             parent_order_id,
+            submitted_at_utc: None,
         });
     }
 
@@ -243,6 +247,7 @@ impl StrategyState {
             debit: Some(candidate.debit),
             score: candidate.score,
             parent_order_id,
+            submitted_at_utc: None,
         });
     }
 
@@ -271,11 +276,15 @@ impl StrategyState {
             debit: None,
             score: candidate.score,
             parent_order_id,
+            submitted_at_utc: None,
         });
     }
 
     /// Appends one submitted entry draft to the state.
     pub fn record_entry_submission(&mut self, draft: StrategyStateEntryDraft) {
+        let submitted_at_utc = draft
+            .submitted_at_utc
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
         self.entries.push(StrategyStateEntry {
             trade_date: draft.trade_date,
             underlying: draft.underlying,
@@ -290,6 +299,7 @@ impl StrategyState {
             debit: draft.debit,
             score: draft.score,
             parent_order_id: draft.parent_order_id,
+            submitted_at_utc: Some(submitted_at_utc),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
@@ -338,6 +348,9 @@ pub struct StrategyStateEntry {
     pub score: f64,
     /// Alpaca parent order ID for the entry.
     pub parent_order_id: Option<String>,
+    /// Timestamp captured immediately before submitting the entry order(s).
+    #[serde(default)]
+    pub submitted_at_utc: Option<String>,
     /// Close order-list ID, if a close has been submitted.
     #[serde(default)]
     pub close_order_list_id: Option<String>,
@@ -618,6 +631,7 @@ mod tests {
             debit: None,
             score: 61.9,
             parent_order_id: Some("parent-1".to_string()),
+            submitted_at_utc: Some("2026-05-02T19:30:28Z".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
@@ -773,6 +787,7 @@ mod tests {
             debit: None,
             score: 60.0,
             parent_order_id: Some("open-parent-1".to_string()),
+            submitted_at_utc: Some("2026-05-04T14:00:00Z".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
@@ -852,6 +867,7 @@ mod tests {
             debit: Some(0.88),
             score: 74.5,
             parent_order_id: Some("open-parent-1".to_string()),
+            submitted_at_utc: Some("2026-05-04T14:00:00Z".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,

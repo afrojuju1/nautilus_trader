@@ -227,24 +227,13 @@ export ALPACA_SNAPSHOT_CONTRACT_LIMIT=50
 cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-snapshots -- SPY
 ```
 
-## Dry-run put-credit scanner
+## Option-chain scan comparison
 
-This command scans for put-credit candidates and prints the top candidate for each underlying. It
-does not submit orders.
-
-```bash
-cargo run -p nautilus-alpaca --features live --bin alpaca-dry-run-put-credit -- SPY QQQ IWM
-```
-
-Optional scanner overrides:
+This command compares the REST-normalized scanner output with the Nautilus option-chain scanner for
+one underlying and expiry. It does not submit orders.
 
 ```bash
-export ALPACA_DRY_RUN_MIN_DTE=5
-export ALPACA_DRY_RUN_MAX_DTE=10
-export ALPACA_DRY_RUN_SHORT_DELTA_MIN=0.18
-export ALPACA_DRY_RUN_SHORT_DELTA_MAX=0.28
-export ALPACA_DRY_RUN_WIDTHS="2,3,5"
-cargo run -p nautilus-alpaca --features live --bin alpaca-dry-run-put-credit -- SPY
+cargo run -p nautilus-alpaca --features live --bin alpaca-compare-option-chain-scan -- --pretty SPY YYYY-MM-DD
 ```
 
 ## Validate a multi-leg order payload

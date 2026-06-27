@@ -228,6 +228,7 @@ impl SelectedOptionsEntry {
         trade_date: &str,
         order_list_id: &str,
         quantity: u64,
+        submitted_at_utc: Option<String>,
         parent_order_id: Option<String>,
     ) -> StrategyStateEntryDraft {
         match self {
@@ -245,6 +246,7 @@ impl SelectedOptionsEntry {
                 debit: None,
                 score: entry.candidate.score,
                 parent_order_id,
+                submitted_at_utc,
             },
             Self::IronCondor(entry) => StrategyStateEntryDraft {
                 trade_date: trade_date.to_string(),
@@ -260,6 +262,7 @@ impl SelectedOptionsEntry {
                 debit: None,
                 score: entry.candidate.score,
                 parent_order_id,
+                submitted_at_utc,
             },
             Self::Debit(entry) => StrategyStateEntryDraft {
                 trade_date: trade_date.to_string(),
@@ -275,6 +278,7 @@ impl SelectedOptionsEntry {
                 debit: Some(entry.candidate.debit),
                 score: entry.candidate.score,
                 parent_order_id,
+                submitted_at_utc,
             },
             Self::NakedOption(entry) => StrategyStateEntryDraft {
                 trade_date: trade_date.to_string(),
@@ -290,6 +294,7 @@ impl SelectedOptionsEntry {
                 debit: None,
                 score: entry.candidate.score,
                 parent_order_id,
+                submitted_at_utc,
             },
         }
     }

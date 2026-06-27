@@ -178,6 +178,7 @@ mod tests {
             debit: None,
             score: 60.0,
             parent_order_id: Some("parent-1".to_string()),
+            submitted_at_utc: Some("1970-01-01T00:00:00Z".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,

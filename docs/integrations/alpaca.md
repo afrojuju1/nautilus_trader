@@ -19,7 +19,7 @@ integrations until this surface has more production proof.
 Safe live examples are available in
 [`examples/live/alpaca/`](../../examples/live/alpaca/README.md).
 
-The examples start with read-only account, option contract, option snapshot, dry-run scanner, and
+The examples start with read-only account, option contract, option snapshot, option-chain scan, and
 multi-leg payload validation commands. They do not submit orders by default.
 
 ## Overview
@@ -39,7 +39,7 @@ The Rust Alpaca runtime currently includes the following implemented components:
   performance reporting.
 - `alpaca-options-engine --check-config`: Legacy config-check command for deployed options
   runtime configuration.
-- Operator binaries for read-only account status, option-chain inspection, dry-run scanning,
+- Operator binaries for read-only account status, option-chain inspection, bounded scan comparison,
   multi-leg payload validation, fleet status, alerts, and performance reports.
 
 The Python package exposes config objects, a stock-bar and exact-option snapshot data client, an
@@ -207,7 +207,7 @@ export ALPACA_TRADING_BASE_URL="https://paper-api.alpaca.markets"
 cargo run -p nautilus-alpaca --features live --bin alpaca-check-account-orders
 cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-contracts -- SPY QQQ
 cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-snapshots -- SPY
-cargo run -p nautilus-alpaca --features live --bin alpaca-dry-run-put-credit -- SPY QQQ
+cargo run -p nautilus-alpaca --features live --bin alpaca-compare-option-chain-scan -- --pretty SPY YYYY-MM-DD
 cargo run -p nautilus-alpaca --features live --bin alpaca-validate-mleg-order -- \
   SPY260619P00450000 SPY260619P00445000 0.40 1
 ```

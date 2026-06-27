@@ -116,8 +116,9 @@ validation and operational cleanup, not keeping a second account-engine owner al
   mismatches caused by stricter Nautilus option-chain quote validity.
 - [ ] Confirm live-node logs show Alpaca instrument bootstrap, non-zero cached option instruments,
   option-chain subscription, and `option_chain_opportunity_scan` events.
-- [ ] Keep `ALPACA_SUBMIT=false` until strategy admission, durable state recording, and startup
-  reconciliation are complete.
+- [ ] Keep `ALPACA_SUBMIT=false` for market-hours cutover proof. Strategy admission, durable state
+  recording, and startup reconciliation are code-complete, but live paper submission still needs a
+  bounded broker proof.
 
 ### 2. Entry Admission Cutover
 
@@ -136,12 +137,15 @@ path refuses entries using the same durable state and broker constraints.
     cutover proof can keep the current no-storage live-node path.
   - [x] Preserve same-day duplicate checks, active-entry limits, daily-submit limits, per-underlying
     limits, per-sector limits, and fleet limits.
-- [ ] Feed admission with live broker state.
+- [x] Feed admission with live broker state.
   - [x] Prefer Nautilus cache/portfolio/order state where it exposes equivalent information.
-  - [ ] Keep Alpaca HTTP only for account flags or option-specific broker admission details not already
+  - [x] Keep Alpaca HTTP only for account flags or option-specific broker admission details not already
     represented by Nautilus runtime state.
-  - [ ] Preserve the existing account/position/open-order option-spread admission checks before paper
+  - [x] Preserve the existing account/position/open-order option-spread admission checks before paper
     submission is enabled.
+  - Startup live-submit readiness reads Alpaca HTTP account, positions, and open orders, reconciles
+    strategy state, and blocks unmanaged broker state. Per-candidate admission uses Nautilus cache
+    positions plus open/inflight orders.
 - [x] Make the strategy emit the same selected/blocked/dry-run operator evidence as the old loop.
   - [x] Selected dry-runs must record `submission_disabled`.
   - [x] Blocks must include reason, current, limit, and details where available.
@@ -157,7 +161,7 @@ loop.
 
 - [ ] Add a strategy-owned pending submission record keyed by order-list ID.
   - [x] Store selected entry, trade date, quantity, expected client order IDs, and order count.
-  - [ ] Store submit timestamps.
+  - [x] Store submit timestamps.
   - [x] Keep this state in memory immediately after `submit_order` / `submit_order_list`.
 - [x] Record accepted submissions from Nautilus order events.
   - [x] Use `Strategy::on_order_accepted`, `on_order_rejected`, and `on_order_denied`.
@@ -185,13 +189,13 @@ loop.
     current process immediately.
   - [x] Mark the sink unhealthy, deny new entries, and emit operator evidence when persistence
     fails.
-- [ ] Reconcile state on startup before enabling paper submission.
+- [x] Reconcile state on startup before enabling paper submission.
   - [x] Load persisted entries.
   - [x] Require migrations, storage readiness, healthy sink, and an active account writer lease
     when `ALPACA_SUBMIT=true`.
   - [x] Reconcile broker orders/positions so pending or partially accepted entries are not double
     submitted after restart.
-- [ ] Done when accepted/rejected strategy submissions update durable state without calling direct
+- [x] Done when accepted/rejected strategy submissions update durable state without calling direct
   account-engine submission code.
 
 ### 4. Paper Submit Cutover
@@ -214,8 +218,8 @@ loop.
 
 ### 6. Scanner Evidence Persistence
 
-- [ ] Decide whether scanner evidence is persisted by a dedicated consumer or a storage-aware actor.
-- [ ] Keep scan math and candidate ranking pure; persistence should consume scan results, not own
+- [x] Persist scanner evidence through the scan actor's async candidate-ledger sink.
+- [x] Keep scan math and candidate ranking pure; persistence consumes scan results and does not own
   candidate selection.
 
 ### 7. Management Loop Cutover
@@ -235,7 +239,7 @@ loop.
 
 ### 8. Diagnostic Cleanup
 
-- [ ] Retire long-running standalone scanner loops after actor/strategy paths provide equivalent
+- [x] Retire long-running standalone scanner loops after actor/strategy paths provide equivalent
   evidence.
 - [ ] Keep intentionally diagnostic commands such as scan comparison and bounded cutover proof.
 
@@ -248,7 +252,7 @@ loop.
 - [x] Management loop
   - Tracked in "7. Management Loop Cutover" above.
 
-- [ ] One-off scanner binaries
+- [x] One-off scanner binaries
   - Tracked in "8. Diagnostic Cleanup" above.
 
 ## Guardrails

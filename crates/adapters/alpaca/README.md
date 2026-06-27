@@ -10,7 +10,7 @@ implemented surface focuses on US equity option workflows:
 - A Rust execution/runtime path for option-spread submission, trade-update handling, and REST
   reconciliation.
 - Diagnostic and operator binaries for paper-trading account checks, option-chain inspection,
-  dry-run scanning, multi-leg validation, candidate alerts, and performance reporting.
+  bounded scan comparison, multi-leg validation, candidate alerts, and performance reporting.
 
 The Python `TradingNode` path exposes Alpaca data and execution factories for stock bars, exact
 option snapshot quotes/Greeks, simple equity DAY limit orders, and option multi-leg DAY limit order

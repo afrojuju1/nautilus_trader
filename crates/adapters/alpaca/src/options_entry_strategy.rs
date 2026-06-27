@@ -227,6 +227,7 @@ struct PendingEntrySubmission {
     entry: SelectedOptionsEntry,
     trade_date: String,
     order_list_id: String,
+    submitted_at_utc: String,
     quantity: u64,
     order_count: usize,
     accepted: usize,
@@ -1362,12 +1363,14 @@ impl AlpacaOptionsEntryStrategy {
             self.pending_client_order_ids
                 .insert(client_order_id, order_list_id.clone());
         }
+        let submitted_at_utc = Utc::now().to_rfc3339();
         self.pending_submissions.insert(
             order_list_id.clone(),
             PendingEntrySubmission {
                 entry,
                 trade_date,
                 order_list_id,
+                submitted_at_utc,
                 quantity: self.config.quantity,
                 order_count,
                 accepted: 0,
@@ -1398,6 +1401,7 @@ impl AlpacaOptionsEntryStrategy {
                     &pending.trade_date,
                     &pending.order_list_id,
                     pending.quantity,
+                    Some(pending.submitted_at_utc.clone()),
                     Some(event.venue_order_id.to_string()),
                 ));
                 pending.recorded = true;
@@ -1462,6 +1466,7 @@ impl AlpacaOptionsEntryStrategy {
                         &pending.trade_date,
                         &pending.order_list_id,
                         pending.quantity,
+                        Some(pending.submitted_at_utc.clone()),
                         None,
                     ),
                     close_reason.to_string(),
@@ -1561,7 +1566,9 @@ impl AlpacaOptionsEntryStrategy {
                 broker_admission_reasons
                     .push(format!("existing open position on candidate leg {symbol}"));
             }
-            if cache.has_orders_open(None, Some(instrument_id), None, None, None) {
+            if cache.has_orders_open(None, Some(instrument_id), None, None, None)
+                || cache.has_orders_inflight(None, Some(instrument_id), None, None, None)
+            {
                 broker_admission_reasons.push(format!(
                     "working order already references candidate leg {symbol}"
                 ));
@@ -1581,7 +1588,11 @@ impl AlpacaOptionsEntryStrategy {
             }
         }
 
-        for order in cache.orders_open(None, None, None, None, None) {
+        for order in cache
+            .orders_open(None, None, None, None, None)
+            .into_iter()
+            .chain(cache.orders_inflight(None, None, None, None, None))
+        {
             let instrument_id = order.instrument_id();
             if candidate_ids.contains(&instrument_id) {
                 continue;
@@ -2234,7 +2245,11 @@ fn instrument_underlying_matches(
 
 fn open_broker_order_intent_count(cache: &CacheApi<'_>) -> usize {
     let mut intent_ids = BTreeSet::new();
-    for order in cache.orders_open(None, None, None, None, None) {
+    for order in cache
+        .orders_open(None, None, None, None, None)
+        .into_iter()
+        .chain(cache.orders_inflight(None, None, None, None, None))
+    {
         if let Some(order_list_id) = order.order_list_id() {
             intent_ids.insert(format!("list:{order_list_id}"));
         } else {
@@ -2436,6 +2451,7 @@ fn state_entry_draft_payload(draft: &StrategyStateEntryDraft) -> serde_json::Val
         "debit": draft.debit,
         "score": draft.score,
         "parent_order_id": draft.parent_order_id,
+        "submitted_at_utc": draft.submitted_at_utc,
     })
 }
 
@@ -2454,6 +2470,7 @@ fn state_entry_payload(entry: &StrategyStateEntry) -> serde_json::Value {
         "debit": entry.debit,
         "score": entry.score,
         "parent_order_id": entry.parent_order_id,
+        "submitted_at_utc": entry.submitted_at_utc,
         "close_order_list_id": entry.close_order_list_id,
         "close_parent_order_id": entry.close_parent_order_id,
         "close_reason": entry.close_reason,

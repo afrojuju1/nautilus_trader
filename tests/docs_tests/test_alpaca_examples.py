@@ -39,7 +39,7 @@ def test_alpaca_docs_reference_existing_runtime_bins() -> None:
         "alpaca-check-account-orders",
         "alpaca-load-option-contracts",
         "alpaca-load-option-snapshots",
-        "alpaca-dry-run-put-credit",
+        "alpaca-compare-option-chain-scan",
         "alpaca-validate-mleg-order",
         "alpaca-paper-execution-harness",
         "alpaca-options-engine",
@@ -50,7 +50,7 @@ def test_alpaca_docs_reference_existing_runtime_bins() -> None:
 def test_alpaca_paper_smoke_examples_keep_submit_cancel_policy() -> None:
     examples = _read(ALPACA_EXAMPLE_README)
     integration_doc = _read(ALPACA_INTEGRATION_DOC)
-    smoke_section = examples.split("## Paper submit/cancel smoke test", maxsplit=1)[1]
+    smoke_section = examples.split("## Rust operator submit/cancel diagnostic", maxsplit=1)[1]
     smoke_section = smoke_section.split("\n## ", maxsplit=1)[0]
 
     assert "alpaca-paper-execution-harness" in smoke_section
