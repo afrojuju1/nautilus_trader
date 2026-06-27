@@ -23,7 +23,6 @@ pub(super) async fn fetch_candidate_bars(
     candidates: &[TrackCandidate],
     timeframe: &str,
     lookahead_minutes: i64,
-    feed: Option<&str>,
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<BTreeMap<String, Vec<AlpacaOptionBar>>> {
     let symbols = candidates
@@ -58,7 +57,6 @@ pub(super) async fn fetch_candidate_bars(
     let mut bars_request =
         OptionBarsRequest::for_symbols(symbols, timeframe.to_string(), start.to_rfc3339());
     bars_request.end = Some(end.to_rfc3339());
-    bars_request.feed = feed.map(ToString::to_string);
     Ok(client.option_bars(&bars_request).await?.bars)
 }
 

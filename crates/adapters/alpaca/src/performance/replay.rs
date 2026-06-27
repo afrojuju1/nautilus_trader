@@ -261,7 +261,6 @@ pub async fn replay_historical_candidates(
         &candidates,
         &request.timeframe,
         request.lookahead_minutes,
-        None,
         &mut warnings,
     )
     .await?;

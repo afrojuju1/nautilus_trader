@@ -96,7 +96,6 @@ pub async fn track_candidate_outcomes(
             &historical_fill_candidates,
             &request.historical_fill_timeframe,
             request.historical_fill_lookahead_minutes,
-            Some(data_config.option_feed.as_str()),
             &mut warnings,
         )
         .await?;
