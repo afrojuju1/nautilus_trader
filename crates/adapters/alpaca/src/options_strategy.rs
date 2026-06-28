@@ -50,6 +50,7 @@ use crate::{
         AlpacaOptionsRuntimeConfig, OptionsCandidateSet, OptionsScanOutcome, OptionsScanReport,
         SelectedOptionsEntry,
     },
+    regime_features::{RegimeContext, insert_regime_context},
     runtime::{StrategyState, StrategyStateEntry, StrategyStateEntryDraft, emit_operator_event},
     state_persistence::StrategyStatePersistenceHandle,
     storage::StrategyStateMutation,
@@ -65,6 +66,8 @@ const MANAGEMENT_TIMER: &str = "alpaca_options_management";
 pub struct OptionsCandidateData {
     /// Ranked option candidates discovered by the scanner.
     pub candidates: OptionsCandidateSet,
+    /// Regime context applied before candidate selection.
+    pub regime_context: Option<RegimeContext>,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 }
@@ -74,13 +77,15 @@ impl OptionsCandidateData {
 
     /// Creates a new custom data payload from an candidate set.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         candidates: OptionsCandidateSet,
+        regime_context: Option<RegimeContext>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
     ) -> Self {
         Self {
             candidates,
+            regime_context,
             ts_event,
             ts_init,
         }
@@ -119,7 +124,7 @@ impl CustomDataTrait for OptionsCandidateData {
     }
 
     fn to_json(&self) -> anyhow::Result<String> {
-        Ok(serde_json::to_string(&serde_json::json!({
+        let mut payload = serde_json::json!({
             "trade_date": self.candidates.trade_date,
             "ts_event": self.ts_event.as_u64(),
             "ts_init": self.ts_init.as_u64(),
@@ -134,7 +139,9 @@ impl CustomDataTrait for OptionsCandidateData {
                 .candidates
                 .selected_entry()
                 .map(selected_entry_payload),
-        }))?)
+        });
+        insert_regime_context(&mut payload, self.regime_context.as_ref());
+        Ok(serde_json::to_string(&payload)?)
     }
 
     fn clone_arc(&self) -> Arc<dyn CustomDataTrait> {
@@ -147,6 +154,7 @@ impl CustomDataTrait for OptionsCandidateData {
                 && self.ts_init == other.ts_init
                 && self.candidates.trade_date == other.candidates.trade_date
                 && self.candidates.ranked_entries().len() == other.candidates.ranked_entries().len()
+                && self.regime_context == other.regime_context
         })
     }
 
@@ -304,6 +312,7 @@ impl AlpacaOptionsStrategy {
         let Some(entry) = data.candidates.selected_entry().cloned() else {
             return Ok(None);
         };
+        let regime_context = data.regime_context.as_ref();
 
         match entry_gate_decision(&self.config.admission, Utc::now()) {
             EntryGateDecision::Continue => {}
@@ -333,6 +342,7 @@ impl AlpacaOptionsStrategy {
                     None,
                     None,
                     &[],
+                    regime_context,
                 );
                 return Ok(None);
             }
@@ -362,9 +372,45 @@ impl AlpacaOptionsStrategy {
                     None,
                     None,
                     &[],
+                    regime_context,
                 );
                 return Ok(None);
             }
+        }
+
+        if let Some(context) = regime_context.filter(|context| context.dry_run_only) {
+            log::info!(
+                "Regime dry-run Alpaca options entry: trade_date={} underlying={} strategy={} symbols={} label={} codes={}",
+                data.candidates.trade_date,
+                entry.underlying(),
+                entry.strategy_name(),
+                entry.option_symbols().join(","),
+                context.label.as_str(),
+                context.explanation_codes.join(",")
+            );
+            let mut payload = json!({
+                "action": "dry_run",
+                "reason": "regime_dry_run_only",
+                "trade_date": data.candidates.trade_date,
+                "underlying": entry.underlying(),
+                "strategy": entry.strategy_name(),
+                "symbols": entry.option_symbols(),
+                "score": entry.score(),
+            });
+            insert_regime_context(&mut payload, Some(context));
+            emit_operator_event("entry_decision", payload);
+            self.record_selected_candidate_alert(
+                &data.candidates.trade_date,
+                &entry,
+                "dry_run",
+                None,
+                Some("regime_dry_run_only"),
+                None,
+                None,
+                &context.explanation_codes,
+                regime_context,
+            );
+            return Ok(None);
         }
 
         if !selected_submit_enabled(&self.config.admission, &entry) {
@@ -396,16 +442,17 @@ impl AlpacaOptionsStrategy {
                 None,
                 None,
                 &[],
+                regime_context,
             );
             return Ok(None);
         }
 
         if let Some(block) = self.lifecycle_submission_block(&entry) {
-            self.log_entry_block(&data.candidates.trade_date, &entry, &block);
+            self.log_entry_block(&data.candidates.trade_date, &entry, &block, regime_context);
             return Ok(None);
         }
         if let Some(block) = self.selected_entry_quote_freshness_block(&entry) {
-            self.log_entry_block(&data.candidates.trade_date, &entry, &block);
+            self.log_entry_block(&data.candidates.trade_date, &entry, &block, regime_context);
             return Ok(None);
         }
 
@@ -459,6 +506,7 @@ impl AlpacaOptionsStrategy {
                 None,
                 None,
                 &[],
+                regime_context,
             );
             return Ok(None);
         }
@@ -471,7 +519,7 @@ impl AlpacaOptionsStrategy {
             &data.candidates.trade_date,
             &snapshot,
         ) {
-            self.log_entry_block(&data.candidates.trade_date, &entry, &block);
+            self.log_entry_block(&data.candidates.trade_date, &entry, &block, regime_context);
             return Ok(None);
         }
 
@@ -507,6 +555,7 @@ impl AlpacaOptionsStrategy {
                 None,
                 None,
                 &[],
+                regime_context,
             );
             return Ok(None);
         }
@@ -516,6 +565,7 @@ impl AlpacaOptionsStrategy {
             entry,
             &data.candidates.trade_date,
             &order_list_id,
+            regime_context,
         ) {
             Ok(submission) => Ok(Some(submission)),
             Err(error) => {
@@ -576,6 +626,7 @@ impl AlpacaOptionsStrategy {
         entry: SelectedOptionsEntry,
         trade_date: &str,
         order_list_id: &str,
+        regime_context: Option<&RegimeContext>,
     ) -> anyhow::Result<AlpacaOptionsSubmission> {
         let orders = self.build_entry_orders(&entry, order_list_id)?;
         let client_order_ids = orders
@@ -599,6 +650,7 @@ impl AlpacaOptionsStrategy {
             None,
             None,
             &[],
+            regime_context,
         );
 
         if let Err(error) = self.submit_entry_orders(orders, order_list_id) {
@@ -1756,6 +1808,7 @@ impl AlpacaOptionsStrategy {
         trade_date: &str,
         entry: &SelectedOptionsEntry,
         block: &SubmissionBlock,
+        regime_context: Option<&RegimeContext>,
     ) {
         log::info!(
             "Skipping Alpaca options entry: trade_date={} reason={} current={:?} limit={:?} details={:?} underlying={} strategy={} symbols={}",
@@ -1768,21 +1821,20 @@ impl AlpacaOptionsStrategy {
             entry.strategy_name(),
             entry.option_symbols().join(",")
         );
-        emit_operator_event(
-            "entry_decision",
-            json!({
-                "action": "selected_but_blocked",
-                "trade_date": trade_date,
-                "reason": block.reason.clone(),
-                "current": block.current,
-                "limit": block.limit,
-                "details": block.details.clone(),
-                "underlying": entry.underlying(),
-                "strategy": entry.strategy_name(),
-                "symbols": entry.option_symbols(),
-                "score": entry.score(),
-            }),
-        );
+        let mut payload = json!({
+            "action": "selected_but_blocked",
+            "trade_date": trade_date,
+            "reason": block.reason.clone(),
+            "current": block.current,
+            "limit": block.limit,
+            "details": block.details.clone(),
+            "underlying": entry.underlying(),
+            "strategy": entry.strategy_name(),
+            "symbols": entry.option_symbols(),
+            "score": entry.score(),
+        });
+        insert_regime_context(&mut payload, regime_context);
+        emit_operator_event("entry_decision", payload);
         self.record_selected_candidate_alert(
             trade_date,
             entry,
@@ -1792,6 +1844,7 @@ impl AlpacaOptionsStrategy {
             block.current,
             block.limit,
             &block.details,
+            regime_context,
         );
     }
 
@@ -1806,6 +1859,7 @@ impl AlpacaOptionsStrategy {
         current: Option<usize>,
         limit: Option<usize>,
         details: &[String],
+        regime_context: Option<&RegimeContext>,
     ) {
         let Some(persistence) = &self.config.candidate_ledger_persistence else {
             return;
@@ -1833,6 +1887,7 @@ impl AlpacaOptionsStrategy {
         if !details.is_empty() {
             insert_value_field(&mut payload, "details", json!(details));
         }
+        insert_regime_context(&mut payload, regime_context);
         if let Err(error) = persistence.append_candidate_alert(
             trade_date,
             SELECTED_CANDIDATE_ALERT,

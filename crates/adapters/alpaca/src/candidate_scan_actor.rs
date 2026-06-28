@@ -38,7 +38,9 @@ use crate::{
     },
     options_strategy::OptionsCandidateData,
     regime_features::{
-        RegimeFeatureConfig, RegimeFeatureData, regime_feature_snapshot_from_option_chain,
+        RegimeContext, RegimeFeatureConfig, RegimeFeatureData, RegimeRoutingSummary,
+        apply_regime_routing, insert_regime_context, regime_context_from_features,
+        regime_feature_snapshot_from_option_chain,
     },
     runtime::{
         credit_spread_strategy_name, debit_spread_strategy_name, emit_operator_event,
@@ -255,6 +257,7 @@ impl OptionChainCandidateScanActor {
         trade_date: &str,
         candidates: &OptionsCandidateSet,
         scan_payload: Value,
+        regime_context: Option<&RegimeContext>,
     ) {
         let Some(persistence) = &self.candidate_ledger_persistence else {
             return;
@@ -273,11 +276,12 @@ impl OptionChainCandidateScanActor {
             .take(candidate_limit)
             .enumerate()
         {
-            let payload = selected_entry_candidate_ledger_payload(
+            let mut payload = selected_entry_candidate_ledger_payload(
                 entry,
                 self.config.scan.options_buying_power,
                 Some(index + 1),
             );
+            insert_regime_context(&mut payload, regime_context);
             if let Err(error) = persistence.append(trade_date, "candidate", payload) {
                 log::error!("Failed to enqueue Alpaca option-chain candidate evidence: {error:#}");
                 break;
@@ -324,16 +328,33 @@ impl DataActor for OptionChainCandidateScanActor {
             &self.config.scan.regime_features,
             ts_init,
         );
+        let regime_context = regime_context_from_features(&feature_snapshot);
         emit_operator_event("regime_feature_snapshot", feature_snapshot.to_json_value());
         let regime_data = RegimeFeatureData::new(feature_snapshot).into_custom_data();
         self.publish_data(&regime_data.data_type, &regime_data);
 
-        let candidates = scan_option_chain_candidates(slice, &self.config.scan, &trade_date);
-        let evidence_payload = candidate_event_payload(slice, &candidates);
+        let mut candidates = scan_option_chain_candidates(slice, &self.config.scan, &trade_date);
+        let routing_summary = apply_regime_routing(&mut candidates.ranked_entries, &regime_context);
+        let evidence_payload = candidate_event_payload(
+            slice,
+            &candidates,
+            Some(&regime_context),
+            Some(&routing_summary),
+        );
         emit_operator_event("option_chain_candidate_scan", evidence_payload.clone());
-        self.record_candidate_evidence(&trade_date, &candidates, evidence_payload);
-        let data = OptionsCandidateData::new(candidates.clone(), slice.ts_event, ts_init)
-            .into_custom_data();
+        self.record_candidate_evidence(
+            &trade_date,
+            &candidates,
+            evidence_payload,
+            Some(&regime_context),
+        );
+        let data = OptionsCandidateData::new(
+            candidates.clone(),
+            Some(regime_context),
+            slice.ts_event,
+            ts_init,
+        )
+        .into_custom_data();
         self.publish_data(&data.data_type, &data);
         self.latest_candidates = Some(candidates);
         Ok(())
@@ -505,9 +526,14 @@ fn naked_scanner_for(
     }
 }
 
-fn candidate_event_payload(slice: &OptionChainSlice, candidates: &OptionsCandidateSet) -> Value {
+fn candidate_event_payload(
+    slice: &OptionChainSlice,
+    candidates: &OptionsCandidateSet,
+    regime_context: Option<&RegimeContext>,
+    routing_summary: Option<&RegimeRoutingSummary>,
+) -> Value {
     let input = option_chain_candidate_input(slice);
-    json!({
+    let mut payload = json!({
         "source": "option_chain",
         "series_id": slice.series_id.to_string(),
         "underlying": input.underlying,
@@ -519,7 +545,12 @@ fn candidate_event_payload(slice: &OptionChainSlice, candidates: &OptionsCandida
         "scans": candidates.scans.iter().map(scan_report_payload).collect::<Vec<_>>(),
         "ranked_entries": candidates.ranked_entries().len(),
         "selected": candidates.selected_entry().map(selected_entry_payload),
-    })
+    });
+    insert_regime_context(&mut payload, regime_context);
+    if let (Value::Object(fields), Some(summary)) = (&mut payload, routing_summary) {
+        fields.insert("regime_routing".to_string(), summary.to_json_value());
+    }
+    payload
 }
 
 fn scan_report_payload(report: &OptionsScanReport) -> Value {

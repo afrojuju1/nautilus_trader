@@ -1,7 +1,7 @@
 # Alpaca Regime Router
 
 Status: v1 feature input contract defined; option-chain liquidity feature snapshots implemented;
-router not yet implemented.
+fail-conservative router slice implemented.
 
 This document defines the target architecture for Alpaca option strategy regime routing. It refines
 the regime-router slice described in the Nautilus-native candidate scanning architecture and the
@@ -24,8 +24,10 @@ Current implementation boundary:
   values, uses the existing active-risk quote stale policy for freshness, and marks required
   bar/trend/event feature groups unavailable. It does not produce a regime label, confidence, family
   weight, block, or candidate metadata.
-- Runtime code still must not stamp regime metadata until a router consumes the feature contract and
-  applies the fail-conservative policy. Misleading labels are worse than missing labels.
+- Runtime routing now consumes that feature contract, records compact `RegimeContext` evidence, and
+  applies the fail-conservative policy: `unknown`, `dry_run_only`, and naked-option family blocks
+  while required bar/trend/event inputs are unavailable. It does not produce directional or neutral
+  labels from placeholder inputs.
 
 ## Boundary
 
@@ -411,10 +413,10 @@ Minimum validation reports:
 | Slice | Outcome | Work | Done when |
 | --- | --- | --- | --- |
 | 0. Input contract | Done in this document. | Define approved feature groups, freshness, labels, confidence, evidence shape, and validation ranges. | Implementation can start without stamping fake labels. |
-| 1. Types and pure router | Pure router API. | Add `RegimeInput`, `RegimeContext`, labels, explanation codes, and routing policy types. | Unit-level callers can classify synthetic feature snapshots without venue I/O. |
+| 1. Types and pure router | Done for fail-conservative v1. | Add `RegimeInput`, `RegimeContext`, labels, explanation codes, and routing policy types. | Unit-level callers can classify synthetic feature snapshots without venue I/O. |
 | 2. Feature snapshot | In progress: option-liquidity slice implemented. | Build a `RegimeFeatureActor` or service that computes v1 feature snapshots from bars, option-chain state, external signals, and optional ClickHouse/catalog history. | Operator diagnostics can display feature freshness and current regime. |
-| 3. Candidate integration | Ranking receives regime context. | Add regime context to candidate input and selection policy. | Dry-run scans record regime decisions without changing order behavior. |
-| 4. Family routing | Strategy families are weighted or blocked. | Apply v1 routing policy to iron condors, credit/debit spreads, and undefined-risk strategies. | Candidate ledgers show which families were allowed, down-ranked, or blocked. |
+| 3. Candidate integration | Done for scanner/strategy path. | Add regime context to candidate input and selection policy. | Dry-run scans record regime decisions without changing order behavior. |
+| 4. Family routing | Partial: unknown blocks naked-option families and forces dry-run. | Apply v1 routing policy to iron condors, credit/debit spreads, and undefined-risk strategies. | Candidate ledgers show which families were allowed, down-ranked, or blocked. |
 | 5. Replay validation | Outcome analysis by regime. | Replay candidate ledgers against historical market data and feature snapshots. | Reports show performance by regime, strategy family, and explanation code. |
 | 6. Live enablement | Controlled production use. | Enable routing in paper mode, then promote specific blocks/weights once evidence supports them. | Live/paper operator status reports regime, freshness, and routing action. |
 
@@ -430,6 +432,12 @@ Minimum validation reports:
   coverage, chain source timestamp, and freshness.
 - Current unavailable groups: underlying bars, underlying trend/volatility, and event load are
   marked unavailable by the implemented snapshot rather than defaulting to neutral.
+- Current routing behavior: the scanner computes a pure `RegimeContext` from the feature snapshot,
+  filters blocked strategy families before candidate selection, writes the context into scanner and
+  candidate ledgers, and passes the same context through `OptionsCandidateData`.
+- Current order behavior: `AlpacaOptionsStrategy` honors `dry_run_only` from the context before
+  normal submission gates. With only option-liquidity available, all routed selected candidates are
+  dry-run evidence until the required bar/trend/event groups exist.
 - Breadth proxy: optional only. Use configured ETF/index proxies when complete; otherwise mark
   breadth unavailable and do not treat it as neutral.
 - Portfolio context: optional coarse stress input only. Hard portfolio caps remain in risk

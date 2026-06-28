@@ -1,6 +1,6 @@
 //! Regime feature evidence produced from Nautilus runtime data.
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::BTreeMap, sync::Arc};
 
 use nautilus_core::UnixNanos;
 use nautilus_model::data::{
@@ -8,6 +8,8 @@ use nautilus_model::data::{
     option_chain::{OptionChainSlice, OptionStrikeData},
 };
 use serde_json::{Value, json};
+
+use crate::options_entry::SelectedOptionsEntry;
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
@@ -75,6 +77,147 @@ impl FeatureFreshnessStatus {
             Self::Stale => "stale",
             Self::Missing => "missing",
         }
+    }
+}
+
+/// Stable regime labels recorded by the router.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegimeLabel {
+    /// Lower realized volatility and contained range behavior.
+    QuietMeanReverting,
+    /// Persistent directional movement with controlled volatility.
+    DirectionalTrend,
+    /// Elevated realized range with unstable direction.
+    HighVolChop,
+    /// Earnings, news, gaps, or stress dominate the decision.
+    EventShock,
+    /// Option liquidity is degraded enough to route conservatively.
+    LiquidityStressed,
+    /// Required features are missing, stale, degraded, or not yet classifiable.
+    Unknown,
+}
+
+impl RegimeLabel {
+    /// Returns the stable wire name for this label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::QuietMeanReverting => "quiet_mean_reverting",
+            Self::DirectionalTrend => "directional_trend",
+            Self::HighVolChop => "high_vol_chop",
+            Self::EventShock => "event_shock",
+            Self::LiquidityStressed => "liquidity_stressed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Regime routing output consumed by candidate selection and ledgers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegimeContext {
+    /// Regime label.
+    pub label: RegimeLabel,
+    /// Deterministic confidence in `[0.0, 1.0]`.
+    pub confidence: f64,
+    /// Snapshot timestamp.
+    pub as_of_ts: UnixNanos,
+    /// Feature calculation version.
+    pub feature_version: String,
+    /// Feature freshness evidence.
+    pub feature_freshness: Vec<FeatureFreshness>,
+    /// Feature groups not usable by routing.
+    pub unavailable_features: Vec<RegimeFeatureGroup>,
+    /// Strategy-family weights. Empty means no weighting was applied.
+    pub strategy_family_weights: BTreeMap<String, f64>,
+    /// Strategy families blocked before candidate selection.
+    pub blocked_strategy_families: Vec<String>,
+    /// Threshold adjustments. Empty means no threshold adjustment was applied.
+    pub threshold_adjustments: BTreeMap<String, f64>,
+    /// Whether order-capable strategy code must dry-run this decision.
+    pub dry_run_only: bool,
+    /// Explanation codes for the routing decision.
+    pub explanation_codes: Vec<String>,
+}
+
+impl RegimeContext {
+    /// Returns `true` when this context blocks the candidate's strategy family.
+    #[must_use]
+    pub fn blocks_entry(&self, entry: &SelectedOptionsEntry) -> bool {
+        self.blocks_strategy_family(entry.descriptor().candidate_type)
+    }
+
+    /// Returns `true` when this context blocks a strategy family.
+    #[must_use]
+    pub fn blocks_strategy_family(&self, strategy_family: &str) -> bool {
+        self.blocked_strategy_families
+            .iter()
+            .any(|family| family == strategy_family)
+    }
+
+    /// Returns the compact routing action label.
+    #[must_use]
+    pub fn routing_action(&self) -> &'static str {
+        if self.dry_run_only {
+            "dry_run_only"
+        } else if self.blocked_strategy_families.is_empty() {
+            "allowed"
+        } else {
+            "blocked_families"
+        }
+    }
+
+    /// Returns this context as compact JSON.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "label": self.label.as_str(),
+            "confidence": self.confidence,
+            "as_of_ts": self.as_of_ts.as_u64(),
+            "as_of_ts_utc": self.as_of_ts.to_rfc3339(),
+            "feature_version": self.feature_version,
+            "feature_freshness": self
+                .feature_freshness
+                .iter()
+                .map(FeatureFreshness::to_json_value)
+                .collect::<Vec<_>>(),
+            "unavailable_features": self
+                .unavailable_features
+                .iter()
+                .map(|group| group.as_str())
+                .collect::<Vec<_>>(),
+            "strategy_family_weights": self.strategy_family_weights,
+            "blocked_strategy_families": self.blocked_strategy_families,
+            "threshold_adjustments": self.threshold_adjustments,
+            "dry_run_only": self.dry_run_only,
+            "routing_action": self.routing_action(),
+            "explanation_codes": self.explanation_codes,
+        })
+    }
+}
+
+/// Summary of routing applied to ranked candidates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegimeRoutingSummary {
+    /// Candidate count before routing.
+    pub initial_candidates: usize,
+    /// Candidate count after routing.
+    pub routed_candidates: usize,
+    /// Candidate count blocked before selection.
+    pub blocked_candidates: usize,
+    /// Strategy families blocked by this routing pass.
+    pub blocked_strategy_families: Vec<String>,
+}
+
+impl RegimeRoutingSummary {
+    /// Returns this summary as compact JSON.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "initial_candidates": self.initial_candidates,
+            "routed_candidates": self.routed_candidates,
+            "blocked_candidates": self.blocked_candidates,
+            "blocked_strategy_families": self.blocked_strategy_families,
+        })
     }
 }
 
@@ -267,6 +410,107 @@ impl RegimeFeatureSnapshot {
                 .collect::<Vec<_>>(),
             "ts_init": self.ts_init.as_u64(),
         })
+    }
+}
+
+/// Builds a fail-conservative routing context from one feature snapshot.
+#[must_use]
+pub fn regime_context_from_features(snapshot: &RegimeFeatureSnapshot) -> RegimeContext {
+    let required_groups = [
+        RegimeFeatureGroup::UnderlyingBars,
+        RegimeFeatureGroup::UnderlyingTrendVol,
+        RegimeFeatureGroup::OptionLiquidity,
+        RegimeFeatureGroup::EventLoad,
+    ];
+    let mut required_missing = false;
+    let mut required_stale = false;
+    let mut required_degraded = false;
+    let mut explanation_codes = Vec::new();
+
+    for group in required_groups {
+        match snapshot
+            .freshness_for(group)
+            .map(|freshness| freshness.status)
+        {
+            Some(FeatureFreshnessStatus::Fresh) => {}
+            Some(FeatureFreshnessStatus::Degraded) => {
+                required_degraded = true;
+                push_explanation_code(&mut explanation_codes, "required_feature_degraded");
+            }
+            Some(FeatureFreshnessStatus::Stale) => {
+                required_stale = true;
+                push_explanation_code(&mut explanation_codes, "required_feature_stale");
+            }
+            Some(FeatureFreshnessStatus::Missing) | None => {
+                required_missing = true;
+                push_explanation_code(&mut explanation_codes, "required_feature_missing");
+            }
+        }
+    }
+
+    if snapshot
+        .option_liquidity
+        .as_ref()
+        .and_then(|liquidity| liquidity.wide_quote_ratio)
+        .is_some_and(|ratio| ratio > 0.0)
+    {
+        push_explanation_code(&mut explanation_codes, "liquidity_wide_quotes");
+    }
+
+    if explanation_codes.is_empty() {
+        push_explanation_code(&mut explanation_codes, "routing_thresholds_unavailable");
+    }
+
+    let required_features_usable = !(required_missing || required_stale || required_degraded);
+    let dry_run_only = true;
+    let confidence = if required_missing || required_stale {
+        0.0
+    } else if required_degraded || !required_features_usable {
+        0.25
+    } else {
+        0.25
+    };
+
+    RegimeContext {
+        label: RegimeLabel::Unknown,
+        confidence,
+        as_of_ts: snapshot.as_of_ts,
+        feature_version: snapshot.feature_version.clone(),
+        feature_freshness: snapshot.feature_freshness.clone(),
+        unavailable_features: snapshot.unavailable_features.clone(),
+        strategy_family_weights: BTreeMap::new(),
+        blocked_strategy_families: vec!["naked_option".to_string()],
+        threshold_adjustments: BTreeMap::new(),
+        dry_run_only,
+        explanation_codes,
+    }
+}
+
+/// Applies regime routing to ranked entries before selection.
+#[must_use]
+pub fn apply_regime_routing(
+    ranked_entries: &mut Vec<SelectedOptionsEntry>,
+    context: &RegimeContext,
+) -> RegimeRoutingSummary {
+    let initial_candidates = ranked_entries.len();
+    ranked_entries.retain(|entry| !context.blocks_entry(entry));
+    let routed_candidates = ranked_entries.len();
+
+    RegimeRoutingSummary {
+        initial_candidates,
+        routed_candidates,
+        blocked_candidates: initial_candidates.saturating_sub(routed_candidates),
+        blocked_strategy_families: context.blocked_strategy_families.clone(),
+    }
+}
+
+/// Inserts regime context into an object payload.
+pub fn insert_regime_context(payload: &mut Value, context: Option<&RegimeContext>) {
+    let Some(context) = context else {
+        return;
+    };
+    if let Value::Object(fields) = payload {
+        fields.insert("regime_context".to_string(), context.to_json_value());
     }
 }
 
@@ -554,6 +798,12 @@ fn median(values: &mut [f64]) -> Option<f64> {
     }
 }
 
+fn push_explanation_code(codes: &mut Vec<String>, code: &str) {
+    if !codes.iter().any(|value| value == code) {
+        codes.push(code.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -569,6 +819,14 @@ mod tests {
         types::{Price, Quantity},
     };
     use ustr::Ustr;
+
+    use crate::{
+        candidate_engine::{
+            CreditSpreadKind, NakedOptionCandidate, NakedOptionKind, OptionCapitalRequirementModel,
+            ScoredContract, SpreadCandidate,
+        },
+        options_entry::{SelectedEntry, SelectedNakedOptionEntry, SelectedOptionsEntry},
+    };
 
     use super::*;
 
@@ -648,6 +906,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn regime_context_fails_conservative_when_required_groups_are_missing() {
+        let slice = option_chain_slice(UnixNanos::from_seconds(105), UnixNanos::from_seconds(100));
+        let snapshot = regime_feature_snapshot_from_option_chain(
+            &slice,
+            &RegimeFeatureConfig::default(),
+            UnixNanos::from_seconds(106),
+        );
+        let context = regime_context_from_features(&snapshot);
+
+        assert_eq!(context.label, RegimeLabel::Unknown);
+        assert_eq!(context.confidence, 0.0);
+        assert!(context.dry_run_only);
+        assert!(context.blocks_strategy_family("naked_option"));
+        assert!(
+            context
+                .explanation_codes
+                .contains(&"required_feature_missing".to_string())
+        );
+    }
+
+    #[test]
+    fn regime_routing_blocks_naked_options_before_selection() {
+        let slice = option_chain_slice(UnixNanos::from_seconds(105), UnixNanos::from_seconds(100));
+        let snapshot = regime_feature_snapshot_from_option_chain(
+            &slice,
+            &RegimeFeatureConfig::default(),
+            UnixNanos::from_seconds(106),
+        );
+        let context = regime_context_from_features(&snapshot);
+        let mut entries = vec![naked_entry(100.0), credit_entry(80.0)];
+
+        let summary = apply_regime_routing(&mut entries, &context);
+
+        assert_eq!(summary.initial_candidates, 2);
+        assert_eq!(summary.routed_candidates, 1);
+        assert_eq!(summary.blocked_candidates, 1);
+        assert!(matches!(
+            entries.first(),
+            Some(SelectedOptionsEntry::Credit(_))
+        ));
+    }
+
     fn option_chain_slice(as_of_ts: UnixNanos, quote_ts: UnixNanos) -> OptionChainSlice {
         let strike = Price::from("500.00");
         let call_id = InstrumentId::from("SPY260702C00500000.OPRA");
@@ -705,5 +1006,56 @@ mod tests {
 
     fn quantity_to_one() -> Quantity {
         Quantity::from("1")
+    }
+
+    fn credit_entry(score: f64) -> SelectedOptionsEntry {
+        SelectedOptionsEntry::Credit(SelectedEntry {
+            underlying: "SPY".to_string(),
+            kind: CreditSpreadKind::Put,
+            candidate: SpreadCandidate {
+                short: scored_contract("SPY260702P00500000", 500.0),
+                long: scored_contract("SPY260702P00495000", 495.0),
+                width: 5.0,
+                credit: 1.0,
+                max_loss: 4.0,
+                return_on_risk: 0.25,
+                score,
+            },
+        })
+    }
+
+    fn naked_entry(score: f64) -> SelectedOptionsEntry {
+        SelectedOptionsEntry::NakedOption(SelectedNakedOptionEntry {
+            underlying: "SPY".to_string(),
+            kind: NakedOptionKind::Put,
+            candidate: NakedOptionCandidate {
+                short: scored_contract("SPY260702P00500000", 500.0),
+                credit: 1.0,
+                capital_requirement_model: OptionCapitalRequirementModel::CashSecuredPut,
+                estimated_buying_power_requirement: 5_000.0,
+                buying_power_usage_pct: Some(0.1),
+                return_on_buying_power: 0.02,
+                score,
+            },
+        })
+    }
+
+    fn scored_contract(symbol: &str, strike: f64) -> ScoredContract {
+        ScoredContract {
+            symbol: symbol.to_string(),
+            expiration_date: "2026-07-02".to_string(),
+            dte: 5,
+            strike,
+            bid: 1.0,
+            ask: 1.1,
+            delta_abs: 0.2,
+            spread_pct: 0.05,
+            bid_size: 1,
+            ask_size: 1,
+            volume: 0,
+            open_interest: 250,
+            implied_volatility: Some(0.2),
+            metrics: None,
+        }
     }
 }
