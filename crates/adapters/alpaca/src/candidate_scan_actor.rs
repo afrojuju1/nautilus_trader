@@ -1,8 +1,11 @@
 //! Read-only Nautilus actor for option-chain candidate evidence.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroUsize,
+};
 
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::{Datelike, Duration, NaiveDate, Utc};
 use chrono_tz::Tz;
 use nautilus_common::{
     actor::{DataActor, DataActorConfig, DataActorCore},
@@ -10,8 +13,12 @@ use nautilus_common::{
 };
 use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
-    data::option_chain::{OptionChainSlice, StrikeRange},
-    identifiers::{ActorId, ClientId, OptionSeriesId},
+    data::{
+        Bar, BarSpecification, BarType,
+        option_chain::{OptionChainSlice, StrikeRange},
+    },
+    enums::{AggregationSource, BarAggregation, PriceType},
+    identifiers::{ActorId, ClientId, InstrumentId, OptionSeriesId},
     instruments::{Instrument, InstrumentAny},
 };
 use serde_json::{Value, json};
@@ -24,7 +31,10 @@ use crate::{
     },
     candidate_ledger_persistence::CandidateLedgerPersistenceHandle,
     candidate_payloads::selected_entry_candidate_ledger_payload,
-    common::consts::{ALPACA_OPTION_CHAIN_EXPIRATION_PARAM, ALPACA_OPTION_CHAIN_UNDERLYING_PARAM},
+    common::consts::{
+        ALPACA_OPTION_CHAIN_EXPIRATION_PARAM, ALPACA_OPTION_CHAIN_UNDERLYING_PARAM, ALPACA_VENUE,
+    },
+    earnings::EarningsEvent,
     option_chain_candidates::{
         option_chain_candidate_input, scan_credit_spread_option_chain,
         scan_debit_spread_option_chain, scan_iron_condor_option_chain, scan_naked_option_chain,
@@ -38,9 +48,9 @@ use crate::{
     },
     options_strategy::OptionsCandidateData,
     regime_features::{
-        RegimeContext, RegimeFeatureConfig, RegimeFeatureData, RegimeRoutingSummary,
-        apply_regime_routing, insert_regime_context, regime_context_from_features,
-        regime_feature_snapshot_from_option_chain,
+        RegimeContext, RegimeFeatureConfig, RegimeFeatureData, RegimeFeatureInputs,
+        RegimeRoutingSummary, apply_regime_routing, insert_regime_context,
+        regime_context_from_features, regime_feature_snapshot_from_option_chain,
     },
     runtime::{
         credit_spread_strategy_name, debit_spread_strategy_name, emit_operator_event,
@@ -79,6 +89,16 @@ pub struct OptionChainCandidateScanConfig {
     pub trade_date_timezone: Tz,
     /// Read-only regime feature snapshot settings.
     pub regime_features: RegimeFeatureConfig,
+    /// Days of underlying bars to request for regime feature windows.
+    pub underlying_bar_lookback_days: i64,
+    /// Maximum cached underlying bars per underlying.
+    pub underlying_bar_limit: usize,
+    /// Approved earnings events used by event-load features.
+    pub event_shock_earnings_events: Vec<EarningsEvent>,
+    /// Calendar days before an earnings report considered event load.
+    pub event_shock_block_days_before_earnings: i64,
+    /// Calendar days after an earnings report considered event load.
+    pub event_shock_block_days_after_earnings: i64,
 }
 
 impl Default for OptionChainCandidateScanConfig {
@@ -114,6 +134,11 @@ impl Default for OptionChainCandidateScanConfig {
             candidate_ledger_max_candidates: 10,
             trade_date_timezone: chrono_tz::UTC,
             regime_features: RegimeFeatureConfig::default(),
+            underlying_bar_lookback_days: 90,
+            underlying_bar_limit: 120,
+            event_shock_earnings_events: Vec::new(),
+            event_shock_block_days_before_earnings: 1,
+            event_shock_block_days_after_earnings: 1,
         }
     }
 }
@@ -161,6 +186,8 @@ pub struct OptionChainCandidateScanActor {
     config: OptionChainCandidateScanActorConfig,
     candidate_ledger_persistence: Option<CandidateLedgerPersistenceHandle>,
     subscribed_series: BTreeSet<OptionSeriesId>,
+    underlying_bar_types: BTreeMap<String, BarType>,
+    latest_underlying_bars: BTreeMap<String, Vec<Bar>>,
     latest_candidates: Option<OptionsCandidateSet>,
 }
 
@@ -179,6 +206,8 @@ impl OptionChainCandidateScanActor {
             config,
             candidate_ledger_persistence: None,
             subscribed_series: BTreeSet::new(),
+            underlying_bar_types: BTreeMap::new(),
+            latest_underlying_bars: BTreeMap::new(),
             latest_candidates: None,
         }
     }
@@ -252,12 +281,79 @@ impl OptionChainCandidateScanActor {
         Ok(())
     }
 
+    fn request_underlying_bars(&mut self, series_id: OptionSeriesId) -> anyhow::Result<()> {
+        let underlying = series_id.underlying.to_string();
+        let bar_type = underlying_daily_bar_type(&underlying);
+        if self
+            .underlying_bar_types
+            .insert(underlying.clone(), bar_type)
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let end = Utc::now();
+        let start = end - Duration::days(self.config.scan.underlying_bar_lookback_days.max(1));
+        let limit = NonZeroUsize::new(self.config.scan.underlying_bar_limit.max(1));
+        log::info!(
+            "Requesting Alpaca underlying bars for {underlying}: bar_type={bar_type} start={} end={}",
+            start.to_rfc3339(),
+            end.to_rfc3339(),
+        );
+        self.request_bars(
+            bar_type,
+            Some(start),
+            Some(end),
+            limit,
+            self.config.client_id,
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn store_underlying_bars(&mut self, bar_type: BarType, mut bars: Vec<Bar>) {
+        let Some(underlying) = self.underlying_for_bar_type(bar_type) else {
+            return;
+        };
+        if bars.is_empty() {
+            return;
+        }
+
+        bars.sort_by_key(|bar| bar.ts_event);
+        let limit = self.config.scan.underlying_bar_limit.max(1);
+        if bars.len() > limit {
+            bars = bars[bars.len() - limit..].to_vec();
+        }
+        self.latest_underlying_bars.insert(underlying, bars);
+    }
+
+    fn store_underlying_bar(&mut self, bar: Bar) {
+        let Some(underlying) = self.underlying_for_bar_type(bar.bar_type) else {
+            return;
+        };
+        let limit = self.config.scan.underlying_bar_limit.max(1);
+        let bars = self.latest_underlying_bars.entry(underlying).or_default();
+        bars.retain(|cached| cached.ts_event != bar.ts_event);
+        bars.push(bar);
+        bars.sort_by_key(|cached| cached.ts_event);
+        if bars.len() > limit {
+            let excess = bars.len() - limit;
+            bars.drain(0..excess);
+        }
+    }
+
+    fn underlying_for_bar_type(&self, bar_type: BarType) -> Option<String> {
+        self.underlying_bar_types
+            .iter()
+            .find_map(|(underlying, cached)| (*cached == bar_type).then(|| underlying.clone()))
+    }
+
     fn record_candidate_evidence(
         &self,
         trade_date: &str,
         candidates: &OptionsCandidateSet,
         scan_payload: Value,
-        regime_context: Option<&RegimeContext>,
+        regime_context: &RegimeContext,
     ) {
         let Some(persistence) = &self.candidate_ledger_persistence else {
             return;
@@ -281,7 +377,7 @@ impl OptionChainCandidateScanActor {
                 self.config.scan.options_buying_power,
                 Some(index + 1),
             );
-            insert_regime_context(&mut payload, regime_context);
+            insert_regime_context(&mut payload, Some(regime_context));
             if let Err(error) = persistence.append(trade_date, "candidate", payload) {
                 log::error!("Failed to enqueue Alpaca option-chain candidate evidence: {error:#}");
                 break;
@@ -303,6 +399,9 @@ impl DataActor for OptionChainCandidateScanActor {
             } else {
                 self.subscribe_series(series_id);
             }
+            if let Err(error) = self.request_underlying_bars(series_id) {
+                log::warn!("Failed to request Alpaca underlying bars for {series_id}: {error:#}");
+            }
         }
         Ok(())
     }
@@ -323,9 +422,29 @@ impl DataActor for OptionChainCandidateScanActor {
     fn on_option_chain(&mut self, slice: &OptionChainSlice) -> anyhow::Result<()> {
         let trade_date = market_trade_date(self.config.scan.trade_date_timezone);
         let ts_init = self.core.timestamp_ns();
+        let underlying = slice.series_id.underlying.to_string();
+        let underlying_bars = self
+            .latest_underlying_bars
+            .get(&underlying)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let feature_inputs = RegimeFeatureInputs {
+            underlying_bars,
+            earnings_events: &self.config.scan.event_shock_earnings_events,
+            event_shock_block_days_before_earnings: self
+                .config
+                .scan
+                .event_shock_block_days_before_earnings,
+            event_shock_block_days_after_earnings: self
+                .config
+                .scan
+                .event_shock_block_days_after_earnings,
+        };
         let feature_snapshot = regime_feature_snapshot_from_option_chain(
             slice,
             &self.config.scan.regime_features,
+            feature_inputs,
+            &trade_date,
             ts_init,
         );
         let regime_context = regime_context_from_features(&feature_snapshot);
@@ -335,19 +454,10 @@ impl DataActor for OptionChainCandidateScanActor {
 
         let mut candidates = scan_option_chain_candidates(slice, &self.config.scan, &trade_date);
         let routing_summary = apply_regime_routing(&mut candidates.ranked_entries, &regime_context);
-        let evidence_payload = candidate_event_payload(
-            slice,
-            &candidates,
-            Some(&regime_context),
-            Some(&routing_summary),
-        );
+        let evidence_payload =
+            candidate_event_payload(slice, &candidates, &regime_context, &routing_summary);
         emit_operator_event("option_chain_candidate_scan", evidence_payload.clone());
-        self.record_candidate_evidence(
-            &trade_date,
-            &candidates,
-            evidence_payload,
-            Some(&regime_context),
-        );
+        self.record_candidate_evidence(&trade_date, &candidates, evidence_payload, &regime_context);
         let data = OptionsCandidateData::new(
             candidates.clone(),
             Some(regime_context),
@@ -360,11 +470,25 @@ impl DataActor for OptionChainCandidateScanActor {
         Ok(())
     }
 
+    fn on_bar(&mut self, bar: &Bar) -> anyhow::Result<()> {
+        self.store_underlying_bar(*bar);
+        Ok(())
+    }
+
+    fn on_historical_bars(&mut self, bars: &[Bar]) -> anyhow::Result<()> {
+        if let Some(first) = bars.first() {
+            self.store_underlying_bars(first.bar_type, bars.to_vec());
+        }
+        Ok(())
+    }
+
     fn on_stop(&mut self) -> anyhow::Result<()> {
         for series_id in self.subscribed_series.iter().copied().collect::<Vec<_>>() {
             self.unsubscribe_option_chain(series_id, self.config.client_id);
         }
         self.subscribed_series.clear();
+        self.underlying_bar_types.clear();
+        self.latest_underlying_bars.clear();
         Ok(())
     }
 }
@@ -393,7 +517,20 @@ pub fn candidate_scan_config_from_runtime(
             option_quote_stale_after_secs: config.active_risk_quote_stale_secs,
             ..Default::default()
         },
+        underlying_bar_lookback_days: 90,
+        underlying_bar_limit: 120,
+        event_shock_earnings_events: config.event_shock_earnings_events.clone(),
+        event_shock_block_days_before_earnings: config.event_shock_block_days_before_earnings,
+        event_shock_block_days_after_earnings: config.event_shock_block_days_after_earnings,
     }
+}
+
+fn underlying_daily_bar_type(underlying: &str) -> BarType {
+    BarType::new(
+        InstrumentId::from(format!("{underlying}.{ALPACA_VENUE}").as_str()),
+        BarSpecification::new(1, BarAggregation::Day, PriceType::Last),
+        AggregationSource::External,
+    )
 }
 
 fn candidate_ledger_candidate_limit(max_candidates: usize, candidate_count: usize) -> usize {
@@ -529,8 +666,8 @@ fn naked_scanner_for(
 fn candidate_event_payload(
     slice: &OptionChainSlice,
     candidates: &OptionsCandidateSet,
-    regime_context: Option<&RegimeContext>,
-    routing_summary: Option<&RegimeRoutingSummary>,
+    regime_context: &RegimeContext,
+    routing_summary: &RegimeRoutingSummary,
 ) -> Value {
     let input = option_chain_candidate_input(slice);
     let mut payload = json!({
@@ -546,9 +683,12 @@ fn candidate_event_payload(
         "ranked_entries": candidates.ranked_entries().len(),
         "selected": candidates.selected_entry().map(selected_entry_payload),
     });
-    insert_regime_context(&mut payload, regime_context);
-    if let (Value::Object(fields), Some(summary)) = (&mut payload, routing_summary) {
-        fields.insert("regime_routing".to_string(), summary.to_json_value());
+    insert_regime_context(&mut payload, Some(regime_context));
+    if let Value::Object(fields) = &mut payload {
+        fields.insert(
+            "regime_routing".to_string(),
+            routing_summary.to_json_value(),
+        );
     }
     payload
 }

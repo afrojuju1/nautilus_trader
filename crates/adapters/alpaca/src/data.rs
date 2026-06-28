@@ -38,8 +38,9 @@ use nautilus_model::{
         option_chain::OptionGreeks,
     },
     enums::{AggressorSide, BarAggregation, GreeksConvention, PriceType},
-    identifiers::{ClientId, InstrumentId, TradeId, Venue},
-    instruments::{Instrument, InstrumentAny},
+    identifiers::{ClientId, InstrumentId, Symbol, TradeId, Venue},
+    instruments::{Equity, Instrument, InstrumentAny},
+    types::{Currency, Price},
 };
 use nautilus_network::websocket::{
     TransportBackend, WebSocketClient, WebSocketConfig, channel_message_handler,
@@ -63,7 +64,8 @@ use crate::{
         client::AlpacaHttpClient,
         models::{
             AlpacaOptionBar, AlpacaOptionContract, AlpacaOptionQuote, AlpacaOptionSnapshot,
-            AlpacaOptionType, OptionBarsRequest, OptionSnapshotsRequest, StockSnapshotsRequest,
+            AlpacaOptionType, AlpacaStockBar, OptionBarsRequest, OptionSnapshotsRequest,
+            StockBarsRequest, StockSnapshotsRequest,
         },
     },
     parse::{
@@ -1082,7 +1084,7 @@ impl DataClient for AlpacaDataClient {
     }
 
     fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
-        log::debug!("Requesting Alpaca option bars: {}", request.bar_type);
+        log::debug!("Requesting Alpaca bars: {}", request.bar_type);
 
         let http_client = self.http_client.clone();
         let sender = self.data_sender.clone();
@@ -1097,24 +1099,26 @@ impl DataClient for AlpacaDataClient {
         let params = request.params;
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
-        let feed = self.config.option_feed.as_str().to_string();
+        let option_feed = self.config.option_feed.as_str().to_string();
+        let stock_feed = self.config.stock_feed.as_str().to_string();
 
-        self.spawn_task("request_option_bars", async move {
-            let bars = match request_option_bars_from_http(
+        self.spawn_task("request_bars", async move {
+            let bars = match request_bars_from_http(
                 &http_client,
                 &instruments,
                 bar_type,
                 start,
                 end,
                 limit,
-                &feed,
+                &option_feed,
+                &stock_feed,
                 clock,
             )
             .await
             {
                 Ok(bars) => bars,
                 Err(error) => {
-                    log::warn!("Alpaca option bar request failed: {error:#}");
+                    log::warn!("Alpaca bar request failed: {error:#}");
                     Vec::new()
                 }
             };
@@ -1131,7 +1135,7 @@ impl DataClient for AlpacaDataClient {
             ));
 
             if let Err(error) = sender.send(DataEvent::Response(response)) {
-                log::error!("Failed to send Alpaca option bars response: {error}");
+                log::error!("Failed to send Alpaca bars response: {error}");
             }
 
             Ok(())
@@ -1604,6 +1608,44 @@ fn stream_instrument(
     Some((instrument_id, instrument))
 }
 
+async fn request_bars_from_http(
+    http_client: &AlpacaHttpClient,
+    instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    bar_type: BarType,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    limit: Option<usize>,
+    option_feed: &str,
+    stock_feed: &str,
+    clock: &'static AtomicTime,
+) -> anyhow::Result<Vec<Bar>> {
+    if parse_alpaca_option_instrument_id(bar_type.instrument_id()).is_ok() {
+        request_option_bars_from_http(
+            http_client,
+            instruments,
+            bar_type,
+            start,
+            end,
+            limit,
+            option_feed,
+            clock,
+        )
+        .await
+    } else {
+        request_stock_bars_from_http(
+            http_client,
+            instruments,
+            bar_type,
+            start,
+            end,
+            limit,
+            stock_feed,
+            clock,
+        )
+        .await
+    }
+}
+
 async fn request_option_bars_from_http(
     http_client: &AlpacaHttpClient,
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
@@ -1645,7 +1687,7 @@ async fn request_option_bars_from_http(
     let symbol = alpaca_symbol_from_instrument_id(instrument_id);
     let mut request = OptionBarsRequest::for_symbols(
         [symbol.clone()],
-        alpaca_option_bar_timeframe(bar_type)?,
+        alpaca_bar_timeframe(bar_type, "option")?,
         start.to_rfc3339(),
     );
     request.end = end.map(|end| end.to_rfc3339());
@@ -1683,7 +1725,88 @@ async fn request_option_bars_from_http(
     Ok(bars)
 }
 
-fn alpaca_option_bar_timeframe(bar_type: BarType) -> anyhow::Result<String> {
+async fn request_stock_bars_from_http(
+    http_client: &AlpacaHttpClient,
+    instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    bar_type: BarType,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    limit: Option<usize>,
+    feed: &str,
+    clock: &'static AtomicTime,
+) -> anyhow::Result<Vec<Bar>> {
+    anyhow::ensure!(
+        bar_type.is_standard(),
+        "Alpaca stock bars require a standard bar type, got {bar_type}",
+    );
+    anyhow::ensure!(
+        bar_type.is_externally_aggregated(),
+        "Alpaca stock bars require EXTERNAL aggregation, got {bar_type}",
+    );
+    anyhow::ensure!(
+        bar_type.spec().price_type == PriceType::Last,
+        "Alpaca stock bars require LAST price type, got {}",
+        bar_type.spec().price_type,
+    );
+
+    let instrument_id = bar_type.instrument_id();
+    anyhow::ensure!(
+        instrument_id.venue == Venue::new(ALPACA_VENUE),
+        "expected Alpaca venue {}, got {}",
+        ALPACA_VENUE,
+        instrument_id.venue,
+    );
+    let start = start.ok_or_else(|| anyhow!("Alpaca stock bar requests require a start time"))?;
+    let instrument = match instruments.get_cloned(&instrument_id) {
+        Some(instrument) => instrument,
+        None => {
+            let instrument = stock_bar_instrument(instrument_id, clock.get_time_ns())?;
+            instruments.insert(instrument.id(), instrument.clone());
+            instrument
+        }
+    };
+    let symbol = instrument_id.symbol.as_str().to_string();
+    let mut request = StockBarsRequest::for_symbols(
+        [symbol.clone()],
+        alpaca_bar_timeframe(bar_type, "stock")?,
+        start.to_rfc3339(),
+    );
+    request.end = end.map(|end| end.to_rfc3339());
+    request.feed = Some(feed.to_string());
+    request.limit = limit.unwrap_or(10_000).clamp(1, 10_000);
+
+    let response = http_client
+        .stock_bars(&request)
+        .await
+        .context("failed to request Alpaca stock bars")?;
+    let source_bars = response
+        .bars
+        .get(&symbol)
+        .or_else(|| {
+            response
+                .bars
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(&symbol))
+                .map(|(_, bars)| bars)
+        })
+        .cloned()
+        .unwrap_or_default();
+
+    let mut bars = source_bars
+        .iter()
+        .filter_map(|bar| stock_bar(bar_type, &instrument, bar, clock))
+        .collect::<Vec<_>>();
+    bars.sort_by_key(|bar| bar.ts_event);
+    if let Some(limit) = limit
+        && bars.len() > limit
+    {
+        bars.truncate(limit);
+    }
+
+    Ok(bars)
+}
+
+fn alpaca_bar_timeframe(bar_type: BarType, instrument_kind: &str) -> anyhow::Result<String> {
     let spec = bar_type.spec();
     let step = spec.step.get();
     match spec.aggregation {
@@ -1691,7 +1814,7 @@ fn alpaca_option_bar_timeframe(bar_type: BarType) -> anyhow::Result<String> {
         BarAggregation::Hour => Ok(format!("{step}Hour")),
         BarAggregation::Day => Ok(format!("{step}Day")),
         other => Err(anyhow!(
-            "unsupported Alpaca option bar aggregation {other}; expected minute, hour, or day"
+            "unsupported Alpaca {instrument_kind} bar aggregation {other}; expected minute, hour, or day"
         )),
     }
 }
@@ -1711,6 +1834,51 @@ fn option_bar(
     let volume = instrument.try_make_qty(bar.volume? as f64, None).ok()?;
 
     Bar::new_checked(bar_type, open, high, low, close, volume, ts_event, ts_init).ok()
+}
+
+fn stock_bar(
+    bar_type: BarType,
+    instrument: &InstrumentAny,
+    bar: &AlpacaStockBar,
+    clock: &'static AtomicTime,
+) -> Option<Bar> {
+    let ts_event = bar.timestamp.as_deref().and_then(parse_rfc3339_timestamp)?;
+    let ts_init = clock.get_time_ns();
+    let open = instrument.try_make_price(bar.open?).ok()?;
+    let high = instrument.try_make_price(bar.high?).ok()?;
+    let low = instrument.try_make_price(bar.low?).ok()?;
+    let close = instrument.try_make_price(bar.close?).ok()?;
+    let volume = instrument.try_make_qty(bar.volume? as f64, None).ok()?;
+
+    Bar::new_checked(bar_type, open, high, low, close, volume, ts_event, ts_init).ok()
+}
+
+fn stock_bar_instrument(
+    instrument_id: InstrumentId,
+    ts_init: UnixNanos,
+) -> anyhow::Result<InstrumentAny> {
+    Ok(Equity::new_checked(
+        instrument_id,
+        Symbol::from(instrument_id.symbol.as_str()),
+        None,
+        Currency::USD(),
+        4,
+        Price::from("0.0001"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ts_init,
+        ts_init,
+    )?
+    .into_any())
 }
 
 async fn stock_snapshot_price(

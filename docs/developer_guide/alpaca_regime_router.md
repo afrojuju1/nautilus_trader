@@ -1,7 +1,8 @@
 # Alpaca Regime Router
 
-Status: v1 feature input contract defined; option-chain liquidity feature snapshots implemented;
-fail-conservative router slice implemented.
+Status: v1 feature input contract defined; option-chain liquidity, cached underlying bar, derived
+trend/vol, and approved earnings event-load snapshots implemented; fail-conservative router slice
+implemented.
 
 This document defines the target architecture for Alpaca option strategy regime routing. It refines
 the regime-router slice described in the Nautilus-native candidate scanning architecture and the
@@ -19,15 +20,16 @@ Current implementation boundary:
 - Those are prerequisite signals and safety gates, not a regime router.
 - The live option-chain scanner now publishes `RegimeFeatureData` snapshots and a
   `regime_feature_snapshot` operator event from the same `OptionChainSlice` it already consumes for
-  candidate scans.
-- The current implemented snapshot is intentionally narrow: it produces real option-liquidity
-  values, uses the existing active-risk quote stale policy for freshness, and marks required
-  bar/trend/event feature groups unavailable. It does not produce a regime label, confidence, family
-  weight, block, or candidate metadata.
+  candidate scans. It enriches that slice with standard Nautilus underlying `Bar` cache data and the
+  existing approved earnings event-shock input when those sources are available.
+- The current implemented snapshot produces real option-liquidity values, cached underlying-bar
+  coverage, derived trend/realized-vol values, and event-load values. Missing, stale, or degraded
+  groups remain explicit in `feature_freshness` and `unavailable_features`; the router must not
+  treat absent inputs as neutral.
 - Runtime routing now consumes that feature contract, records compact `RegimeContext` evidence, and
   applies the fail-conservative policy: `unknown`, `dry_run_only`, and naked-option family blocks
-  while required bar/trend/event inputs are unavailable. It does not produce directional or neutral
-  labels from placeholder inputs.
+  while required inputs are missing, stale, degraded, or not yet promoted to active thresholds. It
+  does not produce directional or neutral labels from placeholder inputs.
 
 ## Boundary
 
@@ -160,10 +162,10 @@ V1 is intentionally deterministic and source-limited. The approved inputs are:
 
 | Group | Required for v1 | Approved source | Freshness rule |
 | --- | --- | --- | --- |
-| Underlying bars | Yes | Nautilus bar cache/stream, `ParquetDataCatalog`, or ClickHouse market-data warehouse. | Live: last complete bar no older than two configured bar intervals. Replay: bar timestamp must be at or before decision time. |
-| Underlying trend/vol features | Yes | Derived by the feature actor from approved bars. | Computed from the same fresh bar snapshot as the underlying bars. |
+| Underlying bars | Yes | Nautilus bar cache/stream, `ParquetDataCatalog`, or ClickHouse market-data warehouse. Current scanner requests daily underlying bars through standard Alpaca `request_bars`. | Live: last complete bar must satisfy the configured stale-after window. Replay: bar timestamp must be at or before decision time. |
+| Underlying trend/vol features | Yes | Derived from approved bars. Current scanner derives close-to-close window return, mean return, and realized volatility from cached underlying bars. | Computed from the same fresh bar snapshot as the underlying bars. |
 | Option liquidity snapshot | Yes for families under consideration | `OptionChainSlice`, Nautilus quote cache, Alpaca option snapshot adapter, or future option quote stream. | Quote age must be no older than `management.active_risk_quote_stale_secs` for selected legs when available; chain-level summaries must name their source timestamp. |
-| Event load | Yes | Normalized earnings feed and event cache used by Alpaca admission. | Earnings data must cover the trade date and next configured event-block window. Unknown timing remains blocking unless explicitly allowed by the event policy. |
+| Event load | Yes | Normalized earnings feed and event cache used by Alpaca admission. Current scanner reuses the configured approved earnings events and event-shock window. | Earnings data must cover the trade date and next configured event-block window. Unknown timing remains blocking unless explicitly allowed by the event policy. |
 | Portfolio stress summary | Optional in v1 | Existing risk-capital state, strategy state, broker positions, and future Greek/stress governor output. | Must be produced in the same decision pass as risk admission if used for routing. |
 | Breadth/proxy instruments | Optional in v1 | Configured ETF/index proxies from approved bar sources. | Use only when every configured proxy passes the bar freshness rule; otherwise mark the feature group unavailable. |
 | Historical feature snapshot | Optional in v1 | ClickHouse or catalog-derived feature snapshots. | Replay: as-of timestamp must be no later than decision time. Live: snapshot must be current for the configured session. |
@@ -414,7 +416,7 @@ Minimum validation reports:
 | --- | --- | --- | --- |
 | 0. Input contract | Done in this document. | Define approved feature groups, freshness, labels, confidence, evidence shape, and validation ranges. | Implementation can start without stamping fake labels. |
 | 1. Types and pure router | Done for fail-conservative v1. | Add `RegimeInput`, `RegimeContext`, labels, explanation codes, and routing policy types. | Unit-level callers can classify synthetic feature snapshots without venue I/O. |
-| 2. Feature snapshot | In progress: option-liquidity slice implemented. | Build a `RegimeFeatureActor` or service that computes v1 feature snapshots from bars, option-chain state, external signals, and optional ClickHouse/catalog history. | Operator diagnostics can display feature freshness and current regime. |
+| 2. Feature snapshot | Implemented for current scanner inputs. | Compute v1 snapshots from option-chain state, cached/requested underlying bars, and approved earnings event-shock inputs. Future work can move historical bars to catalog/ClickHouse sources behind the same feature contract. | Operator diagnostics display feature freshness and current regime coverage. |
 | 3. Candidate integration | Done for scanner/strategy path. | Add regime context to candidate input and selection policy. | Dry-run scans record regime decisions without changing order behavior. |
 | 4. Family routing | Partial: unknown blocks naked-option families and forces dry-run. | Apply v1 routing policy to iron condors, credit/debit spreads, and undefined-risk strategies. | Candidate ledgers show which families were allowed, down-ranked, or blocked. |
 | 5. Replay validation | Outcome analysis by regime. | Replay candidate ledgers against historical market data and feature snapshots. | Reports show performance by regime, strategy family, and explanation code. |
@@ -425,19 +427,21 @@ Minimum validation reports:
 - Underlying universe: all enabled option underlyings from the Alpaca runtime config.
 - Initial producer: `OptionChainCandidateScanActor` publishes a separate `RegimeFeatureData` custom
   payload from the existing option-chain subscription, avoiding a duplicate scanner loop. A
-  dedicated `RegimeFeatureActor` can replace or extend this once underlying bar and warehouse inputs
-  are available through Nautilus data paths.
+  dedicated `RegimeFeatureActor` can replace or extend this once warehouse/catalog feature inputs
+  are promoted behind the same Nautilus data contract.
 - Current feature values: `option_liquidity` includes contract and quote counts, two-sided quote
   coverage, median spread percentage, wide-quote ratio, open-interest coverage, implied-volatility
-  coverage, chain source timestamp, and freshness.
-- Current unavailable groups: underlying bars, underlying trend/volatility, and event load are
-  marked unavailable by the implemented snapshot rather than defaulting to neutral.
+  coverage, chain source timestamp, and freshness. `underlying_bars` and `underlying_trend_vol`
+  come from cached/requested Nautilus bars. `event_load` comes from the approved earnings
+  event-shock input used by admission.
 - Current routing behavior: the scanner computes a pure `RegimeContext` from the feature snapshot,
   filters blocked strategy families before candidate selection, writes the context into scanner and
   candidate ledgers, and passes the same context through `OptionsCandidateData`.
 - Current order behavior: `AlpacaOptionsStrategy` honors `dry_run_only` from the context before
-  normal submission gates. With only option-liquidity available, all routed selected candidates are
-  dry-run evidence until the required bar/trend/event groups exist.
+  normal submission gates. Current routing still stays fail-conservative until market-hours
+  validation proves feature freshness and thresholds are intentionally promoted.
+- Current operator visibility: `alpaca-ops status` reports the latest regime feature coverage from
+  operator events or candidate-ledger scanner evidence.
 - Breadth proxy: optional only. Use configured ETF/index proxies when complete; otherwise mark
   breadth unavailable and do not treat it as neutral.
 - Portfolio context: optional coarse stress input only. Hard portfolio caps remain in risk

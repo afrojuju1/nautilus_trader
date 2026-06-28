@@ -87,6 +87,7 @@ struct OperatorStatus {
     active_entries: Vec<ActiveEntryStatus>,
     risk: RiskStatus,
     last_scan: Option<Value>,
+    regime_coverage: Option<RegimeCoverageStatus>,
     last_scanner_diagnostic: Option<Value>,
     last_decision: Option<Value>,
     last_management_snapshot: Option<Value>,
@@ -196,6 +197,23 @@ struct RiskStatus {
     max_active_entries_per_underlying: Option<usize>,
     active_entries_by_sector: BTreeMap<String, usize>,
     max_active_entries_per_sector: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct RegimeCoverageStatus {
+    source: String,
+    underlying: Option<String>,
+    trade_date: Option<String>,
+    label: Option<String>,
+    routing_action: Option<String>,
+    dry_run_only: Option<bool>,
+    feature_freshness: BTreeMap<String, String>,
+    unavailable_features: Vec<String>,
+    explanation_codes: Vec<String>,
+    has_underlying_bars: bool,
+    has_underlying_trend_vol: bool,
+    has_option_liquidity: bool,
+    has_event_load: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -574,6 +592,8 @@ fn build_status(
             latest_candidate_ledger_record(&config.candidate_ledger_records, "scanner_result")
         })
         .or_else(|| latest_event(events, "management_iteration"));
+    let regime_coverage =
+        regime_coverage_status(events, &config.candidate_ledger_records, last_scan.as_ref());
     let last_scanner_diagnostic = latest_event(events, "scanner_diagnostic");
     let last_decision = latest_event(events, "entry_decision")
         .or_else(|| {
@@ -626,6 +646,7 @@ fn build_status(
         active_entries,
         risk,
         last_scan,
+        regime_coverage,
         last_scanner_diagnostic,
         last_decision,
         last_management_snapshot,
@@ -1067,6 +1088,13 @@ fn print_human_status(status: &OperatorStatus) {
             .map_or_else(|| "none".to_string(), compact_json)
     );
     println!(
+        "regime_coverage: {}",
+        status
+            .regime_coverage
+            .as_ref()
+            .map_or_else(|| "none".to_string(), regime_coverage_line)
+    );
+    println!(
         "last_scanner_diagnostic: {}",
         status
             .last_scanner_diagnostic
@@ -1157,6 +1185,112 @@ async fn latest_activities(client: &AlpacaHttpClient) -> anyhow::Result<Vec<Alpa
         ..nautilus_alpaca::http::models::ListActivitiesRequest::option_reconciliation()
     };
     Ok(client.account_activities(&request).await?)
+}
+
+fn regime_coverage_status(
+    events: &[Value],
+    candidate_ledger_records: &[Value],
+    last_scan: Option<&Value>,
+) -> Option<RegimeCoverageStatus> {
+    let snapshot = latest_event(events, "regime_feature_snapshot");
+    let scanner_record = last_scan
+        .cloned()
+        .or_else(|| latest_candidate_ledger_record(candidate_ledger_records, "scanner_result"));
+    let context = scanner_record
+        .as_ref()
+        .and_then(|record| record.get("regime_context"));
+    let source = if snapshot.is_some() {
+        "operator_event"
+    } else {
+        "candidate_ledger"
+    };
+    let evidence = snapshot.as_ref().or(context)?;
+
+    let feature_freshness = evidence
+        .get("feature_freshness")
+        .and_then(Value::as_array)
+        .map(|values| feature_freshness_map(values))
+        .unwrap_or_default();
+    let unavailable_features = evidence
+        .get("unavailable_features")
+        .and_then(Value::as_array)
+        .map(|values| string_array(values))
+        .unwrap_or_default();
+    let explanation_codes = context
+        .and_then(|value| value.get("explanation_codes"))
+        .and_then(Value::as_array)
+        .map(|values| string_array(values))
+        .unwrap_or_default();
+
+    Some(RegimeCoverageStatus {
+        source: source.to_string(),
+        underlying: evidence
+            .get("underlying")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                scanner_record
+                    .as_ref()
+                    .and_then(|record| record.get("underlying"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            }),
+        trade_date: evidence
+            .get("trade_date")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                scanner_record
+                    .as_ref()
+                    .and_then(|record| record.get("trade_date"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            }),
+        label: context
+            .and_then(|value| value.get("label"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        routing_action: context
+            .and_then(|value| value.get("routing_action"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        dry_run_only: context
+            .and_then(|value| value.get("dry_run_only"))
+            .and_then(Value::as_bool),
+        has_underlying_bars: feature_available(&feature_freshness, "underlying_bars"),
+        has_underlying_trend_vol: feature_available(&feature_freshness, "underlying_trend_vol"),
+        has_option_liquidity: feature_available(&feature_freshness, "option_liquidity"),
+        has_event_load: feature_available(&feature_freshness, "event_load"),
+        feature_freshness,
+        unavailable_features,
+        explanation_codes,
+    })
+}
+
+fn feature_freshness_map(values: &[Value]) -> BTreeMap<String, String> {
+    values
+        .iter()
+        .filter_map(|value| {
+            Some((
+                value.get("group")?.as_str()?.to_string(),
+                value.get("status")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn feature_available(feature_freshness: &BTreeMap<String, String>, group: &str) -> bool {
+    feature_freshness
+        .get(group)
+        .is_some_and(|status| matches!(status.as_str(), "fresh" | "degraded"))
+}
+
+fn string_array(values: &[Value]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn latest_event(events: &[Value], event_type: &str) -> Option<Value> {
@@ -1412,6 +1546,32 @@ fn home_dir() -> PathBuf {
 
 fn non_empty(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.to_string())
+}
+
+fn regime_coverage_line(status: &RegimeCoverageStatus) -> String {
+    format!(
+        "source={} underlying={} trade_date={} label={} action={} dry_run={} features=underlying_bars:{},underlying_trend_vol:{},option_liquidity:{},event_load:{} freshness={} unavailable={} explanations={}",
+        status.source,
+        status.underlying.as_deref().unwrap_or("unknown"),
+        status.trade_date.as_deref().unwrap_or("unknown"),
+        status.label.as_deref().unwrap_or("unknown"),
+        status.routing_action.as_deref().unwrap_or("unknown"),
+        status
+            .dry_run_only
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        status.has_underlying_bars,
+        status.has_underlying_trend_vol,
+        status.has_option_liquidity,
+        status.has_event_load,
+        status
+            .feature_freshness
+            .iter()
+            .map(|(group, freshness)| format!("{group}:{freshness}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        status.unavailable_features.join(","),
+        status.explanation_codes.join(","),
+    )
 }
 
 fn compact_json(value: &Value) -> String {

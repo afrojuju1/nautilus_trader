@@ -2,25 +2,30 @@
 
 use std::{any::Any, collections::BTreeMap, sync::Arc};
 
+use chrono::NaiveDate;
 use nautilus_core::UnixNanos;
 use nautilus_model::data::{
-    CustomData, CustomDataTrait, DataType, HasTsInit,
+    Bar, CustomData, CustomDataTrait, DataType, HasTsInit,
     option_chain::{OptionChainSlice, OptionStrikeData},
 };
 use serde_json::{Value, json};
 
-use crate::options_entry::SelectedOptionsEntry;
+use crate::{earnings::EarningsEvent, options_entry::SelectedOptionsEntry};
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// Current schema version for regime feature snapshots.
 pub const REGIME_FEATURE_SCHEMA_VERSION: u16 = 1;
-/// Deterministic feature version for option-chain liquidity snapshots.
-pub const OPTION_CHAIN_LIQUIDITY_FEATURE_VERSION: &str = "option_chain_liquidity.v1";
+/// Deterministic feature version for Alpaca regime feature snapshots.
+pub const ALPACA_REGIME_FEATURE_VERSION: &str = "alpaca_regime_features.v1";
 /// Default fraction of option midprice considered a wide quote.
 pub const DEFAULT_WIDE_QUOTE_SPREAD_PCT: f64 = 0.15;
 /// Default minimum two-sided quotes for the chain-level liquidity group to be usable.
 pub const DEFAULT_MIN_TWO_SIDED_QUOTES: usize = 1;
+/// Default number of underlying bars required for a usable trend/volatility window.
+pub const DEFAULT_UNDERLYING_BAR_LOOKBACK: usize = 20;
+/// Default maximum accepted age for the latest underlying bar.
+pub const DEFAULT_UNDERLYING_BAR_STALE_AFTER_SECS: u64 = 3 * 24 * 60 * 60;
 
 /// Runtime feature groups available to future regime routing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,7 +174,7 @@ impl RegimeContext {
     /// Returns this context as compact JSON.
     #[must_use]
     pub fn to_json_value(&self) -> Value {
-        json!({
+        let mut payload = json!({
             "label": self.label.as_str(),
             "confidence": self.confidence,
             "as_of_ts": self.as_of_ts.as_u64(),
@@ -185,13 +190,26 @@ impl RegimeContext {
                 .iter()
                 .map(|group| group.as_str())
                 .collect::<Vec<_>>(),
-            "strategy_family_weights": self.strategy_family_weights,
             "blocked_strategy_families": self.blocked_strategy_families,
-            "threshold_adjustments": self.threshold_adjustments,
             "dry_run_only": self.dry_run_only,
             "routing_action": self.routing_action(),
             "explanation_codes": self.explanation_codes,
-        })
+        });
+        if let Value::Object(fields) = &mut payload {
+            if !self.strategy_family_weights.is_empty() {
+                fields.insert(
+                    "strategy_family_weights".to_string(),
+                    json!(&self.strategy_family_weights),
+                );
+            }
+            if !self.threshold_adjustments.is_empty() {
+                fields.insert(
+                    "threshold_adjustments".to_string(),
+                    json!(&self.threshold_adjustments),
+                );
+            }
+        }
+        payload
     }
 }
 
@@ -204,8 +222,6 @@ pub struct RegimeRoutingSummary {
     pub routed_candidates: usize,
     /// Candidate count blocked before selection.
     pub blocked_candidates: usize,
-    /// Strategy families blocked by this routing pass.
-    pub blocked_strategy_families: Vec<String>,
 }
 
 impl RegimeRoutingSummary {
@@ -216,7 +232,6 @@ impl RegimeRoutingSummary {
             "initial_candidates": self.initial_candidates,
             "routed_candidates": self.routed_candidates,
             "blocked_candidates": self.blocked_candidates,
-            "blocked_strategy_families": self.blocked_strategy_families,
         })
     }
 }
@@ -286,19 +301,143 @@ impl FeatureFreshness {
 pub struct RegimeFeatureConfig {
     /// Maximum accepted option quote age. Zero disables stale classification.
     pub option_quote_stale_after_secs: u64,
+    /// Maximum accepted age for the latest underlying bar. Zero disables stale classification.
+    pub underlying_bar_stale_after_secs: u64,
     /// Fraction of midprice considered a wide quote for chain-level summaries.
     pub wide_quote_spread_pct: f64,
     /// Minimum two-sided option quotes required for fresh chain liquidity.
     pub min_two_sided_quotes: usize,
+    /// Minimum underlying bars required for fresh bar coverage and trend/vol features.
+    pub min_underlying_bars: usize,
 }
 
 impl Default for RegimeFeatureConfig {
     fn default() -> Self {
         Self {
             option_quote_stale_after_secs: 30,
+            underlying_bar_stale_after_secs: DEFAULT_UNDERLYING_BAR_STALE_AFTER_SECS,
             wide_quote_spread_pct: DEFAULT_WIDE_QUOTE_SPREAD_PCT,
             min_two_sided_quotes: DEFAULT_MIN_TWO_SIDED_QUOTES,
+            min_underlying_bars: DEFAULT_UNDERLYING_BAR_LOOKBACK,
         }
+    }
+}
+
+/// Inputs from runtime-owned sources used to enrich one feature snapshot.
+#[derive(Clone, Copy, Debug)]
+pub struct RegimeFeatureInputs<'a> {
+    /// Cached underlying bars for the option-chain underlying.
+    pub underlying_bars: &'a [Bar],
+    /// Approved earnings events from runtime event-shock configuration.
+    pub earnings_events: &'a [EarningsEvent],
+    /// Calendar days before an earnings report considered event load.
+    pub event_shock_block_days_before_earnings: i64,
+    /// Calendar days after an earnings report considered event load.
+    pub event_shock_block_days_after_earnings: i64,
+}
+
+impl<'a> RegimeFeatureInputs<'a> {
+    /// Returns an input set with no optional runtime sources.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            underlying_bars: &[],
+            earnings_events: &[],
+            event_shock_block_days_before_earnings: 0,
+            event_shock_block_days_after_earnings: 0,
+        }
+    }
+}
+
+/// Underlying bar coverage features.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnderlyingBarFeatures {
+    /// Source that produced the bar window.
+    pub source: String,
+    /// Number of bars in the retained window.
+    pub bar_count: usize,
+    /// First bar timestamp in the retained window.
+    pub first_bar_ts: UnixNanos,
+    /// Latest bar timestamp in the retained window.
+    pub latest_bar_ts: UnixNanos,
+    /// Close from the latest bar.
+    pub latest_close: f64,
+    /// Maximum latest-bar age in seconds relative to snapshot time.
+    pub latest_bar_age_secs: Option<u64>,
+}
+
+impl UnderlyingBarFeatures {
+    /// Returns this bar coverage summary as compact JSON.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "source": self.source,
+            "bar_count": self.bar_count,
+            "first_bar_ts": self.first_bar_ts.as_u64(),
+            "first_bar_ts_utc": self.first_bar_ts.to_rfc3339(),
+            "latest_bar_ts": self.latest_bar_ts.as_u64(),
+            "latest_bar_ts_utc": self.latest_bar_ts.to_rfc3339(),
+            "latest_close": self.latest_close,
+            "latest_bar_age_secs": self.latest_bar_age_secs,
+        })
+    }
+}
+
+/// Trend and realized-volatility features derived from underlying bars.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnderlyingTrendVolFeatures {
+    /// Source that produced the summary.
+    pub source: String,
+    /// Number of close-to-close returns in the summary.
+    pub return_count: usize,
+    /// Total close-to-close return over the retained window.
+    pub window_return_pct: f64,
+    /// Average close-to-close return over the retained window.
+    pub mean_return_pct: f64,
+    /// Realized close-to-close volatility over the retained window.
+    pub realized_volatility_pct: f64,
+}
+
+impl UnderlyingTrendVolFeatures {
+    /// Returns this trend/vol summary as compact JSON.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "source": self.source,
+            "return_count": self.return_count,
+            "window_return_pct": self.window_return_pct,
+            "mean_return_pct": self.mean_return_pct,
+            "realized_volatility_pct": self.realized_volatility_pct,
+        })
+    }
+}
+
+/// Earnings/event-load summary for the underlying.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EventLoadFeatures {
+    /// Source that produced the event load.
+    pub source: String,
+    /// Number of approved events for the underlying.
+    pub underlying_event_count: usize,
+    /// Number of events inside the configured event-shock window.
+    pub active_event_count: usize,
+    /// Nearest event distance in calendar days.
+    pub nearest_days_to_report: Option<i64>,
+    /// Whether configured event-shock policy currently blocks entries.
+    pub blocks_new_entries: bool,
+}
+
+impl EventLoadFeatures {
+    /// Returns this event-load summary as compact JSON.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "source": self.source,
+            "underlying_event_count": self.underlying_event_count,
+            "active_event_count": self.active_event_count,
+            "nearest_days_to_report": self.nearest_days_to_report,
+            "blocks_new_entries": self.blocks_new_entries,
+        })
     }
 }
 
@@ -368,8 +507,14 @@ pub struct RegimeFeatureSnapshot {
     pub trade_date: String,
     /// Underlying symbol.
     pub underlying: String,
+    /// Underlying bar coverage feature group, when produced.
+    pub underlying_bars: Option<UnderlyingBarFeatures>,
+    /// Underlying trend/realized-vol feature group, when produced.
+    pub underlying_trend_vol: Option<UnderlyingTrendVolFeatures>,
     /// Option-liquidity feature group, when produced.
     pub option_liquidity: Option<OptionLiquidityFeatures>,
+    /// Earnings or event-load feature group, when produced.
+    pub event_load: Option<EventLoadFeatures>,
     /// Freshness evidence for produced and unavailable groups.
     pub feature_freshness: Vec<FeatureFreshness>,
     /// Feature groups not usable by a router.
@@ -397,7 +542,10 @@ impl RegimeFeatureSnapshot {
             "as_of_ts_utc": self.as_of_ts.to_rfc3339(),
             "trade_date": self.trade_date,
             "underlying": self.underlying,
+            "underlying_bars": self.underlying_bars.as_ref().map(UnderlyingBarFeatures::to_json_value),
+            "underlying_trend_vol": self.underlying_trend_vol.as_ref().map(UnderlyingTrendVolFeatures::to_json_value),
             "option_liquidity": self.option_liquidity.as_ref().map(OptionLiquidityFeatures::to_json_value),
+            "event_load": self.event_load.as_ref().map(EventLoadFeatures::to_json_value),
             "feature_freshness": self
                 .feature_freshness
                 .iter()
@@ -424,7 +572,6 @@ pub fn regime_context_from_features(snapshot: &RegimeFeatureSnapshot) -> RegimeC
     ];
     let mut required_missing = false;
     let mut required_stale = false;
-    let mut required_degraded = false;
     let mut explanation_codes = Vec::new();
 
     for group in required_groups {
@@ -434,7 +581,6 @@ pub fn regime_context_from_features(snapshot: &RegimeFeatureSnapshot) -> RegimeC
         {
             Some(FeatureFreshnessStatus::Fresh) => {}
             Some(FeatureFreshnessStatus::Degraded) => {
-                required_degraded = true;
                 push_explanation_code(&mut explanation_codes, "required_feature_degraded");
             }
             Some(FeatureFreshnessStatus::Stale) => {
@@ -461,12 +607,8 @@ pub fn regime_context_from_features(snapshot: &RegimeFeatureSnapshot) -> RegimeC
         push_explanation_code(&mut explanation_codes, "routing_thresholds_unavailable");
     }
 
-    let required_features_usable = !(required_missing || required_stale || required_degraded);
-    let dry_run_only = true;
     let confidence = if required_missing || required_stale {
         0.0
-    } else if required_degraded || !required_features_usable {
-        0.25
     } else {
         0.25
     };
@@ -481,7 +623,7 @@ pub fn regime_context_from_features(snapshot: &RegimeFeatureSnapshot) -> RegimeC
         strategy_family_weights: BTreeMap::new(),
         blocked_strategy_families: vec!["naked_option".to_string()],
         threshold_adjustments: BTreeMap::new(),
-        dry_run_only,
+        dry_run_only: true,
         explanation_codes,
     }
 }
@@ -500,7 +642,6 @@ pub fn apply_regime_routing(
         initial_candidates,
         routed_candidates,
         blocked_candidates: initial_candidates.saturating_sub(routed_candidates),
-        blocked_strategy_families: context.blocked_strategy_families.clone(),
     }
 }
 
@@ -590,6 +731,8 @@ impl CustomDataTrait for RegimeFeatureData {
 pub fn regime_feature_snapshot_from_option_chain(
     slice: &OptionChainSlice,
     config: &RegimeFeatureConfig,
+    inputs: RegimeFeatureInputs<'_>,
+    trade_date: impl Into<String>,
     ts_init: UnixNanos,
 ) -> RegimeFeatureSnapshot {
     let as_of_ts = if slice.ts_event.is_zero() {
@@ -597,21 +740,39 @@ pub fn regime_feature_snapshot_from_option_chain(
     } else {
         slice.ts_event
     };
+    let trade_date = trade_date.into();
+    let underlying = slice.series_id.underlying.to_string();
+    let underlying_bars = underlying_bar_features(inputs.underlying_bars, as_of_ts);
+    let underlying_bar_freshness = underlying_bar_freshness(&underlying_bars, config, as_of_ts);
+    let underlying_trend_vol =
+        underlying_trend_vol_features(inputs.underlying_bars, config.min_underlying_bars);
+    let underlying_trend_vol_freshness =
+        underlying_trend_vol_freshness(&underlying_trend_vol, &underlying_bar_freshness);
     let liquidity = option_liquidity_features(slice, config, as_of_ts);
     let liquidity_freshness =
         option_liquidity_freshness(&liquidity, config, latest_quote_ts(slice), as_of_ts);
+    let event_load = event_load_features(
+        &underlying,
+        inputs.earnings_events,
+        &trade_date,
+        inputs.event_shock_block_days_before_earnings,
+        inputs.event_shock_block_days_after_earnings,
+    );
+    let event_load_freshness = event_load_freshness(&event_load, as_of_ts);
     let feature_freshness = vec![
+        underlying_bar_freshness,
+        underlying_trend_vol_freshness,
         liquidity_freshness,
-        FeatureFreshness::missing(RegimeFeatureGroup::UnderlyingBars, "not_produced"),
-        FeatureFreshness::missing(RegimeFeatureGroup::UnderlyingTrendVol, "not_produced"),
-        FeatureFreshness::missing(RegimeFeatureGroup::EventLoad, "not_produced"),
+        event_load_freshness,
     ];
     let unavailable_features = feature_freshness
         .iter()
         .filter(|freshness| {
             matches!(
                 freshness.status,
-                FeatureFreshnessStatus::Missing | FeatureFreshnessStatus::Stale
+                FeatureFreshnessStatus::Missing
+                    | FeatureFreshnessStatus::Stale
+                    | FeatureFreshnessStatus::Degraded
             )
         })
         .map(|freshness| freshness.group)
@@ -619,15 +780,200 @@ pub fn regime_feature_snapshot_from_option_chain(
 
     RegimeFeatureSnapshot {
         schema_version: REGIME_FEATURE_SCHEMA_VERSION,
-        feature_version: OPTION_CHAIN_LIQUIDITY_FEATURE_VERSION.to_string(),
+        feature_version: ALPACA_REGIME_FEATURE_VERSION.to_string(),
         as_of_ts,
-        trade_date: as_of_ts.to_datetime_utc().date_naive().to_string(),
-        underlying: slice.series_id.underlying.to_string(),
+        trade_date,
+        underlying,
+        underlying_bars,
+        underlying_trend_vol,
         option_liquidity: liquidity,
+        event_load,
         feature_freshness,
         unavailable_features,
         ts_init,
     }
+}
+
+fn underlying_bar_features(bars: &[Bar], as_of_ts: UnixNanos) -> Option<UnderlyingBarFeatures> {
+    let first = bars.first()?;
+    let latest = bars.last()?;
+    let latest_close = latest.close.as_f64();
+    if !latest_close.is_finite() || latest_close <= 0.0 {
+        return None;
+    }
+
+    Some(UnderlyingBarFeatures {
+        source: "nautilus_bar_cache".to_string(),
+        bar_count: bars.len(),
+        first_bar_ts: first.ts_event,
+        latest_bar_ts: latest.ts_event,
+        latest_close,
+        latest_bar_age_secs: age_secs(as_of_ts, latest.ts_event),
+    })
+}
+
+fn underlying_bar_freshness(
+    features: &Option<UnderlyingBarFeatures>,
+    config: &RegimeFeatureConfig,
+    as_of_ts: UnixNanos,
+) -> FeatureFreshness {
+    let Some(features) = features else {
+        return FeatureFreshness::missing(RegimeFeatureGroup::UnderlyingBars, "nautilus_bar_cache");
+    };
+
+    let age_secs = age_secs(as_of_ts, features.latest_bar_ts);
+    let status = if features.bar_count < config.min_underlying_bars {
+        FeatureFreshnessStatus::Degraded
+    } else if config.underlying_bar_stale_after_secs > 0
+        && age_secs.is_some_and(|age| age > config.underlying_bar_stale_after_secs)
+    {
+        FeatureFreshnessStatus::Stale
+    } else {
+        FeatureFreshnessStatus::Fresh
+    };
+
+    FeatureFreshness::produced(
+        RegimeFeatureGroup::UnderlyingBars,
+        "nautilus_bar_cache",
+        Some(features.latest_bar_ts),
+        age_secs,
+        status,
+    )
+}
+
+fn underlying_trend_vol_features(
+    bars: &[Bar],
+    min_underlying_bars: usize,
+) -> Option<UnderlyingTrendVolFeatures> {
+    if bars.len() < min_underlying_bars.max(2) {
+        return None;
+    }
+
+    let closes = bars
+        .iter()
+        .map(|bar| bar.close.as_f64())
+        .filter(|close| close.is_finite() && *close > 0.0)
+        .collect::<Vec<_>>();
+    if closes.len() < min_underlying_bars.max(2) {
+        return None;
+    }
+
+    let returns = closes
+        .windows(2)
+        .filter_map(|pair| {
+            let previous = pair[0];
+            let current = pair[1];
+            (previous > 0.0).then_some((current / previous) - 1.0)
+        })
+        .collect::<Vec<_>>();
+    if returns.is_empty() {
+        return None;
+    }
+
+    let mean_return = returns.iter().sum::<f64>() / returns.len() as f64;
+    let variance = returns
+        .iter()
+        .map(|value| {
+            let diff = value - mean_return;
+            diff * diff
+        })
+        .sum::<f64>()
+        / returns.len() as f64;
+    let first_close = *closes.first()?;
+    let latest_close = *closes.last()?;
+    Some(UnderlyingTrendVolFeatures {
+        source: "nautilus_bar_cache".to_string(),
+        return_count: returns.len(),
+        window_return_pct: ((latest_close / first_close) - 1.0) * 100.0,
+        mean_return_pct: mean_return * 100.0,
+        realized_volatility_pct: variance.sqrt() * 100.0,
+    })
+}
+
+fn underlying_trend_vol_freshness(
+    features: &Option<UnderlyingTrendVolFeatures>,
+    bar_freshness: &FeatureFreshness,
+) -> FeatureFreshness {
+    if features.is_none() {
+        return FeatureFreshness::missing(
+            RegimeFeatureGroup::UnderlyingTrendVol,
+            "nautilus_bar_cache",
+        );
+    }
+
+    FeatureFreshness::produced(
+        RegimeFeatureGroup::UnderlyingTrendVol,
+        "nautilus_bar_cache",
+        bar_freshness.latest_ts,
+        bar_freshness.age_secs,
+        bar_freshness.status,
+    )
+}
+
+fn event_load_features(
+    underlying: &str,
+    events: &[EarningsEvent],
+    trade_date: &str,
+    block_days_before_earnings: i64,
+    block_days_after_earnings: i64,
+) -> Option<EventLoadFeatures> {
+    if events.is_empty() {
+        return None;
+    }
+
+    let trade_date = NaiveDate::parse_from_str(trade_date, "%Y-%m-%d").ok()?;
+    let underlying = underlying.to_ascii_uppercase();
+    let mut underlying_event_count = 0;
+    let mut active_event_count = 0;
+    let mut nearest_days_to_report: Option<i64> = None;
+
+    for event in events.iter().filter(|event| event.underlying == underlying) {
+        underlying_event_count += 1;
+        let days_to_report = event
+            .report_date
+            .signed_duration_since(trade_date)
+            .num_days();
+        nearest_days_to_report = Some(nearest_days_to_report.map_or(days_to_report, |nearest| {
+            if days_to_report.abs() < nearest.abs() {
+                days_to_report
+            } else {
+                nearest
+            }
+        }));
+        if -block_days_after_earnings <= days_to_report
+            && days_to_report <= block_days_before_earnings
+        {
+            active_event_count += 1;
+        }
+    }
+
+    Some(EventLoadFeatures {
+        source: "approved_earnings_events".to_string(),
+        underlying_event_count,
+        active_event_count,
+        nearest_days_to_report,
+        blocks_new_entries: active_event_count > 0,
+    })
+}
+
+fn event_load_freshness(
+    event_load: &Option<EventLoadFeatures>,
+    as_of_ts: UnixNanos,
+) -> FeatureFreshness {
+    if event_load.is_none() {
+        return FeatureFreshness::missing(
+            RegimeFeatureGroup::EventLoad,
+            "approved_earnings_events",
+        );
+    }
+
+    FeatureFreshness::produced(
+        RegimeFeatureGroup::EventLoad,
+        "approved_earnings_events",
+        Some(as_of_ts),
+        Some(0),
+        FeatureFreshnessStatus::Fresh,
+    )
 }
 
 fn option_liquidity_features(
@@ -836,6 +1182,8 @@ mod tests {
         let snapshot = regime_feature_snapshot_from_option_chain(
             &slice,
             &RegimeFeatureConfig::default(),
+            RegimeFeatureInputs::empty(),
+            "2026-06-28",
             UnixNanos::from_seconds(106),
         );
 
@@ -859,6 +1207,8 @@ mod tests {
         let snapshot = regime_feature_snapshot_from_option_chain(
             &slice,
             &RegimeFeatureConfig::default(),
+            RegimeFeatureInputs::empty(),
+            "2026-06-28",
             UnixNanos::from_seconds(106),
         );
 
@@ -889,6 +1239,8 @@ mod tests {
         let snapshot = regime_feature_snapshot_from_option_chain(
             &slice,
             &config,
+            RegimeFeatureInputs::empty(),
+            "2026-06-28",
             UnixNanos::from_seconds(201),
         );
 
@@ -912,6 +1264,8 @@ mod tests {
         let snapshot = regime_feature_snapshot_from_option_chain(
             &slice,
             &RegimeFeatureConfig::default(),
+            RegimeFeatureInputs::empty(),
+            "2026-06-28",
             UnixNanos::from_seconds(106),
         );
         let context = regime_context_from_features(&snapshot);
@@ -933,6 +1287,8 @@ mod tests {
         let snapshot = regime_feature_snapshot_from_option_chain(
             &slice,
             &RegimeFeatureConfig::default(),
+            RegimeFeatureInputs::empty(),
+            "2026-06-28",
             UnixNanos::from_seconds(106),
         );
         let context = regime_context_from_features(&snapshot);
