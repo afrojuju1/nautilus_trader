@@ -102,7 +102,7 @@ for official NautilusTrader documentation.
   - [ ] Underlying snapshots.
 - [x] Add an active-risk option quote cache or explicitly document why REST snapshots are the
       supported quote path for the release.
-- [ ] Add true real-time Alpaca option quote/trade streaming transport before treating quote
+- [x] Add true real-time Alpaca option quote/trade streaming transport before treating quote
       freshness as a stronger live-trading dependency.
 - [ ] Add entitlement-aware feed behavior for indicative versus OPRA option data.
 - [x] Wire exact Alpaca option instrument loading into a standard Rust Nautilus data-client path.
@@ -183,7 +183,7 @@ for official NautilusTrader documentation.
 - [ ] Add fixture tests for startup reconciliation.
 - [ ] Add fixture tests for terminal position reconciliation.
 - [ ] Add fixture tests for account options trading-level and approval preflight.
-- [ ] Add fixture tests for real-time option quote/trade stream parsing if the stream cache is
+- [x] Add fixture tests for real-time option quote/trade stream parsing if the stream cache is
       included in the release scope.
 - [ ] Add replay-harness tests for candidate outcomes against historical option data fixtures.
 - [x] Add docs example smoke/import tests.
@@ -234,6 +234,7 @@ for official NautilusTrader documentation.
 - [x] Phase 2: add adapter integration fixtures and example smoke tests.
 - [x] Phase 3: add account capability preflight.
 - [x] Phase 3: add assignment/exercise/expiry polling and lifecycle-risk handling.
-- [x] Phase 3: add active-risk option quote cache and explicitly defer true streaming transport.
+- [x] Phase 3: add active-risk option quote cache and option quote/trade streaming with snapshot
+      fallback.
 - [x] Phase 3: add historical option replay/research harness.
 - [ ] Phase 3: broaden remaining data, order, and historical-data support.

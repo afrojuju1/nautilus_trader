@@ -22,6 +22,14 @@ Sources:
 - Postgres `candidate_ledger` records for the configured storage account.
 - Alpaca historical option bars from `AlpacaHttpClient::option_bars`.
 
+Availability and entitlement:
+
+- Alpaca historical option bars require option market-data entitlements for the configured feed.
+- Alpaca's historical option data availability begins in February 2024; earlier request ranges can
+  return empty or partial bar sets and should be treated as missing historical evidence.
+- Standard Nautilus `RequestBars` now uses the same Alpaca option-bar endpoint through
+  `AlpacaDataClient` for external LAST minute/hour/day option bars.
+
 Consumers:
 
 - Strategy threshold review.

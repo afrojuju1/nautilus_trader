@@ -69,10 +69,10 @@ Known gaps:
 - Assignment, exercise, and expiration lifecycle risk is now polled from Alpaca account activities
   and blocks entry admission when configured. Remaining lifecycle work is paper observation and
   performance-ledger attribution.
-- The scanner still relies primarily on REST snapshots. Active-risk option quote freshness now uses
-  explicit Nautilus quote subscriptions for active entries and high-rank candidates, backed by the
-  current Alpaca option snapshot poller. A true Alpaca option quote/trade stream decoder remains a
-  data-client latency and stream-health improvement.
+- The scanner still relies primarily on REST snapshots. Active-risk option quote freshness uses
+  explicit Nautilus quote subscriptions for active entries and high-rank candidates. The Alpaca
+  data client now prefers the option market-data WebSocket stream for quotes/trades and keeps REST
+  snapshots as quote fallback and Greeks transport.
 - Historical opportunity tracking exists, but strategy tuning still needs a replay/research harness
   over historical option data and candidate ledgers before sizing or strategy expansion is justified
   by evidence.
@@ -580,15 +580,18 @@ Required before promoting beyond experimental:
    Nautilus quote subscription path.**
    - `AlpacaOptionsStrategy` subscribes explicit active-entry option legs and top-ranked candidate
      option legs through Nautilus `subscribe_quotes`.
-   - `AlpacaDataClient` currently satisfies those subscriptions with Alpaca option REST snapshots
-     and emits `QuoteTick` values using Alpaca quote timestamps when present.
+   - `AlpacaDataClient` satisfies those subscriptions with Alpaca option market-data WebSocket
+     quotes when available, falls back to REST snapshots when the stream is unavailable, and emits
+     `QuoteTick` values using Alpaca event timestamps when present.
+   - Snapshot quote fallback resumes after two snapshot poll intervals without a stream quote, so
+     a connected-but-silent stream does not freeze the active-risk quote cache.
    - Management close marks and close triggers read the Nautilus quote cache first. Stale cached
      active-entry quotes block close attempts, emit `active_risk_quote_stale`, and surface in
      `alpaca-ops status`.
    - Candidate entry checks block on stale cached selected-leg quotes, but do not block first-time
      entries solely because the subscription cache has not emitted yet.
-   - Remaining data-client improvement: add a true Alpaca option quote/trade websocket decoder and
-     stream-health handling to reduce REST snapshot latency.
+   - `alpaca-ops status` includes the latest `option_market_data_stream` event so operators can
+     distinguish stream-backed freshness from snapshot fallback.
 
 4. Historical option research and replay harness. **Status: initial read-only harness complete.**
    - `alpaca-ops replay` replays candidate ledgers against Alpaca historical option bars where
@@ -755,8 +758,8 @@ Implement the Phase 7.5 required platform work in this order:
 1. Account capability preflight. Done in the runtime path.
 2. Assignment, exercise, and expiration risk daemon. Done for runtime gating and operator status.
 3. Active-risk option quote cache on the current Nautilus subscription path. Done for runtime
-   gating and operator status; true option quote/trade streaming remains a later data-client
-   improvement.
+   gating and operator status; option quote/trade streaming is wired with snapshot fallback and
+   still needs market-hours entitlement validation.
 4. Historical option research and replay harness. Initial read-only `alpaca-ops replay` command is
    done for historical option-bar marks and aggregate summaries; richer historical Greek and
    option-chain evidence depends on warehouse availability.

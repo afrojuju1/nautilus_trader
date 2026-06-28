@@ -16,5 +16,6 @@
 //! Alpaca account WebSocket support.
 
 pub mod client;
+pub(crate) mod market_data;
 pub mod messages;
 pub mod parse;

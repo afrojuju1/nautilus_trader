@@ -18,7 +18,7 @@
 use crate::common::{
     credentials::AlpacaCredential,
     urls::{
-        DATA_BASE_URL, LIVE_TRADE_UPDATES_WS_URL, LIVE_TRADING_BASE_URL,
+        DATA_BASE_URL, LIVE_TRADE_UPDATES_WS_URL, LIVE_TRADING_BASE_URL, OPTION_WS_URL,
         PAPER_TRADE_UPDATES_WS_URL, PAPER_TRADING_BASE_URL,
     },
 };
@@ -111,6 +111,8 @@ pub struct AlpacaDataClientConfig {
     pub environment: AlpacaEnvironment,
     /// Optional override for the market data REST base URL.
     pub data_base_url: Option<String>,
+    /// Optional override for the option market data WebSocket base URL.
+    pub option_market_data_ws_url: Option<String>,
     /// Optional override for the trading REST base URL.
     pub trading_base_url: Option<String>,
     /// Stock market data feed.
@@ -130,6 +132,7 @@ impl Default for AlpacaDataClientConfig {
             api_secret: None,
             environment: AlpacaEnvironment::default(),
             data_base_url: None,
+            option_market_data_ws_url: None,
             trading_base_url: None,
             stock_feed: AlpacaStockFeed::default(),
             option_feed: AlpacaOptionFeed::default(),
@@ -150,6 +153,14 @@ impl AlpacaDataClientConfig {
     #[must_use]
     pub fn resolved_data_base_url(&self) -> &str {
         self.data_base_url.as_deref().unwrap_or(DATA_BASE_URL)
+    }
+
+    /// Returns the option market data WebSocket URL, considering overrides and feed selection.
+    #[must_use]
+    pub fn resolved_option_market_data_ws_url(&self) -> String {
+        self.option_market_data_ws_url
+            .clone()
+            .unwrap_or_else(|| format!("{OPTION_WS_URL}/{}", self.option_feed.as_str()))
     }
 
     /// Returns the trading REST base URL, considering overrides and environment.

@@ -51,6 +51,7 @@ live = [
   "dep:nautilus-trading",
   "dep:sqlx",
   "dep:rust_decimal",
+  "dep:rmp-serde",
   "dep:toml",
   "dep:tokio-tungstenite",
   "dep:uuid",
@@ -94,6 +95,7 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 reqwest = { workspace = true }
 rust_decimal = { workspace = true, optional = true }
+rmp-serde = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true, optional = true }

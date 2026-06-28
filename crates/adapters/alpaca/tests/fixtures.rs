@@ -11,7 +11,7 @@ use nautilus_alpaca::{
         },
         credentials::AlpacaCredential,
         urls::{
-            DATA_BASE_URL, LIVE_TRADE_UPDATES_WS_URL, LIVE_TRADING_BASE_URL,
+            DATA_BASE_URL, LIVE_TRADE_UPDATES_WS_URL, LIVE_TRADING_BASE_URL, OPTION_WS_URL,
             PAPER_TRADE_UPDATES_WS_URL, PAPER_TRADING_BASE_URL,
         },
     },
@@ -150,6 +150,10 @@ fn credentials_resolve_primary_and_fallback_environment_names() {
 fn configs_resolve_default_and_override_endpoints() {
     let data = AlpacaDataClientConfig::default();
     assert_eq!(data.resolved_data_base_url(), DATA_BASE_URL);
+    assert_eq!(
+        data.resolved_option_market_data_ws_url(),
+        format!("{OPTION_WS_URL}/indicative")
+    );
     assert_eq!(data.resolved_trading_base_url(), PAPER_TRADING_BASE_URL);
     assert_eq!(data.stock_feed, AlpacaStockFeed::Iex);
     assert_eq!(data.option_feed, AlpacaOptionFeed::Indicative);
@@ -157,6 +161,7 @@ fn configs_resolve_default_and_override_endpoints() {
     let data_override = AlpacaDataClientConfig {
         environment: AlpacaEnvironment::Live,
         data_base_url: Some("http://localhost:9101".to_string()),
+        option_market_data_ws_url: Some("ws://localhost:9103/v1beta1/opra".to_string()),
         trading_base_url: Some("http://localhost:9102".to_string()),
         stock_feed: AlpacaStockFeed::Sip,
         option_feed: AlpacaOptionFeed::Opra,
@@ -169,6 +174,10 @@ fn configs_resolve_default_and_override_endpoints() {
     assert_eq!(
         data_override.resolved_trading_base_url(),
         "http://localhost:9102",
+    );
+    assert_eq!(
+        data_override.resolved_option_market_data_ws_url(),
+        "ws://localhost:9103/v1beta1/opra",
     );
     assert_eq!(data_override.stock_feed.as_str(), "sip");
     assert_eq!(data_override.option_feed.as_str(), "opra");

@@ -92,6 +92,7 @@ struct OperatorStatus {
     last_management_snapshot: Option<Value>,
     last_management_block: Option<Value>,
     last_active_risk_quote_cache: Option<Value>,
+    last_option_market_data_stream: Option<Value>,
     last_lifecycle_event: Option<Value>,
     last_broker_event: Option<Value>,
     alerts: Vec<OperatorAlert>,
@@ -582,6 +583,7 @@ fn build_status(
     let last_management_snapshot = latest_event(events, "management_snapshot");
     let last_management_block = latest_event(events, "management_block");
     let last_active_risk_quote_cache = latest_event(events, "active_risk_quote_cache");
+    let last_option_market_data_stream = latest_event(events, "option_market_data_stream");
     let last_lifecycle_event = latest_event(events, "option_lifecycle_poll")
         .or_else(|| latest_event(events, "option_lifecycle_poll_error"));
     let last_broker_event = latest_broker_event(recent_orders, activities);
@@ -629,6 +631,7 @@ fn build_status(
         last_management_snapshot,
         last_management_block,
         last_active_risk_quote_cache,
+        last_option_market_data_stream,
         last_lifecycle_event,
         last_broker_event,
         alerts,
@@ -1095,6 +1098,13 @@ fn print_human_status(status: &OperatorStatus) {
         "last_active_risk_quote_cache: {}",
         status
             .last_active_risk_quote_cache
+            .as_ref()
+            .map_or_else(|| "none".to_string(), compact_json)
+    );
+    println!(
+        "last_option_market_data_stream: {}",
+        status
+            .last_option_market_data_stream
             .as_ref()
             .map_or_else(|| "none".to_string(), compact_json)
     );

@@ -5479,6 +5479,7 @@ dependencies = [
  "pyo3",
  "pyo3-stub-gen",
  "reqwest 0.13.4",
+ "rmp-serde",
  "rust_decimal",
  "serde",
  "serde_json",

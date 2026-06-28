@@ -39,12 +39,24 @@ and strategies.
     `cargo run -p nautilus-alpaca --features live,backtest-node --bin alpaca-option-chain-scan-node -- <CATALOG_PATH> <UNDERLYING> [VENUE]`.
 - [x] Add Alpaca live data-client support for option `QuoteTick` and `OptionGreeks` subscriptions
   before wiring the actor into a live `TradingNode`.
-  - Implemented through a shared Alpaca option snapshot poller in `AlpacaDataClient`.
+  - Implemented through `AlpacaDataClient` using Nautilus-native subscriptions.
   - `subscribe_quotes` emits Nautilus `QuoteTick`, `subscribe_option_greeks` emits
     `OptionGreeks`, and `request_forward_prices` bootstraps ATM-relative chains from stock
     snapshots.
-  - Remaining live-data improvement: replace or augment REST polling with Alpaca option WebSocket
-    streams when that path is added.
+  - Option quote subscriptions prefer Alpaca's option market-data WebSocket `v1beta1/{feed}` stream
+    using MsgPack frames, and keep the REST snapshot poller as quote fallback when the stream is
+    unavailable or returns entitlement/protocol errors.
+  - Snapshot quote fallback also resumes when no stream quote has arrived for two snapshot poll
+    intervals, so a connected-but-silent stream does not freeze active-risk freshness.
+  - Option trade subscriptions use the standard Nautilus `subscribe_trades` path and emit
+    `TradeTick` values with `AggressorSide::NoAggressor` because Alpaca's stream does not provide
+    aggressor side.
+  - `OptionGreeks` remain snapshot-backed because the option stream does not carry Greeks.
+  - Standard external-LAST `RequestBars` for Alpaca option instruments now map to Alpaca historical
+    option bars through `AlpacaDataClient`; unsupported bar aggregations return an empty
+    `BarsResponse` after logging the request error.
+  - `alpaca-ops status` surfaces the latest `option_market_data_stream` event so operators can see
+    stream vs snapshot-fallback source and feed.
 - [x] Add a REST-vs-option-chain comparison command for the same symbol, expiry, and scan time.
   - Implemented as `alpaca-compare-option-chain-scan`.
   - It loads one Alpaca REST option snapshot for the requested underlying/expiry, scans the same
@@ -244,6 +256,8 @@ loop.
     `subscribe_quotes`.
   - Cached `QuoteTick` timestamps drive stale-quote close blocks, selected-candidate freshness
     blocks when a stale cached quote exists, and `alpaca-ops status` quote-cache/stale alerts.
+  - The Alpaca data client fills those cache entries from the option stream when fresh stream quotes
+    are available and suppresses quote snapshot refresh only while stream quote freshness is current.
   - Missing active close-leg quotes remain a `close_quote_missing` management block; first-time
     candidate entries are not blocked solely because the subscription cache has not emitted yet.
 - [x] Remove direct management behavior from the account-engine loop once the new owner is proven.

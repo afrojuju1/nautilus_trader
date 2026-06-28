@@ -5,7 +5,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -18,11 +18,12 @@ use nautilus_common::{
     messages::{
         DataEvent,
         data::{
-            DataResponse, ForwardPricesResponse, InstrumentResponse, InstrumentsResponse,
-            RequestForwardPrices, RequestInstrument, RequestInstruments, SubscribeInstrument,
-            SubscribeInstrumentStatus, SubscribeInstruments, SubscribeOptionGreeks,
-            SubscribeQuotes, UnsubscribeInstrument, UnsubscribeInstrumentStatus,
-            UnsubscribeInstruments, UnsubscribeOptionGreeks, UnsubscribeQuotes,
+            BarsResponse, DataResponse, ForwardPricesResponse, InstrumentResponse,
+            InstrumentsResponse, RequestBars, RequestForwardPrices, RequestInstrument,
+            RequestInstruments, SubscribeInstrument, SubscribeInstrumentStatus,
+            SubscribeInstruments, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
+            UnsubscribeInstrument, UnsubscribeInstrumentStatus, UnsubscribeInstruments,
+            UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
@@ -32,35 +33,57 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{Data, ForwardPrice, QuoteTick, greeks::OptionGreekValues, option_chain::OptionGreeks},
-    enums::GreeksConvention,
-    identifiers::{ClientId, InstrumentId, Venue},
+    data::{
+        Bar, BarType, Data, ForwardPrice, QuoteTick, TradeTick, greeks::OptionGreekValues,
+        option_chain::OptionGreeks,
+    },
+    enums::{AggressorSide, BarAggregation, GreeksConvention, PriceType},
+    identifiers::{ClientId, InstrumentId, TradeId, Venue},
     instruments::{Instrument, InstrumentAny},
 };
+use nautilus_network::websocket::{
+    TransportBackend, WebSocketClient, WebSocketConfig, channel_message_handler,
+};
 use rust_decimal::Decimal;
-use tokio::task::JoinHandle;
+use serde_json::json;
+use tokio::{sync::mpsc, task::JoinHandle};
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::{
-    common::consts::{
-        ALPACA_OPEN_INTEREST_INFO_KEY, ALPACA_OPTION_CHAIN_EXPIRATION_PARAM,
-        ALPACA_OPTION_CHAIN_MAX_EXPIRATION_PARAM, ALPACA_OPTION_CHAIN_MIN_EXPIRATION_PARAM,
-        ALPACA_OPTION_CHAIN_TYPE_PARAM, ALPACA_OPTION_CHAIN_UNDERLYING_PARAM, ALPACA_VENUE,
+    common::{
+        consts::{
+            ALPACA_OPEN_INTEREST_INFO_KEY, ALPACA_OPTION_CHAIN_EXPIRATION_PARAM,
+            ALPACA_OPTION_CHAIN_MAX_EXPIRATION_PARAM, ALPACA_OPTION_CHAIN_MIN_EXPIRATION_PARAM,
+            ALPACA_OPTION_CHAIN_TYPE_PARAM, ALPACA_OPTION_CHAIN_UNDERLYING_PARAM, ALPACA_VENUE,
+        },
+        credentials::AlpacaCredential,
     },
     config::AlpacaDataClientConfig,
     http::{
         client::AlpacaHttpClient,
         models::{
-            AlpacaOptionContract, AlpacaOptionQuote, AlpacaOptionSnapshot, AlpacaOptionType,
-            OptionSnapshotsRequest, StockSnapshotsRequest,
+            AlpacaOptionBar, AlpacaOptionContract, AlpacaOptionQuote, AlpacaOptionSnapshot,
+            AlpacaOptionType, OptionBarsRequest, OptionSnapshotsRequest, StockSnapshotsRequest,
         },
     },
     parse::{
         AlpacaOptionSymbolParts, canonical_alpaca_option_symbol, parse_alpaca_option_instrument_id,
     },
     providers::AlpacaOptionContractProvider,
+    runtime::emit_operator_event,
+    websocket::market_data::{
+        AlpacaOptionMarketDataMessage, AlpacaOptionMarketDataSubscriptionRequest,
+        AlpacaOptionStreamQuote, AlpacaOptionStreamTrade, parse_option_market_data_message,
+    },
 };
 
 const DEFAULT_OPTION_SNAPSHOT_POLL_SECS: u64 = 5;
+const OPTION_MARKET_DATA_WS_HEARTBEAT_SECS: u64 = 30;
+const OPTION_MARKET_DATA_RECONNECT_TIMEOUT_MS: u64 = 10_000;
+const OPTION_MARKET_DATA_RECONNECT_DELAY_INITIAL_MS: u64 = 1_000;
+const OPTION_MARKET_DATA_RECONNECT_DELAY_MAX_MS: u64 = 30_000;
+const OPTION_MARKET_DATA_RECONNECT_BACKOFF_FACTOR: f64 = 2.0;
+const OPTION_MARKET_DATA_RECONNECT_JITTER_MS: u64 = 250;
 
 #[derive(Debug, Default)]
 struct OptionSnapshotSubscriptions {
@@ -74,11 +97,15 @@ impl OptionSnapshotSubscriptions {
         self.quote_instrument_ids.is_empty() && self.greeks_instrument_ids.is_empty()
     }
 
-    fn instrument_ids(&self) -> Vec<InstrumentId> {
-        self.quote_instrument_ids
-            .union(&self.greeks_instrument_ids)
-            .copied()
-            .collect()
+    fn instrument_ids(&self, include_quote_snapshots: bool) -> Vec<InstrumentId> {
+        if include_quote_snapshots {
+            self.quote_instrument_ids
+                .union(&self.greeks_instrument_ids)
+                .copied()
+                .collect()
+        } else {
+            self.greeks_instrument_ids.iter().copied().collect()
+        }
     }
 
     fn should_emit_quote(&self, instrument_id: &InstrumentId) -> bool {
@@ -87,6 +114,162 @@ impl OptionSnapshotSubscriptions {
 
     fn should_emit_greeks(&self, instrument_id: &InstrumentId) -> bool {
         self.greeks_instrument_ids.contains(instrument_id)
+    }
+}
+
+#[derive(Debug, Default)]
+struct OptionMarketDataSubscriptions {
+    quote_instrument_ids: BTreeSet<InstrumentId>,
+    trade_instrument_ids: BTreeSet<InstrumentId>,
+    is_streaming: bool,
+    cmd_tx: Option<mpsc::UnboundedSender<OptionMarketDataCommand>>,
+}
+
+impl OptionMarketDataSubscriptions {
+    fn is_empty(&self) -> bool {
+        self.quote_instrument_ids.is_empty() && self.trade_instrument_ids.is_empty()
+    }
+
+    fn quote_symbols(&self) -> Vec<String> {
+        instrument_symbols_for_stream(&self.quote_instrument_ids)
+    }
+
+    fn trade_symbols(&self) -> Vec<String> {
+        instrument_symbols_for_stream(&self.trade_instrument_ids)
+    }
+
+    fn instrument_id_for_symbol(&self, symbol: &str) -> Option<InstrumentId> {
+        self.quote_instrument_ids
+            .iter()
+            .chain(self.trade_instrument_ids.iter())
+            .copied()
+            .find(|instrument_id| {
+                alpaca_symbol_from_instrument_id(*instrument_id).eq_ignore_ascii_case(symbol)
+            })
+    }
+}
+
+#[derive(Debug)]
+enum OptionMarketDataCommand {
+    Subscribe {
+        quotes: Vec<String>,
+        trades: Vec<String>,
+    },
+    Unsubscribe {
+        quotes: Vec<String>,
+        trades: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OptionMarketDataSource {
+    Unknown,
+    Stream,
+    SnapshotFallback,
+    Error,
+}
+
+impl OptionMarketDataSource {
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::Stream => 1,
+            Self::SnapshotFallback => 2,
+            Self::Error => 3,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Stream => "stream",
+            Self::SnapshotFallback => "snapshot_fallback",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OptionMarketDataRuntimeState {
+    source: AtomicU8,
+    last_stream_quote_init_ns: AtomicU64,
+}
+
+impl Default for OptionMarketDataRuntimeState {
+    fn default() -> Self {
+        Self {
+            source: AtomicU8::new(OptionMarketDataSource::Unknown.as_u8()),
+            last_stream_quote_init_ns: AtomicU64::new(0),
+        }
+    }
+}
+
+impl OptionMarketDataRuntimeState {
+    fn is_quote_stream_fresh(
+        &self,
+        clock: &'static AtomicTime,
+        quote_snapshot_fallback_after: Duration,
+    ) -> bool {
+        if self.source.load(Ordering::Acquire) != OptionMarketDataSource::Stream.as_u8() {
+            return false;
+        }
+
+        let last_stream_quote_init_ns = self.last_stream_quote_init_ns.load(Ordering::Acquire);
+        last_stream_quote_init_ns > 0
+            && clock
+                .get_time_ns()
+                .as_u64()
+                .saturating_sub(last_stream_quote_init_ns)
+                <= quote_snapshot_fallback_after.as_nanos() as u64
+    }
+
+    fn reset(&self) {
+        self.source
+            .store(OptionMarketDataSource::Unknown.as_u8(), Ordering::Release);
+        self.last_stream_quote_init_ns.store(0, Ordering::Release);
+    }
+
+    fn mark_stream_quote(
+        &self,
+        feed: &str,
+        quote_subscriptions: usize,
+        trade_subscriptions: usize,
+        clock: &'static AtomicTime,
+    ) {
+        self.last_stream_quote_init_ns
+            .store(clock.get_time_ns().as_u64(), Ordering::Release);
+        self.mark_source(
+            OptionMarketDataSource::Stream,
+            feed,
+            "quote",
+            quote_subscriptions,
+            trade_subscriptions,
+        );
+    }
+
+    fn mark_source(
+        &self,
+        source: OptionMarketDataSource,
+        feed: &str,
+        reason: &str,
+        quote_subscriptions: usize,
+        trade_subscriptions: usize,
+    ) {
+        let previous = self.source.swap(source.as_u8(), Ordering::AcqRel);
+        if previous == source.as_u8() {
+            return;
+        }
+
+        emit_operator_event(
+            "option_market_data_stream",
+            json!({
+                "source": source.as_str(),
+                "feed": feed,
+                "reason": reason,
+                "quote_subscriptions": quote_subscriptions,
+                "trade_subscriptions": trade_subscriptions,
+            }),
+        );
     }
 }
 
@@ -110,6 +293,8 @@ pub struct AlpacaDataClient {
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     option_snapshot_subscriptions: Arc<Mutex<OptionSnapshotSubscriptions>>,
+    option_market_data_subscriptions: Arc<Mutex<OptionMarketDataSubscriptions>>,
+    option_market_data_state: Arc<OptionMarketDataRuntimeState>,
 }
 
 impl AlpacaDataClient {
@@ -134,6 +319,10 @@ impl AlpacaDataClient {
             option_snapshot_subscriptions: Arc::new(Mutex::new(
                 OptionSnapshotSubscriptions::default(),
             )),
+            option_market_data_subscriptions: Arc::new(Mutex::new(
+                OptionMarketDataSubscriptions::default(),
+            )),
+            option_market_data_state: Arc::new(OptionMarketDataRuntimeState::default()),
         })
     }
 
@@ -192,7 +381,9 @@ impl AlpacaDataClient {
         let sender = self.data_sender.clone();
         let instruments = self.instruments.clone();
         let subscriptions = self.option_snapshot_subscriptions.clone();
+        let market_data_state = self.option_market_data_state.clone();
         let interval = self.option_snapshot_poll_interval();
+        let quote_snapshot_fallback_after = interval + interval;
         let feed = self.config.option_feed.as_str().to_string();
         let clock = self.clock;
 
@@ -203,6 +394,8 @@ impl AlpacaDataClient {
                     &sender,
                     &instruments,
                     &subscriptions,
+                    &market_data_state,
+                    quote_snapshot_fallback_after,
                     &feed,
                     clock,
                 )
@@ -229,6 +422,103 @@ impl AlpacaDataClient {
             .lock()
             .expect(MUTEX_POISONED)
             .is_polling = false;
+    }
+
+    fn ensure_option_market_data_stream(&self) {
+        if !self.is_connected() {
+            return;
+        }
+
+        let Some(credential) =
+            AlpacaCredential::resolve(self.config.api_key.clone(), self.config.api_secret.clone())
+        else {
+            let (quote_count, trade_count) = self.option_market_data_subscription_counts();
+            self.option_market_data_state.mark_source(
+                OptionMarketDataSource::SnapshotFallback,
+                self.config.option_feed.as_str(),
+                "missing_credentials",
+                quote_count,
+                trade_count,
+            );
+            self.ensure_option_snapshot_poller();
+            return;
+        };
+
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        {
+            let mut subscriptions = self
+                .option_market_data_subscriptions
+                .lock()
+                .expect(MUTEX_POISONED);
+            if subscriptions.is_streaming || subscriptions.is_empty() {
+                return;
+            }
+
+            subscriptions.is_streaming = true;
+            subscriptions.cmd_tx = Some(cmd_tx);
+        }
+
+        let url = self.config.resolved_option_market_data_ws_url();
+        let sender = self.data_sender.clone();
+        let instruments = self.instruments.clone();
+        let subscriptions = self.option_market_data_subscriptions.clone();
+        let market_data_state = self.option_market_data_state.clone();
+        let feed = self.config.option_feed.as_str().to_string();
+        let clock = self.clock;
+
+        self.spawn_task("option_market_data_stream", async move {
+            let result = stream_option_market_data(
+                url,
+                credential,
+                sender,
+                instruments,
+                subscriptions.clone(),
+                market_data_state.clone(),
+                feed.clone(),
+                clock,
+                cmd_rx,
+            )
+            .await;
+
+            {
+                let mut subscriptions = subscriptions.lock().expect(MUTEX_POISONED);
+                subscriptions.is_streaming = false;
+                subscriptions.cmd_tx = None;
+            }
+
+            if let Err(error) = &result {
+                let (quote_count, trade_count) = option_market_data_subscription_counts(
+                    &subscriptions.lock().expect(MUTEX_POISONED),
+                );
+                market_data_state.mark_source(
+                    OptionMarketDataSource::Error,
+                    &feed,
+                    &error.to_string(),
+                    quote_count,
+                    trade_count,
+                );
+            }
+
+            result
+        });
+    }
+
+    fn mark_option_market_data_stream_stopped(&self) {
+        let mut subscriptions = self
+            .option_market_data_subscriptions
+            .lock()
+            .expect(MUTEX_POISONED);
+        subscriptions.is_streaming = false;
+        subscriptions.cmd_tx = None;
+        self.option_market_data_state.reset();
+    }
+
+    fn option_market_data_subscription_counts(&self) -> (usize, usize) {
+        let subscriptions = self
+            .option_market_data_subscriptions
+            .lock()
+            .expect(MUTEX_POISONED);
+        option_market_data_subscription_counts(&subscriptions)
     }
 
     async fn load_option_instrument(
@@ -287,6 +577,94 @@ impl AlpacaDataClient {
         self.ensure_option_snapshot_poller();
     }
 
+    fn subscribe_option_market_data_quotes(&self, instrument_id: InstrumentId) {
+        let symbol = alpaca_symbol_from_instrument_id(instrument_id);
+        let inserted = {
+            let mut subscriptions = self
+                .option_market_data_subscriptions
+                .lock()
+                .expect(MUTEX_POISONED);
+            subscriptions.quote_instrument_ids.insert(instrument_id)
+        };
+
+        if inserted {
+            self.send_option_market_data_command(OptionMarketDataCommand::Subscribe {
+                quotes: vec![symbol],
+                trades: Vec::new(),
+            });
+        }
+        self.ensure_option_market_data_stream();
+    }
+
+    fn unsubscribe_option_market_data_quotes(&self, instrument_id: InstrumentId) {
+        let symbol = alpaca_symbol_from_instrument_id(instrument_id);
+        let removed = {
+            let mut subscriptions = self
+                .option_market_data_subscriptions
+                .lock()
+                .expect(MUTEX_POISONED);
+            subscriptions.quote_instrument_ids.remove(&instrument_id)
+        };
+
+        if removed {
+            self.send_option_market_data_command(OptionMarketDataCommand::Unsubscribe {
+                quotes: vec![symbol],
+                trades: Vec::new(),
+            });
+        }
+    }
+
+    fn subscribe_option_market_data_trades(&self, instrument_id: InstrumentId) {
+        let symbol = alpaca_symbol_from_instrument_id(instrument_id);
+        let inserted = {
+            let mut subscriptions = self
+                .option_market_data_subscriptions
+                .lock()
+                .expect(MUTEX_POISONED);
+            subscriptions.trade_instrument_ids.insert(instrument_id)
+        };
+
+        if inserted {
+            self.send_option_market_data_command(OptionMarketDataCommand::Subscribe {
+                quotes: Vec::new(),
+                trades: vec![symbol],
+            });
+        }
+        self.ensure_option_market_data_stream();
+    }
+
+    fn unsubscribe_option_market_data_trades(&self, instrument_id: InstrumentId) {
+        let symbol = alpaca_symbol_from_instrument_id(instrument_id);
+        let removed = {
+            let mut subscriptions = self
+                .option_market_data_subscriptions
+                .lock()
+                .expect(MUTEX_POISONED);
+            subscriptions.trade_instrument_ids.remove(&instrument_id)
+        };
+
+        if removed {
+            self.send_option_market_data_command(OptionMarketDataCommand::Unsubscribe {
+                quotes: Vec::new(),
+                trades: vec![symbol],
+            });
+        }
+    }
+
+    fn send_option_market_data_command(&self, command: OptionMarketDataCommand) {
+        let cmd_tx = self
+            .option_market_data_subscriptions
+            .lock()
+            .expect(MUTEX_POISONED)
+            .cmd_tx
+            .clone();
+        if let Some(cmd_tx) = cmd_tx
+            && let Err(error) = cmd_tx.send(command)
+        {
+            log::debug!("Alpaca option market-data stream command channel closed: {error}");
+        }
+    }
+
     fn subscribe_option_snapshot_greeks(&self, instrument_id: InstrumentId) {
         let mut subscriptions = self
             .option_snapshot_subscriptions
@@ -323,6 +701,7 @@ impl DataClient for AlpacaDataClient {
         log::info!("Stopping Alpaca data client {}", self.client_id);
         self.abort_pending_tasks();
         self.mark_option_snapshot_poller_stopped();
+        self.mark_option_market_data_stream_stopped();
         self.is_connected.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -338,6 +717,15 @@ impl DataClient for AlpacaDataClient {
         subscriptions.quote_instrument_ids.clear();
         subscriptions.greeks_instrument_ids.clear();
         subscriptions.is_polling = false;
+        let mut market_data_subscriptions = self
+            .option_market_data_subscriptions
+            .lock()
+            .expect(MUTEX_POISONED);
+        market_data_subscriptions.quote_instrument_ids.clear();
+        market_data_subscriptions.trade_instrument_ids.clear();
+        market_data_subscriptions.is_streaming = false;
+        market_data_subscriptions.cmd_tx = None;
+        self.option_market_data_state.reset();
         self.is_connected.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -362,6 +750,7 @@ impl DataClient for AlpacaDataClient {
 
         self.is_connected.store(true, Ordering::Release);
         self.ensure_option_snapshot_poller();
+        self.ensure_option_market_data_stream();
         log::info!("Connected: client_id={}", self.client_id);
         Ok(())
     }
@@ -373,16 +762,14 @@ impl DataClient for AlpacaDataClient {
 
         self.abort_pending_tasks();
         self.mark_option_snapshot_poller_stopped();
+        self.mark_option_market_data_stream_stopped();
         self.is_connected.store(false, Ordering::Release);
         log::info!("Disconnected: client_id={}", self.client_id);
         Ok(())
     }
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
-        log::debug!(
-            "Subscribing to Alpaca option snapshot quotes: {}",
-            cmd.instrument_id,
-        );
+        log::debug!("Subscribing to Alpaca option quotes: {}", cmd.instrument_id,);
         anyhow::ensure!(
             cmd.instrument_id.venue == self.venue(),
             "expected Alpaca venue {}, got {}",
@@ -401,13 +788,14 @@ impl DataClient for AlpacaDataClient {
             cmd.params,
         ))?;
         self.subscribe_option_snapshot_quotes(instrument_id);
+        self.subscribe_option_market_data_quotes(instrument_id);
 
         Ok(())
     }
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
         log::debug!(
-            "Unsubscribing from Alpaca option snapshot quotes: {}",
+            "Unsubscribing from Alpaca option quotes: {}",
             cmd.instrument_id,
         );
         self.option_snapshot_subscriptions
@@ -415,6 +803,40 @@ impl DataClient for AlpacaDataClient {
             .expect(MUTEX_POISONED)
             .quote_instrument_ids
             .remove(&cmd.instrument_id);
+        self.unsubscribe_option_market_data_quotes(cmd.instrument_id);
+        Ok(())
+    }
+
+    fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
+        log::debug!("Subscribing to Alpaca option trades: {}", cmd.instrument_id);
+        anyhow::ensure!(
+            cmd.instrument_id.venue == self.venue(),
+            "expected Alpaca venue {}, got {}",
+            self.venue(),
+            cmd.instrument_id.venue,
+        );
+
+        let instrument_id = cmd.instrument_id;
+        self.subscribe_instrument(SubscribeInstrument::new(
+            instrument_id,
+            cmd.client_id,
+            cmd.venue,
+            cmd.command_id,
+            cmd.ts_init,
+            cmd.correlation_id,
+            cmd.params,
+        ))?;
+        self.subscribe_option_market_data_trades(instrument_id);
+
+        Ok(())
+    }
+
+    fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
+        log::debug!(
+            "Unsubscribing from Alpaca option trades: {}",
+            cmd.instrument_id
+        );
+        self.unsubscribe_option_market_data_trades(cmd.instrument_id);
         Ok(())
     }
 
@@ -659,6 +1081,65 @@ impl DataClient for AlpacaDataClient {
         Ok(())
     }
 
+    fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
+        log::debug!("Requesting Alpaca option bars: {}", request.bar_type);
+
+        let http_client = self.http_client.clone();
+        let sender = self.data_sender.clone();
+        let instruments = self.instruments.clone();
+        let clock = self.clock;
+        let bar_type = request.bar_type;
+        let start = request.start;
+        let end = request.end;
+        let limit = request.limit.map(std::num::NonZeroUsize::get);
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let params = request.params;
+        let start_nanos = datetime_to_unix_nanos(start);
+        let end_nanos = datetime_to_unix_nanos(end);
+        let feed = self.config.option_feed.as_str().to_string();
+
+        self.spawn_task("request_option_bars", async move {
+            let bars = match request_option_bars_from_http(
+                &http_client,
+                &instruments,
+                bar_type,
+                start,
+                end,
+                limit,
+                &feed,
+                clock,
+            )
+            .await
+            {
+                Ok(bars) => bars,
+                Err(error) => {
+                    log::warn!("Alpaca option bar request failed: {error:#}");
+                    Vec::new()
+                }
+            };
+
+            let response = DataResponse::Bars(BarsResponse::new(
+                request_id,
+                client_id,
+                bar_type,
+                bars,
+                start_nanos,
+                end_nanos,
+                clock.get_time_ns(),
+                params,
+            ));
+
+            if let Err(error) = sender.send(DataEvent::Response(response)) {
+                log::error!("Failed to send Alpaca option bars response: {error}");
+            }
+
+            Ok(())
+        });
+
+        Ok(())
+    }
+
     fn request_forward_prices(&self, request: RequestForwardPrices) -> anyhow::Result<()> {
         let http_client = self.http_client.clone();
         let sender = self.data_sender.clone();
@@ -800,16 +1281,23 @@ async fn poll_option_snapshots(
     sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     subscriptions: &Arc<Mutex<OptionSnapshotSubscriptions>>,
+    market_data_state: &Arc<OptionMarketDataRuntimeState>,
+    quote_snapshot_fallback_after: Duration,
     feed: &str,
     clock: &'static AtomicTime,
 ) -> anyhow::Result<bool> {
+    let include_quote_snapshots =
+        !market_data_state.is_quote_stream_fresh(clock, quote_snapshot_fallback_after);
     let instrument_ids = {
         let subscriptions = subscriptions.lock().expect(MUTEX_POISONED);
         if subscriptions.is_empty() {
             return Ok(false);
         }
-        subscriptions.instrument_ids()
+        subscriptions.instrument_ids(include_quote_snapshots)
     };
+    if instrument_ids.is_empty() {
+        return Ok(true);
+    }
 
     let mut request = OptionSnapshotsRequest::for_symbols(
         instrument_ids
@@ -849,6 +1337,18 @@ async fn poll_option_snapshots(
                 clock,
             )
         {
+            let quote_count = subscriptions
+                .lock()
+                .expect(MUTEX_POISONED)
+                .quote_instrument_ids
+                .len();
+            market_data_state.mark_source(
+                OptionMarketDataSource::SnapshotFallback,
+                feed,
+                "snapshot_quote",
+                quote_count,
+                0,
+            );
             send_data_event(sender, DataEvent::Data(Data::Quote(quote)), "option quote");
         }
         if emit_greeks
@@ -859,6 +1359,358 @@ async fn poll_option_snapshots(
     }
 
     Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_option_market_data(
+    url: String,
+    credential: AlpacaCredential,
+    sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    subscriptions: Arc<Mutex<OptionMarketDataSubscriptions>>,
+    market_data_state: Arc<OptionMarketDataRuntimeState>,
+    feed: String,
+    clock: &'static AtomicTime,
+    mut cmd_rx: mpsc::UnboundedReceiver<OptionMarketDataCommand>,
+) -> anyhow::Result<()> {
+    let (message_handler, mut raw_rx) = channel_message_handler();
+    let cfg = WebSocketConfig {
+        url,
+        headers: vec![
+            (
+                "APCA-API-KEY-ID".to_string(),
+                credential.api_key().to_string(),
+            ),
+            (
+                "APCA-API-SECRET-KEY".to_string(),
+                credential.api_secret().to_string(),
+            ),
+            (
+                "Content-Type".to_string(),
+                "application/msgpack".to_string(),
+            ),
+        ],
+        heartbeat: Some(OPTION_MARKET_DATA_WS_HEARTBEAT_SECS),
+        heartbeat_msg: None,
+        reconnect_timeout_ms: Some(OPTION_MARKET_DATA_RECONNECT_TIMEOUT_MS),
+        reconnect_delay_initial_ms: Some(OPTION_MARKET_DATA_RECONNECT_DELAY_INITIAL_MS),
+        reconnect_delay_max_ms: Some(OPTION_MARKET_DATA_RECONNECT_DELAY_MAX_MS),
+        reconnect_backoff_factor: Some(OPTION_MARKET_DATA_RECONNECT_BACKOFF_FACTOR),
+        reconnect_jitter_ms: Some(OPTION_MARKET_DATA_RECONNECT_JITTER_MS),
+        reconnect_max_attempts: None,
+        idle_timeout_ms: None,
+        backend: TransportBackend::default(),
+        proxy_url: None,
+    };
+
+    let client = WebSocketClient::connect(cfg, Some(message_handler), None, None, Vec::new(), None)
+        .await
+        .context("failed to connect Alpaca option market-data stream")?;
+    send_current_option_market_data_subscription(&client, &subscriptions).await?;
+
+    loop {
+        tokio::select! {
+            Some(command) = cmd_rx.recv() => {
+                send_option_market_data_command(&client, command).await?;
+            }
+            Some(raw) = raw_rx.recv() => {
+                match raw {
+                    Message::Ping(data) => {
+                        if let Err(error) = client.send_pong(data.to_vec()).await {
+                            log::warn!("Failed to send Alpaca option market-data pong: {error}");
+                        }
+                    }
+                    Message::Close(_) => {
+                        client.notify_closed();
+                        return Err(anyhow!("Alpaca option market-data stream closed"));
+                    }
+                    other => {
+                        let messages = parse_option_market_data_message(&other)?;
+                        for message in messages {
+                            handle_option_market_data_message(
+                                message,
+                                &client,
+                                &sender,
+                                &instruments,
+                                &subscriptions,
+                                &market_data_state,
+                                &feed,
+                                clock,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+            else => {
+                client.notify_closed();
+                return Err(anyhow!("Alpaca option market-data stream channel closed"));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_option_market_data_message(
+    message: AlpacaOptionMarketDataMessage,
+    client: &WebSocketClient,
+    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    subscriptions: &Arc<Mutex<OptionMarketDataSubscriptions>>,
+    market_data_state: &Arc<OptionMarketDataRuntimeState>,
+    feed: &str,
+    clock: &'static AtomicTime,
+) -> anyhow::Result<()> {
+    match message {
+        AlpacaOptionMarketDataMessage::Quote(quote) => {
+            if let Some((instrument_id, instrument)) =
+                stream_instrument(&quote.symbol, subscriptions, instruments)
+                && let Some(tick) =
+                    option_stream_quote_tick(instrument_id, &instrument, &quote, clock)
+            {
+                let (quote_count, trade_count) = option_market_data_subscription_counts(
+                    &subscriptions.lock().expect(MUTEX_POISONED),
+                );
+                market_data_state.mark_stream_quote(feed, quote_count, trade_count, clock);
+                send_data_event(
+                    sender,
+                    DataEvent::Data(Data::Quote(tick)),
+                    "option stream quote",
+                );
+            }
+        }
+        AlpacaOptionMarketDataMessage::Trade(trade) => {
+            if let Some((instrument_id, instrument)) =
+                stream_instrument(&trade.symbol, subscriptions, instruments)
+                && let Some(tick) =
+                    option_stream_trade_tick(instrument_id, &instrument, &trade, clock)
+            {
+                let (quote_count, trade_count) = option_market_data_subscription_counts(
+                    &subscriptions.lock().expect(MUTEX_POISONED),
+                );
+                market_data_state.mark_source(
+                    OptionMarketDataSource::Stream,
+                    feed,
+                    "trade",
+                    quote_count,
+                    trade_count,
+                );
+                send_data_event(
+                    sender,
+                    DataEvent::Data(Data::Trade(tick)),
+                    "option stream trade",
+                );
+            }
+        }
+        AlpacaOptionMarketDataMessage::Subscription(subscription) => {
+            let quote_count = subscription.quotes.len();
+            let trade_count = subscription.trades.len();
+            log::info!(
+                "Alpaca option market-data subscriptions: quotes={} trades={}",
+                quote_count,
+                trade_count
+            );
+        }
+        AlpacaOptionMarketDataMessage::Success(success) => {
+            log::info!(
+                "Alpaca option market-data stream success: {}",
+                success.msg.as_deref().unwrap_or("ok")
+            );
+        }
+        AlpacaOptionMarketDataMessage::Error(error) => {
+            let reason = format!(
+                "code={} msg={}",
+                error
+                    .code
+                    .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+                error.msg.as_deref().unwrap_or("unknown")
+            );
+            let (quote_count, trade_count) = option_market_data_subscription_counts(
+                &subscriptions.lock().expect(MUTEX_POISONED),
+            );
+            market_data_state.mark_source(
+                OptionMarketDataSource::Error,
+                feed,
+                &reason,
+                quote_count,
+                trade_count,
+            );
+            return Err(anyhow!("Alpaca option market-data stream error: {reason}"));
+        }
+        AlpacaOptionMarketDataMessage::Reconnected => {
+            log::info!("Alpaca option market-data stream reconnected");
+            send_current_option_market_data_subscription(client, subscriptions).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_current_option_market_data_subscription(
+    client: &WebSocketClient,
+    subscriptions: &Arc<Mutex<OptionMarketDataSubscriptions>>,
+) -> anyhow::Result<()> {
+    let (quotes, trades) = {
+        let subscriptions = subscriptions.lock().expect(MUTEX_POISONED);
+        (subscriptions.quote_symbols(), subscriptions.trade_symbols())
+    };
+    send_option_market_data_request(
+        client,
+        AlpacaOptionMarketDataSubscriptionRequest::subscribe(quotes, trades),
+    )
+    .await
+}
+
+async fn send_option_market_data_command(
+    client: &WebSocketClient,
+    command: OptionMarketDataCommand,
+) -> anyhow::Result<()> {
+    let request = match command {
+        OptionMarketDataCommand::Subscribe { quotes, trades } => {
+            AlpacaOptionMarketDataSubscriptionRequest::subscribe(quotes, trades)
+        }
+        OptionMarketDataCommand::Unsubscribe { quotes, trades } => {
+            AlpacaOptionMarketDataSubscriptionRequest::unsubscribe(quotes, trades)
+        }
+    };
+    send_option_market_data_request(client, request).await
+}
+
+async fn send_option_market_data_request(
+    client: &WebSocketClient,
+    request: AlpacaOptionMarketDataSubscriptionRequest,
+) -> anyhow::Result<()> {
+    if request.is_empty() {
+        return Ok(());
+    }
+
+    let payload = request.to_msgpack_bytes()?;
+    client
+        .send_bytes(payload, None)
+        .await
+        .context("failed to send Alpaca option market-data subscription request")
+}
+
+fn stream_instrument(
+    symbol: &str,
+    subscriptions: &Arc<Mutex<OptionMarketDataSubscriptions>>,
+    instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+) -> Option<(InstrumentId, InstrumentAny)> {
+    let instrument_id = subscriptions
+        .lock()
+        .expect(MUTEX_POISONED)
+        .instrument_id_for_symbol(symbol)?;
+    let instrument = instruments.get_cloned(&instrument_id)?;
+    Some((instrument_id, instrument))
+}
+
+async fn request_option_bars_from_http(
+    http_client: &AlpacaHttpClient,
+    instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    bar_type: BarType,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    limit: Option<usize>,
+    feed: &str,
+    clock: &'static AtomicTime,
+) -> anyhow::Result<Vec<Bar>> {
+    anyhow::ensure!(
+        bar_type.is_standard(),
+        "Alpaca option bars require a standard bar type, got {bar_type}",
+    );
+    anyhow::ensure!(
+        bar_type.is_externally_aggregated(),
+        "Alpaca option bars require EXTERNAL aggregation, got {bar_type}",
+    );
+    anyhow::ensure!(
+        bar_type.spec().price_type == PriceType::Last,
+        "Alpaca option bars require LAST price type, got {}",
+        bar_type.spec().price_type,
+    );
+
+    let instrument_id = bar_type.instrument_id();
+    let start = start.ok_or_else(|| anyhow!("Alpaca option bar requests require a start time"))?;
+    let instrument = match instruments.get_cloned(&instrument_id) {
+        Some(instrument) => instrument,
+        None => {
+            let provider = AlpacaOptionContractProvider::new(http_client.clone());
+            let instrument = AlpacaDataClient::load_option_instrument(&provider, instrument_id)
+                .await
+                .with_context(|| format!("failed to load Alpaca instrument {instrument_id}"))?;
+            instruments.insert(instrument.id(), instrument.clone());
+            instrument
+        }
+    };
+
+    let symbol = alpaca_symbol_from_instrument_id(instrument_id);
+    let mut request = OptionBarsRequest::for_symbols(
+        [symbol.clone()],
+        alpaca_option_bar_timeframe(bar_type)?,
+        start.to_rfc3339(),
+    );
+    request.end = end.map(|end| end.to_rfc3339());
+    request.feed = Some(feed.to_string());
+    request.limit = limit.unwrap_or(10_000).clamp(1, 10_000);
+
+    let response = http_client
+        .option_bars(&request)
+        .await
+        .context("failed to request Alpaca option bars")?;
+    let source_bars = response
+        .bars
+        .get(&symbol)
+        .or_else(|| {
+            response
+                .bars
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(&symbol))
+                .map(|(_, bars)| bars)
+        })
+        .cloned()
+        .unwrap_or_default();
+
+    let mut bars = source_bars
+        .iter()
+        .filter_map(|bar| option_bar(bar_type, &instrument, bar, clock))
+        .collect::<Vec<_>>();
+    bars.sort_by_key(|bar| bar.ts_event);
+    if let Some(limit) = limit
+        && bars.len() > limit
+    {
+        bars.truncate(limit);
+    }
+
+    Ok(bars)
+}
+
+fn alpaca_option_bar_timeframe(bar_type: BarType) -> anyhow::Result<String> {
+    let spec = bar_type.spec();
+    let step = spec.step.get();
+    match spec.aggregation {
+        BarAggregation::Minute => Ok(format!("{step}Min")),
+        BarAggregation::Hour => Ok(format!("{step}Hour")),
+        BarAggregation::Day => Ok(format!("{step}Day")),
+        other => Err(anyhow!(
+            "unsupported Alpaca option bar aggregation {other}; expected minute, hour, or day"
+        )),
+    }
+}
+
+fn option_bar(
+    bar_type: BarType,
+    instrument: &InstrumentAny,
+    bar: &AlpacaOptionBar,
+    clock: &'static AtomicTime,
+) -> Option<Bar> {
+    let ts_event = bar.timestamp.as_deref().and_then(parse_rfc3339_timestamp)?;
+    let ts_init = clock.get_time_ns();
+    let open = instrument.try_make_price(bar.open?).ok()?;
+    let high = instrument.try_make_price(bar.high?).ok()?;
+    let low = instrument.try_make_price(bar.low?).ok()?;
+    let close = instrument.try_make_price(bar.close?).ok()?;
+    let volume = instrument.try_make_qty(bar.volume? as f64, None).ok()?;
+
+    Bar::new_checked(bar_type, open, high, low, close, volume, ts_event, ts_init).ok()
 }
 
 async fn stock_snapshot_price(
@@ -931,6 +1783,73 @@ fn option_quote_tick(
     .ok()
 }
 
+fn option_stream_quote_tick(
+    instrument_id: InstrumentId,
+    instrument: &InstrumentAny,
+    quote: &AlpacaOptionStreamQuote,
+    clock: &'static AtomicTime,
+) -> Option<QuoteTick> {
+    if quote.bid_price <= 0.0 || quote.ask_price <= 0.0 || quote.ask_price < quote.bid_price {
+        return None;
+    }
+
+    let ts_init = clock.get_time_ns();
+    let ts_event = parse_rfc3339_timestamp(&quote.timestamp).unwrap_or(ts_init);
+    let bid_price = instrument.try_make_price(quote.bid_price).ok()?;
+    let ask_price = instrument.try_make_price(quote.ask_price).ok()?;
+    let bid_size = instrument.try_make_qty(quote.bid_size as f64, None).ok()?;
+    let ask_size = instrument.try_make_qty(quote.ask_size as f64, None).ok()?;
+
+    QuoteTick::new_checked(
+        instrument_id,
+        bid_price,
+        ask_price,
+        bid_size,
+        ask_size,
+        ts_event,
+        ts_init,
+    )
+    .ok()
+}
+
+fn option_stream_trade_tick(
+    instrument_id: InstrumentId,
+    instrument: &InstrumentAny,
+    trade: &AlpacaOptionStreamTrade,
+    clock: &'static AtomicTime,
+) -> Option<TradeTick> {
+    if trade.price <= 0.0 || trade.size == 0 {
+        return None;
+    }
+
+    let ts_init = clock.get_time_ns();
+    let ts_event = parse_rfc3339_timestamp(&trade.timestamp).unwrap_or(ts_init);
+    let price = instrument.try_make_price(trade.price).ok()?;
+    let size = instrument.try_make_qty(trade.size as f64, None).ok()?;
+    let trade_id = TradeId::from(
+        format!(
+            "{}:{}:{}:{}:{}",
+            trade.symbol,
+            trade.timestamp,
+            trade.exchange.as_deref().unwrap_or(""),
+            trade.price,
+            trade.size,
+        )
+        .as_str(),
+    );
+
+    TradeTick::new_checked(
+        instrument_id,
+        price,
+        size,
+        AggressorSide::NoAggressor,
+        trade_id,
+        ts_event,
+        ts_init,
+    )
+    .ok()
+}
+
 fn option_greeks(
     instrument_id: InstrumentId,
     instrument: &InstrumentAny,
@@ -987,6 +1906,22 @@ fn alpaca_symbol_from_instrument_id(instrument_id: InstrumentId) -> String {
         .strip_prefix("O:")
         .unwrap_or(instrument_id.symbol.as_str())
         .to_string()
+}
+
+fn instrument_symbols_for_stream(instrument_ids: &BTreeSet<InstrumentId>) -> Vec<String> {
+    instrument_ids
+        .iter()
+        .map(|instrument_id| alpaca_symbol_from_instrument_id(*instrument_id))
+        .collect()
+}
+
+fn option_market_data_subscription_counts(
+    subscriptions: &OptionMarketDataSubscriptions,
+) -> (usize, usize) {
+    (
+        subscriptions.quote_instrument_ids.len(),
+        subscriptions.trade_instrument_ids.len(),
+    )
 }
 
 fn parse_rfc3339_timestamp(value: &str) -> Option<UnixNanos> {
