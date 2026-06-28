@@ -1,6 +1,7 @@
 # Alpaca Regime Router
 
-Status: v1 feature input contract defined; router not yet implemented.
+Status: v1 feature input contract defined; option-chain liquidity feature snapshots implemented;
+router not yet implemented.
 
 This document defines the target architecture for Alpaca option strategy regime routing. It refines
 the regime-router slice described in the Nautilus-native candidate scanning architecture and the
@@ -16,9 +17,15 @@ Current implementation boundary:
   reprice laddering, and replay decision explanations now exist in the Alpaca runtime/reporting
   paths.
 - Those are prerequisite signals and safety gates, not a regime router.
-- This document now defines the v1 `RegimeInput` contract. Runtime code still must not stamp regime
-  metadata until a real feature snapshot is produced from these inputs. Misleading labels are worse
-  than missing labels.
+- The live option-chain scanner now publishes `RegimeFeatureData` snapshots and a
+  `regime_feature_snapshot` operator event from the same `OptionChainSlice` it already consumes for
+  candidate scans.
+- The current implemented snapshot is intentionally narrow: it produces real option-liquidity
+  values, uses the existing active-risk quote stale policy for freshness, and marks required
+  bar/trend/event feature groups unavailable. It does not produce a regime label, confidence, family
+  weight, block, or candidate metadata.
+- Runtime code still must not stamp regime metadata until a router consumes the feature contract and
+  applies the fail-conservative policy. Misleading labels are worse than missing labels.
 
 ## Boundary
 
@@ -49,7 +56,8 @@ combines it with flow information, and uses the result to gate entries.
 
 For Alpaca options, that pattern should become a reusable strategy-family router:
 
-- `RegimeFeatureActor`: read-only actor that computes or loads regime features.
+- `RegimeFeatureActor` or scanner-owned feature producer: read-only component that computes or loads
+  regime features.
 - `RegimeRouter`: pure classifier that turns features into routing policy.
 - `CandidateEngine`: ranks candidates using `RegimeContext`.
 - `SelectionPolicy`: applies strategy-family weights, blocks, or dry-run routing.
@@ -404,7 +412,7 @@ Minimum validation reports:
 | --- | --- | --- | --- |
 | 0. Input contract | Done in this document. | Define approved feature groups, freshness, labels, confidence, evidence shape, and validation ranges. | Implementation can start without stamping fake labels. |
 | 1. Types and pure router | Pure router API. | Add `RegimeInput`, `RegimeContext`, labels, explanation codes, and routing policy types. | Unit-level callers can classify synthetic feature snapshots without venue I/O. |
-| 2. Feature snapshot | Read-only feature production. | Build a `RegimeFeatureActor` or service that computes v1 feature snapshots from bars, option-chain state, external signals, and optional ClickHouse/catalog history. | Operator diagnostics can display feature freshness and current regime. |
+| 2. Feature snapshot | In progress: option-liquidity slice implemented. | Build a `RegimeFeatureActor` or service that computes v1 feature snapshots from bars, option-chain state, external signals, and optional ClickHouse/catalog history. | Operator diagnostics can display feature freshness and current regime. |
 | 3. Candidate integration | Ranking receives regime context. | Add regime context to candidate input and selection policy. | Dry-run scans record regime decisions without changing order behavior. |
 | 4. Family routing | Strategy families are weighted or blocked. | Apply v1 routing policy to iron condors, credit/debit spreads, and undefined-risk strategies. | Candidate ledgers show which families were allowed, down-ranked, or blocked. |
 | 5. Replay validation | Outcome analysis by regime. | Replay candidate ledgers against historical market data and feature snapshots. | Reports show performance by regime, strategy family, and explanation code. |
@@ -413,6 +421,15 @@ Minimum validation reports:
 ## V1 Decisions
 
 - Underlying universe: all enabled option underlyings from the Alpaca runtime config.
+- Initial producer: `OptionChainCandidateScanActor` publishes a separate `RegimeFeatureData` custom
+  payload from the existing option-chain subscription, avoiding a duplicate scanner loop. A
+  dedicated `RegimeFeatureActor` can replace or extend this once underlying bar and warehouse inputs
+  are available through Nautilus data paths.
+- Current feature values: `option_liquidity` includes contract and quote counts, two-sided quote
+  coverage, median spread percentage, wide-quote ratio, open-interest coverage, implied-volatility
+  coverage, chain source timestamp, and freshness.
+- Current unavailable groups: underlying bars, underlying trend/volatility, and event load are
+  marked unavailable by the implemented snapshot rather than defaulting to neutral.
 - Breadth proxy: optional only. Use configured ETF/index proxies when complete; otherwise mark
   breadth unavailable and do not treat it as neutral.
 - Portfolio context: optional coarse stress input only. Hard portfolio caps remain in risk
@@ -428,7 +445,8 @@ Minimum validation reports:
 - Exact v1 threshold values for trend, range, volatility, and gap labels need calibration from the
   validation ranges above.
 - Whether paper mode should start with route-only evidence or immediately apply dry-run family
-  blocks should be decided when the first feature actor output is available.
+  blocks should be decided after replay coverage includes bars/trend/event features alongside
+  option-liquidity snapshots.
 
 ## Design Preference
 

@@ -82,6 +82,8 @@ pub mod providers;
 #[cfg(feature = "python")]
 pub mod python;
 #[cfg(feature = "live")]
+pub mod regime_features;
+#[cfg(feature = "live")]
 pub mod runtime;
 #[cfg(feature = "live")]
 pub mod runtime_env;

@@ -37,6 +37,9 @@ use crate::{
         AlpacaOptionsRuntimeConfig, OptionsCandidateSet, OptionsScanOutcome, OptionsScanReport,
     },
     options_strategy::OptionsCandidateData,
+    regime_features::{
+        RegimeFeatureConfig, RegimeFeatureData, regime_feature_snapshot_from_option_chain,
+    },
     runtime::{
         credit_spread_strategy_name, debit_spread_strategy_name, emit_operator_event,
         naked_option_strategy_name,
@@ -72,6 +75,8 @@ pub struct OptionChainCandidateScanConfig {
     pub candidate_ledger_max_candidates: usize,
     /// Timezone used to derive the strategy trade date for daily risk limits.
     pub trade_date_timezone: Tz,
+    /// Read-only regime feature snapshot settings.
+    pub regime_features: RegimeFeatureConfig,
 }
 
 impl Default for OptionChainCandidateScanConfig {
@@ -106,6 +111,7 @@ impl Default for OptionChainCandidateScanConfig {
             quantity: 1,
             candidate_ledger_max_candidates: 10,
             trade_date_timezone: chrono_tz::UTC,
+            regime_features: RegimeFeatureConfig::default(),
         }
     }
 }
@@ -312,13 +318,22 @@ impl DataActor for OptionChainCandidateScanActor {
 
     fn on_option_chain(&mut self, slice: &OptionChainSlice) -> anyhow::Result<()> {
         let trade_date = market_trade_date(self.config.scan.trade_date_timezone);
+        let ts_init = self.core.timestamp_ns();
+        let feature_snapshot = regime_feature_snapshot_from_option_chain(
+            slice,
+            &self.config.scan.regime_features,
+            ts_init,
+        );
+        emit_operator_event("regime_feature_snapshot", feature_snapshot.to_json_value());
+        let regime_data = RegimeFeatureData::new(feature_snapshot).into_custom_data();
+        self.publish_data(&regime_data.data_type, &regime_data);
+
         let candidates = scan_option_chain_candidates(slice, &self.config.scan, &trade_date);
         let evidence_payload = candidate_event_payload(slice, &candidates);
         emit_operator_event("option_chain_candidate_scan", evidence_payload.clone());
         self.record_candidate_evidence(&trade_date, &candidates, evidence_payload);
-        let data =
-            OptionsCandidateData::new(candidates.clone(), slice.ts_event, self.core.timestamp_ns())
-                .into_custom_data();
+        let data = OptionsCandidateData::new(candidates.clone(), slice.ts_event, ts_init)
+            .into_custom_data();
         self.publish_data(&data.data_type, &data);
         self.latest_candidates = Some(candidates);
         Ok(())
@@ -353,6 +368,10 @@ pub fn candidate_scan_config_from_runtime(
         quantity: config.quantity,
         candidate_ledger_max_candidates: config.candidate_ledger_max_candidates,
         trade_date_timezone: config.entry_timezone,
+        regime_features: RegimeFeatureConfig {
+            option_quote_stale_after_secs: config.active_risk_quote_stale_secs,
+            ..Default::default()
+        },
     }
 }
 
