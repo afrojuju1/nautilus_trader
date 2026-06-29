@@ -61,7 +61,8 @@ Alpaca payloads and translate broker facts back into Nautilus execution reports.
 - Add adapter-level shared equity risk gates for kill switch, max order notional, max total
   notional, buying power, duplicate symbol exposure, and short-sale blocking.
 - Add a paper submit/cancel smoke harness for one tiny equity order.
-- Add a profile loader so Python examples can use installed Rust runtime account env files.
+- Add a profile loader so Python examples can set account identity while loading the shared repo
+  `.env` used by Rust operator tools.
 - Add an `UpsideGapContinuation` Python strategy port and paper node example.
 - Add a combined equity daily strategy example with both migrated strategies sharing one Alpaca
   data client, execution client, and account-level risk gate surface.

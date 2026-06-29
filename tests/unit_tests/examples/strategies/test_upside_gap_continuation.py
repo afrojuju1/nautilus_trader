@@ -15,13 +15,11 @@
 
 from decimal import Decimal
 
-from nautilus_trader.adapters.alpaca.strategies.upside_gap_continuation import (
-    UpsideGapContinuationConfig,
-)
-from nautilus_trader.adapters.alpaca.strategies.upside_gap_continuation import _BarPoint
-from nautilus_trader.adapters.alpaca.strategies.upside_gap_continuation import _features_for_index
-from nautilus_trader.adapters.alpaca.strategies.upside_gap_continuation import _passes_signal
-from nautilus_trader.adapters.alpaca.strategies.upside_gap_continuation import _signal_score
+from nautilus_trader.examples.strategies.upside_gap_continuation import UpsideGapContinuationConfig
+from nautilus_trader.examples.strategies.upside_gap_continuation import _BarPoint
+from nautilus_trader.examples.strategies.upside_gap_continuation import _features_for_index
+from nautilus_trader.examples.strategies.upside_gap_continuation import _passes_signal
+from nautilus_trader.examples.strategies.upside_gap_continuation import _signal_score
 from nautilus_trader.model.data import BarType
 
 

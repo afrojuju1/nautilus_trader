@@ -15,14 +15,12 @@
 
 from decimal import Decimal
 
-from nautilus_trader.adapters.alpaca.strategies.gap_down_fragile_rebound import (
-    GapDownFragileReboundConfig,
-)
-from nautilus_trader.adapters.alpaca.strategies.gap_down_fragile_rebound import _BarPoint
-from nautilus_trader.adapters.alpaca.strategies.gap_down_fragile_rebound import _features_for_index
-from nautilus_trader.adapters.alpaca.strategies.gap_down_fragile_rebound import _passes_signal
-from nautilus_trader.adapters.alpaca.strategies.gap_down_fragile_rebound import _quantile
-from nautilus_trader.adapters.alpaca.strategies.gap_down_fragile_rebound import _SignalFeatures
+from nautilus_trader.examples.strategies.gap_down_fragile_rebound import GapDownFragileReboundConfig
+from nautilus_trader.examples.strategies.gap_down_fragile_rebound import _BarPoint
+from nautilus_trader.examples.strategies.gap_down_fragile_rebound import _features_for_index
+from nautilus_trader.examples.strategies.gap_down_fragile_rebound import _passes_signal
+from nautilus_trader.examples.strategies.gap_down_fragile_rebound import _quantile
+from nautilus_trader.examples.strategies.gap_down_fragile_rebound import _SignalFeatures
 from nautilus_trader.model.data import BarType
 
 

@@ -15,22 +15,23 @@
 
 import argparse
 
+from nautilus_trader.adapters.alpaca.profiles import alpaca_default_env_file
 from nautilus_trader.adapters.alpaca.profiles import alpaca_env_file_for_profile
 from nautilus_trader.adapters.alpaca.profiles import load_alpaca_env_file
 from nautilus_trader.adapters.alpaca.profiles import load_alpaca_profile_from_args
 
 
-def test_alpaca_env_file_for_profile_prefers_account_env(tmp_path) -> None:
-    account_dir = tmp_path / "accounts"
-    account_dir.mkdir()
-    account_file = account_dir / "paper-directional.env"
-    account_file.write_text("ALPACA_API_KEY=key\n", encoding="utf-8")
+def test_alpaca_default_env_file_uses_explicit_override(tmp_path, monkeypatch) -> None:
+    override = tmp_path / "override.env"
+    monkeypatch.setenv("NAUTILUS_ALPACA_ENV_FILE", str(override))
 
-    assert alpaca_env_file_for_profile("paper-directional", tmp_path) == account_file
+    assert alpaca_default_env_file(tmp_path) == override
 
 
-def test_alpaca_env_file_for_profile_falls_back_to_main_env(tmp_path) -> None:
-    assert alpaca_env_file_for_profile("paper-main", tmp_path) == tmp_path / "options.env"
+def test_alpaca_env_file_for_profile_uses_repo_env(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("NAUTILUS_ALPACA_ENV_FILE", raising=False)
+
+    assert alpaca_env_file_for_profile("paper-directional", tmp_path) == tmp_path / ".env"
 
 
 def test_load_alpaca_env_file_does_not_override_existing_by_default(tmp_path, monkeypatch) -> None:
@@ -56,22 +57,28 @@ def test_load_alpaca_env_file_does_not_override_existing_by_default(tmp_path, mo
 
 def test_load_alpaca_profile_from_args_sets_account_name(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("NAUTILUS_ALPACA_ACCOUNT", raising=False)
-    account_dir = tmp_path / "accounts"
-    account_dir.mkdir()
-    env_file = account_dir / "paper-directional.env"
+    monkeypatch.setenv("NAUTILUS_ALPACA_REPO", str(tmp_path))
+    env_file = tmp_path / ".env"
     env_file.write_text("ALPACA_API_KEY=file-key\n", encoding="utf-8")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path.parent))
-
-    config_home = tmp_path.parent / "nautilus-trader" / "alpaca"
-    config_home.mkdir(parents=True)
-    account_dir.rename(config_home / "accounts")
 
     args = argparse.Namespace(alpaca_profile="paper-directional", alpaca_env_file=None)
 
     path = load_alpaca_profile_from_args(args)
 
-    assert path == config_home / "accounts" / "paper-directional.env"
+    assert path == env_file
     assert loaded_env("NAUTILUS_ALPACA_ACCOUNT") == "paper-directional"
+
+
+def test_load_alpaca_profile_from_args_loads_repo_env_without_profile(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("NAUTILUS_ALPACA_REPO", str(tmp_path))
+    env_file = tmp_path / ".env"
+    env_file.write_text("ALPACA_API_KEY=file-key\n", encoding="utf-8")
+    args = argparse.Namespace(alpaca_profile=None, alpaca_env_file=None)
+
+    path = load_alpaca_profile_from_args(args)
+
+    assert path == env_file
+    assert loaded_env("ALPACA_API_KEY") == "file-key"
 
 
 def loaded_env(name: str) -> str:

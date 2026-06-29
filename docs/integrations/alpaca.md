@@ -44,7 +44,8 @@ The Rust Alpaca runtime currently includes the following implemented components:
 - Separate tooling remains for option-chain scan comparison and multi-leg payload validation.
 
 The Python package exposes config objects, a stock-bar and exact-option snapshot data client, an
-equity plus option multi-leg execution client, and strategy scaffolds.
+equity plus option multi-leg execution client, and the Alpaca-specific put-credit scanner scaffold.
+Regular daily-bar strategy examples live under the source-neutral examples strategy package.
 
 ## Alpaca documentation
 
@@ -187,8 +188,8 @@ The following gaps should remain explicit until they are implemented and proven:
 - The Python `TradingNode` path is intentionally narrow: static equities, exact OCC option
   symbols, stock bars, option snapshot quotes/Greeks, whole-share equity/ETF `DAY` limit orders,
   and option multi-leg `DAY` limit order lists.
-- Current Python strategy ports are equity/ETF daily-bar strategies:
-  `GapDownFragileRebound` and `UpsideGapContinuation`.
+- Current Python strategy ports are source-neutral equity/ETF daily-bar strategies used by Alpaca
+  examples: `GapDownFragileRebound` and `UpsideGapContinuation`.
 - Python shared risk gates are adapter-level guardrails, not a complete portfolio risk system.
 - Python execution uses REST reconciliation; trade update WebSocket handling remains in the Rust
   runtime.

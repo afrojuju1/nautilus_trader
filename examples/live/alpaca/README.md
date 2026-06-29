@@ -21,7 +21,7 @@ export ALPACA_TRADING_BASE_URL="https://paper-api.alpaca.markets"
 The runtime also accepts `ALPACA_API_KEY` for the key and `ALPACA_SECRET_KEY` or
 `ALPACA_API_SECRET` for the secret.
 
-Python examples can also load the installed Rust runtime account env files directly:
+Python examples also load the repo-local `.env` used by the Rust operator tools:
 
 ```bash
 python examples/live/alpaca/gap_down_fragile_rebound_paper.py \
@@ -30,12 +30,11 @@ python examples/live/alpaca/gap_down_fragile_rebound_paper.py \
   --alpaca-profile paper-directional
 ```
 
-`--alpaca-profile paper-directional` resolves to
-`~/.config/nautilus-trader/alpaca/accounts/paper-directional.env`. Use `--alpaca-profile
-paper-main` for `~/.config/nautilus-trader/alpaca/options.env`, or pass
-`--alpaca-env-file <path>` for an explicit env file.
+`--alpaca-profile paper-directional` sets `NAUTILUS_ALPACA_ACCOUNT=paper-directional` and then
+loads the shared repo `.env`. Pass `--alpaca-env-file <path>` only for an explicit diagnostic or
+account-boundary override.
 
-Keep account-specific broker-paper risk gates and strategy sizing in the same profile env file:
+Keep broker-paper risk gates and strategy sizing in the repo `.env`:
 
 ```bash
 ALPACA_EQUITY_KILL_SWITCH=false
@@ -284,24 +283,23 @@ export ALPACA_KILL_SWITCH=true
 cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- --check-config
 ```
 
-To use an account-specific env file:
+To use an explicit diagnostic or account-boundary env file:
 
 ```bash
-export NAUTILUS_ALPACA_ENV_FILE="$HOME/.config/nautilus-trader/alpaca/options.env"
+export NAUTILUS_ALPACA_ENV_FILE="/path/to/account-boundary.env"
 cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- --check-config
 ```
 
-Copy the sample config files from `deploy/alpaca/` before running the runtime as a service:
+Copy the sample env and config files before running the runtime as a service:
 
 ```bash
+cp deploy/alpaca/alpaca-options.env.example .env
+chmod 600 .env
 mkdir -p "$HOME/.config/nautilus-trader/alpaca"
-cp deploy/alpaca/alpaca-options.env.example \
-  "$HOME/.config/nautilus-trader/alpaca/options.env"
 cp deploy/alpaca/alpaca-options.base.toml.example \
   "$HOME/.config/nautilus-trader/alpaca/base-options.toml"
 cp deploy/alpaca/alpaca-options.toml.example \
   "$HOME/.config/nautilus-trader/alpaca/options.toml"
-chmod 600 "$HOME/.config/nautilus-trader/alpaca/options.env"
 ```
 
 Do not enable `ALPACA_SUBMIT`, `ALPACA_MANAGE`, or `ALPACA_CLOSE` until paper credentials,
@@ -323,10 +321,10 @@ alpaca-control alerts candidates --all --dry-run
 alpaca-control performance --all
 ```
 
-The installed config layers are `options.env`, `base-options.toml`,
-`options.toml`, and `fleet.toml`. `NAUTILUS_ALPACA_ENV_FILE` selects an account env file;
-`ALPACA_CONFIG_PATH` selects the account TOML; `extends = "base-options.toml"` lets account
-TOML inherit shared scanner and management defaults. Operational env overrides such as
+The installed config layers are repo `.env`, `base-options.toml`, `options.toml`, and `fleet.toml`.
+`NAUTILUS_ALPACA_ENV_FILE` selects an explicit env-file override; `ALPACA_CONFIG_PATH` selects the
+account TOML; `extends = "base-options.toml"` lets account TOML inherit shared scanner and
+management defaults. Operational env overrides such as
 `ALPACA_SUBMIT`, `ALPACA_MANAGE`, `ALPACA_CLOSE`, `ALPACA_KILL_SWITCH`, and
 `ALPACA_MAX_ITERATIONS` take precedence over TOML for those supported fields.
 

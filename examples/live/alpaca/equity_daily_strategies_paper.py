@@ -30,10 +30,6 @@ from nautilus_trader.adapters.alpaca import AlpacaLiveDataClientFactory
 from nautilus_trader.adapters.alpaca import AlpacaLiveExecClientFactory
 from nautilus_trader.adapters.alpaca import add_alpaca_profile_args
 from nautilus_trader.adapters.alpaca import load_alpaca_profile_from_args
-from nautilus_trader.adapters.alpaca.strategies import GapDownFragileRebound
-from nautilus_trader.adapters.alpaca.strategies import GapDownFragileReboundConfig
-from nautilus_trader.adapters.alpaca.strategies import UpsideGapContinuation
-from nautilus_trader.adapters.alpaca.strategies import UpsideGapContinuationConfig
 from nautilus_trader.adapters.sandbox.config import SandboxExecutionClientConfig
 from nautilus_trader.adapters.sandbox.factory import SandboxLiveExecClientFactory
 from nautilus_trader.config import InstrumentProviderConfig
@@ -41,6 +37,10 @@ from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import RoutingConfig
 from nautilus_trader.config import TradingNodeConfig
+from nautilus_trader.examples.strategies.gap_down_fragile_rebound import GapDownFragileRebound
+from nautilus_trader.examples.strategies.gap_down_fragile_rebound import GapDownFragileReboundConfig
+from nautilus_trader.examples.strategies.upside_gap_continuation import UpsideGapContinuation
+from nautilus_trader.examples.strategies.upside_gap_continuation import UpsideGapContinuationConfig
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.identifiers import InstrumentId

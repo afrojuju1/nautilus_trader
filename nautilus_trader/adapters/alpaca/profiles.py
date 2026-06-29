@@ -13,7 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Helpers for loading installed Alpaca runtime account profiles into Python examples.
+Helpers for loading the shared Alpaca runtime env into Python examples.
 """
 
 from __future__ import annotations
@@ -27,27 +27,34 @@ from pathlib import Path
 ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def alpaca_config_home() -> Path:
+def alpaca_default_env_file(repo_root: Path | None = None) -> Path:
     """
-    Return the installed Alpaca runtime config directory.
+    Return the shared repo-local Alpaca env file.
     """
-    config_home = os.getenv("XDG_CONFIG_HOME")
-    if config_home:
-        return Path(config_home).expanduser() / "nautilus-trader" / "alpaca"
-    return Path.home() / ".config" / "nautilus-trader" / "alpaca"
+    if explicit := os.getenv("NAUTILUS_ALPACA_ENV_FILE"):
+        return Path(explicit).expanduser()
+
+    if repo_root is not None:
+        return repo_root.expanduser() / ".env"
+
+    if repo := os.getenv("NAUTILUS_ALPACA_REPO"):
+        return Path(repo).expanduser() / ".env"
+
+    current = Path.cwd().resolve()
+    for directory in (current, *current.parents):
+        candidate = directory / ".env"
+        if candidate.exists():
+            return candidate
+    return current / ".env"
 
 
-def alpaca_env_file_for_profile(profile: str, config_home: Path | None = None) -> Path:
+def alpaca_env_file_for_profile(profile: str, repo_root: Path | None = None) -> Path:
     """
-    Return the env file used by a Rust Alpaca runtime profile.
+    Return the shared env file used by a Rust Alpaca runtime profile.
+
+    Profiles select account identity only. They do not imply account-specific env files.
     """
-    root = config_home or alpaca_config_home()
-    account_file = root / "accounts" / f"{profile}.env"
-    if account_file.exists():
-        return account_file
-    if profile == "paper-main":
-        return root / "options-engine.env"
-    return account_file
+    return alpaca_default_env_file(repo_root)
 
 
 def load_alpaca_env_file(path: Path, *, override: bool = False) -> dict[str, str]:
@@ -72,8 +79,8 @@ def add_alpaca_profile_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--alpaca-profile",
         help=(
-            "Load ~/.config/nautilus-trader/alpaca/accounts/<profile>.env before building the "
-            "node. Use paper-main for ~/.config/nautilus-trader/alpaca/options-engine.env."
+            "Set NAUTILUS_ALPACA_ACCOUNT before building the node. Env values load from the "
+            "repo-local .env unless --alpaca-env-file is passed."
         ),
     )
     parser.add_argument(
@@ -89,11 +96,15 @@ def load_alpaca_profile_from_args(
     override: bool = False,
 ) -> Path | None:
     """
-    Load the env file selected by ``--alpaca-profile`` or ``--alpaca-env-file``.
+    Load the shared env file and apply any selected Alpaca account profile.
     """
     env_file = getattr(args, "alpaca_env_file", None)
     profile = getattr(args, "alpaca_profile", None)
     if env_file is None and profile is None:
+        path = alpaca_default_env_file()
+        if path.exists():
+            load_alpaca_env_file(path, override=override)
+            return path
         return None
 
     path = (
