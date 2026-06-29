@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
+from nautilus_trader.adapters.alpaca.common import normalize_alpaca_symbol
 from nautilus_trader.adapters.alpaca.constants import ALPACA_VENUE
 from nautilus_trader.adapters.alpaca.providers import is_alpaca_option_symbol
 from nautilus_trader.execution.messages import SubmitOrderList
@@ -241,7 +242,9 @@ def _mleg_leg_matches_order(order: Order, leg: dict[str, Any]) -> bool:
     symbol = leg.get("symbol")
     if symbol is None:
         return False
-    if _normalize_symbol(str(symbol)) != _normalize_symbol(order.instrument_id.symbol.value):
+    if normalize_alpaca_symbol(str(symbol)) != normalize_alpaca_symbol(
+        order.instrument_id.symbol.value,
+    ):
         return False
     side = leg.get("side")
     if side is not None and _order_side_from_alpaca(str(side)) != order.side:
@@ -264,10 +267,3 @@ def _order_side_from_alpaca(value: str) -> OrderSide:
 
 def _order_qty(order: Order) -> Decimal:
     return Decimal(str(order.quantity))
-
-
-def _normalize_symbol(symbol: str) -> str:
-    normalized = symbol.strip().upper()
-    if not normalized:
-        raise ValueError("symbol must not be empty")
-    return normalized

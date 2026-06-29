@@ -27,7 +27,6 @@ use nautilus_alpaca::{
         models::{AlpacaOrder, ReplaceOrderRequest},
     },
     strategy::scan_put_credit_underlying,
-    submit::{MlegSubmitLeg, MlegSubmitOrderListRequest, build_mleg_submit_order_list},
 };
 use nautilus_common::{
     cache::Cache,
@@ -38,10 +37,12 @@ use nautilus_common::{
 use nautilus_core::{UUID4, time::get_atomic_clock_realtime};
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
-    enums::{AccountType, OmsType, OrderSide},
+    enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce},
+    events::OrderInitialized,
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TraderId, Venue,
     },
+    orders::OrderList,
     types::{Price, Quantity},
 };
 use nautilus_trading::options::candidates::PutCreditScannerConfig;
@@ -269,6 +270,137 @@ fn build_submit_order_list(
         ],
         ts_init: get_atomic_clock_realtime().get_time_ns(),
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MlegSubmitLeg {
+    client_order_id: ClientOrderId,
+    instrument_id: InstrumentId,
+    order_side: OrderSide,
+    quantity: Quantity,
+    limit_price: Price,
+    reduce_only: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MlegSubmitOrderListRequest {
+    trader_id: TraderId,
+    client_id: Option<ClientId>,
+    strategy_id: StrategyId,
+    order_list_id: OrderListId,
+    legs: Vec<MlegSubmitLeg>,
+    ts_init: nautilus_core::UnixNanos,
+}
+
+fn build_mleg_submit_order_list(
+    request: MlegSubmitOrderListRequest,
+) -> anyhow::Result<SubmitOrderList> {
+    if request.legs.len() < 2 {
+        anyhow::bail!("multi-leg SubmitOrderList requires at least two legs");
+    }
+    if request.legs.len() > 4 {
+        anyhow::bail!("multi-leg SubmitOrderList supports at most four legs");
+    }
+
+    let client_order_ids = request
+        .legs
+        .iter()
+        .map(|leg| leg.client_order_id)
+        .collect::<Vec<_>>();
+    let first_instrument_id = request.legs[0].instrument_id;
+    let order_inits = request
+        .legs
+        .iter()
+        .map(|leg| {
+            if !leg.quantity.is_positive() {
+                anyhow::bail!("leg {} quantity must be positive", leg.client_order_id);
+            }
+            if !leg.limit_price.is_positive() {
+                anyhow::bail!("leg {} limit price must be positive", leg.client_order_id);
+            }
+
+            let linked_order_ids = client_order_ids
+                .iter()
+                .copied()
+                .filter(|candidate| *candidate != leg.client_order_id)
+                .collect::<Vec<_>>();
+            Ok(order_init(
+                request.trader_id,
+                request.strategy_id,
+                *leg,
+                request.order_list_id,
+                linked_order_ids,
+                request.ts_init,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let order_list = OrderList::new(
+        request.order_list_id,
+        first_instrument_id,
+        request.strategy_id,
+        client_order_ids,
+        request.ts_init,
+    );
+
+    Ok(SubmitOrderList::new(
+        request.trader_id,
+        request.client_id,
+        request.strategy_id,
+        order_list,
+        order_inits,
+        None,
+        None,
+        None,
+        UUID4::new(),
+        request.ts_init,
+        None,
+    ))
+}
+
+fn order_init(
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    leg: MlegSubmitLeg,
+    order_list_id: OrderListId,
+    linked_order_ids: Vec<ClientOrderId>,
+    ts: nautilus_core::UnixNanos,
+) -> OrderInitialized {
+    OrderInitialized::new(
+        trader_id,
+        strategy_id,
+        leg.instrument_id,
+        leg.client_order_id,
+        leg.order_side,
+        OrderType::Limit,
+        leg.quantity,
+        TimeInForce::Day,
+        false,
+        leg.reduce_only,
+        false,
+        false,
+        UUID4::new(),
+        ts,
+        ts,
+        Some(leg.limit_price),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(order_list_id),
+        Some(linked_order_ids),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 fn alpaca_instrument_id(symbol: &str) -> anyhow::Result<InstrumentId> {

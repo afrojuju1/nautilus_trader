@@ -3,6 +3,11 @@
 This workstream evaluates recorded Alpaca option candidates against historical option market data.
 It is research-only: it does not submit, cancel, reconcile, or mutate strategy state.
 
+This is the maintained historical evaluation path. Do not restore adapter-owned custom backtest
+binaries for strategy scoring; use `alpaca-ops replay` / `alpaca-ops performance` over the
+operational store and market-data catalog/warehouse, or promote reusable backtest behavior into the
+standard Nautilus backtest/catalog architecture.
+
 Run it through the operator CLI:
 
 ```bash

@@ -17,7 +17,6 @@ Alpaca data client for Python ``TradingNode`` usage.
 """
 
 import asyncio
-import os
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
@@ -26,14 +25,12 @@ from typing import Any
 import msgspec
 import pandas as pd
 
+from nautilus_trader.adapters.alpaca.common import alpaca_auth_headers
+from nautilus_trader.adapters.alpaca.common import format_alpaca_datetime
+from nautilus_trader.adapters.alpaca.common import resolve_alpaca_credentials
 from nautilus_trader.adapters.alpaca.config import AlpacaDataClientConfig
-from nautilus_trader.adapters.alpaca.constants import ALPACA_API_KEY_ENV
-from nautilus_trader.adapters.alpaca.constants import ALPACA_API_SECRET_ENV
 from nautilus_trader.adapters.alpaca.constants import ALPACA_DATA_BASE_URL
-from nautilus_trader.adapters.alpaca.constants import ALPACA_SECRET_KEY_ENV
 from nautilus_trader.adapters.alpaca.constants import ALPACA_VENUE
-from nautilus_trader.adapters.alpaca.constants import APCA_API_KEY_ID_ENV
-from nautilus_trader.adapters.alpaca.constants import APCA_API_SECRET_KEY_ENV
 from nautilus_trader.adapters.alpaca.providers import AlpacaInstrumentProvider
 from nautilus_trader.adapters.alpaca.providers import is_alpaca_option_symbol
 from nautilus_trader.adapters.alpaca.snapshots import greeks_from_option_snapshot
@@ -70,8 +67,6 @@ from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Quantity
 
 
-APCA_API_KEY_HEADER = "APCA-API-KEY-ID"
-APCA_API_SECRET_HEADER = "APCA-API-SECRET-KEY"  # noqa: S105
 ALPACA_STOCK_BARS_PAGE_LIMIT = 10_000
 
 
@@ -105,12 +100,9 @@ class AlpacaDataClient(LiveMarketDataClient):
         self._instrument_provider = instrument_provider
         self._http_client = nautilus_pyo3.HttpClient(timeout_secs=config.request_timeout_secs)
         self._data_base_url = (config.data_base_url or ALPACA_DATA_BASE_URL).rstrip("/")
-        self._api_key = _first_present(config.api_key, APCA_API_KEY_ID_ENV, ALPACA_API_KEY_ENV)
-        self._api_secret = _first_present(
+        self._api_key, self._api_secret = resolve_alpaca_credentials(
+            config.api_key,
             config.api_secret,
-            APCA_API_SECRET_KEY_ENV,
-            ALPACA_SECRET_KEY_ENV,
-            ALPACA_API_SECRET_ENV,
         )
         self._bars_timestamp_on_close = config.bars_timestamp_on_close
         self._bar_poll_interval_secs = config.bar_poll_interval_secs
@@ -448,9 +440,9 @@ class AlpacaDataClient(LiveMarketDataClient):
         }
 
         if start is not None:
-            params["start"] = _format_alpaca_datetime(start)
+            params["start"] = format_alpaca_datetime(start)
         if end is not None:
-            params["end"] = _format_alpaca_datetime(end)
+            params["end"] = format_alpaca_datetime(end)
 
         rows: list[dict[str, Any]] = []
         remaining = limit
@@ -500,15 +492,12 @@ class AlpacaDataClient(LiveMarketDataClient):
         ]
 
     def _headers(self) -> dict[str, str]:
-        if not self._api_key or not self._api_secret:
-            raise RuntimeError(
-                "Alpaca data credentials are required. Set APCA_API_KEY_ID and "
-                "APCA_API_SECRET_KEY, or pass api_key/api_secret in AlpacaDataClientConfig.",
-            )
-        return {
-            APCA_API_KEY_HEADER: self._api_key,
-            APCA_API_SECRET_HEADER: self._api_secret,
-        }
+        return alpaca_auth_headers(
+            self._api_key,
+            self._api_secret,
+            surface="data",
+            config_name="AlpacaDataClientConfig",
+        )
 
     def _instrument_for_bar_type(self, bar_type: BarType) -> Instrument:
         instrument = self._instrument_provider.find(bar_type.instrument_id)
@@ -532,17 +521,6 @@ class AlpacaDataClient(LiveMarketDataClient):
             self._last_bar_ts_by_type[bar_type] = max(bar.ts_event for bar in bars)
 
 
-def _first_present(explicit: str | None, *env_names: str) -> str | None:
-    if explicit:
-        return explicit
-
-    for env_name in env_names:
-        value = os.getenv(env_name)
-        if value:
-            return value
-    return None
-
-
 def _timeframe_for_bar_type(bar_type: BarType) -> str:
     spec = bar_type.spec
     if spec.price_type != PriceType.LAST:
@@ -560,15 +538,6 @@ def _timeframe_for_bar_type(bar_type: BarType) -> str:
         return f"{spec.step}Month"
 
     raise ValueError(f"Unsupported Alpaca stock bar aggregation {spec.aggregation}")
-
-
-def _format_alpaca_datetime(value: datetime | pd.Timestamp) -> str:
-    timestamp = pd.Timestamp(value)
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.tz_localize("UTC")
-    else:
-        timestamp = timestamp.tz_convert("UTC")
-    return timestamp.isoformat().replace("+00:00", "Z")
 
 
 def _rows_for_symbol(payload: Any, symbol: str) -> list[dict[str, Any]]:

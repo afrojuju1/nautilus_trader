@@ -17,25 +17,20 @@ Alpaca broker execution client for US equity/ETF orders and option multi-leg ord
 """
 
 import asyncio
-import os
-from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
 import msgspec
-import pandas as pd
 
+from nautilus_trader.adapters.alpaca.common import alpaca_auth_headers
+from nautilus_trader.adapters.alpaca.common import format_alpaca_datetime
+from nautilus_trader.adapters.alpaca.common import normalize_alpaca_symbol
+from nautilus_trader.adapters.alpaca.common import resolve_alpaca_credentials
+from nautilus_trader.adapters.alpaca.common import timestamp_ns_from_value
 from nautilus_trader.adapters.alpaca.config import AlpacaExecClientConfig
-from nautilus_trader.adapters.alpaca.constants import ALPACA_API_KEY_ENV
-from nautilus_trader.adapters.alpaca.constants import ALPACA_API_SECRET_ENV
 from nautilus_trader.adapters.alpaca.constants import ALPACA_LIVE_TRADING_BASE_URL
 from nautilus_trader.adapters.alpaca.constants import ALPACA_PAPER_TRADING_BASE_URL
-from nautilus_trader.adapters.alpaca.constants import ALPACA_SECRET_KEY_ENV
 from nautilus_trader.adapters.alpaca.constants import ALPACA_VENUE
-from nautilus_trader.adapters.alpaca.constants import APCA_API_KEY_ID_ENV
-from nautilus_trader.adapters.alpaca.constants import APCA_API_SECRET_KEY_ENV
-from nautilus_trader.adapters.alpaca.data import APCA_API_KEY_HEADER
-from nautilus_trader.adapters.alpaca.data import APCA_API_SECRET_HEADER
 from nautilus_trader.adapters.alpaca.orders import mleg_leg_snapshot_for_order
 from nautilus_trader.adapters.alpaca.orders import mleg_order_plan_from_order_list
 from nautilus_trader.adapters.alpaca.orders import mleg_payload_from_order_plan
@@ -50,7 +45,6 @@ from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.core import nautilus_pyo3
-from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import BatchCancelOrders
 from nautilus_trader.execution.messages import CancelAllOrders
@@ -155,12 +149,9 @@ class AlpacaExecutionClient(LiveExecutionClient):
                 else ALPACA_PAPER_TRADING_BASE_URL
             )
         ).rstrip("/")
-        self._api_key = _first_present(config.api_key, APCA_API_KEY_ID_ENV, ALPACA_API_KEY_ENV)
-        self._api_secret = _first_present(
+        self._api_key, self._api_secret = resolve_alpaca_credentials(
+            config.api_key,
             config.api_secret,
-            APCA_API_SECRET_KEY_ENV,
-            ALPACA_SECRET_KEY_ENV,
-            ALPACA_API_SECRET_ENV,
         )
         self._accepted_venue_order_ids: set[VenueOrderId] = set()
         self._terminal_venue_order_ids: set[VenueOrderId] = set()
@@ -498,9 +489,9 @@ class AlpacaExecutionClient(LiveExecutionClient):
         if command.instrument_id is not None:
             params["symbols"] = command.instrument_id.symbol.value
         if command.start is not None:
-            params["after"] = _format_alpaca_datetime(command.start)
+            params["after"] = format_alpaca_datetime(command.start)
         if command.end is not None:
-            params["until"] = _format_alpaca_datetime(command.end)
+            params["until"] = format_alpaca_datetime(command.end)
 
         orders = await self._get_json("/v2/orders", params)
         if not isinstance(orders, list):
@@ -534,9 +525,9 @@ class AlpacaExecutionClient(LiveExecutionClient):
             "direction": "desc",
         }
         if command.start is not None:
-            params["after"] = _format_alpaca_datetime(command.start)
+            params["after"] = format_alpaca_datetime(command.start)
         if command.end is not None:
-            params["until"] = _format_alpaca_datetime(command.end)
+            params["until"] = format_alpaca_datetime(command.end)
 
         activities = await self._get_json("/v2/account/activities/FILL", params)
         if not isinstance(activities, list):
@@ -644,7 +635,7 @@ class AlpacaExecutionClient(LiveExecutionClient):
             self._emit_order_snapshot(order, remote)
 
     def _risk_denial_reason(self, order: Order) -> str | None:
-        symbol = _normalize_symbol(order.instrument_id.symbol.value)
+        symbol = normalize_alpaca_symbol(order.instrument_id.symbol.value)
         return _equity_risk_denial_reason(
             order=order,
             config=self._config,
@@ -752,7 +743,7 @@ class AlpacaExecutionClient(LiveExecutionClient):
 
         quantity = Decimal(0)
         for position in self._cache.positions_open(venue=ALPACA_VENUE, account_id=self.account_id):
-            if _normalize_symbol(position.instrument_id.symbol.value) == symbol:
+            if normalize_alpaca_symbol(position.instrument_id.symbol.value) == symbol:
                 quantity += _signed_position_qty(position)
         return quantity
 
@@ -786,7 +777,7 @@ class AlpacaExecutionClient(LiveExecutionClient):
                 continue
             if open_order.client_order_id in self._remote_open_client_order_ids:
                 continue
-            if _normalize_symbol(open_order.instrument_id.symbol.value) != symbol:
+            if normalize_alpaca_symbol(open_order.instrument_id.symbol.value) != symbol:
                 continue
             if open_order.side == side:
                 quantity += _order_qty(open_order)
@@ -946,7 +937,7 @@ class AlpacaExecutionClient(LiveExecutionClient):
             ),
             avg_px=_decimal_from_optional(data.get("filled_avg_price")),
             report_id=UUID4(),
-            ts_accepted=_timestamp_ns_from_value(
+            ts_accepted=timestamp_ns_from_value(
                 data.get("submitted_at") or data.get("created_at"),
                 ts_last,
             ),
@@ -959,7 +950,7 @@ class AlpacaExecutionClient(LiveExecutionClient):
         instrument = self._instrument_for_symbol(symbol)
         venue_order_id = VenueOrderId(_required_str(data, "order_id"))
         trade_id = TradeId(_required_str(data, "id"))
-        ts_event = _timestamp_ns_from_value(
+        ts_event = timestamp_ns_from_value(
             data.get("transaction_time") or data.get("date"),
             ts_init,
         )
@@ -1034,15 +1025,12 @@ class AlpacaExecutionClient(LiveExecutionClient):
         return _decode_response(response.status, response.body)
 
     def _headers(self) -> dict[str, str]:
-        if not self._api_key or not self._api_secret:
-            raise RuntimeError(
-                "Alpaca execution credentials are required. Set APCA_API_KEY_ID and "
-                "APCA_API_SECRET_KEY, or pass api_key/api_secret in AlpacaExecClientConfig.",
-            )
-        return {
-            APCA_API_KEY_HEADER: self._api_key,
-            APCA_API_SECRET_HEADER: self._api_secret,
-        }
+        return alpaca_auth_headers(
+            self._api_key,
+            self._api_secret,
+            surface="execution",
+            config_name="AlpacaExecClientConfig",
+        )
 
 
 def _validate_equity_limit_order(order: Order) -> str | None:
@@ -1215,7 +1203,7 @@ def _equity_position_risk_maps(
     for position in positions:
         if not isinstance(position, dict):
             continue
-        symbol = _normalize_symbol(_required_str(position, "symbol"))
+        symbol = normalize_alpaca_symbol(_required_str(position, "symbol"))
         if is_alpaca_option_symbol(symbol):
             continue
         quantity = _signed_position_qty_from_alpaca(position)
@@ -1255,7 +1243,7 @@ def _accumulate_equity_open_order_risk(
     notional_by_symbol: dict[str, Decimal],
     client_order_ids: set[ClientOrderId],
 ) -> None:
-    symbol = _normalize_symbol(_required_str(order_row, "symbol"))
+    symbol = normalize_alpaca_symbol(_required_str(order_row, "symbol"))
     side = _order_side_from_alpaca(_required_str(order_row, "side"))
     quantity = _required_decimal(order_row, "qty")
     price = (
@@ -1325,16 +1313,6 @@ def _decode_response(status: int, body: bytes) -> Any:
     return msgspec.json.decode(body)
 
 
-def _first_present(explicit: str | None, *env_names: str) -> str | None:
-    if explicit:
-        return explicit
-    for env_name in env_names:
-        value = os.getenv(env_name)
-        if value:
-            return value
-    return None
-
-
 def _first_decimal(
     data: dict[str, Any],
     *keys: str,
@@ -1370,13 +1348,6 @@ def _required_str(data: dict[str, Any], key: str) -> str:
     if value is None or str(value).strip() == "":
         raise ValueError(f"Alpaca response missing {key}")
     return str(value)
-
-
-def _normalize_symbol(symbol: str) -> str:
-    normalized = symbol.strip().upper()
-    if not normalized:
-        raise ValueError("symbol must not be empty")
-    return normalized
 
 
 def _quantity_from_decimal(instrument: Instrument, value: Decimal) -> Quantity:
@@ -1463,7 +1434,7 @@ def _alpaca_rejected_reason(data: dict[str, Any]) -> str:
 
 
 def _timestamp_ns_from_order(data: dict[str, Any], default: int) -> int:
-    return _timestamp_ns_from_value(
+    return timestamp_ns_from_value(
         data.get("updated_at")
         or data.get("filled_at")
         or data.get("canceled_at")
@@ -1472,23 +1443,3 @@ def _timestamp_ns_from_order(data: dict[str, Any], default: int) -> int:
         or data.get("created_at"),
         default,
     )
-
-
-def _timestamp_ns_from_value(value: Any, default: int) -> int:
-    if value is None:
-        return default
-    timestamp = pd.Timestamp(value)
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.tz_localize("UTC")
-    else:
-        timestamp = timestamp.tz_convert("UTC")
-    return dt_to_unix_nanos(timestamp)
-
-
-def _format_alpaca_datetime(value: datetime | pd.Timestamp) -> str:
-    timestamp = pd.Timestamp(value)
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.tz_localize("UTC")
-    else:
-        timestamp = timestamp.tz_convert("UTC")
-    return timestamp.isoformat().replace("+00:00", "Z")

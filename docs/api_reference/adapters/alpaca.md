@@ -4,10 +4,10 @@ This page documents the Python-facing Alpaca modules currently present in
 `nautilus_trader.adapters.alpaca`.
 
 :::warning
-The current Alpaca integration is an experimental Rust options runtime. The Python
-`AlpacaLiveDataClientFactory` and `AlpacaLiveExecClientFactory` are placeholders and should not be
-registered with a live `TradingNode` yet. Use `docs/integrations/alpaca.md` for the implemented
-runtime scope and safe read-only/dry-run examples.
+The current Alpaca integration is still an experimental adapter/runtime slice, not full Alpaca API
+parity. The Python `TradingNode` factories are implemented for the narrow documented surface:
+static US equity instruments, exact OCC option instruments, stock bars, option snapshot
+quotes/Greeks, simple equity/ETF `DAY` limit orders, and option multi-leg order lists.
 :::
 
 ## Package
@@ -28,9 +28,8 @@ runtime scope and safe read-only/dry-run examples.
 
 ## Config
 
-The config classes are available to Python users today, but they are shared with the Rust options
-runtime and future live clients. They should not be read as proof that the standard Python
-`TradingNode` factories are ready.
+The config classes are available to Python users for the documented `TradingNode` surface and are
+also shared with the Rust options runtime.
 
 ```{eval-rst}
 .. automodule:: nautilus_trader.adapters.alpaca.config
@@ -41,8 +40,7 @@ runtime and future live clients. They should not be read as proof that the stand
 
 ## Factories
 
-The Python factory classes are importable but deliberately raise `NotImplementedError` until the
-standard Python live-client path is implemented:
+The Python factory classes create the standard Alpaca Python data and execution clients:
 
 ```python
 from nautilus_trader.adapters.alpaca.factories import AlpacaLiveDataClientFactory
@@ -50,6 +48,11 @@ from nautilus_trader.adapters.alpaca.factories import AlpacaLiveExecClientFactor
 ```
 
 ## Strategies
+
+The exported Alpaca put-credit strategy module is a scanner scaffold, not the canonical execution
+architecture. The standard option execution smoke path is the Python options multi-leg
+`TradingNode` example, which submits normal Nautilus `SubmitOrderList` commands through the Alpaca
+execution client.
 
 ```{eval-rst}
 .. automodule:: nautilus_trader.adapters.alpaca.strategies

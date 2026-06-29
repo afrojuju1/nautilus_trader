@@ -99,26 +99,26 @@ Market-hours revalidation note:
   `reason=outside_close_window`; account checks still showed zero open orders and the managed QQQ
   call-credit position.
 
-## Direct Lifecycle Proof
+## Standard Lifecycle Proof
 
-Use explicit symbols when you need to test a known order lifecycle:
-
-```bash
-cargo run -p nautilus-alpaca --features live --bin alpaca-paper-execution-harness -- \
-  <SHORT_PUT_SYMBOL> <LONG_PUT_SYMBOL> <CREDIT_LIMIT> 1
-```
-
-Tune polling for fill or cancel scenarios:
+Use the Python options `TradingNode` example with explicit symbols when you need to test a known
+paper order lifecycle:
 
 ```bash
-export ALPACA_EXECUTION_POLL_ATTEMPTS=10
-export ALPACA_EXECUTION_POST_CANCEL_POLL_ATTEMPTS=5
-export ALPACA_EXECUTION_POLL_SECS=2
+python examples/live/alpaca/options_mleg_trading_node.py \
+  --broker-paper \
+  --confirm-submit \
+  --cancel-after-submit \
+  --short-symbol <SHORT_PUT_SYMBOL> \
+  --long-symbol <LONG_PUT_SYMBOL> \
+  --short-leg-limit 0.50 \
+  --long-leg-limit 0.10 \
+  --qty 1
 ```
 
 Acceptance criteria:
 
-- Accepted/canceled/rejected/filled status is visible from REST polling.
+- Accepted/canceled/rejected/filled status is visible through normal execution reports.
 - Account activities are paginated and matching fills are counted when fills occur.
 - Final account surface is printed and checked.
 

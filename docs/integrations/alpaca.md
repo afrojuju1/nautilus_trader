@@ -19,8 +19,8 @@ integrations until this surface has more production proof.
 Safe live examples are available in
 [`examples/live/alpaca/`](../../examples/live/alpaca/README.md).
 
-The examples start with read-only account, option contract, option snapshot, option-chain scan, and
-multi-leg payload validation commands. They do not submit orders by default.
+The examples start with read-only account, option contract, option snapshot, and option-chain scan
+commands. They do not submit orders by default.
 
 ## Overview
 
@@ -41,7 +41,7 @@ The Rust Alpaca runtime currently includes the following implemented components:
   configuration.
 - `alpaca-ops`: Unified operator CLI for read-only account status, fleet status, alerts,
   performance reports, and strategy-state sync.
-- Separate tooling remains for option-chain scan comparison and multi-leg payload validation.
+- Separate tooling remains for option-chain scan comparison.
 
 The Python package exposes config objects, a stock-bar and exact-option snapshot data client, an
 equity plus option multi-leg execution client, and the Alpaca-specific put-credit scanner scaffold.
@@ -108,10 +108,10 @@ those symbols into instrument IDs on venue `ALPACA`:
 <ALPACA_OPTION_SYMBOL>.ALPACA
 ```
 
-For example, an Alpaca option symbol such as `SPY260619P00450000` becomes:
+For example, an Alpaca option symbol such as `SPY270115P00450000` becomes:
 
 ```text
-SPY260619P00450000.ALPACA
+SPY270115P00450000.ALPACA
 ```
 
 The adapter keeps the Alpaca symbol as the raw symbol and uses the contract payload for underlying,
@@ -213,8 +213,6 @@ cargo run -p nautilus-alpaca --features live --bin alpaca-ops -- account
 cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-contracts -- SPY QQQ
 cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-snapshots -- SPY
 cargo run -p nautilus-alpaca --features live --bin alpaca-compare-option-chain-scan -- --pretty SPY YYYY-MM-DD
-cargo run -p nautilus-alpaca --features live --bin alpaca-validate-mleg-order -- \
-  SPY260619P00450000 SPY260619P00445000 0.40 1
 ```
 
 Before running the live node, check config with submission disabled:
@@ -246,16 +244,8 @@ python examples/live/alpaca/options_mleg_trading_node.py \
   --run-seconds 30
 ```
 
-Use the Rust harness only as the operator/runtime diagnostic, then verify open orders afterward:
-
-```bash
-cargo run -p nautilus-alpaca --features live --bin alpaca-paper-execution-harness -- \
-  SPY260619P00450000 SPY260619P00445000 4.95 1
-cargo run -p nautilus-alpaca --features live --bin alpaca-ops -- account
-```
-
-Both submit paths request cancellation after an accepted non-terminal order. If any smoke order
-remains open, cancel it in the Alpaca paper dashboard or API before continuing.
+After any paper smoke run, verify open orders with `alpaca-ops account`. If any smoke order remains
+open, cancel it in the Alpaca paper dashboard or API before continuing.
 
 Only enable paper submission deliberately, after verifying credentials, endpoints, account status,
 open orders, positions, and risk caps.

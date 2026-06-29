@@ -1,161 +1,92 @@
 # Alpaca Options TradingNode Migration
 
-This is the first concrete options migration slice after the equity `TradingNode` work.
+This document tracks the migration away from direct Alpaca REST strategy utilities and toward normal
+Nautilus `TradingNode` data and execution flows.
 
 ## Current Checkpoint
 
-On May 25, 2026, the Alpaca paper market clock was closed. Alpaca reported the next regular
-session open as May 26, 2026 at 09:30 ET, so a natural equity signal/order lifecycle cannot be
-observed until that session.
+The first standard Python node slice is implemented.
 
-The combined equity node was still exercised through the live broker-paper path with the
-`paper-directional` profile. It connected to Alpaca paper, loaded account state, initialized zero
-open orders and zero positions, subscribed all configured equity bars, received historical bars,
-and shut down cleanly through `TradingNode.stop()`.
+- `AlpacaLiveDataClientFactory` creates an Alpaca data client for static US equity instruments,
+  exact OCC option instruments, stock bars, and option snapshot quotes/Greeks.
+- `AlpacaLiveExecClientFactory` creates an Alpaca execution client for simple US equity/ETF `DAY`
+  limit orders and two-to-four-leg option `SubmitOrderList` commands.
+- The options multi-leg Python example registers exact option instruments, subscribes option
+  snapshot quotes/Greeks, and can submit/cancel a paper multi-leg order through the standard
+  execution client when explicitly confirmed.
+- The Rust `alpaca-options-node` remains the account-level options runtime for hosted strategy
+  families, risk gates, lifecycle handling, operator projections, and paper/live operational proof.
 
-The same profile also verified the current option surfaces:
-
-- Account status is active and not trading-blocked.
-- Account state reported zero open positions and zero open orders.
-- The Rust Alpaca option loader returned `1650` active SPY put instruments for the near expiration
-  window.
-- The Rust snapshot loader requested `100` option snapshots and received `67` quotes with Greeks or
-  IV.
-- The Rust multi-leg payload builder produced a valid Alpaca `mleg` put-credit payload.
-
-On June 22, 2026, the Rust adapter gained a native `AlpacaDataClient` and
-`AlpacaDataClientFactory`. The client follows Nautilus' live `DataClient` contract for lifecycle,
-instrument subscription replay, and `DataResponse::Instrument` / `DataResponse::Instruments`
-requests. It reuses `AlpacaHttpClient`, `AlpacaOptionContractProvider`, and the existing
-`OptionContract` parser to load explicit Alpaca option instruments by `InstrumentId`, for example
-`SPY260619P00450000.ALPACA`. It intentionally does not load full option universes on connect.
-
-## First Migration Target
-
-Start with the Alpaca put-credit spread path.
-
-This is the right first target because it already has working pieces in the Rust Alpaca adapter:
-
-- Option contract loading and conversion into Nautilus `OptionContract` values.
-- Option snapshot loading with quote, IV, and Greek fields.
-- Put-credit candidate scoring.
-- Multi-leg order-list construction.
-- Alpaca `mleg` payload validation.
-- One Rust paper submit/cancel harness for operator diagnostics.
-- Strategy-state, candidate, outcome, and performance ledgers in the runtime.
-
-This should not start with the `spreads_notebook` short-DTE long-call package. That research did not
-clear the packaging bar. It also should not start with `options_gap_core_v1` as an option-order
-strategy: that package is an equity strategy with an options-confirmation data filter, so it belongs
-after the base equity book and option data surface are stable.
+The direct Rust MLeg payload validation/submission diagnostics have been retired. New smoke proof
+should exercise either the Python `TradingNode` path or the Rust `alpaca-options-node` runtime, not
+standalone Alpaca payload posting.
 
 ## Target Architecture
 
-The strategy should become a regular Nautilus strategy running inside a `TradingNode`.
+Strategies should be regular Nautilus strategies running inside a `TradingNode`.
 
 ```text
 TradingNode
   |
   |-- Alpaca data client
-  |     |-- option contracts
-  |     |-- option quotes/snapshots/Greeks
+  |     |-- exact option instruments
+  |     |-- option snapshot quotes/Greeks
+  |     |-- stock bars
   |     `-- underlying equity context
   |
   |-- Alpaca execution client
   |     |-- SubmitOrderList -> Alpaca mleg submit
   |     |-- parent and leg order status mapping
   |     |-- cancel/close/reconcile
-  |     `-- option account, position, activity reports
+  |     `-- account, position, activity reports
   |
-  `-- PutCreditSpread strategy
-        |-- consumes data from the node
-        |-- emits normal Nautilus order-list commands
+  `-- Nautilus strategy
+        |-- consumes data from the node/cache
+        |-- emits normal Nautilus commands
         `-- does not call Alpaca REST directly
 ```
 
-The important boundary is that scanner logic may remain Rust, but broker I/O should sit behind the
-adapter. Strategies should consume node data and submit Nautilus commands; they should not own
-Alpaca credentials, REST clients, broker payloads, or reconciliation.
+The important boundary is that scanner and candidate-selection logic may remain Rust-backed, but
+broker I/O sits behind the adapter. Strategies consume node data and submit Nautilus commands; they
+do not own Alpaca credentials, REST clients, broker payloads, or reconciliation.
 
-## Concrete Broker Gaps
+## Remaining Gaps
 
-1. Option instrument loading in the standard node path.
+1. Strategy ownership for the exported Python put-credit scanner surface.
 
-   Rust can now request or subscribe explicit Alpaca option contracts through a Nautilus
-   `DataClient`, but the Python Alpaca live data factory still uses `AlpacaEquityInstrumentProvider`
-   for its public `TradingNode` path. The next node slice needs an Alpaca option provider surface
-   that can load contracts by underlying, expiration window, option type, and explicit OCC symbols,
-   then publish those instruments into the cache before strategies submit option orders.
+   `AlpacaPutCreditStrategy` is still a timer scaffold over PyO3 scanner bindings. It does not yet
+   consume `TradingNode` option data or emit `SubmitOrderList` commands. Track this separately from
+   adapter plumbing so the public Python strategy surface either becomes real Nautilus strategy code
+   or leaves the public adapter API.
 
-2. Option data requests and subscriptions.
+2. Trade-update streaming in the Python execution client.
 
-   The Python Alpaca data client currently supports static equity instruments and stock bars. The
-   options strategy needs option snapshots or quote ticks with bid, ask, IV, Greeks, open interest,
-   and timestamps. The first slice can poll snapshots; streaming quote ownership can remain a later
-   decision.
+   The Python client currently relies on REST reconciliation. The Rust runtime owns trade-update
+   WebSocket handling today. Promote streaming only when it plugs into the standard execution client
+   event path without adding a parallel broker loop.
 
-3. Strategy-to-order-list construction.
+3. Option market-data streaming in the Python data client.
 
-   Rust already has `build_mleg_submit_order_list` and normalized option leg plans. The Python
-   strategy path needs an exposed builder or equivalent order factory helper so a selected put-credit
-   candidate becomes a normal Nautilus `SubmitOrderList` with stable client order IDs and linked
-   legs.
+   The Python node path polls option snapshots. Native option quote/trade streaming should improve
+   the Alpaca data client and strategy cache path directly.
 
-4. Multi-leg execution submission.
+4. Full lifecycle proof for assignment, exercise, expiration, and correction events.
 
-   The Python Alpaca execution client currently denies `SubmitOrderList` as unsupported. The next
-   implementation must translate two-to-four option legs into Alpaca `order_class=mleg`, submit the
-   parent order, and emit accepted/rejected events for the Nautilus order-list legs without inventing
-   a second broker path.
+   The Rust runtime has lifecycle handling and activity polling; broader Python-node parity should
+   reuse the same adapter/account report semantics rather than introducing new lifecycle daemons.
 
-5. Cancel and close lifecycle.
+5. Historical strategy evaluation through standard stores.
 
-   The adapter needs parent-order cancellation by venue order ID or client order ID, close-order-list
-   construction for reduce-only legs, and idempotent handling for already-terminal parent orders.
+   Historical candidate replay and performance analytics belong in `alpaca-ops replay` /
+   `alpaca-ops performance` backed by the operational store and market-data catalog/warehouse. Do
+   not grow adapter-owned custom backtest binaries.
 
-6. Option position and account reports.
+## Done Criteria For The Migration
 
-   The equity client maps account, equity positions, open orders, fills, and activities. The options
-   path needs equivalent report generation for option positions, nested multi-leg orders, option
-   account activities, fills, assignment, exercise, expiration, and correction events.
-
-7. Options risk gates.
-
-   Equity notional caps are not enough. Defined-risk spreads need max loss per spread, max contracts,
-   max open risk, per-underlying limits, daily submission limits, options buying power checks,
-   duplicate exposure checks, kill switch handling, and permission/rejection classification.
-
-8. Operator projections.
-
-   Candidate ledgers, strategy state, outcome tracking, and performance reporting should remain
-   projections over strategy decisions and broker facts. They should not be a separate execution
-   system once the `TradingNode` broker path is active.
-
-## Implementation Order
-
-Completed foundation on June 22, 2026: add a native Rust `AlpacaDataClient` and factory that can
-exact-load Alpaca option instruments through the Nautilus `DataClient` interface.
-
-1. Add an Alpaca option instrument provider and a small paper-profile option contract check under
-   the Python adapter surface or bind the Rust data client into the standard Python node assembly.
-2. Add option snapshot polling to the Python Alpaca data client, backed by the existing Rust REST
-   model where practical.
-3. Expose the Rust option-leg plan/order-list builder to Python or add an equivalent tested Python
-   builder that produces canonical Nautilus `SubmitOrderList` commands.
-4. Implement Alpaca `SubmitOrderList` handling in the execution client for two-to-four option legs.
-5. Add paper submit/cancel tests and a one-contract paper smoke harness with tiny risk caps.
-6. Convert the put-credit spread strategy from scanner-only behavior to normal strategy behavior:
-   consume node data, select a candidate, submit a Nautilus order list, and let the adapter own
-   broker I/O.
-7. Move close and reconciliation behavior behind the same execution adapter surface.
-
-## Done Criteria For The First Slice
-
-- A Python `TradingNode` can cache selected Alpaca option contracts for one underlying.
-- The node can request or poll option snapshots for those contracts.
-- A selected put-credit candidate can be converted into a Nautilus `SubmitOrderList`.
-- The Alpaca execution client can submit and cancel that order list in paper.
-- The node emits normal execution events and account/position reports.
-- No strategy code posts directly to Alpaca REST.
-- Existing Rust runtime controls and ledgers remain available as operator projections during the
-  transition.
+- Public examples use the Python `TradingNode` or `alpaca-options-node` as the execution proof path.
+- Strategy code does not post directly to Alpaca REST.
+- Option data enters strategies through Nautilus data/cache contracts.
+- Option orders leave strategies as normal Nautilus commands.
+- Operator ledgers and reports remain projections over strategy decisions and broker facts.
+- Historical evaluation uses the maintained replay/performance read models, not a parallel
+  adapter-owned backtest engine.

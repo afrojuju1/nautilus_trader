@@ -4,9 +4,7 @@ Alpaca snapshot conversion helpers.
 
 from typing import Any
 
-import pandas as pd
-
-from nautilus_trader.core.datetime import dt_to_unix_nanos
+from nautilus_trader.adapters.alpaca.common import timestamp_ns_from_value
 from nautilus_trader.model.data import OptionGreeks
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.identifiers import InstrumentId
@@ -41,7 +39,7 @@ def quote_tick_from_option_snapshot(
 
     bid_size = _first_int(quote, "bs", "bid_size", "bidSize", default=0)
     ask_size = _first_int(quote, "as", "ask_size", "askSize", default=0)
-    ts_event = _timestamp_ns_from_value(quote.get("t") or quote.get("timestamp"), ts_init)
+    ts_event = timestamp_ns_from_value(quote.get("t") or quote.get("timestamp"), ts_init)
     return QuoteTick(
         instrument_id=instrument.id,
         bid_price=instrument.make_price(bid_price),
@@ -65,7 +63,7 @@ def greeks_from_option_snapshot(
     greeks = greeks or {}
 
     quote = _nested_dict(snapshot, "latestQuote", "latest_quote") or {}
-    ts_event = _timestamp_ns_from_value(
+    ts_event = timestamp_ns_from_value(
         quote.get("t") or quote.get("timestamp") or snapshot.get("updated_at"),
         ts_init,
     )
@@ -124,14 +122,3 @@ def _first_int(
         except (TypeError, ValueError):
             continue
     return default
-
-
-def _timestamp_ns_from_value(value: Any, default: int) -> int:
-    if value is None:
-        return default
-    timestamp = pd.Timestamp(value)
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.tz_localize("UTC")
-    else:
-        timestamp = timestamp.tz_convert("UTC")
-    return dt_to_unix_nanos(timestamp)

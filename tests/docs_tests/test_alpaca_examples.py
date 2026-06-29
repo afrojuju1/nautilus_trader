@@ -39,28 +39,27 @@ def test_alpaca_docs_reference_existing_runtime_bins() -> None:
         "alpaca-load-option-contracts",
         "alpaca-load-option-snapshots",
         "alpaca-compare-option-chain-scan",
-        "alpaca-validate-mleg-order",
-        "alpaca-paper-execution-harness",
         "alpaca-options-node",
         "alpaca-ops",
     } <= referenced
     assert referenced <= _alpaca_bins()
 
 
-def test_alpaca_paper_smoke_examples_keep_submit_cancel_policy() -> None:
+def test_alpaca_paper_smoke_examples_keep_trading_node_cancel_policy() -> None:
     examples = _read(ALPACA_EXAMPLE_README)
     integration_doc = _read(ALPACA_INTEGRATION_DOC)
-    smoke_section = examples.split("## Rust operator submit/cancel diagnostic", maxsplit=1)[1]
+    smoke_section = examples.split("## Options multi-leg TradingNode", maxsplit=1)[1]
     smoke_section = smoke_section.split("\n## ", maxsplit=1)[0]
 
-    assert "alpaca-paper-execution-harness" in smoke_section
-    assert "alpaca-ops -- account" in smoke_section
-    assert smoke_section.index("alpaca-paper-execution-harness") < smoke_section.index(
-        "alpaca-ops -- account",
-    )
-    assert "Do not leave smoke orders working" in smoke_section
+    assert "options_mleg_trading_node.py" in smoke_section
+    assert "--confirm-submit" in smoke_section
+    assert "--cancel-after-submit" in smoke_section
     assert "alpaca-submit-mleg-order" not in examples
     assert "alpaca-submit-mleg-order" not in integration_doc
+    assert "alpaca-paper-execution-harness" not in examples
+    assert "alpaca-paper-execution-harness" not in integration_doc
+    assert "alpaca-validate-mleg-order" not in examples
+    assert "alpaca-validate-mleg-order" not in integration_doc
 
 
 def test_alpaca_docs_keep_public_examples_non_submitting_by_default() -> None:
@@ -79,8 +78,8 @@ def test_alpaca_docs_use_current_sample_option_contracts() -> None:
     integration_doc = _read(ALPACA_INTEGRATION_DOC)
     combined_docs = f"{examples}\n{integration_doc}"
 
-    assert "SPY260619P00450000" in combined_docs
-    assert "SPY260619P00445000" in combined_docs
-    assert "2026-06-19" in combined_docs
-    for stale_sample in ("2026-01", "260116", "260123"):
+    assert "SPY270115P00450000" in combined_docs
+    assert "SPY270115P00445000" in combined_docs
+    assert "2027-01-15" in combined_docs
+    for stale_sample in ("2026-01", "2026-06-19", "260116", "260123", "260619"):
         assert stale_sample not in combined_docs

@@ -121,13 +121,6 @@ doc = false
 test = false
 
 [[bin]]
-name = "alpaca-options-backtest"
-path = "bin/options_backtest.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
 name = "alpaca-option-chain-scan-node"
 path = "bin/option_chain_scan_node.rs"
 required-features = ["live", "backtest-node"]
@@ -158,29 +151,6 @@ test = false
 [[bin]]
 name = "alpaca-ops"
 path = "bin/ops.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
-name = "alpaca-validate-mleg-order"
-path = "bin/validate_mleg_order.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
-# Internal diagnostic. Prefer the Python options TradingNode for adapter smoke tests and
-# `alpaca-paper-execution-harness` for Rust operator submit/cancel checks.
-name = "alpaca-submit-mleg-order"
-path = "bin/submit_mleg_order.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
-name = "alpaca-paper-execution-harness"
-path = "bin/paper_execution_harness.rs"
 required-features = ["live"]
 doc = false
 test = false

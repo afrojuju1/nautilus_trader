@@ -64,6 +64,9 @@ Rules:
 - Do not restore retired handoff or standalone strategy-loop surfaces such as
   `alpaca-submit-order-list-bridge`, `submit_order_list_bridge.rs`, or
   `alpaca-put-credit-strategy-loop` unless Ade explicitly asks for a staged bridge.
+- Do not restore direct Alpaca MLeg payload diagnostics such as `alpaca-validate-mleg-order`,
+  `alpaca-submit-mleg-order`, or `alpaca-paper-execution-harness`. Use the Python options
+  `TradingNode` smoke path or `alpaca-options-node` runtime path for execution proof.
 - Use the normal runtime submission gate `ALPACA_SUBMIT`; do not reintroduce
   `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED`.
 - Live submit readiness must keep the Alpaca account capability preflight active. `alpaca-options-node`
@@ -79,6 +82,9 @@ Rules:
 - Historical candidate replay belongs in the read-only `alpaca-ops replay` / `performance` research
   path. It may read candidate ledgers and historical market data, but must not submit orders, cancel
   orders, reconcile broker state, or mutate strategy state.
+- Do not restore adapter-owned custom backtest binaries for strategy scoring. Promote reusable
+  behavior to Nautilus catalog/backtest architecture or the maintained `alpaca-ops` replay and
+  performance read models.
 - Do not wire or stamp regime routing metadata until real feature inputs exist. Avoid placeholder
   neutral regime labels because they make candidate evidence look more complete than it is.
 - For Alpaca execution changes, run targeted checks before commit:

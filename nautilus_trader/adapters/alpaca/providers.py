@@ -22,6 +22,7 @@ from datetime import UTC
 from datetime import datetime
 from decimal import Decimal
 
+from nautilus_trader.adapters.alpaca.common import normalize_alpaca_symbol
 from nautilus_trader.adapters.alpaca.constants import ALPACA_VENUE
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import InstrumentProviderConfig
@@ -46,7 +47,7 @@ def make_alpaca_equity(symbol: str, ts_init: int = 0) -> Equity:
     """
     Create a static Nautilus equity instrument for an Alpaca US equity/ETF symbol.
     """
-    normalized = _normalize_symbol(symbol)
+    normalized = normalize_alpaca_symbol(symbol)
     return Equity(
         instrument_id=InstrumentId(Symbol(normalized), ALPACA_VENUE),
         raw_symbol=Symbol(normalized),
@@ -97,7 +98,9 @@ class AlpacaInstrumentProvider(InstrumentProvider):
         config: InstrumentProviderConfig | None = None,
     ) -> None:
         super().__init__(config=config)
-        self._equity_symbols = tuple(_normalize_symbol(symbol) for symbol in equity_symbols or [])
+        self._equity_symbols = tuple(
+            normalize_alpaca_symbol(symbol) for symbol in equity_symbols or []
+        )
         self._option_symbols = tuple(
             _normalize_option_symbol(symbol) for symbol in option_symbols or []
         )
@@ -148,7 +151,7 @@ class AlpacaInstrumentProvider(InstrumentProvider):
                 if is_alpaca_option_symbol(symbol):
                     option_symbols.add(_normalize_option_symbol(symbol))
                 else:
-                    equity_symbols.add(_normalize_symbol(symbol))
+                    equity_symbols.add(normalize_alpaca_symbol(symbol))
 
         return sorted(equity_symbols), sorted(option_symbols)
 
@@ -174,13 +177,6 @@ def is_alpaca_option_symbol(symbol: str) -> bool:
     return True
 
 
-def _normalize_symbol(symbol: str) -> str:
-    normalized = symbol.strip().upper()
-    if not normalized:
-        raise ValueError("symbol must not be empty")
-    return normalized
-
-
 def _normalize_option_symbol(symbol: str) -> str:
     return _parse_occ_option_symbol(symbol).symbol
 
@@ -195,7 +191,7 @@ class _OccOptionSymbol:
 
 
 def _parse_occ_option_symbol(symbol: str) -> _OccOptionSymbol:
-    normalized = _normalize_symbol(symbol)
+    normalized = normalize_alpaca_symbol(symbol)
     if normalized.endswith(f".{ALPACA_VENUE.value}"):
         normalized = normalized[: -(len(ALPACA_VENUE.value) + 1)]
     normalized = normalized.removeprefix("O:")

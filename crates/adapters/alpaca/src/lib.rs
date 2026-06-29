@@ -88,8 +88,6 @@ pub mod strategy;
 #[cfg(feature = "live")]
 pub mod strategy_state_entry;
 #[cfg(feature = "live")]
-pub mod submit;
-#[cfg(feature = "live")]
 pub mod websocket;
 
 #[cfg(feature = "live")]
