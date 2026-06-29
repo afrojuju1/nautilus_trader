@@ -30,6 +30,9 @@ pub struct NautilusCli {
 pub enum Commands {
     Database(DatabaseOpt),
     Warehouse(WarehouseOpt),
+    Ops(OpsOpt),
+    #[cfg(feature = "alpaca")]
+    Adapters(AdaptersOpt),
     #[cfg(feature = "defi")]
     Blockchain(BlockchainOpt),
 }
@@ -117,6 +120,111 @@ pub enum WarehouseCommand {
     BackfillQuotes(ClickHouseBackfillQuotesConfig),
     /// Validates catalog QuoteTick data against ClickHouse rows.
     ValidateQuotes(ClickHouseValidateQuotesConfig),
+}
+
+/// Source-neutral trading operations.
+#[derive(Parser, Debug)]
+#[command(about = "Source-neutral trading operations", long_about = None)]
+pub struct OpsOpt {
+    #[clap(subcommand)]
+    pub command: OpsCommand,
+}
+
+/// Available source-neutral trading operations.
+#[derive(Parser, Debug, Clone)]
+#[command(about = "Source-neutral trading operations", long_about = None)]
+pub enum OpsCommand {
+    /// Checks operational Postgres connectivity and optional strategy-state metadata.
+    Status(OpsStatusConfig),
+}
+
+/// Configuration parameters for source-neutral operational-store status.
+#[derive(Parser, Debug, Clone)]
+pub struct OpsStatusConfig {
+    /// Operational Postgres database URL. Defaults to NAUTILUS_OPERATIONAL_DATABASE_URL.
+    #[arg(long)]
+    pub database_url: Option<String>,
+    /// Operational Postgres schema. Defaults to NAUTILUS_OPERATIONAL_SCHEMA or trading_ops.
+    #[arg(long)]
+    pub schema: Option<String>,
+    /// Optional account ID for strategy-state metadata.
+    #[arg(long)]
+    pub account_id: Option<String>,
+    /// Prints JSON output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[cfg(feature = "alpaca")]
+/// Adapter-specific operational commands.
+#[derive(Parser, Debug)]
+#[command(about = "Adapter-specific operational commands", long_about = None)]
+pub struct AdaptersOpt {
+    #[clap(subcommand)]
+    pub command: AdapterCommand,
+}
+
+#[cfg(feature = "alpaca")]
+/// Available adapter-specific command groups.
+#[derive(Parser, Debug)]
+#[command(about = "Adapter-specific operational commands", long_about = None)]
+pub enum AdapterCommand {
+    Alpaca(AlpacaAdapterOpt),
+}
+
+#[cfg(feature = "alpaca")]
+/// Alpaca adapter operational commands.
+#[derive(Parser, Debug)]
+#[command(about = "Alpaca adapter operations", long_about = None)]
+pub struct AlpacaAdapterOpt {
+    #[clap(subcommand)]
+    pub command: AlpacaAdapterCommand,
+}
+
+#[cfg(feature = "alpaca")]
+/// Available Alpaca adapter commands.
+#[derive(Parser, Debug, Clone)]
+#[command(about = "Alpaca adapter operations", long_about = None)]
+pub enum AlpacaAdapterCommand {
+    /// Prints supervised Alpaca runtime status.
+    Status(ForwardedArgs),
+    /// Checks Alpaca account, positions, and open orders.
+    Account(ForwardedArgs),
+    /// Summarizes configured Alpaca accounts.
+    Fleet(ForwardedArgs),
+    /// Emits Alpaca candidate alerts.
+    Alerts(AlpacaAlertsOpt),
+    /// Builds Alpaca-backed performance reports.
+    Performance(ForwardedArgs),
+    /// Replays Alpaca candidate evidence against historical option bars.
+    Replay(ForwardedArgs),
+    /// Syncs Alpaca operational strategy state to configured local files.
+    SyncState(ForwardedArgs),
+}
+
+#[cfg(feature = "alpaca")]
+/// Alpaca alert commands.
+#[derive(Parser, Debug, Clone)]
+#[command(about = "Alpaca alert operations", long_about = None)]
+pub struct AlpacaAlertsOpt {
+    #[clap(subcommand)]
+    pub command: AlpacaAlertsCommand,
+}
+
+#[cfg(feature = "alpaca")]
+/// Available Alpaca alert commands.
+#[derive(Parser, Debug, Clone)]
+pub enum AlpacaAlertsCommand {
+    /// Emits candidate alerts from the operational store.
+    Candidates(ForwardedArgs),
+}
+
+#[cfg(feature = "alpaca")]
+/// Arguments forwarded to adapter-owned command implementations.
+#[derive(Parser, Debug, Clone)]
+pub struct ForwardedArgs {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub args: Vec<String>,
 }
 
 /// Configuration parameters for the warehouse QuoteTick smoke command.

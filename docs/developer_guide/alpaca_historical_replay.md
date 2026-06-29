@@ -4,14 +4,14 @@ This workstream evaluates recorded Alpaca option candidates against historical o
 It is research-only: it does not submit, cancel, reconcile, or mutate strategy state.
 
 This is the maintained historical evaluation path. Do not restore adapter-owned custom backtest
-binaries for strategy scoring; use `alpaca-ops replay` / `alpaca-ops performance` over the
+binaries for strategy scoring; use `nautilus adapters alpaca replay` / `nautilus adapters alpaca performance` over the
 operational store and market-data catalog/warehouse, or promote reusable backtest behavior into the
 standard Nautilus backtest/catalog architecture.
 
 Run it through the operator CLI:
 
 ```bash
-alpaca-ops replay --since 2026-06-01 --until 2026-06-05 --max-rank 3 --max-candidates 100
+nautilus adapters alpaca replay --since 2026-06-01 --until 2026-06-05 --max-rank 3 --max-candidates 100
 ```
 
 Use `--json` for machine-readable output and `--include-records` when per-candidate rows are needed.
@@ -98,11 +98,11 @@ Build and smoke-check the command with:
 
 ```bash
 cargo check -p nautilus-alpaca --features live --bins
-alpaca-ops replay --help
+nautilus adapters alpaca replay --help
 ```
 
 Run against real data only with configured storage and Alpaca data credentials:
 
 ```bash
-alpaca-ops replay --json --since YYYY-MM-DD --until YYYY-MM-DD --max-rank 3 --max-candidates 100
+nautilus adapters alpaca replay --json --since YYYY-MM-DD --until YYYY-MM-DD --max-rank 3 --max-candidates 100
 ```

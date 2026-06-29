@@ -77,8 +77,8 @@ do not own Alpaca credentials, REST clients, broker payloads, or reconciliation.
 
 5. Historical strategy evaluation through standard stores.
 
-   Historical candidate replay and performance analytics belong in `alpaca-ops replay` /
-   `alpaca-ops performance` backed by the operational store and market-data catalog/warehouse. Do
+   Historical candidate replay and performance analytics belong in `nautilus adapters alpaca replay` /
+   `nautilus adapters alpaca performance` backed by the operational store and market-data catalog/warehouse. Do
    not grow adapter-owned custom backtest binaries.
 
 ## Done Criteria For The Migration

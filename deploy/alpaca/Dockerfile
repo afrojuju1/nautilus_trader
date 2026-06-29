@@ -37,9 +37,11 @@ RUN --mount=type=cache,id=nautilus-alpaca-cargo-registry,target=/usr/local/cargo
     cargo_args=""; \
     for bin in $bins; do cargo_args="$cargo_args --bin $bin"; done; \
     cargo build --locked --profile "$CARGO_PROFILE" -p nautilus-alpaca --features live,warehouse-clickhouse $cargo_args; \
+    cargo build --locked --profile "$CARGO_PROFILE" -p nautilus-cli --features alpaca --bin nautilus; \
     case "$CARGO_PROFILE" in release) profile_dir=release ;; dev) profile_dir=debug ;; *) profile_dir="$CARGO_PROFILE" ;; esac; \
     mkdir -p /artifacts; \
-    for bin in $bins; do cp "/workspace/target/$profile_dir/$bin" "/artifacts/$bin"; done
+    for bin in $bins; do cp "/workspace/target/$profile_dir/$bin" "/artifacts/$bin"; done; \
+    cp "/workspace/target/$profile_dir/nautilus" /artifacts/nautilus
 
 FROM debian:bookworm-slim
 
@@ -65,12 +67,8 @@ ENV HOME=/home/nautilus \
     XDG_CONFIG_HOME=/config \
     XDG_STATE_HOME=/state \
     NAUTILUS_ALPACA_REPO=/workspace \
+    NAUTILUS_BIN=/usr/local/bin/nautilus \
     NAUTILUS_ALPACA_RUNNER_BIN=/usr/local/bin/alpaca-options-node \
-    NAUTILUS_ALPACA_OPERATOR_BIN=/usr/local/bin/alpaca-ops \
-    NAUTILUS_ALPACA_FLEET_BIN=/usr/local/bin/alpaca-ops \
-    NAUTILUS_ALPACA_OPTION_CHAIN_LIVE_BIN=/usr/local/bin/alpaca-options-node \
-    NAUTILUS_ALPACA_COMPARE_SCAN_BIN=/usr/local/bin/alpaca-compare-option-chain-scan \
-    NAUTILUS_ALPACA_CANDIDATE_ALERTS_BIN=/usr/local/bin/alpaca-ops \
-    NAUTILUS_ALPACA_PERFORMANCE_BIN=/usr/local/bin/alpaca-ops
+    NAUTILUS_ALPACA_OPERATOR_BIN=/usr/local/bin/nautilus
 
 CMD ["alpaca-options-node", "--help"]

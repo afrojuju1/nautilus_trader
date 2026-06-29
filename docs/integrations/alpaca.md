@@ -39,7 +39,7 @@ The Rust Alpaca runtime currently includes the following implemented components:
   performance reporting.
 - `alpaca-options-node --check-config`: Config-check command for deployed options runtime
   configuration.
-- `alpaca-ops`: Unified operator CLI for read-only account status, fleet status, alerts,
+- `nautilus adapters alpaca`: Unified operator CLI for read-only account status, fleet status, alerts,
   performance reports, and strategy-state sync.
 - Separate tooling remains for option-chain scan comparison.
 
@@ -209,7 +209,7 @@ export APCA_API_KEY_ID="YOUR_PAPER_KEY"
 export APCA_API_SECRET_KEY="YOUR_PAPER_SECRET"
 export ALPACA_TRADING_BASE_URL="https://paper-api.alpaca.markets"
 
-cargo run -p nautilus-alpaca --features live --bin alpaca-ops -- account
+cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca account
 cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-contracts -- SPY QQQ
 cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-snapshots -- SPY
 cargo run -p nautilus-alpaca --features live --bin alpaca-compare-option-chain-scan -- --pretty SPY YYYY-MM-DD
@@ -244,7 +244,7 @@ python examples/live/alpaca/options_mleg_trading_node.py \
   --run-seconds 30
 ```
 
-After any paper smoke run, verify open orders with `alpaca-ops account`. If any smoke order remains
+After any paper smoke run, verify open orders with `nautilus adapters alpaca account`. If any smoke order remains
 open, cancel it in the Alpaca paper dashboard or API before continuing.
 
 Only enable paper submission deliberately, after verifying credentials, endpoints, account status,

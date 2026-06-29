@@ -21,8 +21,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
-use nautilus_alpaca::{
+use crate::{
     config::AlpacaDataClientConfig,
     http::{
         client::AlpacaHttpClient,
@@ -39,6 +38,7 @@ use nautilus_alpaca::{
     },
     runtime::StrategyStateEntry,
 };
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde_json::json;
 
 #[derive(Debug)]
@@ -82,7 +82,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let args = parse_args()?;
     let config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_operational_store().await?;
     if config.operational_repository.is_none() {
-        anyhow::bail!("NAUTILUS_OPERATIONAL_DATABASE_URL is required for alpaca-ops performance");
+        anyhow::bail!(
+            "NAUTILUS_OPERATIONAL_DATABASE_URL is required for nautilus adapters alpaca performance"
+        );
     }
     let state = config.load_strategy_state().await?;
     let entries = state
@@ -202,7 +204,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
 fn parse_args() -> anyhow::Result<Args> {
     let mut args = Args::default();
-    let mut iter = crate::ops_args().into_iter();
+    let mut iter = crate::operator::args().into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--json" => args.json_output = true,
@@ -276,7 +278,7 @@ fn parse_string_arg(name: &str, value: Option<String>) -> anyhow::Result<String>
 
 fn print_usage() {
     eprintln!(
-        "usage: alpaca-ops performance [--json] [--send-discord] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--no-track-candidate-outcomes] [--track-date YYYY-MM-DD] [--track-max-candidates N] [--track-max-rank N] [--no-track-historical-fill] [--track-historical-fill-lookahead-minutes N] [--track-historical-fill-timeframe 1Min]"
+        "usage: nautilus adapters alpaca performance [--json] [--send-discord] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--no-track-candidate-outcomes] [--track-date YYYY-MM-DD] [--track-max-candidates N] [--track-max-rank N] [--no-track-historical-fill] [--track-historical-fill-lookahead-minutes N] [--track-historical-fill-timeframe 1Min]"
     );
 }
 
@@ -289,7 +291,7 @@ fn activity_after_timestamp(
             .and_hms_opt(0, 0, 0)
             .map(|timestamp| timestamp.and_utc().to_rfc3339());
     }
-    let state = nautilus_alpaca::runtime::StrategyState {
+    let state = crate::runtime::StrategyState {
         entries: entries.to_vec(),
     };
     let earliest = earliest_entry_timestamp(&state)?;

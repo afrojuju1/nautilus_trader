@@ -4,7 +4,7 @@
 # unless an account intentionally sets `env_file` to a different boundary.
 
 [fleet]
-operator_bin = "/home/ade/.local/bin/alpaca-ops"
+operator_bin = "/home/ade/.local/bin/nautilus"
 kill_switch = false
 max_active_entries = 18
 max_active_entries_per_underlying = 2

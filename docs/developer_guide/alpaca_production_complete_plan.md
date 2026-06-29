@@ -302,10 +302,10 @@ Goal: operate the engine without reading raw logs as the primary interface.
 Work:
 
 - Add CLI/status output for account, orders, positions, strategy state, last scan, last decision, and
-  last broker event. (Initial `alpaca-ops status` binary complete with human and JSON output.)
+  last broker event. (Initial `nautilus adapters alpaca status` binary complete with human and JSON output.)
 - Add alerts for rejected orders, websocket disconnect, stale working orders, unmanaged positions,
   reconciliation mismatches, kill-switch activation, and service restart. (Initial alert summary is
-  implemented in `alpaca-ops status`; websocket disconnect alerts consume structured disconnect
+  implemented in `nautilus adapters alpaca status`; websocket disconnect alerts consume structured disconnect
   events when the live engine emits them.)
 - Add structured event logs for strategy decisions and broker state transitions. (Runner emits
   structured `operator_event=` JSON for start, iteration, decision, and submit result events.)
@@ -338,7 +338,7 @@ Goal: turn the proven runner/deployment slice into a maintainable single account
 Work:
 
 - Build and install release binaries for `alpaca-options-node` and
-  `alpaca-ops status`; stop using `cargo run` from systemd and control scripts. (Complete:
+  `nautilus adapters alpaca status`; stop using `cargo run` from systemd and control scripts. (Complete:
   installer builds release binaries and service/control scripts execute installed binaries.)
 - Move strategy state structs, atomic state persistence, operator-event emission, and credit-spread
   management helpers from the runner binary into reusable `src/` modules. (State schema,
@@ -369,7 +369,7 @@ Current status:
 - `alpaca-options.service` was verified running `~/.local/bin/alpaca-options-node`
   instead of `cargo run`.
 - `alpaca-control.sh operator|health` was verified running
-  `~/.local/bin/alpaca-ops status`.
+  `~/.local/bin/nautilus adapters alpaca status`.
 - Strategy state persistence is atomic and shared between runner and operator status through the
   `runtime` module.
 - Credit-spread close decisions are shared through the `management` module with direct unit tests.
@@ -587,14 +587,14 @@ Required before promoting beyond experimental:
      a connected-but-silent stream does not freeze the active-risk quote cache.
    - Management close marks and close triggers read the Nautilus quote cache first. Stale cached
      active-entry quotes block close attempts, emit `active_risk_quote_stale`, and surface in
-     `alpaca-ops status`.
+     `nautilus adapters alpaca status`.
    - Candidate entry checks block on stale cached selected-leg quotes, but do not block first-time
      entries solely because the subscription cache has not emitted yet.
-   - `alpaca-ops status` includes the latest `option_market_data_stream` event so operators can
+   - `nautilus adapters alpaca status` includes the latest `option_market_data_stream` event so operators can
      distinguish stream-backed freshness from snapshot fallback.
 
 4. Historical option research and replay harness. **Status: initial read-only harness complete.**
-   - `alpaca-ops replay` replays candidate ledgers against Alpaca historical option bars where
+   - `nautilus adapters alpaca replay` replays candidate ledgers against Alpaca historical option bars where
      available.
    - Produces score-bucket, strategy, underlying, DTE, delta, spread-width, and liquidity summaries
      with evaluated and missing-mark counts.
@@ -636,7 +636,7 @@ High-value after the required platform work:
      exposures that look harmless by entry count alone.
 
 7. Fill-quality intelligence.
-   - Status: initial reporting complete in `alpaca-ops performance`. Performance rows now report
+   - Status: initial reporting complete in `nautilus adapters alpaca performance`. Performance rows now report
      quoted-vs-actual entry cashflow, entry slippage, fill delay, fill completeness, and explicit
      missing inputs; summary and by-strategy aggregates include fill-quality metrics.
    - Measure each submitted order against quote midpoint, bid/ask spread, quote age, fill delay,
@@ -669,7 +669,7 @@ High-value after the required platform work:
    - Record event blocks as first-class decision reasons so skipped trades can be reviewed.
 
 10. Replay lab and decision time machine.
-    - Status: initial decision explanations complete in candidate outcomes and `alpaca-ops replay`.
+    - Status: initial decision explanations complete in candidate outcomes and `nautilus adapters alpaca replay`.
       Selected-candidate reason/details are preserved, replay records include decision reasons and
       broker rejection reasons, and replay reports bucket outcomes by `by_decision_reason`.
     - Reconstruct any trading day from config, account state, market snapshots, candidate ledgers,
@@ -760,7 +760,7 @@ Implement the Phase 7.5 required platform work in this order:
 3. Active-risk option quote cache on the current Nautilus subscription path. Done for runtime
    gating and operator status; option quote/trade streaming is wired with snapshot fallback and
    still needs market-hours entitlement validation.
-4. Historical option research and replay harness. Initial read-only `alpaca-ops replay` command is
+4. Historical option research and replay harness. Initial read-only `nautilus adapters alpaca replay` command is
    done for historical option-bar marks and aggregate summaries; richer historical Greek and
    option-chain evidence depends on warehouse availability.
 5. Portfolio risk-capital stress governor. Initial implementation complete; richer Greek/stress

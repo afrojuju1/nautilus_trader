@@ -5825,6 +5825,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "log",
+ "nautilus-alpaca",
  "nautilus-blockchain",
  "nautilus-common",
  "nautilus-core",

@@ -143,10 +143,6 @@ alpaca-control --account paper-put-credit-spy status
 alpaca-control --account paper-call-credit-qqq status
 alpaca-control --account paper-undefined-risk status
 alpaca-control --account paper-undefined-risk check-config
-alpaca-control --account paper-undefined-risk scan naked GDX,SLV
-alpaca-control --account paper-directional scan credit SPY,QQQ
-alpaca-control strategy-report
-alpaca-control strategy-report --tomorrow
 alpaca-control alerts candidates --all --dry-run
 alpaca-control alerts candidates --all --send
 alpaca-control alerts enable
@@ -162,7 +158,8 @@ alpaca-control rollout
 alpaca-control fleet --json
 alpaca-control health
 alpaca-control logs
-alpaca-ops fleet --json
+nautilus adapters alpaca fleet --json
+nautilus ops status --account-id paper-main
 ```
 
 ## Dockerized Local Bring-Up
@@ -254,11 +251,9 @@ Stop the containerized engine without removing Postgres data:
 docker compose --env-file .env -f deploy/alpaca/compose.yml --profile engine stop alpaca-options
 ```
 
-`scan` is a one-shot diagnostic candidate scan. It auto-loads the shared repo `.env` or selected
-account env override plus the selected account config, forces dry-run entry decisions, disables
-submit/manage/close, ignores the entry window by default, and raises local account caps so daily
-submit limits do not hide candidates. Use `run-once` when the goal is to execute one normal engine
-iteration with the account's configured runtime gates.
+Ad hoc candidate scans and cutover proofs are no longer `alpaca-control` commands. Use the
+Nautilus node, explicit cargo diagnostics, or the documented Docker cutover profiles so deployment
+control stays separate from migration tooling.
 
 Paper smoke tests that submit orders must be deliberate and short-lived. Keep paper endpoints in
 the repo `.env`, set `ALPACA_MAX_ITERATIONS=1`, keep quantity at `1`, and set
@@ -326,8 +321,8 @@ the service exits without starting another Alpaca account owner.
 The service runs installed release binaries by default:
 
 - Runner: `~/.local/bin/alpaca-options-node`
-- Operator status: `~/.local/bin/alpaca-ops status`
-- Fleet status: `~/.local/bin/alpaca-ops fleet`
+- Operator status: `~/.local/bin/nautilus adapters alpaca status`
+- Fleet status: `~/.local/bin/nautilus adapters alpaca fleet`
 
 Override with `NAUTILUS_ALPACA_RUNNER_BIN` or `NAUTILUS_ALPACA_OPERATOR_BIN` only for diagnostics.
 
@@ -400,12 +395,10 @@ Accounts with debit verticals require `long_premium = true`. A mismatch forces
 `submit_enabled=false` and `kill_switch=true` for that runtime while leaving management/close gates
 available for existing tracked exposure.
 
-The paper profile manifest is the operator source of truth for strategy attribution checks. It maps
-each paper account to the expected runtime TOML fields, entry window, risk caps, and backtest
-profile ID where one exists. `alpaca-control strategy-report` compares live account configs against
-that manifest before printing DB-backed candidate, decision, submission, open-position, and closed
-PnL summaries. `alpaca-control strategy-report --tomorrow` prints the same report shell for the next
-trade date so the `09:45-10:15 ET` entry-window evidence is easy to review after the morning scan.
+The paper profile manifest documents account intent, but the shell wrapper no longer owns
+DB-backed strategy attribution. Use `nautilus adapters alpaca performance` for Alpaca
+broker-backed performance reads and promote source-neutral attribution into `nautilus ops` when the
+read model no longer depends on Alpaca broker fills.
 
 Only create an account env file when an account intentionally needs credentials, endpoints, or
 safety gates that differ from the shared repo `.env`.
@@ -499,7 +492,7 @@ tiny live canary.
 
 ## Operator Status
 
-`alpaca-control operator` runs the `alpaca-ops status` binary and summarizes service state,
+`alpaca-control operator` runs the `nautilus adapters alpaca status` binary and summarizes service state,
 account status, open orders, positions, strategy state, the last structured scan/decision event, the
 latest broker event, and operator alerts. Use `--json` for machine-readable output.
 
@@ -512,7 +505,7 @@ alpaca-control --account paper-main health
 alpaca-control today
 ```
 
-`alpaca-control fleet` runs `alpaca-ops fleet`, reads the fleet registry, and executes per-account
+`alpaca-control fleet` runs `nautilus adapters alpaca fleet`, reads the fleet registry, and executes per-account
 operator status with the shared repo `.env` or an account's explicit env-file override. It is a
 read-only fleet summary; it does not start services, submit orders, or change account state.
 
@@ -523,7 +516,7 @@ alpaca-control accounts
 alpaca-control fleet
 alpaca-control fleet --json
 alpaca-control fleet --include-disabled
-alpaca-ops fleet --json
+nautilus adapters alpaca fleet --json
 ```
 
 `alpaca-control validate` runs the targeted Alpaca formatting, shell syntax, library test, and binary
@@ -631,9 +624,9 @@ realized-trade records.
 Normal overnight monitoring:
 
 ```bash
-alpaca-ops status --json
-alpaca-ops fleet --json
-cargo run -p nautilus-alpaca --features live --bin alpaca-ops -- account
+nautilus adapters alpaca status --json
+nautilus adapters alpaca fleet --json
+cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca account
 ```
 
 Expected overnight state with an open managed spread is service `active`, open orders `0`, unmanaged
@@ -645,7 +638,7 @@ Force flatten:
 sed -i 's/^ALPACA_FORCE_FLATTEN=.*/ALPACA_FORCE_FLATTEN=true/' \
   .env
 systemctl --user restart alpaca-options.service
-alpaca-ops status --json
+nautilus adapters alpaca status --json
 ```
 
 After the account is flat, set `ALPACA_FORCE_FLATTEN=false` and restart the service.
@@ -663,7 +656,7 @@ Unmanaged position:
 
 - Treat `unmanaged_positions` as critical.
 - Do not enable more entries.
-- Compare `alpaca-ops account` against the strategy state file, then either restore state
+- Compare `nautilus adapters alpaca account` against the strategy state file, then either restore state
   from a known-good copy or flatten the unmanaged broker exposure.
 
 Rejected MLeg:

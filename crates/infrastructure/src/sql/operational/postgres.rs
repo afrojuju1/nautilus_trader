@@ -46,6 +46,29 @@ impl OperationalRepository {
         Ok(repository)
     }
 
+    /// Connects to an operational schema without applying migrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if schema validation or database connection fails.
+    pub async fn connect_read_only_with_schema(
+        database_url: &str,
+        schema: &str,
+    ) -> anyhow::Result<Self> {
+        let schema = if schema.trim().is_empty() {
+            OPERATIONAL_SCHEMA_DEFAULT.to_string()
+        } else {
+            validate_schema(schema)?;
+            schema.to_string()
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(database_url)
+            .await?;
+        Ok(Self { pool, schema })
+    }
+
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }

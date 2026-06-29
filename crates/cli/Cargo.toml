@@ -18,6 +18,7 @@ workspace = true
 
 [features]
 default = []
+alpaca = ["dep:nautilus-alpaca", "nautilus-alpaca/live"]
 defi = ["dep:nautilus-blockchain", "nautilus-model/defi"]
 
 [package.metadata.docs.rs]
@@ -31,6 +32,7 @@ nautilus-infrastructure = { workspace = true, features = ["postgres"] }
 nautilus-model = { workspace = true }
 nautilus-persistence = { workspace = true, features = ["clickhouse"] }
 
+nautilus-alpaca = { workspace = true, default-features = false, optional = true }
 nautilus-blockchain = { workspace = true, features = [
   "hypersync",
 ], optional = true }

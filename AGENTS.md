@@ -79,11 +79,14 @@ Rules:
 - Active-risk option quote freshness belongs in `AlpacaOptionsStrategy` through Nautilus
   `subscribe_quotes` and the strategy cache. Do not add a standalone quote loop; improve the Alpaca
   data client when quote transport needs to move from REST snapshots to streaming.
-- Historical candidate replay belongs in the read-only `alpaca-ops replay` / `performance` research
+- Historical candidate replay belongs in the read-only `nautilus adapters alpaca replay` / `performance` research
   path. It may read candidate ledgers and historical market data, but must not submit orders, cancel
   orders, reconcile broker state, or mutate strategy state.
+- Operator commands belong under the Nautilus CLI (`nautilus ops` for source-neutral operational
+  state and `nautilus adapters alpaca` for Alpaca-specific broker/runtime diagnostics). Do not add
+  new behavior to `alpaca-ops`; it is a transitional binary pending removal in Bead `nt-jez`.
 - Do not restore adapter-owned custom backtest binaries for strategy scoring. Promote reusable
-  behavior to Nautilus catalog/backtest architecture or the maintained `alpaca-ops` replay and
+  behavior to Nautilus catalog/backtest architecture or the maintained `nautilus adapters alpaca` replay and
   performance read models.
 - Do not wire or stamp regime routing metadata until real feature inputs exist. Avoid placeholder
   neutral regime labels because they make candidate evidence look more complete than it is.
@@ -93,12 +96,16 @@ Rules:
 cargo fmt -p nautilus-alpaca
 cargo test -p nautilus-alpaca --features live --lib
 cargo check -p nautilus-alpaca --features live --bins
+cargo check -p nautilus-cli --features alpaca --bin nautilus
 ```
 
 Keep Alpaca verification tiered:
 
 - Unit/config/strategy/order changes: run the targeted checks above.
-- Build-only or docs-only deploy changes: run `cargo fmt -p nautilus-alpaca` and `cargo check -p nautilus-alpaca --features live --bins` when Rust code or scripts can affect binaries.
+- Build-only or docs-only deploy changes: run `cargo fmt -p nautilus-alpaca`,
+  `cargo check -p nautilus-alpaca --features live --bins`, and
+  `cargo check -p nautilus-cli --features alpaca --bin nautilus` when Rust code or scripts can
+  affect binaries.
 - Broker/account probes: run only when touching account admission, execution submission, order reconciliation, or before/after a smoke test.
 - Systemd install/control checks: run only when deployment files, installed binaries, or service wiring changes.
 - Paper order smoke tests: run only intentionally, preferably during market hours, and cancel accepted smoke orders unless the user explicitly asks to leave orders open.
@@ -109,7 +116,7 @@ Keep Alpaca verification tiered:
 
 ```bash
 docker compose --env-file .env -f deploy/alpaca/compose.yml --profile engine ps
-docker exec nautilus-alpaca-alpaca-options-1 alpaca-ops status --json
+docker exec nautilus-alpaca-alpaca-options-1 nautilus adapters alpaca status --json
 docker exec nautilus-alpaca-alpaca-options-1 alpaca-options-node --check-config
 ```
 

@@ -2,8 +2,7 @@
 
 use std::env;
 
-use chrono::NaiveDate;
-use nautilus_alpaca::{
+use crate::{
     config::AlpacaDataClientConfig,
     http::client::AlpacaHttpClient,
     options_runtime::AlpacaOptionsRuntimeConfig,
@@ -12,6 +11,7 @@ use nautilus_alpaca::{
         HistoricalReplayRequest, replay_historical_candidates,
     },
 };
+use chrono::NaiveDate;
 
 #[derive(Debug)]
 struct Args {
@@ -45,7 +45,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let args = parse_args()?;
     let config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_operational_store().await?;
     if config.operational_repository.is_none() {
-        anyhow::bail!("NAUTILUS_OPERATIONAL_DATABASE_URL is required for alpaca-ops replay");
+        anyhow::bail!(
+            "NAUTILUS_OPERATIONAL_DATABASE_URL is required for nautilus adapters alpaca replay"
+        );
     }
 
     let mut data_config = AlpacaDataClientConfig::default();
@@ -79,7 +81,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
 fn parse_args() -> anyhow::Result<Args> {
     let mut args = Args::default();
-    let mut iter = crate::ops_args().into_iter();
+    let mut iter = crate::operator::args().into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--json" => args.json_output = true,
@@ -131,7 +133,7 @@ fn parse_string_arg(name: &str, value: Option<String>) -> anyhow::Result<String>
 
 fn print_usage() {
     eprintln!(
-        "usage: alpaca-ops replay [--json] [--include-records] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--max-candidates N] [--max-rank N] [--lookahead-minutes N] [--timeframe 1Min]"
+        "usage: nautilus adapters alpaca replay [--json] [--include-records] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--max-candidates N] [--max-rank N] [--lookahead-minutes N] [--timeframe 1Min]"
     );
 }
 

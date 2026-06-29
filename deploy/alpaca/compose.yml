@@ -115,12 +115,12 @@ services:
   alpaca-check-account:
     <<: *alpaca-runtime
     profiles: ["status"]
-    command: ["alpaca-ops", "account"]
+    command: ["nautilus", "adapters", "alpaca", "account"]
 
   alpaca-status:
     <<: *alpaca-runtime
     profiles: ["status"]
-    command: ["alpaca-ops", "status", "--json"]
+    command: ["nautilus", "adapters", "alpaca", "status", "--json"]
 
   alpaca-compare-option-chain-scan:
     <<: *alpaca-tools-runtime

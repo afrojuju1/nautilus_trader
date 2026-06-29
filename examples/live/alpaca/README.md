@@ -196,7 +196,7 @@ If a smoke order remains open, cancel it in the Alpaca paper dashboard or API be
 This command reads account state, positions, and open orders. It does not submit or cancel orders.
 
 ```bash
-cargo run -p nautilus-alpaca --features live --bin alpaca-ops -- account
+cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca account
 ```
 
 ## Load option contracts
@@ -281,7 +281,6 @@ alpaca-control --account paper-main check-config
 alpaca-control --account paper-main status
 alpaca-control fleet --json
 alpaca-control today
-alpaca-control ledger-summary --all
 alpaca-control alerts candidates --all --dry-run
 alpaca-control performance --all
 ```

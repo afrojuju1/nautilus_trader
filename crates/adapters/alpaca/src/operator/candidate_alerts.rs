@@ -21,8 +21,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::options_runtime::AlpacaOptionsRuntimeConfig;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
-use nautilus_alpaca::options_runtime::AlpacaOptionsRuntimeConfig;
 use nautilus_infrastructure::sql::operational::{
     CandidateLedgerSummaryFilters, read_candidate_ledger_records,
 };
@@ -77,7 +77,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_operational_store().await?;
     let Some(storage) = &config.operational_repository else {
         anyhow::bail!(
-            "NAUTILUS_OPERATIONAL_DATABASE_URL is required for alpaca-ops alerts candidates"
+            "NAUTILUS_OPERATIONAL_DATABASE_URL is required for nautilus adapters alpaca alerts candidates"
         );
     };
     let account_id = config.operational_account_id().to_string();
@@ -170,7 +170,7 @@ impl Args {
             include_submit_rejects: true,
         };
 
-        let mut iter = crate::ops_args().into_iter();
+        let mut iter = crate::operator::args().into_iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--date" => args.date = Some(next_arg(&mut iter, "--date")?),
@@ -226,7 +226,7 @@ fn next_arg(iter: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Resu
 
 fn print_usage() {
     println!(
-        "usage: alpaca-ops alerts candidates [--send|--dry-run] [--date YYYY-MM-DD] [--lookback-minutes N] [--max-rank N]"
+        "usage: nautilus adapters alpaca alerts candidates [--send|--dry-run] [--date YYYY-MM-DD] [--lookback-minutes N] [--max-rank N]"
     );
 }
 

@@ -25,7 +25,7 @@ export ALPACA_TRADE_UPDATES_WS_URL=wss://paper-api.alpaca.markets/stream
 Verify the account is active and no unmanaged option orders or positions are present:
 
 ```bash
-cargo run -p nautilus-alpaca --features live --bin alpaca-ops -- account
+cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca account
 ```
 
 Verify the trade-update stream authenticates:
@@ -60,7 +60,7 @@ ALPACA_ORDER_LIST_HARNESS_REPLACE_OPEN=true \
 Then verify the account returns to a clean state:
 
 ```bash
-cargo run -p nautilus-alpaca --features live --bin alpaca-ops -- account
+cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca account
 cargo run -p nautilus-alpaca --features live --bin alpaca-reconciliation-probe -- 240
 ```
 

@@ -55,7 +55,7 @@ and strategies.
   - Standard external-LAST `RequestBars` for Alpaca option instruments now map to Alpaca historical
     option bars through `AlpacaDataClient`; unsupported bar aggregations return an empty
     `BarsResponse` after logging the request error.
-  - `alpaca-ops status` surfaces the latest `option_market_data_stream` event so operators can see
+  - `nautilus adapters alpaca status` surfaces the latest `option_market_data_stream` event so operators can see
     stream vs snapshot-fallback source and feed.
 - [x] Add a REST-vs-option-chain comparison command for the same symbol, expiry, and scan time.
   - Implemented as `alpaca-compare-option-chain-scan`.
@@ -97,15 +97,16 @@ The live Nautilus node is now the order-capable runtime. Remaining cutover proof
 validation and operational cleanup, not keeping a second account-engine owner alive.
 
 - [x] REST-vs-option-chain scanner parity command exists.
-  - Local: `deploy/alpaca/alpaca-control.sh compare-scan --pretty SPY 2026-07-02`
+  - Local:
+    `cargo run -p nautilus-alpaca --features live --bin alpaca-compare-option-chain-scan -- --pretty SPY 2026-07-02`
   - Docker: `ALPACA_COMPARE_UNDERLYING=SPY ALPACA_COMPARE_EXPIRY=2026-07-02 docker compose -f deploy/alpaca/compose.yml --profile cutover run --rm alpaca-compare-option-chain-scan`
 - [x] Live Nautilus node exists with scanner-to-strategy wiring.
   - Local bounded run:
-    `ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS=90 deploy/alpaca/alpaca-control.sh option-chain-live SPY 2026-07-02`
+    `ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS=90 cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- SPY 2026-07-02`
   - Docker bounded run:
     `ALPACA_OPTION_CHAIN_UNDERLYING=SPY ALPACA_OPTION_CHAIN_EXPIRY=2026-07-02 ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS=90 docker compose -f deploy/alpaca/compose.yml --profile cutover run --rm alpaca-option-chain-live`
-- [x] One-command cutover proof exists.
-  - `deploy/alpaca/alpaca-control.sh cutover-proof SPY 2026-07-02`
+- [x] One-command cutover proof retired from `alpaca-control`.
+  - Keep proof steps explicit so the deploy wrapper does not own migration diagnostics.
 - [ ] Run the cutover proof during market hours across the paper-profile symbols and expiries.
   - Required signal: selected candidate and scan diagnostics match, or mismatches are explained by
     stricter Nautilus option-chain quote validity.
@@ -122,7 +123,7 @@ validation and operational cleanup, not keeping a second account-engine owner al
 
 ### 1. Market-Hours Cutover Proof
 
-- [ ] Run `deploy/alpaca/alpaca-control.sh cutover-proof` during market hours for the configured
+- [ ] Run explicit compare and bounded node proof commands during market hours for the configured
   paper profiles and representative symbols/expiries.
 - [ ] Confirm REST-vs-option-chain selected candidates and scan diagnostics match, or document
   mismatches caused by stricter Nautilus option-chain quote validity.
@@ -224,7 +225,7 @@ loop.
 - [x] Keep lifecycle risk blocks in the strategy admission path before paper submission.
   - The node polls option assignment, exercise, and expiration account activities.
   - Recent assignment/exercise activity and same-day-expiry candidates block live entry submission.
-  - `alpaca-ops status` surfaces the latest lifecycle poll and raises lifecycle alerts.
+  - `nautilus adapters alpaca status` surfaces the latest lifecycle poll and raises lifecycle alerts.
 
 ### 5. Remove Old Entry Loop
 
@@ -255,7 +256,7 @@ loop.
   - `AlpacaOptionsStrategy` subscribes active-entry close legs and top-ranked candidate legs through
     `subscribe_quotes`.
   - Cached `QuoteTick` timestamps drive stale-quote close blocks, selected-candidate freshness
-    blocks when a stale cached quote exists, and `alpaca-ops status` quote-cache/stale alerts.
+    blocks when a stale cached quote exists, and `nautilus adapters alpaca status` quote-cache/stale alerts.
   - The Alpaca data client fills those cache entries from the option stream when fresh stream quotes
     are available and suppresses quote snapshot refresh only while stream quote freshness is current.
   - Missing active close-leg quotes remain a `close_quote_missing` management block; first-time
@@ -269,7 +270,9 @@ loop.
 
 - [x] Retire long-running standalone scanner loops after actor/strategy paths provide equivalent
   evidence.
-- [ ] Keep intentionally diagnostic commands such as scan comparison and bounded cutover proof.
+- [x] Remove intentionally diagnostic cutover commands from `alpaca-control`.
+  - Scan comparison remains a direct diagnostic binary and Docker profile, not a durable control
+    command.
 
 ## Next Loops To Retire
 

@@ -443,7 +443,7 @@ Minimum validation reports:
 - Current order behavior: `AlpacaOptionsStrategy` honors `dry_run_only` from the context before
   normal submission gates. Current routing still stays fail-conservative until market-hours
   validation proves feature freshness and thresholds are intentionally promoted.
-- Current operator visibility: `alpaca-ops status` reports the latest regime feature coverage from
+- Current operator visibility: `nautilus adapters alpaca status` reports the latest regime feature coverage from
   operator events or candidate-ledger scanner evidence.
 - Breadth proxy: optional only. Use configured ETF/index proxies when complete; otherwise mark
   breadth unavailable and do not treat it as neutral.

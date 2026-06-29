@@ -22,8 +22,7 @@ use std::{
     process::Command,
 };
 
-use chrono::{DateTime, Duration, Utc};
-use nautilus_alpaca::{
+use crate::{
     config::AlpacaDataClientConfig,
     http::{
         client::AlpacaHttpClient,
@@ -32,6 +31,7 @@ use nautilus_alpaca::{
     options_runtime::AlpacaOptionsRuntimeConfig,
     runtime::{StrategyState, read_operator_events},
 };
+use chrono::{DateTime, Duration, Utc};
 use nautilus_infrastructure::sql::operational::{
     CandidateLedgerSummaryFilters, StrategyStateMetadata, load_strategy_state_metadata,
     read_candidate_ledger_records,
@@ -411,7 +411,7 @@ impl OperatorConfig {
             operational_store,
             strategy_state_metadata,
             candidate_ledger_records,
-            json_output: crate::ops_args().iter().any(|arg| arg == "--json"),
+            json_output: crate::operator::args().iter().any(|arg| arg == "--json"),
         })
     }
 
@@ -1184,9 +1184,9 @@ fn recent_orders_request() -> ListOrdersRequest {
 }
 
 async fn latest_activities(client: &AlpacaHttpClient) -> anyhow::Result<Vec<AlpacaActivity>> {
-    let request = nautilus_alpaca::http::models::ListActivitiesRequest {
+    let request = crate::http::models::ListActivitiesRequest {
         page_size: env_u64("ALPACA_OPERATOR_ACTIVITY_LIMIT", 20) as usize,
-        ..nautilus_alpaca::http::models::ListActivitiesRequest::option_reconciliation()
+        ..crate::http::models::ListActivitiesRequest::option_reconciliation()
     };
     Ok(client.account_activities(&request).await?)
 }

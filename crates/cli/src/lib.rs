@@ -49,16 +49,22 @@
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+#[cfg(feature = "alpaca")]
+mod adapters;
 #[cfg(feature = "defi")]
 mod blockchain;
 mod database;
+mod ops;
 pub mod opt;
 mod warehouse;
 
+#[cfg(feature = "alpaca")]
+use crate::adapters::run_adapters_command;
 #[cfg(feature = "defi")]
 use crate::blockchain::run_blockchain_command;
 use crate::{
     database::postgres::run_database_command,
+    ops::run_ops_command,
     opt::{Commands, NautilusCli},
     warehouse::run_warehouse_command,
 };
@@ -84,6 +90,9 @@ pub async fn run(opt: NautilusCli) -> anyhow::Result<()> {
     match opt.command {
         Commands::Database(database_opt) => run_database_command(database_opt).await?,
         Commands::Warehouse(warehouse_opt) => run_warehouse_command(warehouse_opt).await?,
+        Commands::Ops(ops_opt) => run_ops_command(ops_opt).await?,
+        #[cfg(feature = "alpaca")]
+        Commands::Adapters(adapters_opt) => run_adapters_command(adapters_opt).await?,
         #[cfg(feature = "defi")]
         Commands::Blockchain(blockchain_opt) => {
             Box::pin(run_blockchain_command(blockchain_opt)).await?;

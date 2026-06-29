@@ -17,7 +17,7 @@
 
 use std::env;
 
-use nautilus_alpaca::{
+use crate::{
     config::AlpacaDataClientConfig,
     http::{
         client::AlpacaHttpClient,

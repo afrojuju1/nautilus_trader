@@ -18,7 +18,7 @@ flowchart LR
     CandidateLedger["candidate_ledger<br/>candidates, decisions, submit results"]
     Snapshots["current option snapshots"]
     HistoricalBars["Alpaca historical option bars<br/>since February 2024"]
-    OutcomeTracker["alpaca-ops performance<br/>candidate outcome tracker"]
+    OutcomeTracker["nautilus adapters alpaca performance<br/>candidate outcome tracker"]
     CandidateOutcome["candidate_outcome<br/>observation records"]
     Analytics["candidate-level analytics read model"]
     PerformanceLedger["performance_ledger<br/>realized broker PnL"]
@@ -37,7 +37,7 @@ Storage table: `candidate_outcome`.
 
 Owner: Alpaca options runtime reporting path.
 
-Write path: `alpaca-ops performance` through `track_candidate_outcomes`.
+Write path: `nautilus adapters alpaca performance` through `track_candidate_outcomes`.
 
 Key fields:
 
@@ -125,7 +125,7 @@ Minimum checks before using a range for research:
 
 ## Operator Read Model
 
-`alpaca-ops performance` and `alpaca-control performance` expose the candidate-outcome read model
+`nautilus adapters alpaca performance` and `alpaca-control performance` expose the candidate-outcome read model
 from Postgres. Operators should use that output instead of interpreting raw rows. The read model
 produces:
 

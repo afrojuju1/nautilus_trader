@@ -21,14 +21,14 @@ use std::{
     process::Command,
 };
 
-use chrono::Utc;
-use nautilus_alpaca::{
+use crate::{
     fleet::{
         AccountConfig, AccountPermissions, FleetConfig, ResolvedFleetConfig, RiskBudget,
         default_registry_path, load_fleet_config,
     },
     runtime_env::configure_account_command_env,
 };
+use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -138,7 +138,7 @@ impl Args {
         let mut json_output = false;
         let mut include_disabled = false;
         let mut registry = None;
-        let mut args = crate::ops_args().into_iter();
+        let mut args = crate::operator::args().into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--json" => json_output = true,
@@ -151,7 +151,7 @@ impl Args {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: alpaca-ops fleet [--json] [--include-disabled] [--registry PATH]"
+                        "usage: nautilus adapters alpaca fleet [--json] [--include-disabled] [--registry PATH]"
                     );
                     std::process::exit(0);
                 }
@@ -225,10 +225,8 @@ fn check_account(
             Some(format!("failed to prepare account env: {error}")),
         );
     }
-    command
-        .arg("status")
-        .arg("--json")
-        .env("NAUTILUS_ALPACA_SERVICE", &account.service);
+    append_status_command_args(&mut command, operator_bin);
+    command.env("NAUTILUS_ALPACA_SERVICE", &account.service);
     if let Some(config_file) = &config_file {
         command.env("ALPACA_CONFIG_PATH", config_file);
     }
@@ -452,11 +450,47 @@ fn nested_usize(value: Option<&Value>, path: &[&str]) -> Option<usize> {
 }
 
 fn default_operator_bin() -> PathBuf {
+    if let Ok(current_exe) = env::current_exe()
+        && (executable_name_is(&current_exe, "nautilus")
+            || executable_name_is(&current_exe, "alpaca-ops"))
+    {
+        return current_exe;
+    }
+
     env::current_exe()
         .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("alpaca-ops")))
+        .and_then(|path| path.parent().map(|parent| parent.join("nautilus")))
         .filter(|path| path.exists())
-        .unwrap_or_else(|| home_dir().join(".local/bin/alpaca-ops"))
+        .or_else(|| {
+            env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(|parent| parent.join("alpaca-ops")))
+                .filter(|path| path.exists())
+        })
+        .or_else(|| {
+            let nautilus = home_dir().join(".local/bin/nautilus");
+            nautilus.exists().then_some(nautilus)
+        })
+        .or_else(|| {
+            let alpaca_ops = home_dir().join(".local/bin/alpaca-ops");
+            alpaca_ops.exists().then_some(alpaca_ops)
+        })
+        .unwrap_or_else(|| home_dir().join(".local/bin/nautilus"))
+}
+
+fn append_status_command_args(command: &mut Command, operator_bin: &Path) {
+    if executable_name_is(operator_bin, "nautilus") {
+        command.args(["adapters", "alpaca", "status"]);
+    } else {
+        command.arg("status");
+    }
+    command.arg("--json");
+}
+
+fn executable_name_is(path: &Path, expected: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == expected)
 }
 
 fn home_dir() -> PathBuf {

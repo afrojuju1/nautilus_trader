@@ -17,7 +17,7 @@
 
 use std::env;
 
-use nautilus_alpaca::{
+use crate::{
     fleet::load_fleet_config_from_env,
     runtime::{StrategyState, save_strategy_state_atomic},
 };

@@ -58,6 +58,8 @@ pub mod factories;
 pub mod fleet;
 pub mod http;
 #[cfg(feature = "live")]
+pub mod operator;
+#[cfg(feature = "live")]
 pub mod option_chain_candidates;
 #[cfg(feature = "live")]
 pub mod options_entry_admission;

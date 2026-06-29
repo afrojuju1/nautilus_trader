@@ -29,6 +29,7 @@ cargo build --release -p nautilus-alpaca --features live,warehouse-clickhouse \
   --bin alpaca-options-node \
   --bin alpaca-ops \
   --bin alpaca-compare-option-chain-scan
+cargo build --release -p nautilus-cli --features alpaca --bin nautilus
 
 install -Dm755 target/release/alpaca-options-node \
   "$HOME/.local/bin/alpaca-options-node"
@@ -36,6 +37,8 @@ install -Dm755 target/release/alpaca-ops \
   "$HOME/.local/bin/alpaca-ops"
 install -Dm755 target/release/alpaca-compare-option-chain-scan \
   "$HOME/.local/bin/alpaca-compare-option-chain-scan"
+install -Dm755 target/release/nautilus \
+  "$HOME/.local/bin/nautilus"
 install -Dm755 deploy/alpaca/alpaca-options-runner.sh \
   "$HOME/.local/bin/alpaca-options-runner"
 install -Dm755 deploy/alpaca/alpaca-control.sh \
@@ -82,10 +85,10 @@ echo "account_env_dir=$ACCOUNT_ENV_DIR"
 echo "account_config_dir=$ACCOUNT_CONFIG_DIR"
 echo "runner=$HOME/.local/bin/alpaca-options-node"
 echo "config_check=$HOME/.local/bin/alpaca-options-node --check-config"
-echo "operator=$HOME/.local/bin/alpaca-ops status"
-echo "fleet_operator=$HOME/.local/bin/alpaca-ops fleet"
-echo "candidate_alerts=$HOME/.local/bin/alpaca-ops alerts candidates"
-echo "performance_report=$HOME/.local/bin/alpaca-ops performance"
+echo "operator=$HOME/.local/bin/nautilus adapters alpaca status"
+echo "fleet_operator=$HOME/.local/bin/nautilus adapters alpaca fleet"
+echo "candidate_alerts=$HOME/.local/bin/nautilus adapters alpaca alerts candidates"
+echo "performance_report=$HOME/.local/bin/nautilus adapters alpaca performance"
 echo "control=$HOME/.local/bin/alpaca-control"
 echo "candidate_alerts_timer=$HOME/.config/systemd/user/alpaca-candidate-alerts.timer"
 echo "performance_digest_timer=$HOME/.config/systemd/user/alpaca-performance-digest.timer"
