@@ -6,10 +6,10 @@ STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 ALPACA_CONFIG_HOME="${NAUTILUS_ALPACA_CONFIG_HOME:-$CONFIG_HOME/nautilus-trader/alpaca}"
 ALPACA_STATE_HOME="${NAUTILUS_ALPACA_STATE_HOME:-$STATE_HOME/nautilus_trader/alpaca}"
 DEFAULT_ACCOUNT="${NAUTILUS_ALPACA_DEFAULT_ACCOUNT:-paper-main}"
-DEFAULT_ENV_FILE="${NAUTILUS_ALPACA_DEFAULT_ENV_FILE:-$ALPACA_CONFIG_HOME/options.env}"
+REPO="${NAUTILUS_ALPACA_REPO:-$HOME/Projects/nautilus_trader}"
+DEFAULT_ENV_FILE="$REPO/.env"
 ACCOUNT_ENV_DIR="${NAUTILUS_ALPACA_ACCOUNT_ENV_DIR:-$ALPACA_CONFIG_HOME/accounts}"
 ACCOUNT_CONFIG_DIR="${NAUTILUS_ALPACA_ACCOUNT_CONFIG_DIR:-$ALPACA_CONFIG_HOME/configs}"
-REPO="${NAUTILUS_ALPACA_REPO:-$HOME/Projects/nautilus_trader}"
 ENGINE_BIN="${NAUTILUS_ALPACA_RUNNER_BIN:-$HOME/.local/bin/alpaca-options-node}"
 OPERATOR_BIN="${NAUTILUS_ALPACA_OPERATOR_BIN:-$HOME/.local/bin/alpaca-ops}"
 FLEET_BIN="${NAUTILUS_ALPACA_FLEET_BIN:-$HOME/.local/bin/alpaca-ops}"
@@ -141,11 +141,7 @@ account_env_file() {
     printf '%s\n' "$configured"
     return
   fi
-  if [[ "$account" == "paper-main" ]]; then
-    printf '%s\n' "$DEFAULT_ENV_FILE"
-  else
-    printf '%s\n' "$ACCOUNT_ENV_DIR/$account.env"
-  fi
+  printf '%s\n' "$DEFAULT_ENV_FILE"
 }
 
 account_config_file() {

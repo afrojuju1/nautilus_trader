@@ -1697,22 +1697,18 @@ async fn request_option_bars_from_http(
         .option_bars(&request)
         .await
         .context("failed to request Alpaca option bars")?;
-    let bars = bars_for_symbol(&response.bars, &symbol)
-        .iter()
-        .filter_map(|bar| {
-            alpaca_historical_bar(
-                bar_type,
-                &instrument,
-                bar.timestamp.as_deref(),
-                bar.open,
-                bar.high,
-                bar.low,
-                bar.close,
-                bar.volume,
-                clock,
-            )
-        })
-        .collect::<Vec<_>>();
+    let raw_bars = bars_for_symbol(&response.bars, &symbol);
+    if raw_bars.is_empty() {
+        log::debug!("Alpaca option bars returned no rows for {symbol} ({bar_type})");
+    }
+    let bars = collect_alpaca_historical_bars(
+        bar_type,
+        &instrument,
+        raw_bars.iter().map(AlpacaHistoricalBarFields::from),
+        "option",
+        &symbol,
+        clock,
+    );
     Ok(sort_and_limit_bars(bars, limit))
 }
 
@@ -1770,22 +1766,21 @@ async fn request_stock_bars_from_http(
         .stock_bars(&request)
         .await
         .context("failed to request Alpaca stock bars")?;
-    let bars = bars_for_symbol(&response.bars, &symbol)
-        .iter()
-        .filter_map(|bar| {
-            alpaca_historical_bar(
-                bar_type,
-                &instrument,
-                bar.timestamp.as_deref(),
-                bar.open,
-                bar.high,
-                bar.low,
-                bar.close,
-                bar.volume,
-                clock,
-            )
-        })
-        .collect::<Vec<_>>();
+    let raw_bars = bars_for_symbol(&response.bars, &symbol);
+    if raw_bars.is_empty() {
+        let response_symbols = response.bars.keys().cloned().collect::<Vec<_>>();
+        log::warn!(
+            "Alpaca stock bars returned no rows for {symbol} ({bar_type}); feed={feed}, response_symbols={response_symbols:?}",
+        );
+    }
+    let bars = collect_alpaca_historical_bars(
+        bar_type,
+        &instrument,
+        raw_bars.iter().map(AlpacaHistoricalBarFields::from),
+        "stock",
+        &symbol,
+        clock,
+    );
     Ok(sort_and_limit_bars(bars, limit))
 }
 
@@ -1822,6 +1817,87 @@ fn alpaca_historical_bar(
     let volume = instrument.try_make_qty(volume? as f64, None).ok()?;
 
     Bar::new_checked(bar_type, open, high, low, close, volume, ts_event, ts_init).ok()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AlpacaHistoricalBarFields<'a> {
+    timestamp: Option<&'a str>,
+    open: Option<f64>,
+    high: Option<f64>,
+    low: Option<f64>,
+    close: Option<f64>,
+    volume: Option<u64>,
+}
+
+impl<'a> From<&'a crate::http::models::AlpacaOptionBar> for AlpacaHistoricalBarFields<'a> {
+    fn from(bar: &'a crate::http::models::AlpacaOptionBar) -> Self {
+        Self {
+            timestamp: bar.timestamp.as_deref(),
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: bar.volume,
+        }
+    }
+}
+
+impl<'a> From<&'a crate::http::models::AlpacaStockBar> for AlpacaHistoricalBarFields<'a> {
+    fn from(bar: &'a crate::http::models::AlpacaStockBar) -> Self {
+        Self {
+            timestamp: bar.timestamp.as_deref(),
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: bar.volume,
+        }
+    }
+}
+
+fn collect_alpaca_historical_bars<'a>(
+    bar_type: BarType,
+    instrument: &InstrumentAny,
+    raw_bars: impl IntoIterator<Item = AlpacaHistoricalBarFields<'a>>,
+    source: &str,
+    symbol: &str,
+    clock: &'static AtomicTime,
+) -> Vec<Bar> {
+    let mut raw_count = 0usize;
+    let mut dropped_count = 0usize;
+    let mut bars = Vec::new();
+    for bar in raw_bars {
+        raw_count += 1;
+        match alpaca_historical_bar(
+            bar_type,
+            instrument,
+            bar.timestamp,
+            bar.open,
+            bar.high,
+            bar.low,
+            bar.close,
+            bar.volume,
+            clock,
+        ) {
+            Some(bar) => bars.push(bar),
+            None => dropped_count += 1,
+        }
+    }
+
+    if raw_count > 0 && bars.is_empty() {
+        log::warn!(
+            "Dropped all {raw_count} Alpaca {source} bars for {symbol} ({bar_type}) during Nautilus conversion",
+        );
+    } else if dropped_count > 0 {
+        log::debug!(
+            "Converted {} of {raw_count} Alpaca {source} bars for {symbol} ({bar_type}); dropped={dropped_count}",
+            bars.len(),
+        );
+    } else if raw_count > 0 {
+        log::debug!("Converted {raw_count} Alpaca {source} bars for {symbol} ({bar_type})",);
+    }
+
+    bars
 }
 
 fn bars_for_symbol<T: Clone>(bars: &BTreeMap<String, Vec<T>>, symbol: &str) -> Vec<T> {
@@ -2108,4 +2184,48 @@ fn option_contract_matches(
 ) -> bool {
     contract.symbol == parts.symbol
         || canonical_alpaca_option_symbol(&contract.symbol) == parts.canonical_symbol
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spy_alpaca_routes_to_stock_bars() {
+        let instrument_id = InstrumentId::from("SPY.ALPACA");
+
+        assert_eq!(instrument_id.symbol.as_str(), "SPY");
+        assert!(parse_alpaca_option_instrument_id(instrument_id).is_err());
+    }
+
+    #[test]
+    fn converts_alpaca_stock_daily_bar() {
+        let bar_type = BarType::from("SPY.ALPACA-1-DAY-LAST-EXTERNAL");
+        let instrument = stock_bar_instrument(bar_type.instrument_id(), UnixNanos::from(0))
+            .expect("stock instrument");
+
+        let bar = alpaca_historical_bar(
+            bar_type,
+            &instrument,
+            Some("2026-04-01T04:00:00Z"),
+            Some(654.08),
+            Some(658.52),
+            Some(653.0),
+            Some(655.18),
+            Some(1_543_102),
+            get_atomic_clock_realtime(),
+        )
+        .expect("bar converts");
+
+        assert_eq!(bar.bar_type, bar_type);
+        assert_eq!(bar.open, Price::from("654.0800"));
+        assert_eq!(bar.high, Price::from("658.5200"));
+        assert_eq!(bar.low, Price::from("653.0000"));
+        assert_eq!(bar.close, Price::from("655.1800"));
+        assert_eq!(bar.volume, nautilus_model::types::Quantity::from(1_543_102));
+        assert_eq!(
+            bar.ts_event,
+            parse_rfc3339_timestamp("2026-04-01T04:00:00Z").expect("timestamp"),
+        );
+    }
 }

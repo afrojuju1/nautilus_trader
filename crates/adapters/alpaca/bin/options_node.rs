@@ -134,7 +134,6 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
     nautilus_common::logging::ensure_logging_initialized();
 
     let runtime_config = AlpacaOptionsRuntimeConfig::from_runtime_env()?;

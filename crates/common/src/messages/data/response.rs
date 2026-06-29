@@ -41,6 +41,28 @@ pub(crate) fn trim_data_to_bounds<T: HasTsInit>(
     start: Option<UnixNanos>,
     end: Option<UnixNanos>,
 ) {
+    trim_data_to_bounds_by(data, start, end, |item| item.ts_init());
+}
+
+/// Trims bars to the inclusive `[start, end]` window on `ts_event`.
+///
+/// Bar request windows are market-data event windows. Historical bars can be
+/// initialized long after their event time, so trimming them on `ts_init` would
+/// incorrectly drop valid data returned by live clients.
+pub(crate) fn trim_bars_to_bounds(
+    data: &mut Vec<Bar>,
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+) {
+    trim_data_to_bounds_by(data, start, end, |bar| bar.ts_event);
+}
+
+fn trim_data_to_bounds_by<T>(
+    data: &mut Vec<T>,
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+    timestamp: impl Fn(&T) -> UnixNanos,
+) {
     let data_len = data.len();
     if data_len == 0 {
         return;
@@ -49,7 +71,7 @@ pub(crate) fn trim_data_to_bounds<T: HasTsInit>(
     let first_index = if let Some(start) = start {
         let Some(i) = data
             .iter()
-            .position(|item| item.ts_init().as_u64() >= start.as_u64())
+            .position(|item| timestamp(item).as_u64() >= start.as_u64())
         else {
             data.clear();
             return;
@@ -62,7 +84,7 @@ pub(crate) fn trim_data_to_bounds<T: HasTsInit>(
     let last_index = if let Some(end) = end {
         let Some(i) = data
             .iter()
-            .rposition(|item| item.ts_init().as_u64() <= end.as_u64())
+            .rposition(|item| timestamp(item).as_u64() <= end.as_u64())
         else {
             data.clear();
             return;

@@ -83,12 +83,15 @@ variables:
 | API key    | `APCA_API_KEY_ID`        | `ALPACA_API_KEY`                          |
 | API secret | `APCA_API_SECRET_KEY`    | `ALPACA_SECRET_KEY`, `ALPACA_API_SECRET`  |
 
-For deployed options runtime utilities, `NAUTILUS_ALPACA_ENV_FILE` can point to an account-specific
-env file. If unset, the runtime looks for:
+For local and single-host options runtime utilities, the repo-local `.env` is the normal env file.
+Run commands from the repo root, or set `NAUTILUS_ALPACA_REPO` so installed binaries can find:
 
 ```bash
-~/.config/nautilus-trader/alpaca/options.env
+/home/ade/Projects/nautilus_trader/.env
 ```
+
+`NAUTILUS_ALPACA_ENV_FILE` is an explicit override for deliberate account or diagnostic boundaries;
+it is not the default operator path.
 
 :::warning
 Do not commit real Alpaca credentials. Start with paper endpoints and keep submission disabled
@@ -147,7 +150,7 @@ Scanner and contract-loading commands use unqualified US equity or ETF root symb
 | Simple equity/ETF limit order | ✓         | Whole-share `DAY` limit buy/sell orders.               |
 | Cancel order                  | ✓         | Single order, batch cancel, and cancel-all requests.   |
 | Shared equity risk gates      | ✓         | Kill switch, notional caps, buying power, duplicate symbol, and short-sale gates. |
-| Rust account env profiles     | ✓         | Python examples can load installed `~/.config/nautilus-trader/alpaca` env files. |
+| Shared repo env loading       | ✓         | Python examples can load the same repo-local `.env` used by Rust operator tooling. |
 | Trade update stream           | -         | REST reconciliation only in the Python client.         |
 | Option multi-leg execution    | ✓         | Two to four option legs through `SubmitOrderList`.      |
 | Bracket/OCO/stop/trailing     | -         | Not implemented for the Python client.                 |

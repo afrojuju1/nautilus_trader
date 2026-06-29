@@ -7,7 +7,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/Projects/nautilus_trader
-EnvironmentFile=%h/.config/nautilus-trader/alpaca/options.env
+Environment=NAUTILUS_ALPACA_REPO=%h/Projects/nautilus_trader
+EnvironmentFile=%h/Projects/nautilus_trader/.env
 ExecStart=%h/.local/bin/alpaca-options-runner
 Restart=on-failure
 RestartSec=30

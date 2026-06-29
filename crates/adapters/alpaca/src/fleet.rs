@@ -23,7 +23,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::runtime::{StrategyState, load_strategy_state};
+use crate::{
+    runtime::{StrategyState, load_strategy_state},
+    runtime_env::default_options_env_path,
+};
 
 /// Fleet registry config.
 #[derive(Clone, Debug, Deserialize)]
@@ -74,7 +77,7 @@ pub struct AccountConfig {
     pub enabled: bool,
     /// User systemd service name.
     pub service: String,
-    /// Account env file.
+    /// Optional account env file. When empty, the account uses the shared repo `.env`.
     pub env_file: PathBuf,
     /// Strategy config file.
     pub config_file: Option<PathBuf>,
@@ -186,6 +189,9 @@ impl ResolvedFleetConfig {
     /// Resolves an account env file.
     #[must_use]
     pub fn env_file(&self, account: &AccountConfig) -> PathBuf {
+        if account.env_file.as_os_str().is_empty() {
+            return shared_env_file();
+        }
         resolve_path(&account.env_file, &self.registry_dir)
     }
 
@@ -334,11 +340,18 @@ fn validate_config(config: &FleetConfig) -> anyhow::Result<()> {
         if account.service.trim().is_empty() {
             anyhow::bail!("fleet account {} service cannot be empty", account.id);
         }
-        if account.env_file.as_os_str().is_empty() {
-            anyhow::bail!("fleet account {} env_file cannot be empty", account.id);
-        }
     }
     Ok(())
+}
+
+fn shared_env_file() -> PathBuf {
+    if let Some(path) = env::var_os("NAUTILUS_ALPACA_ENV_FILE") {
+        return PathBuf::from(path);
+    }
+    default_options_env_path()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| PathBuf::from(".env"))
 }
 
 fn add_state_exposure(

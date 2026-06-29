@@ -58,6 +58,9 @@ Rules:
 - The order-capable Alpaca runtime is `alpaca-options-node`, wired through
   Nautilus-native actor/strategy/data/execution paths. Use `alpaca-options-node --check-config`
   for config checks.
+- Use the repo-local `.env` as the canonical Alpaca operator env file for local, Docker, and
+  single-host deployed workflows. `NAUTILUS_ALPACA_ENV_FILE` is only for deliberate account or
+  diagnostic overrides; do not make config-home `options.env` the default path.
 - Do not restore retired handoff or standalone strategy-loop surfaces such as
   `alpaca-submit-order-list-bridge`, `submit_order_list_bridge.rs`, or
   `alpaca-put-credit-strategy-loop` unless Ade explicitly asks for a staged bridge.
@@ -95,11 +98,11 @@ Keep Alpaca verification tiered:
 - Paper order smoke tests: run only intentionally, preferably during market hours, and cancel accepted smoke orders unless the user explicitly asks to leave orders open.
 - Live or paper Alpaca smoke tests must be real. Do not claim execution proof unless an actual command was run and the resulting account/orders state was checked.
 - Smoke tests that submit paper orders should cancel accepted orders unless the user explicitly asks to leave orders open.
-- For Docker Alpaca rollouts, rebuild/recreate `alpaca-options` with the external env file and
+- For Docker Alpaca rollouts, rebuild/recreate `alpaca-options` with the repo-local `.env` and
   container-readable config mounts, then verify the running stack with:
 
 ```bash
-docker compose -f deploy/alpaca/compose.yml --profile engine ps
+docker compose --env-file .env -f deploy/alpaca/compose.yml --profile engine ps
 docker exec nautilus-alpaca-alpaca-options-1 alpaca-ops status --json
 docker exec nautilus-alpaca-alpaca-options-1 alpaca-options-node --check-config
 ```

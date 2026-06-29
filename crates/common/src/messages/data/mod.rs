@@ -571,20 +571,17 @@ impl DataResponse {
         }
     }
 
-    /// Trims vector payloads to the inclusive `[start, end]` window on `ts_init`.
+    /// Trims vector payloads to the inclusive `[start, end]` window.
     ///
-    /// Applies to variants whose payload elements implement `HasTsInit`
-    /// (`BookDeltas`, `BookDepth`, `Quotes`, `Trades`, `FundingRates`,
-    /// `Bars`, `Instruments`). Other variants are untouched: singular payloads
-    /// (`Instrument`, `Book`),
-    /// `ForwardPrices` (no per-item `ts_init`), and the opaque custom
-    /// `Data` variant.
+    /// Bars are trimmed on `ts_event`; other vector payloads are trimmed on
+    /// `ts_init`. Singular payloads (`Instrument`, `Book`), `ForwardPrices`
+    /// (no per-item timestamp), and opaque custom `Data` are untouched.
     pub fn trim_to_bounds(&mut self) {
         match self {
             Self::Quotes(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
             Self::Trades(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
             Self::FundingRates(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
-            Self::Bars(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
+            Self::Bars(r) => response::trim_bars_to_bounds(&mut r.data, r.start, r.end),
             Self::Instruments(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
             Self::BookDeltas(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
             Self::BookDepth(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
@@ -604,4 +601,53 @@ pub fn is_parent_subscription(params: Option<&Params>) -> bool {
     params
         .and_then(|p| p.get_bool(PARAMS_IS_PARENT))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::{
+        data::Bar,
+        identifiers::InstrumentId,
+        types::{Price, Quantity},
+    };
+
+    use super::*;
+
+    #[test]
+    fn trim_to_bounds_keeps_bars_by_event_time_not_init_time() {
+        let bar_type = BarType::from("SPY.ALPACA-1-DAY-LAST-EXTERNAL");
+        let ts_event = UnixNanos::from(100);
+        let ts_init = UnixNanos::from(1_000);
+        let bar = Bar::new(
+            bar_type,
+            Price::from("1.00"),
+            Price::from("1.00"),
+            Price::from("1.00"),
+            Price::from("1.00"),
+            Quantity::from(1),
+            ts_event,
+            ts_init,
+        );
+        let mut response = DataResponse::Bars(BarsResponse::new(
+            UUID4::new(),
+            ClientId::new("ALPACA"),
+            bar_type,
+            vec![bar],
+            Some(UnixNanos::from(50)),
+            Some(UnixNanos::from(150)),
+            ts_init,
+            None,
+        ));
+
+        response.trim_to_bounds();
+
+        assert_eq!(response.record_count(), Some(1));
+        let DataResponse::Bars(response) = response else {
+            panic!("expected bars response");
+        };
+        assert_eq!(
+            response.data[0].instrument_id(),
+            InstrumentId::from("SPY.ALPACA")
+        );
+    }
 }

@@ -48,7 +48,7 @@ Completed foundation:
 - Initial credit/debit spread management can cancel stale entries, evaluate close triggers with
   expiration-risk exits, emit management snapshots with PnL context, build reduce-only close MLegs,
   and mark filled closes in strategy state.
-- The NUC has a supervised user service, external env file, lock, logs, health command, operator
+- The NUC has a supervised user service, repo-local `.env`, lock, logs, health command, operator
   status command, and kill-switch/submission gates.
 
 Known gaps:
@@ -272,8 +272,8 @@ Goal: run Nautilus as the only live trading engine on the box.
 Work:
 
 - Create a NUC service definition for the Nautilus strategy runner.
-- Store env/secrets outside the repo. (Initial `deploy/alpaca/alpaca-options.env.example`
-  documents the external env file shape without secrets.)
+- Store env/secrets in an untracked repo-local `.env`. (Initial
+  `deploy/alpaca/alpaca-options.env.example` documents the `.env` shape without secrets.)
 - Add paper/live mode, account ID, strategy config, and symbol universe config. (Initial env
   template covers paper URLs, strategy universe, scan cadence, and safety gates.)
 - Add log files, rotation, restart policy, health command, status command, and stop command.
