@@ -3,6 +3,7 @@ Alpaca order payload helpers for the Python live adapter.
 """
 
 import math
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
@@ -15,31 +16,50 @@ from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.orders import Order
 
 
+@dataclass(frozen=True, slots=True)
+class MlegOrderPlanLeg:
+    symbol: str
+    ratio_qty: int
+    side: str
+    position_intent: str
+
+
+@dataclass(frozen=True, slots=True)
+class MlegOrderPlan:
+    strategy_qty: int
+    signed_limit_price: Decimal
+    legs: tuple[MlegOrderPlanLeg, ...]
+
+
 def validate_mleg_order_list(command: SubmitOrderList) -> str | None:
     orders = list(command.order_list.orders)
+    try:
+        mleg_order_plan_from_orders(orders)
+    except ValueError as e:
+        return str(e)
+    return None
+
+
+def mleg_order_plan_from_order_list(command: SubmitOrderList) -> MlegOrderPlan:
+    return mleg_order_plan_from_orders(list(command.order_list.orders))
+
+
+def mleg_order_plan_from_orders(orders: list[Order]) -> MlegOrderPlan:
     if len(orders) < 2:
-        return "MLEG_REQUIRES_AT_LEAST_TWO_LEGS"
+        raise ValueError("MLEG_REQUIRES_AT_LEAST_TWO_LEGS")
     if len(orders) > 4:
-        return "MLEG_SUPPORTS_AT_MOST_FOUR_LEGS"
+        raise ValueError("MLEG_SUPPORTS_AT_MOST_FOUR_LEGS")
 
     all_reduce_only = all(order.is_reduce_only for order in orders)
     any_reduce_only = any(order.is_reduce_only for order in orders)
     if any_reduce_only and not all_reduce_only:
-        return "MLEG_MIXED_OPEN_CLOSE_LEGS"
+        raise ValueError("MLEG_MIXED_OPEN_CLOSE_LEGS")
 
     for order in orders:
         error = _validate_mleg_leg_order(order)
         if error is not None:
-            return error
-    return None
+            raise ValueError(error)
 
-
-def mleg_payload_from_order_list(command: SubmitOrderList) -> dict[str, Any]:
-    error = validate_mleg_order_list(command)
-    if error is not None:
-        raise ValueError(error)
-
-    orders = list(command.order_list.orders)
     quantities = [int(_order_qty(order)) for order in orders]
     strategy_qty = math.gcd(*quantities)
     if strategy_qty <= 0:
@@ -47,19 +67,19 @@ def mleg_payload_from_order_list(command: SubmitOrderList) -> dict[str, Any]:
 
     trade_intent = "close" if all(order.is_reduce_only for order in orders) else "open"
     net_credit = Decimal(0)
-    legs: list[dict[str, str]] = []
+    legs: list[MlegOrderPlanLeg] = []
     for order, leg_qty in zip(orders, quantities, strict=True):
         ratio_qty = leg_qty // strategy_qty
         price = Decimal(str(order.price))
         net_credit += (price if order.side == OrderSide.SELL else -price) * Decimal(ratio_qty)
         position_intent = _alpaca_position_intent(order.side, order.is_reduce_only)
         legs.append(
-            {
-                "symbol": order.instrument_id.symbol.value,
-                "ratio_qty": str(ratio_qty),
-                "side": alpaca_order_side(order.side),
-                "position_intent": position_intent,
-            },
+            MlegOrderPlanLeg(
+                symbol=order.instrument_id.symbol.value,
+                ratio_qty=ratio_qty,
+                side=alpaca_order_side(order.side),
+                position_intent=position_intent,
+            ),
         )
 
     if net_credit == 0:
@@ -70,14 +90,29 @@ def mleg_payload_from_order_list(command: SubmitOrderList) -> dict[str, Any]:
     else:
         premium_kind = "credit" if net_credit < 0 else "debit"
     signed_limit_price = _signed_net_limit_price(abs(net_credit), premium_kind, trade_intent)
+    return MlegOrderPlan(
+        strategy_qty=strategy_qty,
+        signed_limit_price=signed_limit_price,
+        legs=tuple(legs),
+    )
+
+
+def mleg_payload_from_order_list(command: SubmitOrderList) -> dict[str, Any]:
+    return mleg_payload_from_order_plan(
+        command.order_list.id,
+        mleg_order_plan_from_order_list(command),
+    )
+
+
+def mleg_payload_from_order_plan(order_list_id: Any, plan: MlegOrderPlan) -> dict[str, Any]:
     return {
         "order_class": "mleg",
-        "client_order_id": str(command.order_list.id),
-        "qty": str(strategy_qty),
+        "client_order_id": str(order_list_id),
+        "qty": str(plan.strategy_qty),
         "type": "limit",
-        "limit_price": _format_price_decimal(signed_limit_price),
+        "limit_price": _format_price_decimal(plan.signed_limit_price),
         "time_in_force": "day",
-        "legs": legs,
+        "legs": [_mleg_plan_leg_payload(leg) for leg in plan.legs],
     }
 
 
@@ -128,6 +163,15 @@ def nested_order_legs(data: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(legs, list):
         return []
     return [leg for leg in legs if isinstance(leg, dict)]
+
+
+def _mleg_plan_leg_payload(leg: MlegOrderPlanLeg) -> dict[str, str]:
+    return {
+        "symbol": leg.symbol,
+        "ratio_qty": str(leg.ratio_qty),
+        "side": leg.side,
+        "position_intent": leg.position_intent,
+    }
 
 
 def alpaca_order_side(side: OrderSide) -> str:

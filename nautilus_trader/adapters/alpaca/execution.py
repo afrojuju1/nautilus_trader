@@ -37,10 +37,10 @@ from nautilus_trader.adapters.alpaca.constants import APCA_API_SECRET_KEY_ENV
 from nautilus_trader.adapters.alpaca.data import APCA_API_KEY_HEADER
 from nautilus_trader.adapters.alpaca.data import APCA_API_SECRET_HEADER
 from nautilus_trader.adapters.alpaca.orders import mleg_leg_snapshot_for_order
-from nautilus_trader.adapters.alpaca.orders import mleg_payload_from_order_list
+from nautilus_trader.adapters.alpaca.orders import mleg_order_plan_from_order_list
+from nautilus_trader.adapters.alpaca.orders import mleg_payload_from_order_plan
 from nautilus_trader.adapters.alpaca.orders import mleg_report_leg_snapshot
 from nautilus_trader.adapters.alpaca.orders import nested_order_legs
-from nautilus_trader.adapters.alpaca.orders import validate_mleg_order_list
 from nautilus_trader.adapters.alpaca.providers import AlpacaInstrumentProvider
 from nautilus_trader.adapters.alpaca.providers import is_alpaca_option_symbol
 from nautilus_trader.adapters.alpaca.providers import make_alpaca_equity
@@ -283,9 +283,10 @@ class AlpacaExecutionClient(LiveExecutionClient):
 
     async def _submit_order_list(self, command: SubmitOrderList) -> None:
         orders = list(command.order_list.orders)
-        error = validate_mleg_order_list(command)
-        if error is not None:
-            self._deny_orders(orders, error)
+        try:
+            order_plan = mleg_order_plan_from_order_list(command)
+        except ValueError as e:
+            self._deny_orders(orders, str(e))
             return
 
         try:
@@ -299,7 +300,7 @@ class AlpacaExecutionClient(LiveExecutionClient):
             self._deny_orders(orders, risk_reason)
             return
 
-        payload = mleg_payload_from_order_list(command)
+        payload = mleg_payload_from_order_plan(command.order_list.id, order_plan)
         for order in orders:
             self.generate_order_submitted(
                 strategy_id=order.strategy_id,

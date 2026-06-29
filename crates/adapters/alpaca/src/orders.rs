@@ -15,9 +15,18 @@
 
 //! Alpaca order request builders and local validation.
 
+#[cfg(feature = "live")]
+use nautilus_model::{
+    enums::{OrderSide, OrderType, TimeInForce},
+    identifiers::Venue,
+    orders::{Order, OrderAny},
+    types::Quantity,
+};
 use serde::Serialize;
 
 use crate::http::error::{Error, Result};
+#[cfg(feature = "live")]
+use crate::{common::consts::ALPACA_VENUE, parse::parse_alpaca_option_instrument_id};
 
 /// Alpaca order side.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -101,6 +110,18 @@ impl MlegOrderLeg {
             position_intent,
         }
     }
+}
+
+/// Normalized multi-leg order semantics derived from Nautilus order-list legs.
+#[cfg(feature = "live")]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MlegOrderPlan {
+    /// Number of strategy units to trade.
+    pub strategy_quantity: u64,
+    /// Alpaca signed net limit price for the strategy order.
+    pub signed_limit_price: f64,
+    /// Multi-leg components.
+    pub legs: Vec<MlegOrderLeg>,
 }
 
 /// Alpaca simple single-leg order payload.
@@ -450,6 +471,170 @@ impl MlegOrderPayload {
 
         Ok(())
     }
+}
+
+#[cfg(feature = "live")]
+impl MlegOrderPlan {
+    /// Converts this order plan into an Alpaca multi-leg payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plan does not satisfy Alpaca's locally validated MLeg shape.
+    pub fn into_payload(self) -> Result<MlegOrderPayload> {
+        MlegOrderPayload::new_limit(self.strategy_quantity, self.signed_limit_price, self.legs)
+    }
+}
+
+/// Builds normalized multi-leg order semantics from cached Nautilus order-list legs.
+///
+/// # Errors
+///
+/// Returns an error when the order list is not a valid Alpaca option MLeg order.
+#[cfg(feature = "live")]
+pub fn build_mleg_order_plan(orders: &[OrderAny]) -> anyhow::Result<MlegOrderPlan> {
+    if orders.len() < 2 {
+        anyhow::bail!("Alpaca MLeg submit requires at least two leg orders");
+    }
+    if orders.len() > 4 {
+        anyhow::bail!("Alpaca MLeg submit supports at most four leg orders");
+    }
+
+    let quantities = orders
+        .iter()
+        .map(|order| {
+            positive_integer_quantity(
+                order.quantity(),
+                format!("Alpaca MLeg leg {}", order.client_order_id()),
+            )
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let strategy_quantity = quantities
+        .iter()
+        .copied()
+        .reduce(greatest_common_divisor)
+        .ok_or_else(|| anyhow::anyhow!("Alpaca MLeg submit requires leg quantities"))?;
+    if strategy_quantity == 0 {
+        anyhow::bail!("Alpaca MLeg strategy quantity must be positive");
+    }
+
+    let trade_intent = mleg_trade_intent(orders)?;
+    let mut net_credit = 0.0_f64;
+    let mut legs = Vec::with_capacity(orders.len());
+
+    for (order, leg_qty) in orders.iter().zip(quantities) {
+        validate_mleg_leg_order(order)?;
+        let ratio_qty = leg_qty / strategy_quantity;
+        let price = order
+            .price()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Alpaca MLeg leg {} missing limit price",
+                    order.client_order_id()
+                )
+            })?
+            .as_f64();
+        if price <= 0.0 {
+            anyhow::bail!(
+                "Alpaca MLeg leg {} price must be positive, was {price}",
+                order.client_order_id()
+            );
+        }
+
+        let side_multiplier = match order.order_side() {
+            OrderSide::Sell => 1.0,
+            OrderSide::Buy => -1.0,
+            OrderSide::NoOrderSide => {
+                anyhow::bail!(
+                    "Alpaca MLeg leg {} missing order side",
+                    order.client_order_id()
+                )
+            }
+        };
+        net_credit += side_multiplier * price * ratio_qty as f64;
+
+        let position_intent =
+            position_intent_from_order_side(order.order_side(), order.is_reduce_only())?;
+        legs.push(MlegOrderLeg::new(
+            order.instrument_id().symbol.as_str(),
+            position_intent.side(),
+            position_intent,
+            ratio_qty.to_string(),
+        ));
+    }
+
+    if net_credit == 0.0 {
+        anyhow::bail!("Alpaca MLeg signed net limit price must be non-zero");
+    }
+    let premium_kind = match trade_intent {
+        TradeIntent::Open if net_credit > 0.0 => NetPremiumKind::Credit,
+        TradeIntent::Open => NetPremiumKind::Debit,
+        TradeIntent::Close if net_credit < 0.0 => NetPremiumKind::Credit,
+        TradeIntent::Close => NetPremiumKind::Debit,
+    };
+    let signed_limit_price = signed_net_limit_price(net_credit.abs(), premium_kind, trade_intent);
+
+    Ok(MlegOrderPlan {
+        strategy_quantity,
+        signed_limit_price,
+        legs,
+    })
+}
+
+/// Returns the Alpaca position intent implied by a Nautilus order side and reduce-only flag.
+///
+/// # Errors
+///
+/// Returns an error when the order side is missing.
+#[cfg(feature = "live")]
+pub fn position_intent_from_order_side(
+    side: OrderSide,
+    reduce_only: bool,
+) -> anyhow::Result<AlpacaPositionIntent> {
+    match (side, reduce_only) {
+        (OrderSide::Buy, false) => Ok(AlpacaPositionIntent::BuyToOpen),
+        (OrderSide::Sell, false) => Ok(AlpacaPositionIntent::SellToOpen),
+        (OrderSide::Buy, true) => Ok(AlpacaPositionIntent::BuyToClose),
+        (OrderSide::Sell, true) => Ok(AlpacaPositionIntent::SellToClose),
+        (OrderSide::NoOrderSide, _) => anyhow::bail!("Alpaca order missing order side"),
+    }
+}
+
+/// Returns the Alpaca order side for a Nautilus order side.
+///
+/// # Errors
+///
+/// Returns an error when the order side is missing.
+#[cfg(feature = "live")]
+pub fn order_side_from_nautilus(side: OrderSide) -> anyhow::Result<AlpacaOrderSide> {
+    match side {
+        OrderSide::Buy => Ok(AlpacaOrderSide::Buy),
+        OrderSide::Sell => Ok(AlpacaOrderSide::Sell),
+        OrderSide::NoOrderSide => anyhow::bail!("Alpaca order missing order side"),
+    }
+}
+
+/// Parses a positive integer order quantity.
+///
+/// # Errors
+///
+/// Returns an error when the quantity is fractional, zero, or cannot be represented as a `u64`.
+#[cfg(feature = "live")]
+pub fn positive_integer_quantity(
+    quantity: Quantity,
+    order_context: impl std::fmt::Display,
+) -> anyhow::Result<u64> {
+    let normalized = quantity.as_decimal().normalize();
+    if normalized.scale() != 0 {
+        anyhow::bail!("{order_context} quantity must be an integer contract count, was {quantity}");
+    }
+    let parsed = normalized
+        .to_string()
+        .parse::<u64>()
+        .map_err(|e| anyhow::anyhow!("invalid Alpaca quantity {quantity}: {e}"))?;
+    if parsed == 0 {
+        anyhow::bail!("{order_context} quantity must be positive");
+    }
+    Ok(parsed)
 }
 
 /// Builds a paper-safe put credit spread opening payload without submitting it.
@@ -810,6 +995,59 @@ pub fn signed_net_limit_price(
         | (NetPremiumKind::Debit, TradeIntent::Close) => -normalized_limit,
         (NetPremiumKind::Debit, TradeIntent::Open)
         | (NetPremiumKind::Credit, TradeIntent::Close) => normalized_limit,
+    }
+}
+
+#[cfg(feature = "live")]
+fn validate_mleg_leg_order(order: &OrderAny) -> anyhow::Result<()> {
+    if order.instrument_id().venue != Venue::new(ALPACA_VENUE) {
+        anyhow::bail!(
+            "Alpaca MLeg leg {} has non-Alpaca instrument {}",
+            order.client_order_id(),
+            order.instrument_id()
+        );
+    }
+    parse_alpaca_option_instrument_id(order.instrument_id()).map_err(|e| {
+        anyhow::anyhow!(
+            "Alpaca MLeg leg {} has invalid Alpaca option instrument {}: {e}",
+            order.client_order_id(),
+            order.instrument_id()
+        )
+    })?;
+    if order.order_type() != OrderType::Limit {
+        anyhow::bail!(
+            "Alpaca MLeg leg {} must be a limit order, was {:?}",
+            order.client_order_id(),
+            order.order_type()
+        );
+    }
+    if order.time_in_force() != TimeInForce::Day {
+        anyhow::bail!(
+            "Alpaca MLeg leg {} must use DAY time in force, was {:?}",
+            order.client_order_id(),
+            order.time_in_force()
+        );
+    }
+    if order.is_quote_quantity() {
+        anyhow::bail!(
+            "Alpaca MLeg leg {} cannot use quote quantity",
+            order.client_order_id()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live")]
+fn mleg_trade_intent(orders: &[OrderAny]) -> anyhow::Result<TradeIntent> {
+    let all_reduce_only = orders.iter().all(|order| order.is_reduce_only());
+    let any_reduce_only = orders.iter().any(|order| order.is_reduce_only());
+    match (all_reduce_only, any_reduce_only) {
+        (true, true) => Ok(TradeIntent::Close),
+        (false, false) => Ok(TradeIntent::Open),
+        (false, true) => {
+            anyhow::bail!("Alpaca MLeg orders must be all opening or all closing legs")
+        }
+        (true, false) => unreachable!("all_reduce_only implies any_reduce_only"),
     }
 }
 
