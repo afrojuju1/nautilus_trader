@@ -1,14 +1,12 @@
 //! Candidate-ledger payload and identity helpers.
 
+use nautilus_trading::options::candidates::{
+    DebitSpreadCandidate, IronCondorCandidate, NakedOptionCandidate, OptionCandidateMetrics,
+    ScoredContract, SpreadCandidate, annualized_premium_yield,
+};
 use serde_json::{Value, json};
 
-use crate::{
-    candidate_engine::{
-        DebitSpreadCandidate, IronCondorCandidate, NakedOptionCandidate, OptionCandidateMetrics,
-        ScoredContract, SpreadCandidate, annualized_premium_yield,
-    },
-    options_entry::SelectedOptionsEntry,
-};
+use crate::options_entry::SelectedOptionsEntry;
 
 /// Builds the shared candidate-ledger payload for a credit-spread candidate.
 #[must_use]

@@ -20,15 +20,17 @@ use std::env;
 use nautilus_alpaca::{
     fleet::load_fleet_config_from_env,
     runtime::{StrategyState, save_strategy_state_atomic},
-    storage::{STORAGE_SCHEMA_DEFAULT, StorageRepository, load_strategy_state_record},
+};
+use nautilus_infrastructure::sql::operational::{
+    OPERATIONAL_SCHEMA_DEFAULT, OperationalRepository, load_strategy_state_record,
 };
 
 pub(crate) async fn run() -> anyhow::Result<()> {
-    let database_url = env::var("ALPACA_STORAGE_DATABASE_URL")
-        .map_err(|_| anyhow::anyhow!("ALPACA_STORAGE_DATABASE_URL is required"))?;
-    let schema =
-        env::var("ALPACA_STORAGE_SCHEMA").unwrap_or_else(|_| STORAGE_SCHEMA_DEFAULT.to_string());
-    let storage = StorageRepository::connect_with_schema(&database_url, &schema).await?;
+    let database_url = env::var("NAUTILUS_OPERATIONAL_DATABASE_URL")
+        .map_err(|_| anyhow::anyhow!("NAUTILUS_OPERATIONAL_DATABASE_URL is required"))?;
+    let schema = env::var("NAUTILUS_OPERATIONAL_SCHEMA")
+        .unwrap_or_else(|_| OPERATIONAL_SCHEMA_DEFAULT.to_string());
+    let storage = OperationalRepository::connect_with_schema(&database_url, &schema).await?;
     let fleet =
         load_fleet_config_from_env()?.ok_or_else(|| anyhow::anyhow!("fleet config is required"))?;
 

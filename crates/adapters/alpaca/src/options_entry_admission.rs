@@ -694,8 +694,11 @@ fn inside_entry_window_at(config: &EntryAdmissionConfig, now: DateTime<Utc>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nautilus_trading::options::candidates::{
+        CreditSpreadKind, ScoredContract, SpreadCandidate,
+    };
+
     use crate::{
-        candidate_engine::{ScoredContract, SpreadCandidate},
         earnings::{EarningsEvent, EarningsTiming},
         options_entry::{SelectedEntry, SelectedOptionsEntry},
         runtime::{StrategyStateEntryDraft, credit_spread_strategy_name},
@@ -838,7 +841,7 @@ mod tests {
     fn selected_credit_entry(underlying: &str, max_loss: f64) -> SelectedOptionsEntry {
         SelectedOptionsEntry::Credit(SelectedEntry {
             underlying: underlying.to_string(),
-            kind: crate::candidate_engine::CreditSpreadKind::Put,
+            kind: CreditSpreadKind::Put,
             candidate: SpreadCandidate {
                 short: scored_contract(&format!("{underlying}260515P00400000"), 400.0),
                 long: scored_contract(&format!("{underlying}260515P00395000"), 395.0),
@@ -855,8 +858,7 @@ mod tests {
         StrategyStateEntryDraft {
             trade_date: "2026-05-03".to_string(),
             underlying: underlying.to_string(),
-            strategy: credit_spread_strategy_name(crate::candidate_engine::CreditSpreadKind::Put)
-                .to_string(),
+            strategy: credit_spread_strategy_name(CreditSpreadKind::Put).to_string(),
             order_list_id: format!("{underlying}-entry"),
             short_symbol: format!("{underlying}260515P00400000"),
             long_symbol: format!("{underlying}260515P00395000"),

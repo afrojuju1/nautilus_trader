@@ -244,7 +244,7 @@ ownership.
 | Slice | Outcome | Work | Done when |
 | --- | --- | --- | --- |
 | 1. Candidate-set boundary | Strategy input is explicit. | Replace hidden selector calls with `scan_options_candidates` and `OptionsCandidateSet` scan reports plus ranked entries. | Current account-engine strategy consumes an candidate set instead of hidden selector state. Implemented for the Alpaca account-engine path. |
-| 2. Candidate engine boundary | Pure reusable scoring core. | Extract filtering, scoring, ranking, rejection counts, and candidate identity into explicit candidate-engine types below the REST scanner adapter. | Implemented in `crates/adapters/alpaca/src/candidate_engine.rs`; current REST scanner behavior routes through the pure engine without changing operator output. |
+| 2. Candidate engine boundary | Pure reusable scoring core. | Extract filtering, scoring, ranking, rejection counts, and candidate identity into explicit candidate-engine types below the REST scanner adapter. | Implemented in `crates/trading/src/options/candidates.rs`; current REST scanner behavior routes through the pure engine without changing operator output. |
 | 3. REST input adapter | Current operations use the target input model. | Convert Alpaca contract and snapshot responses into normalized candidate inputs; update existing binaries and the options engine to consume candidate-engine types directly. | Implemented for the current Alpaca REST scanner adapter in `strategy.rs`; dry-run scans and the current options engine keep producing the same candidate and ledger evidence through the target input model. |
 | 4. Option-chain input adapter | Nautilus-native market-state input. | Convert `OptionChainSlice` and cached instruments into the same candidate input model. | The same candidate engine can rank candidates from REST snapshots or `OptionChainSlice` events. |
 | 5. Regime router boundary | Reusable strategy-family routing. | Add pure `RegimeInput`, `RegimeContext`, and routing-policy types with threshold-based labels and explanation codes. | Candidate ranking can accept regime context without calling venue APIs or reading operator config. |
@@ -282,7 +282,7 @@ Implemented refactor:
 1. Introduced normalized candidate input types for option contracts, quotes, greeks, and liquidity:
    `CandidateContract`, `CandidateQuote`, and `CandidateMarketSnapshot`.
 2. Moved filtering, scoring, candidate construction, rejection counting, and candidate identity into
-   `crates/adapters/alpaca/src/candidate_engine.rs`.
+   `crates/trading/src/options/candidates.rs`.
 3. Replaced Alpaca REST-shaped scoring calls in the current scanner path with conversion into the
    normalized candidate input model followed by direct candidate-engine calls.
 4. Deleted the displaced `strategy/scoring.rs` path instead of preserving renamed pass-through
@@ -292,7 +292,7 @@ Implemented refactor:
 
 Current code ownership:
 
-- `crates/adapters/alpaca/src/candidate_engine.rs`: pure scoring and ranking module.
+- `crates/trading/src/options/candidates.rs`: pure scoring and ranking module.
 - `crates/adapters/alpaca/src/strategy.rs`: REST data-acquisition and input-adapter surface.
 - `crates/adapters/alpaca/src/candidate_scan_actor.rs`: read-only candidate evidence actor.
 - `crates/adapters/alpaca/src/options_strategy.rs`: order-capable Nautilus strategy owner.

@@ -43,9 +43,9 @@ impl Default for Args {
 
 pub(crate) async fn run() -> anyhow::Result<()> {
     let args = parse_args()?;
-    let config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_storage().await?;
-    if config.storage_repository.is_none() {
-        anyhow::bail!("ALPACA_STORAGE_DATABASE_URL is required for alpaca-ops replay");
+    let config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_operational_store().await?;
+    if config.operational_repository.is_none() {
+        anyhow::bail!("NAUTILUS_OPERATIONAL_DATABASE_URL is required for alpaca-ops replay");
     }
 
     let mut data_config = AlpacaDataClientConfig::default();

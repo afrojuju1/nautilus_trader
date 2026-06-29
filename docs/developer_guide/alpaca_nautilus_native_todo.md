@@ -185,9 +185,9 @@ loop.
   - [x] Other terminal entry rejections should remain observable and should not create false active
     exposure.
 - [x] Add a real persistence boundary for strategy state.
-  - Follow `docs/developer_guide/alpaca_operational_postgres_plan.md`.
-  - [x] Enable `sqlx` Postgres migrations for Alpaca operational storage.
-  - [x] Move inline `StorageRepository::init_schema` DDL into versioned SQL migration files.
+  - Follow `docs/developer_guide/operational_postgres_plan.md`.
+  - [x] Enable `sqlx` Postgres migrations for operational Postgres storage.
+  - [x] Move inline operational schema DDL into versioned SQL migration files.
   - [x] Add `strategy_state_events` as the append-only state mutation ledger.
   - [x] Add `version`, writer metadata, and last-event metadata to `strategy_state`.
   - [x] Add a transactional repository method that inserts one state event and updates the
@@ -203,7 +203,7 @@ loop.
     fails.
 - [x] Reconcile state on startup before enabling paper submission.
   - [x] Load persisted entries.
-  - [x] Require migrations, storage readiness, healthy sink, and an active account writer lease
+  - [x] Require migrations, operational readiness, healthy sink, and an active account writer lease
     when `ALPACA_SUBMIT=true`.
   - [x] Reconcile broker orders/positions so pending or partially accepted entries are not double
     submitted after restart.

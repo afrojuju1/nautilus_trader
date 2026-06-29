@@ -6,7 +6,7 @@ use chrono::Utc;
 use sqlx::{AssertSqlSafe, Row as _};
 use uuid::Uuid;
 
-use crate::storage::StorageRepository;
+use super::OperationalRepository;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeLeaseRequest {
@@ -26,7 +26,7 @@ pub struct RuntimeLeaseStatus {
 }
 
 pub async fn acquire_runtime_lease(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     account_id: &str,
     request: &RuntimeLeaseRequest,
 ) -> anyhow::Result<RuntimeLeaseStatus> {
@@ -73,7 +73,7 @@ pub async fn acquire_runtime_lease(
 }
 
 pub async fn heartbeat_runtime_lease(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     account_id: &str,
     run_id: Uuid,
     ttl: Duration,
@@ -95,7 +95,7 @@ pub async fn heartbeat_runtime_lease(
 }
 
 pub async fn release_runtime_lease(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     account_id: &str,
     run_id: Uuid,
 ) -> anyhow::Result<bool> {
@@ -112,7 +112,7 @@ pub async fn release_runtime_lease(
 }
 
 async fn load_runtime_lease(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     account_id: &str,
 ) -> anyhow::Result<RuntimeLeaseStatus> {
     let query = format!(

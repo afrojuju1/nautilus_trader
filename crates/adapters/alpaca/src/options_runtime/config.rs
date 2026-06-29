@@ -9,18 +9,15 @@ use std::{
 
 use chrono::NaiveTime;
 use chrono_tz::Tz;
+use nautilus_infrastructure::sql::operational::OPERATIONAL_SCHEMA_DEFAULT;
+use nautilus_trading::options::candidates::{
+    CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
+    NakedOptionKind, NakedOptionScannerConfig, PutCreditScannerConfig,
+};
 use serde::Deserialize;
 
 use crate::earnings::load_earnings_events_csv;
-use crate::{
-    candidate_engine::{
-        CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
-        NakedOptionKind, NakedOptionScannerConfig, PutCreditScannerConfig,
-    },
-    fleet::load_fleet_config_from_env,
-    runtime::StrategyState,
-    storage::STORAGE_SCHEMA_DEFAULT,
-};
+use crate::{fleet::load_fleet_config_from_env, runtime::StrategyState};
 
 use super::AlpacaOptionsRuntimeConfig;
 
@@ -690,10 +687,10 @@ pub(super) fn build_options_runtime_config(
         fleet,
         fleet_account_id: None,
         fleet_policy_blocks: Vec::new(),
-        storage_database_url: None,
-        storage_repository: None,
-        storage_schema: STORAGE_SCHEMA_DEFAULT.to_string(),
-        storage_account_id: None,
+        operational_database_url: None,
+        operational_repository: None,
+        operational_schema: OPERATIONAL_SCHEMA_DEFAULT.to_string(),
+        operational_account_id: None,
     };
     apply_fleet_policy(&mut config);
     Ok(config)

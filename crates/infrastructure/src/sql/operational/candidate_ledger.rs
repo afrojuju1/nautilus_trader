@@ -4,10 +4,7 @@ use chrono::{NaiveDate, Utc};
 use serde_json::Value;
 use sqlx::{AssertSqlSafe, Row, types::Json};
 
-use crate::{
-    options_runtime::AlpacaOptionsRuntimeConfig, performance::CandidateLedgerSummary,
-    storage::StorageRepository,
-};
+use super::OperationalRepository;
 
 pub const CANDIDATE_LEDGER_SCHEMA_VERSION: u64 = 1;
 
@@ -18,7 +15,7 @@ pub struct CandidateLedgerSummaryFilters {
 }
 
 pub async fn append_candidate_ledger_record(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     account_id: &str,
     trade_date: &str,
     record_type: &str,
@@ -79,7 +76,7 @@ pub async fn append_candidate_ledger_record(
 }
 
 pub async fn read_candidate_ledger_records(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     account_id: &str,
     filters: CandidateLedgerSummaryFilters,
 ) -> anyhow::Result<Vec<Value>> {
@@ -100,82 +97,4 @@ pub async fn read_candidate_ledger_records(
         records.push(payload.0);
     }
     Ok(records)
-}
-
-pub async fn summarize_candidate_ledger(
-    storage: &StorageRepository,
-    account_id: &str,
-    filters: CandidateLedgerSummaryFilters,
-) -> anyhow::Result<CandidateLedgerSummary> {
-    let records = read_candidate_ledger_records(storage, account_id, filters).await?;
-
-    let mut summary = CandidateLedgerSummary::default();
-    summary.directory = format!(
-        "postgres://{account}/candidate_ledger",
-        account = account_id
-    );
-    summary.files = 0;
-    summary.dates = records
-        .iter()
-        .filter_map(|record| {
-            record
-                .get("trade_date")
-                .and_then(Value::as_str)
-                .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
-                .map(|value| value.to_string())
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    summary.files = summary.dates.len();
-
-    for record in records {
-        summary.records += 1;
-        let record_type = record
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-        *summary.by_type.entry(record_type.clone()).or_insert(0) += 1;
-
-        match record_type.as_str() {
-            "candidate" => {
-                summary.candidates += 1;
-                if let Some(strategy) = record.get("strategy").and_then(Value::as_str) {
-                    *summary
-                        .candidates_by_strategy
-                        .entry(strategy.to_string())
-                        .or_insert(0) += 1;
-                }
-            }
-            "scanner_result" => summary.scanner_results += 1,
-            "decision" => summary.decisions += 1,
-            "submit_result" => summary.submit_results += 1,
-            "candidate_alert" => {
-                summary.candidate_alerts += 1;
-                match record.get("alert_type").and_then(Value::as_str) {
-                    Some("selected_candidate") => summary.selected_candidates += 1,
-                    Some("high_score_candidate") => summary.high_score_candidates += 1,
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(summary)
-}
-
-/// Async wrapper that reads from Postgres storage.
-pub async fn summarize_candidate_ledger_records(
-    config: &AlpacaOptionsRuntimeConfig,
-    since: Option<chrono::NaiveDate>,
-    until: Option<chrono::NaiveDate>,
-) -> anyhow::Result<CandidateLedgerSummary> {
-    let Some(storage) = config.storage_repository.as_ref() else {
-        anyhow::bail!("storage is not connected");
-    };
-    let account_id = config.storage_account_id();
-    let filters = CandidateLedgerSummaryFilters { since, until };
-    summarize_candidate_ledger(storage, account_id, filters).await
 }

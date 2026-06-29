@@ -153,7 +153,7 @@ cache entries now belong in the catalog and ClickHouse; tiny operational checkpo
 name that describes the operational responsibility instead of reviving a broad market-cache table.
 
 The detailed operational Postgres plan lives in
-`alpaca_operational_postgres_plan.md`. That plan owns strategy-state snapshots, state-event
+`operational_postgres_plan.md`. That plan owns strategy-state snapshots, state-event
 durability, runtime leases, migrations, and live-submit readiness. This warehouse workstream owns
 catalog/ClickHouse market-data persistence and uses Postgres only for small ingest manifests.
 
@@ -582,7 +582,7 @@ For scanner features:
 | 7. Read validation command | Cutover proof without a runtime comparison mode. | Add an explicit operator command that compares catalog and ClickHouse for requested dataset/range and reports counts, timestamp range, checksum, and freshness. | Operators can prove a supported read range before changing runtime config. |
 | 8. Flagged ClickHouse read cutover | Controlled read switch. | Promote supported datasets to `clickhouse` mode with explicit rollback to `catalog`. | Operators can switch reads to ClickHouse and back to catalog by configuration. |
 | 9. Dataset expansion | More generic market data coverage. | Add trades, bars, option Greeks, and option-chain liquidity features after quote ticks prove the path. | Research can query generic market datasets by instrument/source/time and option features by underlying, expiration, strike, and time. |
-| 10. Postgres slimming | Operational store is narrow. | Follow `alpaca_operational_postgres_plan.md`; keep market-data cache payloads and scanner feature time series in catalog/ClickHouse; keep Postgres for state, events, ledgers, outcomes, leases, and ingest manifests. | `backtest_market_cache` is retired and no active code writes market-data payloads to Postgres. |
+| 10. Postgres slimming | Operational store is narrow. | Follow `operational_postgres_plan.md`; keep market-data cache payloads and scanner feature time series in catalog/ClickHouse; keep Postgres for state, events, ledgers, outcomes, leases, and ingest manifests. | `backtest_market_cache` is retired and no active code writes market-data payloads to Postgres. |
 | 11. Export to catalog | Replay-compatible bridge. | Export warehouse-selected ranges back into `ParquetDataCatalog` format when needed. | Backtests still consume catalog data, even if ClickHouse selected or prepared the range. |
 
 ## Provisional Answers

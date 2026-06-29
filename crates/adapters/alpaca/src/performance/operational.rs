@@ -1,36 +1,91 @@
 //! Performance and candidate-outcome persistence in Postgres.
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Utc};
+use nautilus_infrastructure::sql::operational::{
+    CandidateLedgerSummaryFilters, CandidateOutcomeSummaryFilters, OperationalRepository,
+    PerformanceLedgerSummaryFilters, append_performance_ledger_payload,
+    read_candidate_ledger_records, read_candidate_outcome_records, read_performance_ledger_records,
+};
 use serde_json::Value;
-use sqlx::{AssertSqlSafe, Row as _, types::Json};
 
 use crate::{
     options_runtime::AlpacaOptionsRuntimeConfig,
     performance::{
-        CandidateOutcomeSummary, EntryPerformance, PerformanceLedgerAppend,
+        CandidateLedgerSummary, CandidateOutcomeSummary, EntryPerformance, PerformanceLedgerAppend,
         PerformanceLedgerSummary,
     },
-    storage::StorageRepository,
 };
 
-#[derive(Debug, Default)]
-pub struct PerformanceLedgerSummaryFilters {
-    pub since: Option<NaiveDate>,
-    pub until: Option<NaiveDate>,
+async fn summarize_candidate_ledger(
+    storage: &OperationalRepository,
+    account_id: &str,
+    filters: CandidateLedgerSummaryFilters,
+) -> anyhow::Result<CandidateLedgerSummary> {
+    let records = read_candidate_ledger_records(storage, account_id, filters).await?;
+
+    let mut summary = CandidateLedgerSummary::default();
+    summary.directory = format!(
+        "postgres://{account}/candidate_ledger",
+        account = account_id
+    );
+    summary.dates = records
+        .iter()
+        .filter_map(|record| {
+            record
+                .get("trade_date")
+                .and_then(Value::as_str)
+                .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+                .map(|value| value.to_string())
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    summary.files = summary.dates.len();
+
+    for record in records {
+        summary.records += 1;
+        let record_type = record
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        *summary.by_type.entry(record_type.clone()).or_insert(0) += 1;
+
+        match record_type.as_str() {
+            "candidate" => {
+                summary.candidates += 1;
+                if let Some(strategy) = record.get("strategy").and_then(Value::as_str) {
+                    *summary
+                        .candidates_by_strategy
+                        .entry(strategy.to_string())
+                        .or_insert(0) += 1;
+                }
+            }
+            "scanner_result" => summary.scanner_results += 1,
+            "decision" => summary.decisions += 1,
+            "submit_result" => summary.submit_results += 1,
+            "candidate_alert" => {
+                summary.candidate_alerts += 1;
+                match record.get("alert_type").and_then(Value::as_str) {
+                    Some("selected_candidate") => summary.selected_candidates += 1,
+                    Some("high_score_candidate") => summary.high_score_candidates += 1,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(summary)
 }
 
-pub type CandidateOutcomeSummaryFilters = PerformanceLedgerSummaryFilters;
-
 pub async fn append_performance_ledger_record(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     account_id: &str,
     ledger_date: &str,
     entry: &EntryPerformance,
     existing_record_key: Option<&str>,
 ) -> anyhow::Result<PerformanceLedgerAppend> {
-    use chrono::Utc;
-
-    let date = chrono::NaiveDate::parse_from_str(ledger_date, "%Y-%m-%d")?;
     let record_key = if let Some(existing_record_key) = existing_record_key {
         existing_record_key.to_string()
     } else {
@@ -66,19 +121,14 @@ pub async fn append_performance_ledger_record(
         serde_json::Value::String(record_key.clone()),
     );
 
-    let query = format!(
-        "INSERT INTO \"{}\".performance_ledger (account_id, ledger_date, ts_utc, record_key, payload)\n         VALUES ($1, $2::date, $3::timestamptz, $4, $5)\n         ON CONFLICT (account_id, record_key) DO UPDATE\n         SET payload = EXCLUDED.payload, ts_utc = EXCLUDED.ts_utc",
-        storage.schema()
-    );
-
-    let result = sqlx::query(AssertSqlSafe(query))
-        .bind(account_id)
-        .bind(date.to_string())
-        .bind(Utc::now().to_rfc3339())
-        .bind(&record_key)
-        .bind(Json(Value::Object(record)))
-        .execute(storage.pool())
-        .await?;
+    let appended = append_performance_ledger_payload(
+        storage,
+        account_id,
+        ledger_date,
+        &record_key,
+        Value::Object(record),
+    )
+    .await?;
 
     Ok(PerformanceLedgerAppend {
         path: format!(
@@ -87,26 +137,17 @@ pub async fn append_performance_ledger_record(
             account = account_id,
             record_key = record_key
         ),
-        appended: result.rows_affected() > 0,
+        appended,
         record_key,
     })
 }
 
-pub async fn summarize_performance_ledger(
-    storage: &StorageRepository,
+async fn summarize_performance_ledger(
+    storage: &OperationalRepository,
     account_id: &str,
     filters: PerformanceLedgerSummaryFilters,
 ) -> anyhow::Result<PerformanceLedgerSummary> {
-    let query = format!(
-        "SELECT payload FROM \"{}\".performance_ledger WHERE account_id = $1 AND ($2::date IS NULL OR ledger_date >= $2::date) AND ($3::date IS NULL OR ledger_date <= $3::date) AND (payload->>'type') = 'realized_trade' ORDER BY ts_utc ASC",
-        storage.schema()
-    );
-    let rows = sqlx::query(AssertSqlSafe(query))
-        .bind(account_id)
-        .bind(filters.since.map(|d| d.to_string()))
-        .bind(filters.until.map(|d| d.to_string()))
-        .fetch_all(storage.pool())
-        .await?;
+    let records = read_performance_ledger_records(storage, account_id, filters).await?;
 
     let mut summary = PerformanceLedgerSummary {
         directory: format!(
@@ -124,9 +165,7 @@ pub async fn summarize_performance_ledger(
     let mut underlying_stats = std::collections::BTreeMap::<String, BucketStats>::new();
     let mut dates = std::collections::BTreeSet::<String>::new();
 
-    for row in rows {
-        let payload: Json<Value> = row.try_get("payload")?;
-        let record = payload.0;
+    for record in records {
         let Some(realized_pnl) = record.get("realized_pnl").and_then(Value::as_f64) else {
             summary.parse_errors += 1;
             continue;
@@ -196,64 +235,11 @@ pub async fn summarize_performance_ledger(
     Ok(summary)
 }
 
-pub async fn append_candidate_outcome(
-    storage: &StorageRepository,
-    account_id: &str,
-    trade_date: &str,
-    record_key: &str,
-    payload: &Value,
-) -> anyhow::Result<bool> {
-    use chrono::Utc;
-
-    let date = chrono::NaiveDate::parse_from_str(trade_date, "%Y-%m-%d")?;
-    let record = match payload {
-        Value::Object(fields) => Value::Object(fields.clone()),
-        _ => Value::Object(
-            [("payload".to_string(), payload.clone())]
-                .into_iter()
-                .collect(),
-        ),
-    };
-    let preserve_existing =
-        record.get("observation_bucket").and_then(Value::as_str) == Some("virtual_close");
-    let conflict_clause = if preserve_existing {
-        "ON CONFLICT (account_id, record_key) DO NOTHING"
-    } else {
-        "ON CONFLICT (account_id, record_key) DO UPDATE\n         SET payload = EXCLUDED.payload, ts_utc = EXCLUDED.ts_utc"
-    };
-    let query = format!(
-        "INSERT INTO \"{}\".candidate_outcome (account_id, trade_date, ts_utc, record_key, payload)\n         VALUES ($1, $2::date, $3::timestamptz, $4, $5)\n         {}",
-        storage.schema(),
-        conflict_clause,
-    );
-    let result = sqlx::query(AssertSqlSafe(query))
-        .bind(account_id)
-        .bind(date.to_string())
-        .bind(Utc::now().to_rfc3339())
-        .bind(record_key)
-        .bind(Json(record))
-        .execute(storage.pool())
-        .await?;
-
-    Ok(result.rows_affected() > 0)
-}
-
-pub async fn summarize_candidate_outcomes(
-    storage: &StorageRepository,
+async fn summarize_candidate_outcomes(
+    storage: &OperationalRepository,
     account_id: &str,
     filters: CandidateOutcomeSummaryFilters,
 ) -> anyhow::Result<CandidateOutcomeSummary> {
-    let query = format!(
-        "SELECT payload FROM \"{}\".candidate_outcome WHERE account_id = $1 AND ($2::date IS NULL OR trade_date >= $2::date) AND ($3::date IS NULL OR trade_date <= $3::date) ORDER BY ts_utc ASC",
-        storage.schema()
-    );
-    let rows = sqlx::query(AssertSqlSafe(query))
-        .bind(account_id)
-        .bind(filters.since.map(|d| d.to_string()))
-        .bind(filters.until.map(|d| d.to_string()))
-        .fetch_all(storage.pool())
-        .await?;
-
     let mut summary = CandidateOutcomeSummary {
         directory: format!(
             "postgres://{schema}.candidate_outcome/{account}",
@@ -263,9 +249,7 @@ pub async fn summarize_candidate_outcomes(
         ..Default::default()
     };
     let mut records_by_key = std::collections::BTreeMap::<String, Value>::new();
-    for row in rows {
-        let payload: sqlx::types::Json<Value> = row.try_get("payload")?;
-        let record = payload.0;
+    for record in read_candidate_outcome_records(storage, account_id, filters).await? {
         let key = candidate_outcome_semantic_key(&record)
             .or_else(|| {
                 record
@@ -654,15 +638,28 @@ impl From<OutcomeStats> for crate::performance::CandidateOutcomeBucketSummary {
     }
 }
 
+pub async fn summarize_candidate_ledger_records(
+    config: &AlpacaOptionsRuntimeConfig,
+    since: Option<chrono::NaiveDate>,
+    until: Option<chrono::NaiveDate>,
+) -> anyhow::Result<CandidateLedgerSummary> {
+    let Some(storage) = config.operational_repository.as_ref() else {
+        anyhow::bail!("operational store is not connected");
+    };
+    let account_id = config.operational_account_id();
+    let filters = CandidateLedgerSummaryFilters { since, until };
+    summarize_candidate_ledger(storage, account_id, filters).await
+}
+
 pub async fn summarize_performance_ledger_records(
     config: &AlpacaOptionsRuntimeConfig,
     since: Option<chrono::NaiveDate>,
     until: Option<chrono::NaiveDate>,
 ) -> anyhow::Result<PerformanceLedgerSummary> {
-    let Some(storage) = &config.storage_repository else {
-        anyhow::bail!("storage is not connected");
+    let Some(storage) = &config.operational_repository else {
+        anyhow::bail!("operational store is not connected");
     };
-    let account_id = config.storage_account_id();
+    let account_id = config.operational_account_id();
     let filters = PerformanceLedgerSummaryFilters { since, until };
     summarize_performance_ledger(storage, account_id, filters).await
 }
@@ -672,10 +669,10 @@ pub async fn summarize_candidate_outcomes_records(
     since: Option<chrono::NaiveDate>,
     until: Option<chrono::NaiveDate>,
 ) -> anyhow::Result<CandidateOutcomeSummary> {
-    let Some(storage) = &config.storage_repository else {
-        anyhow::bail!("storage is not connected");
+    let Some(storage) = &config.operational_repository else {
+        anyhow::bail!("operational store is not connected");
     };
-    let account_id = config.storage_account_id();
+    let account_id = config.operational_account_id();
     let filters = CandidateOutcomeSummaryFilters { since, until };
     summarize_candidate_outcomes(storage, account_id, filters).await
 }

@@ -49,7 +49,6 @@ live = [
   "nautilus-live/node",
   "dep:nautilus-network",
   "dep:nautilus-trading",
-  "dep:sqlx",
   "dep:rust_decimal",
   "dep:rmp-serde",
   "dep:toml",
@@ -98,7 +97,6 @@ rust_decimal = { workspace = true, optional = true }
 rmp-serde = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sqlx = { workspace = true, optional = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, optional = true }

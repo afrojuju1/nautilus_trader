@@ -13,6 +13,7 @@ use nautilus_common::{
     actor::DataActor, cache::CacheApi, factories::OrderFactory, timer::TimeEvent,
 };
 use nautilus_core::{UUID4, UnixNanos};
+use nautilus_infrastructure::sql::operational::StrategyStateMutation;
 use nautilus_model::{
     data::{CustomData, CustomDataTrait, DataType, HasTsInit},
     enums::{OrderSide, OrderStatus, TimeInForce},
@@ -53,7 +54,6 @@ use crate::{
     regime_features::{RegimeContext, insert_regime_context},
     runtime::{StrategyState, StrategyStateEntry, StrategyStateEntryDraft, emit_operator_event},
     state_persistence::StrategyStatePersistenceHandle,
-    storage::StrategyStateMutation,
 };
 use serde_json::{Value, json};
 

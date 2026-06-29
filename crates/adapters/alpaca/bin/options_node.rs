@@ -30,13 +30,13 @@ use nautilus_alpaca::{
         StrategyStateReconciliationRepair, StrategyStateReconciliationReport,
         reconcile_strategy_state,
     },
-    storage::{
-        RuntimeLeaseRequest, STATE_PERSISTENCE_MIGRATION_VERSION, StorageRepository,
-        StrategyStateMutation, acquire_runtime_lease, persist_strategy_state_mutation,
-        release_runtime_lease,
-    },
 };
 use nautilus_common::enums::Environment;
+use nautilus_infrastructure::sql::operational::{
+    OperationalRepository, RuntimeLeaseRequest, STRATEGY_STATE_MIGRATION_VERSION,
+    StrategyStateMutation, acquire_runtime_lease, persist_strategy_state_mutation,
+    release_runtime_lease,
+};
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
     data::option_chain::StrikeRange,
@@ -55,7 +55,7 @@ const DEFAULT_RUNTIME_LEASE_TTL_SECS: u64 = 300;
 struct LiveSubmitPersistence {
     state: StrategyStatePersistenceHandle,
     candidate_ledger: CandidateLedgerPersistenceHandle,
-    storage: Arc<StorageRepository>,
+    repository: Arc<OperationalRepository>,
     account_id: String,
     writer_id: String,
     run_id: Uuid,
@@ -96,7 +96,7 @@ impl LiveSubmitPersistence {
                 }),
             );
         }
-        match release_runtime_lease(&self.storage, &self.account_id, self.run_id).await {
+        match release_runtime_lease(&self.repository, &self.account_id, self.run_id).await {
             Ok(true) => emit_operator_event(
                 "runtime_lease_released",
                 json!({
@@ -144,9 +144,9 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::from_env(&runtime_config)?;
     let live_submit_requested = runtime_config.submit_enabled;
     let runtime_config = if live_submit_requested {
-        AlpacaOptionsRuntimeConfig::from_runtime_env_with_storage()
+        AlpacaOptionsRuntimeConfig::from_runtime_env_with_operational_store()
             .await
-            .context("live submit requires Alpaca Postgres storage readiness")?
+            .context("live submit requires operational Postgres readiness")?
     } else {
         runtime_config
     };
@@ -171,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
         Some(
             prepare_state_persistence(&runtime_config, &args)
                 .await
-                .context("failed to prepare Alpaca state persistence readiness")?,
+                .context("failed to prepare operational state persistence readiness")?,
         )
     } else {
         None
@@ -180,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
         let result = async {
             let persistence = live_submit_persistence
                 .as_ref()
-                .context("live submit storage persistence was not prepared")?;
+                .context("live submit operational persistence was not prepared")?;
             prepare_live_submit_broker_state(
                 &runtime_config,
                 &data_config,
@@ -210,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
     let strategy_state_entry_count = strategy_state.entries.len();
 
     log::info!(
-        "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategies={:?} submit_enabled={} storage_required={} strategy_state_entries={}",
+        "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategies={:?} submit_enabled={} operational_store_required={} strategy_state_entries={}",
         series_id,
         args.snapshot_interval_ms,
         args.max_runtime_secs,
@@ -321,23 +321,23 @@ async fn prepare_state_persistence(
     config: &AlpacaOptionsRuntimeConfig,
     args: &Args,
 ) -> anyhow::Result<LiveSubmitPersistence> {
-    let storage = config
-        .storage_repository
+    let repository = config
+        .operational_repository
         .as_ref()
-        .context("ALPACA_STORAGE_DATABASE_URL is required when ALPACA_SUBMIT=true")?
+        .context("NAUTILUS_OPERATIONAL_DATABASE_URL is required when ALPACA_SUBMIT=true")?
         .clone();
-    let migration_status = storage.migration_status().await?;
+    let migration_status = repository.migration_status().await?;
     if let Some(dirty_version) = migration_status.dirty_version {
-        bail!("Alpaca storage migration is dirty at version {dirty_version}");
+        bail!("Operational Postgres migration is dirty at version {dirty_version}");
     }
     let latest_version = migration_status.latest_version.unwrap_or_default();
-    if latest_version < STATE_PERSISTENCE_MIGRATION_VERSION {
+    if latest_version < STRATEGY_STATE_MIGRATION_VERSION {
         bail!(
-            "Alpaca storage migration {STATE_PERSISTENCE_MIGRATION_VERSION} is required; latest applied version is {latest_version}"
+            "Operational Postgres migration {STRATEGY_STATE_MIGRATION_VERSION} is required; latest applied version is {latest_version}"
         );
     }
 
-    let account_id = config.storage_account_id().to_string();
+    let account_id = config.operational_account_id().to_string();
     let run_id = Uuid::new_v4();
     let holder_id = format!("{}:{}", args.node_name, std::process::id());
     let service_name = env::var("NAUTILUS_ALPACA_SERVICE")
@@ -352,7 +352,7 @@ async fn prepare_state_persistence(
         .unwrap_or(DEFAULT_RUNTIME_LEASE_TTL_SECS),
     );
     let lease = acquire_runtime_lease(
-        &storage,
+        &repository,
         &account_id,
         &RuntimeLeaseRequest {
             holder_id: holder_id.clone(),
@@ -378,17 +378,17 @@ async fn prepare_state_persistence(
         lease.run_id,
         lease.expires_at
     );
-    let heartbeat_storage = storage.clone();
+    let heartbeat_repository = repository.clone();
     let state_persistence = StrategyStatePersistenceHandle::spawn(
-        storage,
+        repository,
         account_id.clone(),
         holder_id.clone(),
         run_id,
     );
     let candidate_ledger_persistence =
-        CandidateLedgerPersistenceHandle::spawn(heartbeat_storage.clone(), account_id.clone());
+        CandidateLedgerPersistenceHandle::spawn(heartbeat_repository.clone(), account_id.clone());
     start_runtime_lease_heartbeat(
-        heartbeat_storage.clone(),
+        heartbeat_repository.clone(),
         account_id.clone(),
         run_id,
         ttl,
@@ -398,7 +398,7 @@ async fn prepare_state_persistence(
     Ok(LiveSubmitPersistence {
         state: state_persistence,
         candidate_ledger: candidate_ledger_persistence,
-        storage: heartbeat_storage,
+        repository: heartbeat_repository,
         account_id,
         writer_id: holder_id,
         run_id,
@@ -471,14 +471,14 @@ async fn prepare_live_submit_broker_state(
     emit_operator_event(
         "live_submit_readiness",
         json!({
-            "storage_ready": true,
+            "operational_store_ready": true,
             "lease_held": true,
             "broker_state_reconciled": true,
-            "required_migration_version": STATE_PERSISTENCE_MIGRATION_VERSION,
+            "required_migration_version": STRATEGY_STATE_MIGRATION_VERSION,
             "latest_migration_version": persistence.migration_latest_version,
             "state_persistence_healthy": persistence.state.is_healthy(),
             "candidate_ledger_persistence_healthy": persistence.candidate_ledger.is_healthy(),
-            "storage_account_id": persistence.account_id,
+            "operational_account_id": persistence.account_id,
             "run_id": persistence.run_id.to_string(),
             "reconciliation_events": report.repairs.len(),
             "state_repaired": report.changed,
@@ -500,7 +500,7 @@ async fn persist_reconciliation_repairs(
     for repair in &report.repairs {
         let mutation = reconciliation_state_mutation(repair, persistence)?;
         persist_strategy_state_mutation(
-            &persistence.storage,
+            &persistence.repository,
             &persistence.account_id,
             &mutation,
             strategy_state,

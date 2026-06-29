@@ -1,14 +1,13 @@
 //! Shared selected-entry metadata for Alpaca options strategies.
 
-use crate::{
-    candidate_engine::{
-        CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, IronCondorCandidate,
-        NakedOptionCandidate, NakedOptionKind, SpreadCandidate,
-    },
-    runtime::{
-        StrategyStateEntryDraft, credit_spread_strategy_name, debit_spread_strategy_name,
-        naked_option_strategy_name,
-    },
+use nautilus_trading::options::candidates::{
+    CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, IronCondorCandidate,
+    NakedOptionCandidate, NakedOptionKind, SpreadCandidate,
+};
+
+use crate::runtime::{
+    StrategyStateEntryDraft, credit_spread_strategy_name, debit_spread_strategy_name,
+    naked_option_strategy_name,
 };
 
 const OPTION_CONTRACT_MULTIPLIER: f64 = 100.0;

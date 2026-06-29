@@ -37,7 +37,7 @@ python = [
   "pyo3-stub-gen",
 ]
 redis = ["dep:redis"]
-postgres = ["dep:sqlx"]
+postgres = ["dep:sqlx", "dep:thiserror", "dep:uuid"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -71,6 +71,8 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 nautilus-live = { workspace = true, features = ["node"] }

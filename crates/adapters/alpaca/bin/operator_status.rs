@@ -31,10 +31,10 @@ use nautilus_alpaca::{
     },
     options_runtime::AlpacaOptionsRuntimeConfig,
     runtime::{StrategyState, read_operator_events},
-    storage::{
-        CandidateLedgerSummaryFilters, StrategyStateMetadata, load_strategy_state_metadata,
-        read_candidate_ledger_records,
-    },
+};
+use nautilus_infrastructure::sql::operational::{
+    CandidateLedgerSummaryFilters, StrategyStateMetadata, load_strategy_state_metadata,
+    read_candidate_ledger_records,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -61,7 +61,7 @@ struct OperatorConfig {
     sectors: BTreeMap<String, String>,
     fleet_account_id: Option<String>,
     fleet_policy_blocks: Vec<String>,
-    storage: StorageStatus,
+    operational_store: OperationalStoreStatus,
     strategy_state_metadata: Option<StrategyStateMetadata>,
     candidate_ledger_records: Vec<Value>,
     json_output: bool,
@@ -79,7 +79,7 @@ struct OperatorStatus {
     checked_at_utc: String,
     engine_state: EngineState,
     service: ServiceStatus,
-    storage: StorageStatus,
+    operational_store: OperationalStoreStatus,
     account: AccountStatus,
     orders: OrdersStatus,
     positions: PositionsStatus,
@@ -126,7 +126,7 @@ struct ServiceStatus {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct StorageStatus {
+struct OperationalStoreStatus {
     enabled: bool,
     schema: String,
     applied_migrations: Option<i64>,
@@ -288,7 +288,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
 impl OperatorConfig {
     async fn from_env() -> anyhow::Result<Self> {
-        let strategy_config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_storage().await?;
+        let strategy_config =
+            AlpacaOptionsRuntimeConfig::from_runtime_env_with_operational_store().await?;
         let account_defaults = strategy_config.fleet.as_ref().and_then(|fleet| {
             fleet
                 .current_account()
@@ -329,19 +330,21 @@ impl OperatorConfig {
             .with_timezone(&strategy_config.entry_timezone)
             .date_naive();
 
-        let (storage, strategy_state_metadata, candidate_ledger_records) =
-            if let Some(repository) = &strategy_config.storage_repository {
+        let (operational_store, strategy_state_metadata, candidate_ledger_records) =
+            if let Some(repository) = &strategy_config.operational_repository {
                 let status = repository.migration_status().await?;
-                let metadata =
-                    load_strategy_state_metadata(repository, strategy_config.storage_account_id())
-                        .await?;
+                let metadata = load_strategy_state_metadata(
+                    repository,
+                    strategy_config.operational_account_id(),
+                )
+                .await?;
                 let filters = CandidateLedgerSummaryFilters {
                     since: trade_date.checked_sub_signed(Duration::days(7)),
                     until: None,
                 };
                 let records = match read_candidate_ledger_records(
                     repository,
-                    strategy_config.storage_account_id(),
+                    strategy_config.operational_account_id(),
                     filters,
                 )
                 .await
@@ -353,7 +356,7 @@ impl OperatorConfig {
                     }
                 };
                 (
-                    StorageStatus {
+                    OperationalStoreStatus {
                         enabled: true,
                         schema: repository.schema().to_string(),
                         applied_migrations: Some(status.applied_count),
@@ -365,9 +368,9 @@ impl OperatorConfig {
                 )
             } else {
                 (
-                    StorageStatus {
+                    OperationalStoreStatus {
                         enabled: false,
-                        schema: strategy_config.storage_schema.clone(),
+                        schema: strategy_config.operational_schema.clone(),
                         applied_migrations: None,
                         latest_migration_version: None,
                         dirty_migration_version: None,
@@ -405,7 +408,7 @@ impl OperatorConfig {
             sectors: strategy_config.sectors,
             fleet_account_id: strategy_config.fleet_account_id,
             fleet_policy_blocks: strategy_config.fleet_policy_blocks,
-            storage,
+            operational_store,
             strategy_state_metadata,
             candidate_ledger_records,
             json_output: crate::ops_args().iter().any(|arg| arg == "--json"),
@@ -413,7 +416,8 @@ impl OperatorConfig {
     }
 
     async fn options_state(&self) -> anyhow::Result<StrategyState> {
-        let strategy_config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_storage().await?;
+        let strategy_config =
+            AlpacaOptionsRuntimeConfig::from_runtime_env_with_operational_store().await?;
         strategy_config.load_strategy_state().await
     }
 }
@@ -523,7 +527,7 @@ fn build_status(
 
     let strategy_state = StrategyStateStatus {
         path: config.state_path.display().to_string(),
-        exists: config.storage.enabled || config.state_path.exists(),
+        exists: config.operational_store.enabled || config.state_path.exists(),
         db_version: config
             .strategy_state_metadata
             .as_ref()
@@ -638,7 +642,7 @@ fn build_status(
         checked_at_utc: now.to_rfc3339(),
         engine_state,
         service,
-        storage: config.storage.clone(),
+        operational_store: config.operational_store.clone(),
         account: account_status,
         orders: orders_status,
         positions: positions_status,
@@ -978,19 +982,19 @@ fn print_human_status(status: &OperatorStatus) {
         status.service.log_file,
     );
     println!(
-        "storage: enabled={} schema={} applied_migrations={} latest_migration_version={} dirty_migration_version={}",
-        status.storage.enabled,
-        status.storage.schema,
+        "operational_store: enabled={} schema={} applied_migrations={} latest_migration_version={} dirty_migration_version={}",
+        status.operational_store.enabled,
+        status.operational_store.schema,
         status
-            .storage
+            .operational_store
             .applied_migrations
             .map_or_else(|| "none".to_string(), |value| value.to_string()),
         status
-            .storage
+            .operational_store
             .latest_migration_version
             .map_or_else(|| "none".to_string(), |value| value.to_string()),
         status
-            .storage
+            .operational_store
             .dirty_migration_version
             .map_or_else(|| "none".to_string(), |value| value.to_string()),
     );

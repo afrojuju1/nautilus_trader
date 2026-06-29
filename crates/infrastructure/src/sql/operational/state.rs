@@ -1,11 +1,12 @@
 //! Strategy state persistence in Postgres.
 
 use chrono::{DateTime, NaiveDate, Utc};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sqlx::{AssertSqlSafe, Row as _, types::Json};
 use uuid::Uuid;
 
-use crate::{runtime::StrategyState, storage::StorageRepository};
+use super::OperationalRepository;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StrategyStateMetadata {
@@ -65,19 +66,25 @@ pub enum StrategyStateWriteStatus {
     DuplicateEvent,
 }
 
-pub async fn load_strategy_state(
-    storage: &StorageRepository,
+pub async fn load_strategy_state<T>(
+    storage: &OperationalRepository,
     account_id: &str,
-) -> anyhow::Result<StrategyState> {
+) -> anyhow::Result<T>
+where
+    T: Default + DeserializeOwned,
+{
     Ok(load_strategy_state_record(storage, account_id)
         .await?
         .unwrap_or_default())
 }
 
-pub async fn load_strategy_state_record(
-    storage: &StorageRepository,
+pub async fn load_strategy_state_record<T>(
+    storage: &OperationalRepository,
     account_id: &str,
-) -> anyhow::Result<Option<StrategyState>> {
+) -> anyhow::Result<Option<T>>
+where
+    T: DeserializeOwned,
+{
     let query = format!(
         "SELECT state FROM \"{}\".strategy_state WHERE account_id = $1",
         storage.schema()
@@ -96,7 +103,7 @@ pub async fn load_strategy_state_record(
 }
 
 pub async fn load_strategy_state_metadata(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     account_id: &str,
 ) -> anyhow::Result<Option<StrategyStateMetadata>> {
     let query = format!(
@@ -122,9 +129,9 @@ pub async fn load_strategy_state_metadata(
 }
 
 pub async fn save_strategy_state(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     account_id: &str,
-    state: &StrategyState,
+    state: &(impl Serialize + ?Sized),
 ) -> anyhow::Result<()> {
     let payload = serde_json::to_value(state)?;
     let query = format!(
@@ -141,10 +148,10 @@ pub async fn save_strategy_state(
 }
 
 pub async fn persist_strategy_state_mutation(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     account_id: &str,
     mutation: &StrategyStateMutation,
-    state: &StrategyState,
+    state: &(impl Serialize + ?Sized),
 ) -> anyhow::Result<StrategyStateWriteResult> {
     let snapshot = serde_json::to_value(state)?;
     let mut transaction = storage.pool().begin().await?;
@@ -188,7 +195,7 @@ pub async fn persist_strategy_state_mutation(
 }
 
 async fn insert_strategy_state_event(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
     mutation: &StrategyStateMutation,
@@ -223,7 +230,7 @@ async fn insert_strategy_state_event(
 }
 
 async fn load_snapshot_version(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
 ) -> anyhow::Result<i64> {
@@ -239,7 +246,7 @@ async fn load_snapshot_version(
 }
 
 async fn ensure_snapshot_row(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
     snapshot: &Value,
@@ -259,7 +266,7 @@ async fn ensure_snapshot_row(
 }
 
 async fn lock_snapshot_version(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
 ) -> anyhow::Result<i64> {
@@ -278,7 +285,7 @@ async fn lock_snapshot_version(
 }
 
 async fn update_strategy_state_snapshot(
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
     mutation: &StrategyStateMutation,

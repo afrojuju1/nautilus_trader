@@ -21,14 +21,13 @@ use nautilus_model::{
     identifiers::{ActorId, ClientId, InstrumentId, OptionSeriesId},
     instruments::{Instrument, InstrumentAny},
 };
+use nautilus_trading::options::candidates::{
+    CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
+    NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig, PutCreditScannerConfig,
+};
 use serde_json::{Value, json};
 
 use crate::{
-    candidate_engine::{
-        CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
-        NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig,
-        PutCreditScannerConfig,
-    },
     candidate_ledger_persistence::CandidateLedgerPersistenceHandle,
     candidate_payloads::selected_entry_candidate_ledger_payload,
     common::consts::{

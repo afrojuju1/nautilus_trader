@@ -19,16 +19,15 @@ use std::{collections::BTreeMap, env, path::PathBuf, sync::Arc};
 
 use chrono::NaiveTime;
 use chrono_tz::Tz;
+use nautilus_infrastructure::sql::operational::{self, OperationalRepository};
+use nautilus_trading::options::candidates::{
+    CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
+    NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig, PutCreditScannerConfig,
+    annualized_premium_yield,
+};
 use serde_json::{Map, Value, json};
 
-#[cfg(feature = "live")]
-use crate::storage::{self, StorageRepository};
 use crate::{
-    candidate_engine::{
-        CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
-        NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig,
-        PutCreditScannerConfig, annualized_premium_yield,
-    },
     config::AlpacaDataClientConfig,
     earnings::EarningsEvent,
     fleet::ResolvedFleetConfig,
@@ -212,14 +211,14 @@ pub struct AlpacaOptionsRuntimeConfig {
     pub fleet_account_id: Option<String>,
     /// Fleet policy blocks applied to this runtime.
     pub fleet_policy_blocks: Vec<String>,
-    /// Strategy-state and ledger persistence repository.
-    pub storage_repository: Option<Arc<StorageRepository>>,
-    /// Postgres database URL used for persistence when storage is enabled.
-    pub storage_database_url: Option<String>,
-    /// Postgres schema for persistence tables.
-    pub storage_schema: String,
+    /// Strategy-state and ledger operational repository.
+    pub operational_repository: Option<Arc<OperationalRepository>>,
+    /// Postgres database URL used for operational persistence.
+    pub operational_database_url: Option<String>,
+    /// Postgres schema for operational persistence tables.
+    pub operational_schema: String,
     /// Optional account ID override for persisted records.
-    pub storage_account_id: Option<String>,
+    pub operational_account_id: Option<String>,
 }
 
 impl AlpacaOptionsRuntimeConfig {
@@ -235,10 +234,10 @@ impl AlpacaOptionsRuntimeConfig {
             load_runtime_config_file_from_env()?,
             env::args().skip(1).collect::<Vec<_>>(),
         )?;
-        config.storage_database_url = None;
-        config.storage_repository = None;
-        config.storage_schema = storage::STORAGE_SCHEMA_DEFAULT.to_string();
-        config.storage_account_id = None;
+        config.operational_database_url = None;
+        config.operational_repository = None;
+        config.operational_schema = operational::OPERATIONAL_SCHEMA_DEFAULT.to_string();
+        config.operational_account_id = None;
         Ok(config)
     }
 
@@ -258,10 +257,10 @@ impl AlpacaOptionsRuntimeConfig {
         crate::runtime_env::load_options_env_file()?;
         let mut config =
             build_options_runtime_config(load_runtime_config_file_from_env()?, Vec::new())?;
-        config.storage_database_url = None;
-        config.storage_repository = None;
-        config.storage_schema = storage::STORAGE_SCHEMA_DEFAULT.to_string();
-        config.storage_account_id = None;
+        config.operational_database_url = None;
+        config.operational_repository = None;
+        config.operational_schema = operational::OPERATIONAL_SCHEMA_DEFAULT.to_string();
+        config.operational_account_id = None;
         Ok(config)
     }
 
@@ -269,10 +268,10 @@ impl AlpacaOptionsRuntimeConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error when config or storage initialization fails.
-    pub async fn from_env_with_storage() -> anyhow::Result<Self> {
+    /// Returns an error when config or operational-store initialization fails.
+    pub async fn from_env_with_operational_store() -> anyhow::Result<Self> {
         let mut config = Self::from_env()?;
-        config.connect_storage_from_env().await?;
+        config.connect_operational_store_from_env().await?;
         Ok(config)
     }
 
@@ -280,49 +279,48 @@ impl AlpacaOptionsRuntimeConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error when config or storage initialization fails.
-    pub async fn from_runtime_env_with_storage() -> anyhow::Result<Self> {
+    /// Returns an error when config or operational-store initialization fails.
+    pub async fn from_runtime_env_with_operational_store() -> anyhow::Result<Self> {
         let mut config = Self::from_runtime_env()?;
-        config.connect_storage_from_env().await?;
+        config.connect_operational_store_from_env().await?;
         Ok(config)
     }
 
-    async fn connect_storage_from_env(&mut self) -> anyhow::Result<()> {
-        let database_url = env::var("ALPACA_STORAGE_DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("ALPACA_STORAGE_DATABASE_URL is required"))?;
-        let schema = env::var("ALPACA_STORAGE_SCHEMA")
-            .unwrap_or_else(|_| storage::STORAGE_SCHEMA_DEFAULT.to_string());
-        let repository = Arc::new(
-            storage::StorageRepository::connect_with_schema(&database_url, &schema).await?,
-        );
-        self.storage_database_url = Some(database_url);
-        self.storage_schema = schema;
-        self.storage_repository = Some(repository);
-        if self.storage_account_id.is_none() {
-            self.storage_account_id = env::var("ALPACA_STORAGE_ACCOUNT_ID")
+    async fn connect_operational_store_from_env(&mut self) -> anyhow::Result<()> {
+        let database_url = env::var("NAUTILUS_OPERATIONAL_DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("NAUTILUS_OPERATIONAL_DATABASE_URL is required"))?;
+        let schema = env::var("NAUTILUS_OPERATIONAL_SCHEMA")
+            .unwrap_or_else(|_| operational::OPERATIONAL_SCHEMA_DEFAULT.to_string());
+        let repository =
+            Arc::new(OperationalRepository::connect_with_schema(&database_url, &schema).await?);
+        self.operational_database_url = Some(database_url);
+        self.operational_schema = schema;
+        self.operational_repository = Some(repository);
+        if self.operational_account_id.is_none() {
+            self.operational_account_id = env::var("NAUTILUS_OPERATIONAL_ACCOUNT_ID")
                 .ok()
                 .or_else(|| env::var("NAUTILUS_ALPACA_ACCOUNT").ok());
         }
         Ok(())
     }
 
-    /// Returns the effective storage account identifier for persistence operations.
+    /// Returns the effective operational account identifier for persistence operations.
     #[must_use]
-    pub fn storage_account_id(&self) -> &str {
-        self.storage_account_id
+    pub fn operational_account_id(&self) -> &str {
+        self.operational_account_id
             .as_deref()
             .or(self.fleet_account_id.as_deref())
-            .unwrap_or(storage::STORAGE_ACCOUNT_ID_DEFAULT)
+            .unwrap_or(operational::OPERATIONAL_ACCOUNT_ID_DEFAULT)
     }
 
     /// Loads state from Postgres when configured, bootstrapping from the local JSON state file when
     /// the account has no stored DB row.
     pub async fn load_strategy_state(&self) -> anyhow::Result<StrategyState> {
-        if let Some(storage) = &self.storage_repository {
+        if let Some(repository) = &self.operational_repository {
             crate::runtime::load_strategy_state_with_storage(
                 &self.state_path,
-                storage,
-                self.storage_account_id(),
+                repository,
+                self.operational_account_id(),
             )
             .await
         } else {
@@ -332,12 +330,12 @@ impl AlpacaOptionsRuntimeConfig {
 
     /// Saves state to Postgres when configured, otherwise to the local JSON state file.
     pub async fn save_strategy_state(&self, state: &StrategyState) -> anyhow::Result<()> {
-        if let Some(storage) = &self.storage_repository {
+        if let Some(repository) = &self.operational_repository {
             crate::runtime::save_strategy_state_with_storage(
                 &self.state_path,
-                storage,
+                repository,
                 state,
-                self.storage_account_id(),
+                self.operational_account_id(),
             )
             .await
         } else {
@@ -378,20 +376,20 @@ impl AlpacaOptionsRuntimeConfig {
         if !self.candidate_ledger_enabled {
             return;
         }
-        let Some(storage) = &self.storage_repository else {
+        let Some(repository) = &self.operational_repository else {
             emit_operator_event(
                 "candidate_ledger_error",
                 json!({
-                    "reason": "storage_not_connected",
+                    "reason": "operational_store_not_connected",
                     "record_type": record_type,
                     "trade_date": trade_date,
                 }),
             );
             return;
         };
-        if let Err(error) = storage::append_candidate_ledger_record(
-            storage,
-            self.storage_account_id(),
+        if let Err(error) = operational::append_candidate_ledger_record(
+            repository,
+            self.operational_account_id(),
             trade_date,
             record_type,
             payload,

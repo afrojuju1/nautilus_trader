@@ -23,8 +23,8 @@ x-alpaca-runtime: &alpaca-runtime
     ALPACA_TRADING_BASE_URL: ${ALPACA_TRADING_BASE_URL:-https://paper-api.alpaca.markets}
     ALPACA_TRADE_UPDATES_WS_URL: ${ALPACA_TRADE_UPDATES_WS_URL:-wss://paper-api.alpaca.markets/stream}
     ALPACA_DATA_BASE_URL: ${ALPACA_DATA_BASE_URL:-}
-    ALPACA_STORAGE_DATABASE_URL: postgres://nautilus:${POSTGRES_PASSWORD:-pass}@postgres:5432/${POSTGRES_DB:-nautilus}
-    ALPACA_STORAGE_SCHEMA: ${ALPACA_STORAGE_SCHEMA:-alpaca}
+    NAUTILUS_OPERATIONAL_DATABASE_URL: postgres://nautilus:${POSTGRES_PASSWORD:-pass}@postgres:5432/${POSTGRES_DB:-nautilus}
+    NAUTILUS_OPERATIONAL_SCHEMA: ${NAUTILUS_OPERATIONAL_SCHEMA:-trading_ops}
     ALPACA_CONFIG_PATH: /config/options.toml
     ALPACA_STATE_PATH: /state/alpaca_options_state.json
     NAUTILUS_ALPACA_ACCOUNT: ${NAUTILUS_ALPACA_DOCKER_ACCOUNT:-paper-main}

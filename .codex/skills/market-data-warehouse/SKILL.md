@@ -18,7 +18,7 @@ Read only the docs needed for the task:
 - For ClickHouse, catalog backfill, dual-write, read-source flags, or warehouse deployment, read
   `docs/developer_guide/market_data_warehouse_workstream.md`.
 - For Postgres operational state, strategy-state events, sqlx migrations, runtime leases, or
-  slimming Postgres, read `docs/developer_guide/alpaca_operational_postgres_plan.md`.
+  slimming Postgres, read `docs/developer_guide/operational_postgres_plan.md`.
 - For candidate outcome reporting grain, mark source, or Postgres-versus-ClickHouse reporting
   boundaries, read `docs/developer_guide/alpaca_candidate_outcome_analytics.md`.
 

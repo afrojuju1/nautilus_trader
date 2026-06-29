@@ -8,7 +8,6 @@ use std::{
 use anyhow::{Context, bail};
 use chrono::{NaiveDate, Utc};
 use nautilus_alpaca::{
-    candidate_engine::{CreditSpreadKind, NakedOptionCapitalContext, NakedOptionKind},
     candidate_scan_actor::{candidate_scan_config_from_runtime, scan_option_chain_candidates},
     config::AlpacaDataClientConfig,
     http::{
@@ -43,6 +42,9 @@ use nautilus_model::{
     enums::{GreeksConvention, OptionKind},
     instruments::OptionContract,
     types::{Price, Quantity},
+};
+use nautilus_trading::options::candidates::{
+    CreditSpreadKind, DebitSpreadKind, NakedOptionCapitalContext, NakedOptionKind,
 };
 use serde_json::{Value, json};
 
@@ -433,18 +435,14 @@ fn credit_side(
 
 fn debit_side(
     chain: &RestOptionChainSnapshot,
-    kind: nautilus_alpaca::candidate_engine::DebitSpreadKind,
+    kind: DebitSpreadKind,
 ) -> (
     &[AlpacaOptionContract],
     &BTreeMap<String, AlpacaOptionSnapshot>,
 ) {
     match kind {
-        nautilus_alpaca::candidate_engine::DebitSpreadKind::Put => {
-            (&chain.put_contracts, &chain.put_snapshots)
-        }
-        nautilus_alpaca::candidate_engine::DebitSpreadKind::Call => {
-            (&chain.call_contracts, &chain.call_snapshots)
-        }
+        DebitSpreadKind::Put => (&chain.put_contracts, &chain.put_snapshots),
+        DebitSpreadKind::Call => (&chain.call_contracts, &chain.call_snapshots),
     }
 }
 

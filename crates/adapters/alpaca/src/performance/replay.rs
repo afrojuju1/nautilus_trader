@@ -3,13 +3,15 @@
 use std::collections::BTreeMap;
 
 use chrono::{NaiveDate, Utc};
+use nautilus_infrastructure::sql::operational::{
+    CandidateLedgerSummaryFilters, read_candidate_ledger_records,
+};
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
     http::{client::AlpacaHttpClient, models::AlpacaOptionBar},
     options_runtime::AlpacaOptionsRuntimeConfig,
-    storage::{CandidateLedgerSummaryFilters, read_candidate_ledger_records},
 };
 
 use super::{
@@ -218,7 +220,7 @@ pub struct HistoricalReplayRecord {
 ///
 /// # Errors
 ///
-/// Returns an error if storage is not connected, the request is invalid, candidate-ledger reads
+/// Returns an error if operational store is not connected, the request is invalid, candidate-ledger reads
 /// fail, or Alpaca historical option-bar requests fail.
 pub async fn replay_historical_candidates(
     client: &AlpacaHttpClient,
@@ -229,8 +231,8 @@ pub async fn replay_historical_candidates(
         request.lookahead_minutes > 0,
         "lookahead_minutes must be positive"
     );
-    let Some(storage) = &config.storage_repository else {
-        anyhow::bail!("storage is not connected");
+    let Some(storage) = &config.operational_repository else {
+        anyhow::bail!("operational store is not connected");
     };
     let default_date = Utc::now()
         .with_timezone(&config.entry_timezone)
@@ -241,7 +243,7 @@ pub async fn replay_historical_candidates(
 
     let ledger_records = read_candidate_ledger_records(
         storage,
-        config.storage_account_id(),
+        config.operational_account_id(),
         CandidateLedgerSummaryFilters {
             since: Some(since),
             until: Some(until),
@@ -319,7 +321,7 @@ pub async fn replay_historical_candidates(
     let summary = aggregate.into_summary();
     Ok(HistoricalReplayReport {
         checked_at_utc: Utc::now().to_rfc3339(),
-        account_id: Some(config.storage_account_id().to_string()),
+        account_id: Some(config.operational_account_id().to_string()),
         since: since.to_string(),
         until: until.to_string(),
         timeframe: request.timeframe.clone(),

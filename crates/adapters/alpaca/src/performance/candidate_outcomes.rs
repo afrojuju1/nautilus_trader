@@ -3,6 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
+use nautilus_infrastructure::sql::operational::{
+    CandidateLedgerSummaryFilters, append_candidate_outcome, read_candidate_ledger_records,
+};
 use serde_json::{Value, json};
 
 use crate::{
@@ -16,9 +19,6 @@ use crate::{
     },
     options_runtime::AlpacaOptionsRuntimeConfig,
     runtime::{StrategyState, StrategyStateEntry},
-    storage::{
-        CandidateLedgerSummaryFilters, append_candidate_outcome, read_candidate_ledger_records,
-    },
 };
 
 use super::{
@@ -45,12 +45,12 @@ pub async fn track_candidate_outcomes(
             .with_timezone(&config.entry_timezone)
             .date_naive()
     });
-    let Some(storage) = &config.storage_repository else {
-        anyhow::bail!("storage is not connected");
+    let Some(storage) = &config.operational_repository else {
+        anyhow::bail!("operational store is not connected");
     };
     let records = read_candidate_ledger_records(
         storage,
-        config.storage_account_id(),
+        config.operational_account_id(),
         CandidateLedgerSummaryFilters {
             since: Some(trade_date),
             until: Some(trade_date),
@@ -75,7 +75,7 @@ pub async fn track_candidate_outcomes(
     let mut snapshot_request = OptionSnapshotsRequest::for_symbols(symbols);
     snapshot_request.feed = Some(data_config.option_feed.as_str().to_string());
     let snapshots = client.option_snapshots(&snapshot_request).await?.snapshots;
-    let payload_account_id = Some(config.storage_account_id().to_string());
+    let payload_account_id = Some(config.operational_account_id().to_string());
     let close_config = VirtualCloseConfig::from(config);
     let mut snapshot_outcomes = BTreeMap::<String, CandidateOutcomeValue>::new();
     let mut historical_fill_candidates = Vec::new();
@@ -185,7 +185,7 @@ pub async fn track_candidate_outcomes(
             });
             let appended_record = append_candidate_outcome(
                 storage,
-                config.storage_account_id(),
+                config.operational_account_id(),
                 &candidate.trade_date,
                 &record_key,
                 &payload,

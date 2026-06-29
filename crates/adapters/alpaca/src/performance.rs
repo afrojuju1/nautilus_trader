@@ -27,11 +27,16 @@ use crate::{
 
 mod candidate_outcomes;
 mod historical_marks;
+mod operational;
 mod replay;
 
 pub use candidate_outcomes::{
     collect_order_ids, earliest_entry_timestamp, entry_in_date_range, entry_performance,
     performance_record_key, summarize_performance, track_candidate_outcomes,
+};
+pub use operational::{
+    append_performance_ledger_record, summarize_candidate_ledger_records,
+    summarize_candidate_outcomes_records, summarize_performance_ledger_records,
 };
 pub use replay::{
     HistoricalReplayBucketSummary, HistoricalReplayRecord, HistoricalReplayReport,

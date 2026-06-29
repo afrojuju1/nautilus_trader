@@ -22,9 +22,9 @@ use std::{
 };
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
-use nautilus_alpaca::{
-    options_runtime::AlpacaOptionsRuntimeConfig,
-    storage::{CandidateLedgerSummaryFilters, read_candidate_ledger_records},
+use nautilus_alpaca::options_runtime::AlpacaOptionsRuntimeConfig;
+use nautilus_infrastructure::sql::operational::{
+    CandidateLedgerSummaryFilters, read_candidate_ledger_records,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -74,11 +74,13 @@ struct AlertState {
 pub(crate) async fn run() -> anyhow::Result<()> {
     let args = Args::parse()?;
     load_alerts_env(args.alerts_env_file.as_deref())?;
-    let config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_storage().await?;
-    let Some(storage) = &config.storage_repository else {
-        anyhow::bail!("ALPACA_STORAGE_DATABASE_URL is required for alpaca-ops alerts candidates");
+    let config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_operational_store().await?;
+    let Some(storage) = &config.operational_repository else {
+        anyhow::bail!(
+            "NAUTILUS_OPERATIONAL_DATABASE_URL is required for alpaca-ops alerts candidates"
+        );
     };
-    let account_id = config.storage_account_id().to_string();
+    let account_id = config.operational_account_id().to_string();
     let trade_date = args.date.clone().unwrap_or_else(|| {
         Utc::now()
             .with_timezone(&config.entry_timezone)

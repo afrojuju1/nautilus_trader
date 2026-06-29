@@ -11,10 +11,14 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+use nautilus_infrastructure::sql::operational::{
+    OperationalRepository, StrategyStateMutation, heartbeat_runtime_lease,
+    persist_strategy_state_mutation,
+};
+
 use crate::{
     candidate_ledger_persistence::CandidateLedgerPersistenceHandle,
     runtime::{StrategyState, emit_operator_event},
-    storage::{StorageRepository, StrategyStateMutation, persist_strategy_state_mutation},
 };
 use serde_json::json;
 
@@ -32,7 +36,7 @@ pub struct StrategyStatePersistenceHandle {
 impl StrategyStatePersistenceHandle {
     #[must_use]
     pub fn spawn(
-        storage: Arc<StorageRepository>,
+        storage: Arc<OperationalRepository>,
         account_id: String,
         writer_id: String,
         run_id: Uuid,
@@ -169,7 +173,7 @@ enum StrategyStatePersistenceRequest {
 }
 
 pub fn start_runtime_lease_heartbeat(
-    storage: Arc<StorageRepository>,
+    storage: Arc<OperationalRepository>,
     account_id: String,
     run_id: Uuid,
     ttl: Duration,
@@ -180,8 +184,7 @@ pub fn start_runtime_lease_heartbeat(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            match crate::storage::heartbeat_runtime_lease(&storage, &account_id, run_id, ttl).await
-            {
+            match heartbeat_runtime_lease(&storage, &account_id, run_id, ttl).await {
                 Ok(true) => {}
                 Ok(false) => {
                     mark_persistence_unhealthy(

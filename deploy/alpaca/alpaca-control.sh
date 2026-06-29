@@ -1100,11 +1100,11 @@ run_strategy_report() {
   echo "profile_alignment"
   run_profile_alignment "$account"
   database_account="${account:-paper-main}"
-  database_url="$(report_env_value "$database_account" "ALPACA_STORAGE_DATABASE_URL")"
-  schema="$(report_env_value "$database_account" "ALPACA_STORAGE_SCHEMA")"
-  schema="${schema:-alpaca}"
+  database_url="$(report_env_value "$database_account" "NAUTILUS_OPERATIONAL_DATABASE_URL")"
+  schema="$(report_env_value "$database_account" "NAUTILUS_OPERATIONAL_SCHEMA")"
+  schema="${schema:-trading_ops}"
   if [[ -z "$database_url" ]]; then
-    echo "strategy_report storage=missing key=ALPACA_STORAGE_DATABASE_URL account=$database_account"
+    echo "strategy_report operational_store=missing key=NAUTILUS_OPERATIONAL_DATABASE_URL account=$database_account"
     return
   fi
   run_strategy_report_sql "$account" "$since" "$until" "$database_url" "$schema"

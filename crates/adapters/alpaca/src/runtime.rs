@@ -24,14 +24,15 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::parse::{AlpacaOptionSymbolParts, parse_alpaca_option_symbol};
 #[cfg(feature = "live")]
-use crate::storage::StorageRepository;
-
-use crate::candidate_engine::{
+use nautilus_infrastructure::sql::operational::{
+    OperationalRepository, load_strategy_state_record, save_strategy_state,
+};
+use nautilus_trading::options::candidates::{
     CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, IronCondorCandidate,
     NakedOptionCandidate, NakedOptionKind, SpreadCandidate,
 };
-use crate::parse::{AlpacaOptionSymbolParts, parse_alpaca_option_symbol};
 
 const CANCELED_DEBIT_REPLACEMENT_EXEMPTIONS_PER_DAY: usize = 1;
 const OPTION_CONTRACT_MULTIPLIER: f64 = 100.0;
@@ -578,16 +579,16 @@ pub fn load_strategy_state(path: &Path) -> anyhow::Result<StrategyState> {
 #[cfg(feature = "live")]
 pub async fn load_strategy_state_with_storage(
     path: &Path,
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     account_id: &str,
 ) -> anyhow::Result<StrategyState> {
-    if let Some(state) = crate::storage::load_strategy_state_record(storage, account_id).await? {
+    if let Some(state) = load_strategy_state_record(storage, account_id).await? {
         save_strategy_state_atomic(path, &state)?;
         return Ok(state);
     }
 
     let state = load_strategy_state(path)?;
-    crate::storage::save_strategy_state(storage, account_id, &state).await?;
+    save_strategy_state(storage, account_id, &state).await?;
     Ok(state)
 }
 
@@ -613,11 +614,11 @@ pub fn save_strategy_state_atomic(path: &Path, state: &StrategyState) -> anyhow:
 #[cfg(feature = "live")]
 pub async fn save_strategy_state_with_storage(
     path: &Path,
-    storage: &StorageRepository,
+    storage: &OperationalRepository,
     state: &StrategyState,
     account_id: &str,
 ) -> anyhow::Result<()> {
-    crate::storage::save_strategy_state(storage, account_id, state).await?;
+    save_strategy_state(storage, account_id, state).await?;
     save_strategy_state_atomic(path, state)
 }
 
@@ -694,7 +695,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::candidate_engine::{OptionCapitalRequirementModel, ScoredContract};
+    use nautilus_trading::options::candidates::{OptionCapitalRequirementModel, ScoredContract};
 
     #[test]
     fn strategy_state_atomic_save_round_trips() {

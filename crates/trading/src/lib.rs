@@ -102,6 +102,7 @@ pub mod _macro_reexports {
 }
 
 pub mod algorithm;
+pub mod options;
 pub mod sessions;
 pub mod strategy;
 

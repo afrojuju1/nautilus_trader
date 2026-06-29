@@ -8,9 +8,6 @@ use std::{
 use anyhow::{Context, anyhow, bail};
 use chrono::{Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use nautilus_alpaca::{
-    candidate_engine::{
-        CreditSpreadKind, DebitSpreadKind, NakedOptionCapitalContext, NakedOptionKind,
-    },
     config::AlpacaDataClientConfig,
     http::{
         client::AlpacaHttpClient,
@@ -31,6 +28,9 @@ use nautilus_alpaca::{
     },
 };
 use nautilus_model::data::greeks::black_scholes_greeks;
+use nautilus_trading::options::candidates::{
+    CreditSpreadKind, DebitSpreadKind, NakedOptionCapitalContext, NakedOptionKind,
+};
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration as TokioDuration, sleep};
 

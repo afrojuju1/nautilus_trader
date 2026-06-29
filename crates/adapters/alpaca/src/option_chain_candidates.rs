@@ -4,8 +4,7 @@ use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
 use nautilus_model::data::option_chain::{OptionChainSlice, OptionGreeks, OptionStrikeData};
-
-use crate::candidate_engine::{
+use nautilus_trading::options::candidates::{
     CandidateContract, CandidateMarketSnapshot, CandidateQuote, CreditSpreadKind,
     CreditSpreadScanResult, DebitSpreadKind, DebitSpreadScanResult, DebitSpreadScannerConfig,
     IronCondorScanResult, IronCondorScannerConfig, NakedOptionCapitalContext, NakedOptionKind,

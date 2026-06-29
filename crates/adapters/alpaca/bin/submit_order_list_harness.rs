@@ -19,7 +19,6 @@ use std::{cell::RefCell, env, process, rc::Rc, str::FromStr, time::Duration};
 
 use nautilus_alpaca::{
     AlpacaExecutionClient,
-    candidate_engine::PutCreditScannerConfig,
     common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
     http::{
@@ -45,6 +44,7 @@ use nautilus_model::{
     },
     types::{Price, Quantity},
 };
+use nautilus_trading::options::candidates::PutCreditScannerConfig;
 use tokio::{
     sync::mpsc,
     time::{Instant, sleep, timeout},

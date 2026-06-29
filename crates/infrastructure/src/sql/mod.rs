@@ -17,5 +17,6 @@
 
 pub mod cache;
 pub mod models;
+pub mod operational;
 pub mod pg;
 pub mod queries;

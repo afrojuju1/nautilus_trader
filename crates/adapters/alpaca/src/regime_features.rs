@@ -1169,12 +1169,10 @@ mod tests {
     };
     use ustr::Ustr;
 
-    use crate::{
-        candidate_engine::{
-            CreditSpreadKind, NakedOptionCandidate, NakedOptionKind, OptionCapitalRequirementModel,
-            ScoredContract, SpreadCandidate,
-        },
-        options_entry::{SelectedEntry, SelectedNakedOptionEntry, SelectedOptionsEntry},
+    use crate::options_entry::{SelectedEntry, SelectedNakedOptionEntry, SelectedOptionsEntry};
+    use nautilus_trading::options::candidates::{
+        CreditSpreadKind, NakedOptionCandidate, NakedOptionKind, OptionCapitalRequirementModel,
+        ScoredContract, SpreadCandidate,
     };
 
     use super::*;

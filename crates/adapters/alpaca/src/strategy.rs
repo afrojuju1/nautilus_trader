@@ -18,19 +18,19 @@
 use std::collections::BTreeMap;
 
 use chrono::{NaiveDate, Utc};
+use nautilus_trading::options::candidates::{
+    CandidateContract, CandidateMarketSnapshot, CandidateQuote, CreditSpreadKind,
+    CreditSpreadScanResult, DebitSpreadKind, DebitSpreadScanResult, DebitSpreadScannerConfig,
+    IronCondorScanResult, IronCondorScannerConfig, NakedOptionCapitalContext, NakedOptionKind,
+    NakedOptionScanResult, NakedOptionScannerConfig, PutCreditScannerConfig,
+    build_candidates_for_kind_with_rejections, build_debit_candidates_for_kind_with_rejections,
+    build_iron_condor_candidates_with_rejections,
+    build_naked_option_candidates_with_capital_and_rejections, merge_rejection_counts,
+    score_contracts_with_rejections_at, score_debit_contracts_with_rejections_at,
+    score_naked_option_contracts_with_rejections_at,
+};
 
 use crate::{
-    candidate_engine::{
-        CandidateContract, CandidateMarketSnapshot, CandidateQuote, CreditSpreadKind,
-        CreditSpreadScanResult, DebitSpreadKind, DebitSpreadScanResult, DebitSpreadScannerConfig,
-        IronCondorScanResult, IronCondorScannerConfig, NakedOptionCapitalContext, NakedOptionKind,
-        NakedOptionScanResult, NakedOptionScannerConfig, PutCreditScannerConfig,
-        build_candidates_for_kind_with_rejections, build_debit_candidates_for_kind_with_rejections,
-        build_iron_condor_candidates_with_rejections,
-        build_naked_option_candidates_with_capital_and_rejections, merge_rejection_counts,
-        score_contracts_with_rejections_at, score_debit_contracts_with_rejections_at,
-        score_naked_option_contracts_with_rejections_at,
-    },
     config::AlpacaDataClientConfig,
     http::{
         client::AlpacaHttpClient,
@@ -734,7 +734,7 @@ fn candidate_snapshots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::candidate_engine::{
+    use nautilus_trading::options::candidates::{
         ScoredContract, build_candidates_for_kind, build_debit_candidates_for_kind,
         build_iron_condor_candidates, build_naked_option_candidates, option_candidate_metrics,
     };

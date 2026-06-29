@@ -15,12 +15,13 @@
 
 //! Python bindings for the Alpaca adapter.
 
+use nautilus_trading::options::candidates::{
+    CreditSpreadScanResult, PutCreditScannerConfig, SpreadCandidate,
+};
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
 use crate::{
-    candidate_engine::{CreditSpreadScanResult, PutCreditScannerConfig, SpreadCandidate},
-    config::AlpacaDataClientConfig,
-    http::client::AlpacaHttpClient,
+    config::AlpacaDataClientConfig, http::client::AlpacaHttpClient,
     strategy::scan_put_credit_underlying,
 };
 

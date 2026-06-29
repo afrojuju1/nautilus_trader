@@ -8,12 +8,9 @@ use std::{collections::BTreeSet, env, path::Path};
 
 use anyhow::{Context, anyhow, bail};
 use chrono::NaiveDate;
-use nautilus_alpaca::{
-    candidate_engine::{CreditSpreadKind, DebitSpreadKind, NakedOptionKind},
-    candidate_scan_actor::{
-        OptionChainCandidateScanActor, OptionChainCandidateScanActorConfig,
-        OptionChainCandidateScanConfig,
-    },
+use nautilus_alpaca::candidate_scan_actor::{
+    OptionChainCandidateScanActor, OptionChainCandidateScanActorConfig,
+    OptionChainCandidateScanConfig,
 };
 use nautilus_backtest::{
     config::{BacktestDataConfig, BacktestRunConfig, BacktestVenueConfig, NautilusDataType},
@@ -27,6 +24,7 @@ use nautilus_model::{
     types::Price,
 };
 use nautilus_persistence::backend::catalog::ParquetDataCatalog;
+use nautilus_trading::options::candidates::{CreditSpreadKind, DebitSpreadKind, NakedOptionKind};
 use ustr::Ustr;
 
 const DEFAULT_SNAPSHOT_INTERVAL_MS: u64 = 5_000;

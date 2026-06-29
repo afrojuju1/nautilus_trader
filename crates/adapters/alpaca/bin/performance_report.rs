@@ -32,15 +32,12 @@ use nautilus_alpaca::{
     options_runtime::AlpacaOptionsRuntimeConfig,
     performance::{
         CandidateOutcomeTrackingRequest, EntryOrderIds, EntryPerformance, PerformanceReport,
+        append_performance_ledger_record as append_storage_performance_ledger_record,
         collect_order_ids, earliest_entry_timestamp, entry_in_date_range, entry_performance,
-        summarize_performance, track_candidate_outcomes,
+        summarize_candidate_ledger_records, summarize_candidate_outcomes_records,
+        summarize_performance, summarize_performance_ledger_records, track_candidate_outcomes,
     },
     runtime::StrategyStateEntry,
-    storage::{
-        append_performance_ledger_record as append_storage_performance_ledger_record,
-        summarize_candidate_ledger_records, summarize_candidate_outcomes_records,
-        summarize_performance_ledger_records,
-    },
 };
 use serde_json::json;
 
@@ -83,9 +80,9 @@ impl Default for Args {
 
 pub(crate) async fn run() -> anyhow::Result<()> {
     let args = parse_args()?;
-    let config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_storage().await?;
-    if config.storage_repository.is_none() {
-        anyhow::bail!("ALPACA_STORAGE_DATABASE_URL is required for alpaca-ops performance");
+    let config = AlpacaOptionsRuntimeConfig::from_runtime_env_with_operational_store().await?;
+    if config.operational_repository.is_none() {
+        anyhow::bail!("NAUTILUS_OPERATIONAL_DATABASE_URL is required for alpaca-ops performance");
     }
     let state = config.load_strategy_state().await?;
     let entries = state
@@ -368,14 +365,14 @@ async fn append_closed_entries_to_performance_ledger(
     entries: &[EntryPerformance],
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<()> {
-    let Some(storage) = &config.storage_repository else {
+    let Some(storage) = &config.operational_repository else {
         return Ok(());
     };
     for entry in entries.iter().filter(|entry| entry.status == "closed") {
         let ledger_date = performance_ledger_date(entry, config);
         let append = append_storage_performance_ledger_record(
             storage,
-            config.storage_account_id(),
+            config.operational_account_id(),
             &ledger_date,
             entry,
             None,

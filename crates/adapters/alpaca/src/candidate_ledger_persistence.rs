@@ -11,10 +11,11 @@ use std::{
 use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{
-    runtime::emit_operator_event,
-    storage::{StorageRepository, append_candidate_ledger_record},
+use nautilus_infrastructure::sql::operational::{
+    OperationalRepository, append_candidate_ledger_record,
 };
+
+use crate::runtime::emit_operator_event;
 
 const CANDIDATE_LEDGER_QUEUE_CAPACITY: usize = 256;
 const CANDIDATE_LEDGER_FLUSH_TIMEOUT_SECS: u64 = 5;
@@ -28,7 +29,7 @@ pub struct CandidateLedgerPersistenceHandle {
 
 impl CandidateLedgerPersistenceHandle {
     #[must_use]
-    pub fn spawn(storage: Arc<StorageRepository>, account_id: String) -> Self {
+    pub fn spawn(storage: Arc<OperationalRepository>, account_id: String) -> Self {
         let (sender, mut receiver) =
             mpsc::channel::<CandidateLedgerPersistenceRequest>(CANDIDATE_LEDGER_QUEUE_CAPACITY);
         let healthy = Arc::new(AtomicBool::new(true));

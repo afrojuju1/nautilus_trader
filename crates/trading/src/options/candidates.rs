@@ -1535,7 +1535,7 @@ fn allow_missing_open_interest_for_naked_option(
         && spread_pct <= max_fallback_spread_pct
 }
 
-pub(crate) fn merge_rejection_counts(
+pub fn merge_rejection_counts(
     target: &mut BTreeMap<String, usize>,
     source: &BTreeMap<String, usize>,
 ) {
