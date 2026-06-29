@@ -13,11 +13,11 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Smoke utility for Alpaca REST-backed execution reconciliation.
+//! Diagnostic command for Alpaca REST-backed execution reconciliation.
 
 use std::env;
 
-use nautilus_alpaca::{
+use crate::{
     config::AlpacaDataClientConfig,
     execution::{
         fill_reports_from_alpaca_activities, order_status_reports_from_alpaca,
@@ -30,10 +30,10 @@ use nautilus_alpaca::{
 };
 use nautilus_core::{UnixNanos, datetime::unix_nanos_to_iso8601, time::get_atomic_clock_realtime};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let lookback_mins = env::args()
-        .nth(1)
+pub(crate) async fn run() -> anyhow::Result<()> {
+    let lookback_mins = crate::operator::args()
+        .first()
+        .cloned()
         .map(|value| value.parse::<u64>())
         .transpose()?
         .or_else(|| {

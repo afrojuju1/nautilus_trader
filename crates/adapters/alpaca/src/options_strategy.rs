@@ -74,7 +74,7 @@ pub struct OptionsCandidateData {
 }
 
 impl OptionsCandidateData {
-    const TYPE_NAME: &'static str = "AlpacaOptionsCandidateData";
+    const TYPE_NAME: &'static str = "OptionsCandidateData";
 
     /// Creates a new custom data payload from an candidate set.
     #[must_use]

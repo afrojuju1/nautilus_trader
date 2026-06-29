@@ -11,6 +11,7 @@ use std::{
 use anyhow::{Context, anyhow};
 use indexmap::IndexMap;
 use nautilus_model::{data::QuoteTick, identifiers::InstrumentId};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
@@ -34,7 +35,7 @@ const DEFAULT_FLUSH_MS: u64 = 1_000;
 const DEFAULT_QUEUE_CAPACITY: usize = 10_000;
 
 /// Configuration for live market-data writes to catalog and ClickHouse.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MarketDataDualWriteConfig {
     pub catalog_uri: String,
     pub source: String,
@@ -97,19 +98,6 @@ impl std::fmt::Debug for LiveMarketDataDualWriter {
 }
 
 impl LiveMarketDataDualWriter {
-    /// Builds a writer from environment variables when dual-write is enabled.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when enabled config is invalid or the worker cannot start.
-    pub fn from_env() -> anyhow::Result<Option<Self>> {
-        let Some(config) = MarketDataDualWriteConfig::from_env()? else {
-            return Ok(None);
-        };
-
-        Self::start(config).map(Some)
-    }
-
     /// Starts a live dual-write worker.
     ///
     /// # Errors

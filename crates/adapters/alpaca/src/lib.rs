@@ -27,8 +27,6 @@
 //!
 //! # Feature flags
 //!
-//! - `python`: Enables the Alpaca PyO3 bindings currently exposed through `nautilus_pyo3`.
-//! - `extension-module`: Builds as a Python extension module (used together with `python`).
 //! - `high-precision`: Reserved for parity with the Nautilus adapter workspace.
 
 #![warn(rustc::all)]
@@ -41,6 +39,7 @@
 
 #[cfg(feature = "live")]
 pub mod account_capabilities;
+#[cfg(feature = "live")]
 pub mod candidate_ledger_persistence;
 #[cfg(feature = "live")]
 pub mod candidate_payloads;
@@ -76,8 +75,6 @@ pub mod parse;
 #[cfg(feature = "live")]
 pub mod performance;
 pub mod providers;
-#[cfg(feature = "python")]
-pub mod python;
 #[cfg(feature = "live")]
 pub mod runtime;
 #[cfg(feature = "live")]
@@ -86,6 +83,7 @@ pub mod runtime_env;
 pub mod state_persistence;
 #[cfg(feature = "live")]
 pub mod state_reconciliation;
+#[cfg(feature = "live")]
 pub mod strategy;
 #[cfg(feature = "live")]
 pub mod strategy_state_entry;

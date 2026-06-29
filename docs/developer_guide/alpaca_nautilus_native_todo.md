@@ -66,7 +66,7 @@ and strategies.
   - Implemented as `alpaca-options-node`.
   - The node registers `AlpacaDataClientFactory`, `AlpacaExecutionClientFactory`,
     `OptionChainCandidateScanActor`, and `AlpacaOptionsStrategy`.
-  - The scan actor publishes typed `AlpacaOptionsCandidateData`; the strategy subscribes through
+  - The scan actor publishes typed `OptionsCandidateData`; the strategy subscribes through
     the Nautilus data bus and submits standard Nautilus orders only when the runtime submit/window
     gates allow it.
   - Entry admission now runs in the strategy path. Live submission uses the normal runtime

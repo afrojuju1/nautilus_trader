@@ -204,6 +204,8 @@ impl LiveDataEngineConfig {
                 .unwrap_or(default.emit_quotes_from_book_depths),
             external_clients,
             debug: debug.unwrap_or(default.debug),
+            #[cfg(feature = "warehouse-clickhouse")]
+            live_market_data_dual_write: default.live_market_data_dual_write,
             qsize: default.qsize,
         })
     }

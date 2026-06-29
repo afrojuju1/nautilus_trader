@@ -52,12 +52,11 @@ do not own Alpaca credentials, REST clients, broker payloads, or reconciliation.
 
 ## Remaining Gaps
 
-1. Strategy ownership for the exported Python put-credit scanner surface.
+1. Strategy ownership for Python option scanner examples.
 
-   `AlpacaPutCreditStrategy` is still a timer scaffold over PyO3 scanner bindings. It does not yet
-   consume `TradingNode` option data or emit `SubmitOrderList` commands. Track this separately from
-   adapter plumbing so the public Python strategy surface either becomes real Nautilus strategy code
-   or leaves the public adapter API.
+   The scanner-only PyO3 put-credit binding is no longer a public adapter API. Add Python option
+   strategy examples only when they consume `TradingNode` option data and emit standard Nautilus
+   commands.
 
 2. Trade-update streaming in the Python execution client.
 

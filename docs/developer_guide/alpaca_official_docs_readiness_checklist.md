@@ -69,14 +69,14 @@ for official NautilusTrader documentation.
 
 ## API reference readiness
 
-- [x] Decide whether the API reference should describe only the implemented Rust/PyO3 runtime
-      surface or wait until the Python adapter factories work.
+- [x] Decide whether the API reference should describe only the implemented Rust runtime and Python
+      package surface or wait until the Python adapter factories work.
 - [x] Document the available Alpaca Python package imports without implying unfinished factories
       are usable.
-- [x] Document the PyO3 scanner/runtime bindings that are intentionally public.
+- [x] Document that Alpaca has no scanner-only public PyO3 surface.
 - [x] Document config objects and clearly mark fields that are engine-specific rather than generic
       adapter configuration.
-- [x] Confirm generated stubs include the Alpaca module as intended.
+- [x] Confirm generated PyO3 stubs do not expose an empty Alpaca module.
 - [x] Run the docs build after adding the API page.
 
 ## Python adapter completion
@@ -203,7 +203,7 @@ for official NautilusTrader documentation.
 ## Packaging and release readiness
 
 - [x] Confirm Alpaca Python modules are included in built wheels.
-- [x] Confirm the `nautilus_pyo3.alpaca` module is intentionally exposed.
+- [x] Confirm no scanner-only `nautilus_pyo3.alpaca` module is exposed.
 - [x] Confirm docs references do not create broken links.
 - [x] Confirm examples do not require real credentials unless explicitly marked.
 - [x] Confirm secrets guidance is present and no real credentials are committed.

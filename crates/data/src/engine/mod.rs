@@ -232,6 +232,15 @@ impl DataEngine {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        #[cfg(feature = "warehouse-clickhouse")]
+        let live_market_data_writer = config
+            .live_market_data_dual_write
+            .clone()
+            .map(LiveMarketDataDualWriter::start)
+            .transpose()
+            .unwrap_or_else(|error| {
+                panic!("failed to configure live market-data dual-write: {error:?}");
+            });
 
         Self {
             clock,
@@ -282,9 +291,7 @@ impl DataEngine {
             #[cfg(feature = "streaming")]
             catalogs: CatalogMap::new(),
             #[cfg(feature = "warehouse-clickhouse")]
-            live_market_data_writer: LiveMarketDataDualWriter::from_env().unwrap_or_else(|error| {
-                panic!("failed to configure live market-data dual-write: {error:?}");
-            }),
+            live_market_data_writer,
             #[cfg(feature = "defi")]
             pool_updaters: AHashMap::new(),
             #[cfg(feature = "defi")]

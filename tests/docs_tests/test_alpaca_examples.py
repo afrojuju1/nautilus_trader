@@ -7,6 +7,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ALPACA_CARGO_TOML = REPO_ROOT / "crates/adapters/alpaca/Cargo.toml"
+CLI_CARGO_TOML = REPO_ROOT / "crates/cli/Cargo.toml"
 ALPACA_EXAMPLE_README = REPO_ROOT / "examples/live/alpaca/README.md"
 ALPACA_INTEGRATION_DOC = REPO_ROOT / "docs/integrations/alpaca.md"
 
@@ -17,8 +18,8 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _alpaca_bins() -> set[str]:
-    with ALPACA_CARGO_TOML.open("rb") as cargo_toml:
+def _cargo_bins(path: Path) -> set[str]:
+    with path.open("rb") as cargo_toml:
         metadata = tomllib.load(cargo_toml)
 
     return {binary["name"] for binary in metadata.get("bin", [])}
@@ -34,15 +35,10 @@ def _referenced_bins(*paths: Path) -> set[str]:
 
 def test_alpaca_docs_reference_existing_runtime_bins() -> None:
     referenced = _referenced_bins(ALPACA_EXAMPLE_README, ALPACA_INTEGRATION_DOC)
+    valid_bins = _cargo_bins(ALPACA_CARGO_TOML) | _cargo_bins(CLI_CARGO_TOML)
 
-    assert {
-        "alpaca-load-option-contracts",
-        "alpaca-load-option-snapshots",
-        "alpaca-compare-option-chain-scan",
-        "alpaca-options-node",
-        "alpaca-ops",
-    } <= referenced
-    assert referenced <= _alpaca_bins()
+    assert {"alpaca-compare-option-chain-scan", "alpaca-options-node", "nautilus"} <= referenced
+    assert referenced <= valid_bins
 
 
 def test_alpaca_paper_smoke_examples_keep_trading_node_cancel_policy() -> None:

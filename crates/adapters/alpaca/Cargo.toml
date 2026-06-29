@@ -22,15 +22,6 @@ crate-type = ["rlib"]
 
 [features]
 default = ["high-precision"]
-extension-module = [
-  "nautilus-common/extension-module",
-  "nautilus-core/extension-module",
-  "nautilus-live/extension-module",
-  "nautilus-model/extension-module",
-  "nautilus-network/extension-module",
-  "python",
-  "pyo3/extension-module",
-]
 high-precision = ["nautilus-model/high-precision"]
 backtest-node = [
   "dep:nautilus-backtest",
@@ -56,17 +47,6 @@ live = [
   "dep:uuid",
   "tokio",
 ]
-python = [
-  "live",
-  "nautilus-common/python",
-  "nautilus-core/python",
-  "nautilus-live/python",
-  "nautilus-model/python",
-  "nautilus-network/python",
-  "pyo3",
-  "pyo3-stub-gen",
-]
-
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
@@ -90,8 +70,6 @@ chrono = { workspace = true }
 chrono-tz = { workspace = true }
 dotenvy = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
-pyo3 = { workspace = true, optional = true }
-pyo3-stub-gen = { workspace = true, optional = true }
 reqwest = { workspace = true }
 rust_decimal = { workspace = true, optional = true }
 rmp-serde = { workspace = true, optional = true }
@@ -105,20 +83,6 @@ toml = { workspace = true, optional = true }
 url = { workspace = true }
 ustr = { workspace = true }
 uuid = { workspace = true, optional = true }
-
-[[bin]]
-name = "alpaca-load-option-contracts"
-path = "bin/load_option_contracts.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
-name = "alpaca-load-option-snapshots"
-path = "bin/load_option_snapshots.rs"
-required-features = ["live"]
-doc = false
-test = false
 
 [[bin]]
 name = "alpaca-option-chain-scan-node"
@@ -144,35 +108,6 @@ test = false
 [[bin]]
 name = "earnings-sync"
 path = "bin/earnings_sync.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
-name = "alpaca-ops"
-path = "bin/ops.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
-name = "alpaca-reconciliation-probe"
-path = "bin/reconciliation_probe.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
-# Internal diagnostic for strategy/handoff development, not the standard adapter smoke surface.
-name = "alpaca-submit-order-list-harness"
-path = "bin/submit_order_list_harness.rs"
-required-features = ["live"]
-doc = false
-test = false
-
-[[bin]]
-name = "alpaca-watch-trade-updates"
-path = "bin/watch_trade_updates.rs"
 required-features = ["live"]
 doc = false
 test = false

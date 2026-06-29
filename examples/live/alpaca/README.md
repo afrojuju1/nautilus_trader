@@ -205,7 +205,7 @@ This command loads active put option contracts for the requested underlyings. It
 orders.
 
 ```bash
-cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-contracts -- SPY QQQ
+cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca option-contracts SPY QQQ
 ```
 
 Optional expiration filters:
@@ -213,7 +213,7 @@ Optional expiration filters:
 ```bash
 export ALPACA_CONTRACTS_MIN_EXPIRATION="2027-01-15"
 export ALPACA_CONTRACTS_MAX_EXPIRATION="2027-01-22"
-cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-contracts -- SPY
+cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca option-contracts SPY
 ```
 
 ## Load option snapshots
@@ -223,7 +223,7 @@ symbols. It does not submit orders.
 
 ```bash
 export ALPACA_SNAPSHOT_CONTRACT_LIMIT=50
-cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-snapshots -- SPY
+cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca option-snapshots SPY
 ```
 
 ## Option-chain scan comparison

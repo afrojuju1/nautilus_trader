@@ -32,6 +32,18 @@ pub(crate) async fn run_alpaca_command(opt: AlpacaAdapterOpt) -> anyhow::Result<
         AlpacaAdapterCommand::SyncState(args) => {
             run_operator_command(AlpacaOperatorCommand::SyncState, args).await?
         }
+        AlpacaAdapterCommand::OptionContracts(args) => {
+            run_operator_command(AlpacaOperatorCommand::OptionContracts, args).await?
+        }
+        AlpacaAdapterCommand::OptionSnapshots(args) => {
+            run_operator_command(AlpacaOperatorCommand::OptionSnapshots, args).await?
+        }
+        AlpacaAdapterCommand::Reconciliation(args) => {
+            run_operator_command(AlpacaOperatorCommand::Reconciliation, args).await?
+        }
+        AlpacaAdapterCommand::TradeUpdates(args) => {
+            run_operator_command(AlpacaOperatorCommand::TradeUpdates, args).await?
+        }
     }
     Ok(())
 }

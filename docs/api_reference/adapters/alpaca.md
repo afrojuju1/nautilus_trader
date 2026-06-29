@@ -49,38 +49,6 @@ from nautilus_trader.adapters.alpaca.factories import AlpacaLiveExecClientFactor
 
 ## Strategies
 
-The exported Alpaca put-credit strategy module is a scanner scaffold, not the canonical execution
-architecture. The standard option execution smoke path is the Python options multi-leg
-`TradingNode` example, which submits normal Nautilus `SubmitOrderList` commands through the Alpaca
-execution client.
-
-```{eval-rst}
-.. automodule:: nautilus_trader.adapters.alpaca.strategies
-   :show-inheritance:
-   :members:
-   :no-index:
-   :member-order: bysource
-```
-
-### Put credit
-
-```{eval-rst}
-.. automodule:: nautilus_trader.adapters.alpaca.strategies.put_credit
-   :show-inheritance:
-   :members:
-   :member-order: bysource
-```
-
-## PyO3 scanner bindings
-
-The current Rust-backed scanner bindings are exposed through:
-
-```python
-from nautilus_trader.core.nautilus_pyo3.alpaca import AlpacaPutCreditCandidate
-from nautilus_trader.core.nautilus_pyo3.alpaca import AlpacaPutCreditScanResult
-from nautilus_trader.core.nautilus_pyo3.alpaca import AlpacaPutCreditScannerConfig
-from nautilus_trader.core.nautilus_pyo3.alpaca import scan_put_credit_once
-```
-
-These bindings run a synchronous put-credit scan over Alpaca option contracts and snapshots. They
-are intentionally narrower than a full live data client.
+Alpaca does not export a scanner-only Python strategy surface. The standard option execution smoke
+path is the Python options multi-leg `TradingNode` example, which submits normal Nautilus
+`SubmitOrderList` commands through the Alpaca execution client.

@@ -83,8 +83,8 @@ Rules:
   path. It may read candidate ledgers and historical market data, but must not submit orders, cancel
   orders, reconcile broker state, or mutate strategy state.
 - Operator commands belong under the Nautilus CLI (`nautilus ops` for source-neutral operational
-  state and `nautilus adapters alpaca` for Alpaca-specific broker/runtime diagnostics). Do not add
-  new behavior to `alpaca-ops`; it is a transitional binary pending removal in Bead `nt-jez`.
+  state and `nautilus adapters alpaca` for Alpaca-specific broker/runtime diagnostics). Do not
+  restore retired standalone Alpaca operator binaries.
 - Do not restore adapter-owned custom backtest binaries for strategy scoring. Promote reusable
   behavior to Nautilus catalog/backtest architecture or the maintained `nautilus adapters alpaca` replay and
   performance read models.

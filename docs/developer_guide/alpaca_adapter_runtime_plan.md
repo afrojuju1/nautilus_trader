@@ -114,7 +114,7 @@ Phase 1:
   complete; submit is exposed separately through the REST client.)
 - Add a dry-run strategy harness that emits candidate decisions without orders. (Initial standalone
   scanner complete; scanner logic is shared by a timer-style Rust loop and a Nautilus
-  `AlpacaPutCreditStrategy` scaffold.)
+  retired Python put-credit scanner scaffold.)
 
 Phase 2:
 
@@ -126,8 +126,8 @@ Phase 2:
 Phase 3:
 
 - Port the `put_credit` selection logic into a Nautilus `Strategy`.
-- Replace the transitional strategy subprocess scanner call with direct Python bindings once the
-  Alpaca Rust scanner/client is exposed through PyO3.
+- Feed candidates through Nautilus actors/data and keep broker-specific scanning and submission in
+  the Alpaca runtime until a source-neutral Python options strategy path exists.
 - Add target/stop exit policy.
 - Add historical decision replay using Alpaca bars/snapshots where available.
 - Run paper soak with order submission disabled, then paper execution enabled.

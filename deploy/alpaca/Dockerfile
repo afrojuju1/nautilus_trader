@@ -30,7 +30,7 @@ RUN --mount=type=cache,id=nautilus-alpaca-cargo-registry,target=/usr/local/cargo
     --mount=type=cache,id=nautilus-alpaca-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=nautilus-alpaca-target,target=/workspace/target,sharing=locked \
     set -eux; \
-    core_bins="alpaca-options-node alpaca-ops"; \
+    core_bins="alpaca-options-node"; \
     tool_bins="alpaca-compare-option-chain-scan"; \
     bins="$core_bins"; \
     if [ "$ALPACA_BUILD_TOOLS" = "true" ]; then bins="$bins $tool_bins"; fi; \

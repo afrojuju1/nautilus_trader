@@ -27,14 +27,11 @@ cd "$REPO"
 
 cargo build --release -p nautilus-alpaca --features live,warehouse-clickhouse \
   --bin alpaca-options-node \
-  --bin alpaca-ops \
   --bin alpaca-compare-option-chain-scan
 cargo build --release -p nautilus-cli --features alpaca --bin nautilus
 
 install -Dm755 target/release/alpaca-options-node \
   "$HOME/.local/bin/alpaca-options-node"
-install -Dm755 target/release/alpaca-ops \
-  "$HOME/.local/bin/alpaca-ops"
 install -Dm755 target/release/alpaca-compare-option-chain-scan \
   "$HOME/.local/bin/alpaca-compare-option-chain-scan"
 install -Dm755 target/release/nautilus \

@@ -13,23 +13,23 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Smoke utility for loading Alpaca option snapshots for recently loaded contracts.
+//! Diagnostic command for loading Alpaca option snapshots for recently loaded contracts.
 
 use std::env;
 
-use nautilus_alpaca::{
+use crate::{
     config::AlpacaDataClientConfig,
     http::{
         client::AlpacaHttpClient,
         models::{AlpacaOptionType, OptionSnapshotsRequest},
     },
+    operator,
     providers::AlpacaOptionContractProvider,
 };
 use time::{Duration, OffsetDateTime};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let underlyings: Vec<String> = env::args().skip(1).collect();
+pub(crate) async fn run() -> anyhow::Result<()> {
+    let underlyings = operator::args();
     let underlyings = if underlyings.is_empty() {
         vec!["SPY".to_string(), "QQQ".to_string()]
     } else {

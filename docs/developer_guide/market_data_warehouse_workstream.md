@@ -479,6 +479,10 @@ The live sink subscribes to standard Nautilus market-data messages and writes Cl
 asynchronously through the same repo-level writer. In the final write model it runs alongside
 catalog persistence, not instead of it.
 
+The sink must be configured explicitly through the live data-engine configuration. Environment
+variables may still populate that config at the live-node boundary for deployment convenience, but
+`DataEngine::new` must not start warehouse workers as a hidden side effect.
+
 Live sink requirements:
 
 - Feature gated until validated, then enabled as part of the standard market-data persistence stack.
@@ -608,7 +612,7 @@ real volume, latency, or operational evidence contradicts them.
 | Schema and migrations location | Put ClickHouse DDL under `schema/sql/clickhouse/` and apply it with the warehouse operator `migrate` command. Keep canonical tables generic. Add raw/source schemas only through explicit migrations after the canonical path proves insufficient. | Market-data warehouse schema is not adapter-owned. Source adapters can own extraction, while the warehouse owns normalized contracts. |
 | Migration tooling | Use `sqlx` migrations for Postgres operational storage. Use the warehouse operator plus the official ClickHouse Rust client for ClickHouse migrations. Defer Atlas or any external schema manager until the thin operator path is clearly insufficient. | This avoids a custom Postgres migration system while also avoiding ORM/tooling bloat for ClickHouse. |
 | Postgres cleanup | `backtest_market_cache` is retired once ClickHouse and catalog writes cover those datasets. Add operational state events and migrations in Postgres before live submit cutover. Do not mirror ledgers to ClickHouse until a reporting consumer needs analytical copies. | This removes the broad JSONB market cache path and keeps a clean split between operational truth and analytical history. |
-| First runtime integration | Build the generic `nautilus-persistence` ClickHouse writer and warehouse `backfill` operation before turning on the live dual-write sink. | It validates contracts and scanner usefulness before introducing a new live-service dependency. |
+| First runtime integration | Build the generic `nautilus-persistence` ClickHouse writer and warehouse `backfill` operation before turning on the live dual-write sink. The live sink is now carried by `LiveDataEngineConfig`/`DataEngineConfig`, not auto-created inside `DataEngine::new`. | It validates contracts and scanner usefulness before introducing a new live-service dependency, and keeps runtime persistence visible in node configuration. |
 | Deployment owner | Self-host ClickHouse from `deploy/warehouse/`. Start with a local/dev stack, then prove the NUC only if storage, CPU, and memory headroom are acceptable. Move to a dedicated self-hosted analytics box if retention or ingest volume outgrows the NUC. | Quote-scale data can outgrow a small live-trading host quickly, and the warehouse must not starve trading processes. |
 
 ## Remaining Open Questions

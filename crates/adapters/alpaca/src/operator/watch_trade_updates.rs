@@ -13,20 +13,20 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Smoke utility for Alpaca account trade-update WebSocket authentication and listening.
+//! Diagnostic command for Alpaca account trade-update WebSocket authentication and listening.
 
-use std::{env, process, time::Duration};
+use std::{env, time::Duration};
 
-use nautilus_alpaca::{
+use crate::{
     common::credentials::AlpacaCredential,
     config::AlpacaExecClientConfig,
     websocket::{client::AlpacaTradeUpdatesWebSocketClient, messages::AlpacaWsMessage},
 };
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let wait_secs = env::args()
-        .nth(1)
+pub(crate) async fn run() -> anyhow::Result<()> {
+    let wait_secs = crate::operator::args()
+        .first()
+        .cloned()
         .map(|value| value.parse::<u64>())
         .transpose()?
         .or_else(|| {
@@ -40,13 +40,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.trade_updates_ws_url = env::var("ALPACA_TRADE_UPDATES_WS_URL").ok();
 
     let credential = AlpacaCredential::resolve(config.api_key.clone(), config.api_secret.clone())
-        .ok_or("missing Alpaca credentials")?;
+        .ok_or_else(|| anyhow::anyhow!("missing Alpaca credentials"))?;
     let mut client =
         AlpacaTradeUpdatesWebSocketClient::new(config.resolved_trade_updates_ws_url(), credential);
     client.connect().await?;
     let Some(mut rx) = client.take_out_rx() else {
         client.disconnect().await;
-        return Err("trade updates receiver unavailable".into());
+        anyhow::bail!("trade updates receiver unavailable");
     };
 
     let mut authorized = false;
@@ -100,7 +100,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if authorized && listening {
         Ok(())
     } else {
-        eprintln!("trade updates stream did not reach authorized+listening within {wait_secs}s");
-        process::exit(1);
+        anyhow::bail!("trade updates stream did not reach authorized+listening within {wait_secs}s")
     }
 }

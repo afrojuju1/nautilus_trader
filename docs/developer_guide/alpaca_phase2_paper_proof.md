@@ -31,13 +31,13 @@ cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca ac
 Verify the trade-update stream authenticates:
 
 ```bash
-cargo run -p nautilus-alpaca --features live --bin alpaca-watch-trade-updates -- 15
+cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca trade-updates 15
 ```
 
 Verify startup reconciliation can reconstruct current broker state:
 
 ```bash
-cargo run -p nautilus-alpaca --features live --bin alpaca-reconciliation-probe -- 240
+cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca reconciliation 240
 ```
 
 Expected clean-idle output:
@@ -49,28 +49,33 @@ Expected clean-idle output:
 
 ## Submit, Event, Cancel, And Repair Proof
 
-Submit one tiny Nautilus `SubmitOrderList` MLeg spread, observe accepted/rejected events, and cancel
-accepted orders:
+Submit one tiny Nautilus `SubmitOrderList` MLeg spread through the Python options `TradingNode`
+example, observe accepted/rejected events, and cancel accepted orders:
 
 ```bash
-ALPACA_ORDER_LIST_HARNESS_REPLACE_OPEN=true \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-submit-order-list-harness -- --scan SPY,QQQ,IWM 1
+python examples/live/alpaca/options_mleg_trading_node.py \
+  --broker-paper \
+  --confirm-submit \
+  --cancel-after-submit \
+  --alpaca-profile paper-main \
+  --short-symbol SPY270115P00450000 \
+  --long-symbol SPY270115P00445000
 ```
 
 Then verify the account returns to a clean state:
 
 ```bash
 cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca account
-cargo run -p nautilus-alpaca --features live --bin alpaca-reconciliation-probe -- 240
+cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca reconciliation 240
 ```
 
 Acceptance criteria:
 
-- The harness prints accepted or rejected Nautilus order events.
-- If accepted and replace proof is enabled, the harness replaces the parent MLeg limit before cleanup.
-- If accepted, the harness requests cancellation.
+- The TradingNode example prints accepted or rejected Nautilus order events.
+- If accepted, the example requests cancellation.
 - `check_account_orders` shows no unintended open orders or positions after cancellation.
-- `reconciliation_probe` succeeds and reports the broker order/fill/position surface.
+- `nautilus adapters alpaca reconciliation` succeeds and reports the broker order/fill/position
+  surface.
 
 Market-hours revalidation note:
 

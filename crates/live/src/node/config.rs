@@ -42,6 +42,8 @@ use nautilus_model::{
     enums::{BarAggregation, BarIntervalType},
     identifiers::{ClientId, ClientOrderId, InstrumentId, TraderId},
 };
+#[cfg(feature = "warehouse-clickhouse")]
+use nautilus_persistence::warehouse::live::MarketDataDualWriteConfig;
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
 use nautilus_system::{
@@ -114,6 +116,9 @@ pub struct LiveDataEngineConfig {
     /// If debug mode is active (will provide extra debug logging).
     #[builder(default)]
     pub debug: bool,
+    /// Optional live market-data dual-write configuration.
+    #[cfg(feature = "warehouse-clickhouse")]
+    pub live_market_data_dual_write: Option<MarketDataDualWriteConfig>,
     /// The queue size for the engine's internal queue buffers.
     ///
     /// Not implemented on the current live runtime; `validate_runtime_support` rejects
@@ -154,6 +159,12 @@ impl From<LiveDataEngineConfig> for DataEngineConfig {
             disable_historical_cache: false,
             external_clients: config.external_clients,
             debug: config.debug,
+            #[cfg(feature = "warehouse-clickhouse")]
+            live_market_data_dual_write: config.live_market_data_dual_write.or_else(|| {
+                MarketDataDualWriteConfig::from_env().unwrap_or_else(|error| {
+                    panic!("failed to configure live market-data dual-write: {error:?}");
+                })
+            }),
         }
     }
 }

@@ -110,7 +110,7 @@ impl std::fmt::Display for MarketDataReadSource {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClickHouseConnectOptions {
     pub url: String,
     pub username: String,

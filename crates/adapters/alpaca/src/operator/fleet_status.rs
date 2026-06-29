@@ -451,8 +451,7 @@ fn nested_usize(value: Option<&Value>, path: &[&str]) -> Option<usize> {
 
 fn default_operator_bin() -> PathBuf {
     if let Ok(current_exe) = env::current_exe()
-        && (executable_name_is(&current_exe, "nautilus")
-            || executable_name_is(&current_exe, "alpaca-ops"))
+        && executable_name_is(&current_exe, "nautilus")
     {
         return current_exe;
     }
@@ -462,28 +461,14 @@ fn default_operator_bin() -> PathBuf {
         .and_then(|path| path.parent().map(|parent| parent.join("nautilus")))
         .filter(|path| path.exists())
         .or_else(|| {
-            env::current_exe()
-                .ok()
-                .and_then(|path| path.parent().map(|parent| parent.join("alpaca-ops")))
-                .filter(|path| path.exists())
-        })
-        .or_else(|| {
             let nautilus = home_dir().join(".local/bin/nautilus");
             nautilus.exists().then_some(nautilus)
-        })
-        .or_else(|| {
-            let alpaca_ops = home_dir().join(".local/bin/alpaca-ops");
-            alpaca_ops.exists().then_some(alpaca_ops)
         })
         .unwrap_or_else(|| home_dir().join(".local/bin/nautilus"))
 }
 
-fn append_status_command_args(command: &mut Command, operator_bin: &Path) {
-    if executable_name_is(operator_bin, "nautilus") {
-        command.args(["adapters", "alpaca", "status"]);
-    } else {
-        command.arg("status");
-    }
+fn append_status_command_args(command: &mut Command, _operator_bin: &Path) {
+    command.args(["adapters", "alpaca", "status"]);
     command.arg("--json");
 }
 

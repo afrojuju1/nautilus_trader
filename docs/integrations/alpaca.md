@@ -210,8 +210,8 @@ export APCA_API_SECRET_KEY="YOUR_PAPER_SECRET"
 export ALPACA_TRADING_BASE_URL="https://paper-api.alpaca.markets"
 
 cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca account
-cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-contracts -- SPY QQQ
-cargo run -p nautilus-alpaca --features live --bin alpaca-load-option-snapshots -- SPY
+cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca option-contracts SPY QQQ
+cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca option-snapshots SPY
 cargo run -p nautilus-alpaca --features live --bin alpaca-compare-option-chain-scan -- --pretty SPY YYYY-MM-DD
 ```
 

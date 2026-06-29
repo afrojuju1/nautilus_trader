@@ -19,6 +19,8 @@ use nautilus_model::{
     enums::{BarAggregation, BarIntervalType},
     identifiers::ClientId,
 };
+#[cfg(feature = "warehouse-clickhouse")]
+use nautilus_persistence::warehouse::live::MarketDataDualWriteConfig;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for `DataEngine` instances.
@@ -78,6 +80,9 @@ pub struct DataEngineConfig {
     /// If debug mode is active (will provide extra debug logging).
     #[builder(default)]
     pub debug: bool,
+    /// Optional live market-data dual-write configuration.
+    #[cfg(feature = "warehouse-clickhouse")]
+    pub live_market_data_dual_write: Option<MarketDataDualWriteConfig>,
 }
 
 impl Default for DataEngineConfig {

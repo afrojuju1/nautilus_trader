@@ -200,6 +200,14 @@ pub enum AlpacaAdapterCommand {
     Replay(ForwardedArgs),
     /// Syncs Alpaca operational strategy state to configured local files.
     SyncState(ForwardedArgs),
+    /// Loads Alpaca option contracts for diagnostics.
+    OptionContracts(ForwardedArgs),
+    /// Loads Alpaca option snapshots for diagnostics.
+    OptionSnapshots(ForwardedArgs),
+    /// Probes Alpaca order/fill/position reconciliation.
+    Reconciliation(ForwardedArgs),
+    /// Probes Alpaca trade-update WebSocket authorization and listening.
+    TradeUpdates(ForwardedArgs),
 }
 
 #[cfg(feature = "alpaca")]
