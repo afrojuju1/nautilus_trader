@@ -700,8 +700,10 @@ mod tests {
 
     use crate::{
         earnings::{EarningsEvent, EarningsTiming},
-        options_entry::{SelectedEntry, SelectedOptionsEntry},
-        runtime::{StrategyStateEntryDraft, credit_spread_strategy_name},
+        runtime::StrategyStateEntryDraft,
+    };
+    use nautilus_trading::options::entries::{
+        SelectedEntry, SelectedOptionsEntry, credit_spread_strategy_name,
     };
 
     #[test]

@@ -283,28 +283,36 @@ Implemented refactor:
    `CandidateContract`, `CandidateQuote`, and `CandidateMarketSnapshot`.
 2. Moved filtering, scoring, candidate construction, rejection counting, and candidate identity into
    `crates/trading/src/options/candidates.rs`.
-3. Replaced Alpaca REST-shaped scoring calls in the current scanner path with conversion into the
+3. Moved selected-entry metadata, strategy-family names, and regime feature/routing primitives into
+   `crates/trading/src/options/entries.rs` and `crates/trading/src/options/regime.rs`.
+4. Replaced Alpaca REST-shaped scoring calls in the current scanner path with conversion into the
    normalized candidate input model followed by direct candidate-engine calls.
-4. Deleted the displaced `strategy/scoring.rs` path instead of preserving renamed pass-through
+5. Deleted the displaced `strategy/scoring.rs` path instead of preserving renamed pass-through
    functions.
-5. Kept ledger writes, operator events, account admission, and broker submission outside the
+6. Kept ledger writes, operator events, account admission, and broker submission outside the
    candidate engine.
 
 Current code ownership:
 
 - `crates/trading/src/options/candidates.rs`: pure scoring and ranking module.
+- `crates/trading/src/options/entries.rs`: selected option-entry metadata and strategy-family
+  names.
+- `crates/trading/src/options/regime.rs`: regime feature snapshots, source-neutral event-load
+  inputs, and pure routing.
 - `crates/adapters/alpaca/src/strategy.rs`: REST data-acquisition and input-adapter surface.
 - `crates/adapters/alpaca/src/candidate_scan_actor.rs`: read-only candidate evidence actor.
 - `crates/adapters/alpaca/src/options_strategy.rs`: order-capable Nautilus strategy owner.
 - `crates/adapters/alpaca/src/options_runtime.rs`: legacy-compatible candidate-output assembly and
   supporting runtime contracts.
-- `crates/adapters/alpaca/src/options_entry.rs`: keep selected-entry metadata aligned with the new
-  ranked candidate model.
+- `crates/adapters/alpaca/src/strategy_state_entry.rs`: Alpaca-only conversion from selected entry
+  metadata into persisted strategy-state drafts.
 
 Acceptance criteria:
 
 - The candidate engine does not import `AlpacaHttpClient`, REST request types, environment parsing,
   storage, operator events, or broker submission modules.
+- Selected-entry metadata and regime routing primitives do not import Alpaca runtime state or
+  broker/account modules.
 - Current REST scans and the options engine still produce the same candidate selection and ledger
   evidence for the same inputs.
 - Public names describe owned concepts, such as `CandidateContract`, `CandidateMarketSnapshot`,

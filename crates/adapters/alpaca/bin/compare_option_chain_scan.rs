@@ -24,9 +24,6 @@ use nautilus_alpaca::{
     },
     parse::{parse_option_contract, parse_option_series_id},
     providers::AlpacaOptionContractProvider,
-    runtime::{
-        credit_spread_strategy_name, debit_spread_strategy_name, naked_option_strategy_name,
-    },
     strategy::{
         scan_credit_spread_snapshot_at, scan_debit_spread_snapshot_at,
         scan_iron_condor_snapshots_at, scan_naked_option_snapshot_at,
@@ -45,6 +42,9 @@ use nautilus_model::{
 };
 use nautilus_trading::options::candidates::{
     CreditSpreadKind, DebitSpreadKind, NakedOptionCapitalContext, NakedOptionKind,
+};
+use nautilus_trading::options::entries::{
+    credit_spread_strategy_name, debit_spread_strategy_name, naked_option_strategy_name,
 };
 use serde_json::{Value, json};
 

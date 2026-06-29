@@ -20,10 +20,15 @@ use std::{collections::BTreeMap, env, path::PathBuf, sync::Arc};
 use chrono::NaiveTime;
 use chrono_tz::Tz;
 use nautilus_infrastructure::sql::operational::{self, OperationalRepository};
-use nautilus_trading::options::candidates::{
-    CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
-    NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig, PutCreditScannerConfig,
-    annualized_premium_yield,
+use nautilus_trading::options::{
+    candidates::{
+        CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
+        NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig,
+        PutCreditScannerConfig, annualized_premium_yield,
+    },
+    entries::{
+        credit_spread_strategy_name, debit_spread_strategy_name, naked_option_strategy_name,
+    },
 };
 use serde_json::{Map, Value, json};
 
@@ -34,10 +39,7 @@ use crate::{
     http::client::AlpacaHttpClient,
     options_lifecycle::OptionLifecycleRiskConfig,
     options_management::CreditSpreadManagementConfig,
-    runtime::{
-        StrategyState, credit_spread_strategy_name, debit_spread_strategy_name,
-        emit_operator_event, naked_option_strategy_name,
-    },
+    runtime::{StrategyState, emit_operator_event},
     strategy::{
         scan_call_credit_underlying, scan_call_debit_underlying, scan_iron_condor_underlying,
         scan_naked_option_underlying_with_capital, scan_put_credit_underlying,
@@ -45,16 +47,14 @@ use crate::{
     },
 };
 
-pub use crate::{
-    candidate_payloads::{
-        candidate_alert_identity_key, candidate_alert_key, credit_candidate_ledger_payload,
-        debit_candidate_ledger_payload, insert_string_field, insert_value_field,
-        iron_condor_candidate_ledger_payload, naked_candidate_ledger_payload,
-    },
-    options_entry::{
-        OptionEntryDescriptor, SelectedDebitEntry, SelectedEntry, SelectedIronCondorEntry,
-        SelectedNakedOptionEntry, SelectedOptionsEntry,
-    },
+pub use crate::candidate_payloads::{
+    candidate_alert_identity_key, candidate_alert_key, credit_candidate_ledger_payload,
+    debit_candidate_ledger_payload, insert_string_field, insert_value_field,
+    iron_condor_candidate_ledger_payload, naked_candidate_ledger_payload,
+};
+pub use nautilus_trading::options::entries::{
+    OptionEntryDescriptor, SelectedDebitEntry, SelectedEntry, SelectedIronCondorEntry,
+    SelectedNakedOptionEntry, SelectedOptionsEntry,
 };
 
 mod candidate_ledger;

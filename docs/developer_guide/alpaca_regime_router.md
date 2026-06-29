@@ -429,11 +429,14 @@ Minimum validation reports:
   payload from the existing option-chain subscription, avoiding a duplicate scanner loop. A
   dedicated `RegimeFeatureActor` can replace or extend this once warehouse/catalog feature inputs
   are promoted behind the same Nautilus data contract.
+- Code ownership: source-neutral option candidate, selected-entry, and regime primitives live under
+  `crates/trading/src/options/`; Alpaca owns only runtime wiring, event-input conversion, ledger
+  presentation, account admission, and broker submission.
 - Current feature values: `option_liquidity` includes contract and quote counts, two-sided quote
   coverage, median spread percentage, wide-quote ratio, open-interest coverage, implied-volatility
   coverage, chain source timestamp, and freshness. `underlying_bars` and `underlying_trend_vol`
-  come from cached/requested Nautilus bars. `event_load` comes from the approved earnings
-  event-shock input used by admission.
+  come from cached/requested Nautilus bars. `event_load` uses source-neutral scheduled-event inputs;
+  the Alpaca runtime currently converts approved earnings event-shock data into that contract.
 - Current routing behavior: the scanner computes a pure `RegimeContext` from the feature snapshot,
   filters blocked strategy families before candidate selection, writes the context into scanner and
   candidate ledgers, and passes the same context through `OptionsCandidateData`.

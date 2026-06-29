@@ -10,17 +10,14 @@ use nautilus_model::data::{
 };
 use serde_json::{Value, json};
 
-use crate::{
-    earnings::{EarningsEvent, days_to_report, is_inside_event_shock_window},
-    options_entry::SelectedOptionsEntry,
-};
+use super::entries::SelectedOptionsEntry;
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// Current schema version for regime feature snapshots.
 pub const REGIME_FEATURE_SCHEMA_VERSION: u16 = 1;
-/// Deterministic feature version for Alpaca regime feature snapshots.
-pub const ALPACA_REGIME_FEATURE_VERSION: &str = "alpaca_regime_features.v1";
+/// Deterministic feature version for options regime feature snapshots.
+pub const REGIME_FEATURE_VERSION: &str = "options_regime_features.v1";
 /// Default fraction of option midprice considered a wide quote.
 pub const DEFAULT_WIDE_QUOTE_SPREAD_PCT: f64 = 0.15;
 /// Default minimum two-sided quotes for the chain-level liquidity group to be usable.
@@ -331,12 +328,12 @@ impl Default for RegimeFeatureConfig {
 pub struct RegimeFeatureInputs<'a> {
     /// Cached underlying bars for the option-chain underlying.
     pub underlying_bars: &'a [Bar],
-    /// Approved earnings events from runtime event-shock configuration.
-    pub earnings_events: &'a [EarningsEvent],
-    /// Calendar days before an earnings report considered event load.
-    pub event_shock_block_days_before_earnings: i64,
-    /// Calendar days after an earnings report considered event load.
-    pub event_shock_block_days_after_earnings: i64,
+    /// Approved external or scheduled events from runtime event-load configuration.
+    pub event_load_events: &'a [RegimeEvent],
+    /// Calendar days before an event considered active event load.
+    pub event_load_block_days_before: i64,
+    /// Calendar days after an event considered active event load.
+    pub event_load_block_days_after: i64,
 }
 
 impl<'a> RegimeFeatureInputs<'a> {
@@ -345,9 +342,36 @@ impl<'a> RegimeFeatureInputs<'a> {
     pub const fn empty() -> Self {
         Self {
             underlying_bars: &[],
-            earnings_events: &[],
-            event_shock_block_days_before_earnings: 0,
-            event_shock_block_days_after_earnings: 0,
+            event_load_events: &[],
+            event_load_block_days_before: 0,
+            event_load_block_days_after: 0,
+        }
+    }
+}
+
+/// Source-neutral scheduled event used for event-load regime features.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegimeEvent {
+    /// Uppercase underlying symbol.
+    pub underlying: String,
+    /// Event date.
+    pub event_date: NaiveDate,
+    /// Event source label for diagnostics.
+    pub source: String,
+}
+
+impl RegimeEvent {
+    /// Creates an event-load input.
+    #[must_use]
+    pub fn new(
+        underlying: impl Into<String>,
+        event_date: NaiveDate,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            underlying: underlying.into().to_ascii_uppercase(),
+            event_date,
+            source: source.into(),
         }
     }
 }
@@ -415,18 +439,18 @@ impl UnderlyingTrendVolFeatures {
     }
 }
 
-/// Earnings/event-load summary for the underlying.
+/// Scheduled event-load summary for the underlying.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventLoadFeatures {
     /// Source that produced the event load.
     pub source: String,
     /// Number of approved events for the underlying.
     pub underlying_event_count: usize,
-    /// Number of events inside the configured event-shock window.
+    /// Number of events inside the configured event-load window.
     pub active_event_count: usize,
     /// Nearest event distance in calendar days.
-    pub nearest_days_to_report: Option<i64>,
-    /// Whether configured event-shock policy currently blocks entries.
+    pub nearest_days_to_event: Option<i64>,
+    /// Whether configured event-load policy currently blocks entries.
     pub blocks_new_entries: bool,
 }
 
@@ -438,7 +462,7 @@ impl EventLoadFeatures {
             "source": self.source,
             "underlying_event_count": self.underlying_event_count,
             "active_event_count": self.active_event_count,
-            "nearest_days_to_report": self.nearest_days_to_report,
+            "nearest_days_to_event": self.nearest_days_to_event,
             "blocks_new_entries": self.blocks_new_entries,
         })
     }
@@ -756,10 +780,10 @@ pub fn regime_feature_snapshot_from_option_chain(
         option_liquidity_freshness(&liquidity, config, latest_quote_ts(slice), as_of_ts);
     let event_load = event_load_features(
         &underlying,
-        inputs.earnings_events,
+        inputs.event_load_events,
         &trade_date,
-        inputs.event_shock_block_days_before_earnings,
-        inputs.event_shock_block_days_after_earnings,
+        inputs.event_load_block_days_before,
+        inputs.event_load_block_days_after,
     );
     let event_load_freshness = event_load_freshness(&event_load, as_of_ts);
     let feature_freshness = vec![
@@ -783,7 +807,7 @@ pub fn regime_feature_snapshot_from_option_chain(
 
     RegimeFeatureSnapshot {
         schema_version: REGIME_FEATURE_SCHEMA_VERSION,
-        feature_version: ALPACA_REGIME_FEATURE_VERSION.to_string(),
+        feature_version: REGIME_FEATURE_VERSION.to_string(),
         as_of_ts,
         trade_date,
         underlying,
@@ -915,10 +939,10 @@ fn underlying_trend_vol_freshness(
 
 fn event_load_features(
     underlying: &str,
-    events: &[EarningsEvent],
+    events: &[RegimeEvent],
     trade_date: &str,
-    block_days_before_earnings: i64,
-    block_days_after_earnings: i64,
+    block_days_before_event: i64,
+    block_days_after_event: i64,
 ) -> Option<EventLoadFeatures> {
     if events.is_empty() {
         return None;
@@ -928,51 +952,67 @@ fn event_load_features(
     let underlying = underlying.to_ascii_uppercase();
     let mut underlying_event_count = 0;
     let mut active_event_count = 0;
-    let mut nearest_days_to_report: Option<i64> = None;
+    let mut nearest_days_to_event: Option<i64> = None;
 
     for event in events.iter().filter(|event| event.underlying == underlying) {
         underlying_event_count += 1;
-        let days_until_report = days_to_report(event, trade_date);
-        nearest_days_to_report =
-            Some(nearest_days_to_report.map_or(days_until_report, |nearest| {
-                if days_until_report.abs() < nearest.abs() {
-                    days_until_report
-                } else {
-                    nearest
-                }
-            }));
-        if is_inside_event_shock_window(
-            days_until_report,
-            block_days_before_earnings,
-            block_days_after_earnings,
+        let days_to_event = event
+            .event_date
+            .signed_duration_since(trade_date)
+            .num_days();
+        nearest_days_to_event = Some(nearest_days_to_event.map_or(days_to_event, |nearest| {
+            if days_to_event.abs() < nearest.abs() {
+                days_to_event
+            } else {
+                nearest
+            }
+        }));
+        if is_inside_event_load_window(
+            days_to_event,
+            block_days_before_event,
+            block_days_after_event,
         ) {
             active_event_count += 1;
         }
     }
 
+    let source = events
+        .iter()
+        .find(|event| event.underlying == underlying)
+        .map_or("event_load".to_string(), |event| event.source.clone());
+
     Some(EventLoadFeatures {
-        source: "approved_earnings_events".to_string(),
+        source,
         underlying_event_count,
         active_event_count,
-        nearest_days_to_report,
+        nearest_days_to_event,
         blocks_new_entries: active_event_count > 0,
     })
+}
+
+fn is_inside_event_load_window(
+    days_to_event: i64,
+    block_days_before_event: i64,
+    block_days_after_event: i64,
+) -> bool {
+    if days_to_event >= 0 {
+        days_to_event <= block_days_before_event
+    } else {
+        days_to_event.abs() <= block_days_after_event
+    }
 }
 
 fn event_load_freshness(
     event_load: &Option<EventLoadFeatures>,
     as_of_ts: UnixNanos,
 ) -> FeatureFreshness {
-    if event_load.is_none() {
-        return FeatureFreshness::missing(
-            RegimeFeatureGroup::EventLoad,
-            "approved_earnings_events",
-        );
-    }
+    let Some(event_load) = event_load else {
+        return FeatureFreshness::missing(RegimeFeatureGroup::EventLoad, "event_load");
+    };
 
     FeatureFreshness::produced(
         RegimeFeatureGroup::EventLoad,
-        "approved_earnings_events",
+        event_load.source.clone(),
         Some(as_of_ts),
         Some(0),
         FeatureFreshnessStatus::Fresh,
@@ -1169,10 +1209,12 @@ mod tests {
     };
     use ustr::Ustr;
 
-    use crate::options_entry::{SelectedEntry, SelectedNakedOptionEntry, SelectedOptionsEntry};
-    use nautilus_trading::options::candidates::{
-        CreditSpreadKind, NakedOptionCandidate, NakedOptionKind, OptionCapitalRequirementModel,
-        ScoredContract, SpreadCandidate,
+    use crate::options::{
+        candidates::{
+            CreditSpreadKind, NakedOptionCandidate, NakedOptionKind, OptionCapitalRequirementModel,
+            ScoredContract, SpreadCandidate,
+        },
+        entries::{SelectedEntry, SelectedNakedOptionEntry, SelectedOptionsEntry},
     };
 
     use super::*;

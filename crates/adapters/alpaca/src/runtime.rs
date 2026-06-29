@@ -29,9 +29,14 @@ use crate::parse::{AlpacaOptionSymbolParts, parse_alpaca_option_symbol};
 use nautilus_infrastructure::sql::operational::{
     OperationalRepository, load_strategy_state_record, save_strategy_state,
 };
-use nautilus_trading::options::candidates::{
-    CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, IronCondorCandidate,
-    NakedOptionCandidate, NakedOptionKind, SpreadCandidate,
+use nautilus_trading::options::{
+    candidates::{
+        CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, IronCondorCandidate,
+        NakedOptionCandidate, NakedOptionKind, SpreadCandidate,
+    },
+    entries::{
+        credit_spread_strategy_name, debit_spread_strategy_name, naked_option_strategy_name,
+    },
 };
 
 const CANCELED_DEBIT_REPLACEMENT_EXEMPTIONS_PER_DAY: usize = 1;
@@ -532,35 +537,6 @@ impl StrategyStateEntry {
     /// Marks the entry canceled or terminal without open exposure.
     pub fn mark_canceled(&mut self) {
         self.canceled = true;
-    }
-}
-
-/// Returns the strategy name for a credit-spread kind.
-#[must_use]
-pub fn credit_spread_strategy_name(kind: CreditSpreadKind) -> &'static str {
-    match kind {
-        CreditSpreadKind::Put => "put_credit",
-        CreditSpreadKind::Call => "call_credit",
-    }
-}
-
-/// Returns the strategy name for a debit-spread kind.
-#[must_use]
-pub fn debit_spread_strategy_name(kind: DebitSpreadKind) -> &'static str {
-    match kind {
-        DebitSpreadKind::Call => "call_debit",
-        DebitSpreadKind::Put => "put_debit",
-    }
-}
-
-/// Returns the strategy name for a naked short option kind.
-#[must_use]
-pub fn naked_option_strategy_name(kind: NakedOptionKind) -> &'static str {
-    match kind {
-        NakedOptionKind::Call => "naked_call",
-        NakedOptionKind::Put => "naked_put",
-        NakedOptionKind::CallOneToThreeDte => "naked_call_1_3dte",
-        NakedOptionKind::PutOneToThreeDte => "naked_put_1_3dte",
     }
 }
 

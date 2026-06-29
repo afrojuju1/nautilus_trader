@@ -1,16 +1,40 @@
-//! Shared selected-entry metadata for Alpaca options strategies.
+//! Source-neutral selected-entry metadata for options strategies.
 
-use nautilus_trading::options::candidates::{
+use super::candidates::{
     CreditSpreadKind, DebitSpreadCandidate, DebitSpreadKind, IronCondorCandidate,
     NakedOptionCandidate, NakedOptionKind, SpreadCandidate,
 };
 
-use crate::runtime::{
-    StrategyStateEntryDraft, credit_spread_strategy_name, debit_spread_strategy_name,
-    naked_option_strategy_name,
-};
-
 const OPTION_CONTRACT_MULTIPLIER: f64 = 100.0;
+
+/// Returns the strategy name for a credit-spread kind.
+#[must_use]
+pub const fn credit_spread_strategy_name(kind: CreditSpreadKind) -> &'static str {
+    match kind {
+        CreditSpreadKind::Put => "put_credit",
+        CreditSpreadKind::Call => "call_credit",
+    }
+}
+
+/// Returns the strategy name for a debit-spread kind.
+#[must_use]
+pub const fn debit_spread_strategy_name(kind: DebitSpreadKind) -> &'static str {
+    match kind {
+        DebitSpreadKind::Call => "call_debit",
+        DebitSpreadKind::Put => "put_debit",
+    }
+}
+
+/// Returns the strategy name for a naked short option kind.
+#[must_use]
+pub const fn naked_option_strategy_name(kind: NakedOptionKind) -> &'static str {
+    match kind {
+        NakedOptionKind::Call => "naked_call",
+        NakedOptionKind::Put => "naked_put",
+        NakedOptionKind::CallOneToThreeDte => "naked_call_1_3dte",
+        NakedOptionKind::PutOneToThreeDte => "naked_put_1_3dte",
+    }
+}
 
 /// Selected credit-spread candidate.
 #[derive(Clone, Debug)]
@@ -237,88 +261,6 @@ impl SelectedOptionsEntry {
                 vec![&entry.candidate.long.symbol, &entry.candidate.short.symbol]
             }
             Self::NakedOption(entry) => vec![&entry.candidate.short.symbol],
-        }
-    }
-
-    /// Builds a strategy-state draft for accepted broker submissions.
-    #[must_use]
-    pub fn state_entry_draft(
-        &self,
-        trade_date: &str,
-        order_list_id: &str,
-        quantity: u64,
-        submitted_at_utc: Option<String>,
-        parent_order_id: Option<String>,
-    ) -> StrategyStateEntryDraft {
-        match self {
-            Self::Credit(entry) => StrategyStateEntryDraft {
-                trade_date: trade_date.to_string(),
-                underlying: entry.underlying.clone(),
-                strategy: credit_spread_strategy_name(entry.kind).to_string(),
-                order_list_id: order_list_id.to_string(),
-                short_symbol: entry.candidate.short.symbol.clone(),
-                long_symbol: entry.candidate.long.symbol.clone(),
-                short_call_symbol: None,
-                long_call_symbol: None,
-                quantity,
-                credit: entry.candidate.credit,
-                debit: None,
-                risk_capital_usd: self.risk_capital_usd(quantity),
-                score: entry.candidate.score,
-                parent_order_id,
-                submitted_at_utc,
-            },
-            Self::IronCondor(entry) => StrategyStateEntryDraft {
-                trade_date: trade_date.to_string(),
-                underlying: entry.underlying.clone(),
-                strategy: "iron_condor".to_string(),
-                order_list_id: order_list_id.to_string(),
-                short_symbol: entry.candidate.put.short.symbol.clone(),
-                long_symbol: entry.candidate.put.long.symbol.clone(),
-                short_call_symbol: Some(entry.candidate.call.short.symbol.clone()),
-                long_call_symbol: Some(entry.candidate.call.long.symbol.clone()),
-                quantity,
-                credit: entry.candidate.credit,
-                debit: None,
-                risk_capital_usd: self.risk_capital_usd(quantity),
-                score: entry.candidate.score,
-                parent_order_id,
-                submitted_at_utc,
-            },
-            Self::Debit(entry) => StrategyStateEntryDraft {
-                trade_date: trade_date.to_string(),
-                underlying: entry.underlying.clone(),
-                strategy: debit_spread_strategy_name(entry.kind).to_string(),
-                order_list_id: order_list_id.to_string(),
-                short_symbol: entry.candidate.short.symbol.clone(),
-                long_symbol: entry.candidate.long.symbol.clone(),
-                short_call_symbol: None,
-                long_call_symbol: None,
-                quantity,
-                credit: -entry.candidate.debit,
-                debit: Some(entry.candidate.debit),
-                risk_capital_usd: self.risk_capital_usd(quantity),
-                score: entry.candidate.score,
-                parent_order_id,
-                submitted_at_utc,
-            },
-            Self::NakedOption(entry) => StrategyStateEntryDraft {
-                trade_date: trade_date.to_string(),
-                underlying: entry.underlying.clone(),
-                strategy: naked_option_strategy_name(entry.kind).to_string(),
-                order_list_id: order_list_id.to_string(),
-                short_symbol: entry.candidate.short.symbol.clone(),
-                long_symbol: String::new(),
-                short_call_symbol: None,
-                long_call_symbol: None,
-                quantity,
-                credit: entry.candidate.credit,
-                debit: None,
-                risk_capital_usd: self.risk_capital_usd(quantity),
-                score: entry.candidate.score,
-                parent_order_id,
-                submitted_at_utc,
-            },
         }
     }
 }

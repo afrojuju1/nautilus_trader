@@ -60,8 +60,6 @@ pub mod http;
 #[cfg(feature = "live")]
 pub mod option_chain_candidates;
 #[cfg(feature = "live")]
-pub mod options_entry;
-#[cfg(feature = "live")]
 pub mod options_entry_admission;
 #[cfg(feature = "live")]
 pub mod options_lifecycle;
@@ -79,8 +77,6 @@ pub mod providers;
 #[cfg(feature = "python")]
 pub mod python;
 #[cfg(feature = "live")]
-pub mod regime_features;
-#[cfg(feature = "live")]
 pub mod runtime;
 #[cfg(feature = "live")]
 pub mod runtime_env;
@@ -89,6 +85,8 @@ pub mod state_persistence;
 #[cfg(feature = "live")]
 pub mod state_reconciliation;
 pub mod strategy;
+#[cfg(feature = "live")]
+pub mod strategy_state_entry;
 #[cfg(feature = "live")]
 pub mod submit;
 #[cfg(feature = "live")]

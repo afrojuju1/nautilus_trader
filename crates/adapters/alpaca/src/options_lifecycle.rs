@@ -3,11 +3,11 @@
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
+use nautilus_trading::options::entries::SelectedOptionsEntry;
 use serde_json::{Value, json};
 
 use crate::{
     http::models::{AlpacaActivity, ListActivitiesRequest},
-    options_entry::SelectedOptionsEntry,
     options_entry_admission::SubmissionBlock,
     runtime::emit_operator_event,
 };

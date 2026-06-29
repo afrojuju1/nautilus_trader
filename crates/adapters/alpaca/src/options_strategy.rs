@@ -25,6 +25,7 @@ use nautilus_model::{
 };
 use nautilus_trading::{
     nautilus_strategy,
+    options::regime::{RegimeContext, insert_regime_context},
     strategy::{OrderApi, Strategy, StrategyConfig, StrategyCore},
 };
 use uuid::Uuid;
@@ -51,9 +52,9 @@ use crate::{
         AlpacaOptionsRuntimeConfig, OptionsCandidateSet, OptionsScanOutcome, OptionsScanReport,
         SelectedOptionsEntry,
     },
-    regime_features::{RegimeContext, insert_regime_context},
     runtime::{StrategyState, StrategyStateEntry, StrategyStateEntryDraft, emit_operator_event},
     state_persistence::StrategyStatePersistenceHandle,
+    strategy_state_entry::selected_entry_state_entry_draft,
 };
 use serde_json::{Value, json};
 
@@ -1526,7 +1527,8 @@ impl AlpacaOptionsStrategy {
         if let Some(pending) = self.pending_submissions.get_mut(&order_list_id) {
             pending.accepted = pending.accepted.saturating_add(1);
             if !pending.recorded {
-                draft = Some(pending.entry.state_entry_draft(
+                draft = Some(selected_entry_state_entry_draft(
+                    &pending.entry,
                     &pending.trade_date,
                     &pending.order_list_id,
                     pending.quantity,
@@ -1591,7 +1593,8 @@ impl AlpacaOptionsStrategy {
                     "entry_rejected"
                 };
                 rejected_state = Some((
-                    pending.entry.state_entry_draft(
+                    selected_entry_state_entry_draft(
+                        &pending.entry,
                         &pending.trade_date,
                         &pending.order_list_id,
                         pending.quantity,

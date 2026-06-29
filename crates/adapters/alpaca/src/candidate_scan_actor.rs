@@ -21,9 +21,22 @@ use nautilus_model::{
     identifiers::{ActorId, ClientId, InstrumentId, OptionSeriesId},
     instruments::{Instrument, InstrumentAny},
 };
-use nautilus_trading::options::candidates::{
-    CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
-    NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig, PutCreditScannerConfig,
+use nautilus_trading::options::{
+    candidates::{
+        CreditSpreadKind, DebitSpreadKind, DebitSpreadScannerConfig, IronCondorScannerConfig,
+        NakedOptionCapitalContext, NakedOptionKind, NakedOptionScannerConfig,
+        PutCreditScannerConfig,
+    },
+    entries::{
+        SelectedDebitEntry, SelectedEntry, SelectedIronCondorEntry, SelectedNakedOptionEntry,
+        SelectedOptionsEntry, credit_spread_strategy_name, debit_spread_strategy_name,
+        naked_option_strategy_name,
+    },
+    regime::{
+        RegimeContext, RegimeEvent, RegimeFeatureConfig, RegimeFeatureData, RegimeFeatureInputs,
+        RegimeRoutingSummary, apply_regime_routing, insert_regime_context,
+        regime_context_from_features, regime_feature_snapshot_from_option_chain,
+    },
 };
 use serde_json::{Value, json};
 
@@ -38,23 +51,11 @@ use crate::{
         option_chain_candidate_input, scan_credit_spread_option_chain,
         scan_debit_spread_option_chain, scan_iron_condor_option_chain, scan_naked_option_chain,
     },
-    options_entry::{
-        SelectedDebitEntry, SelectedEntry, SelectedIronCondorEntry, SelectedNakedOptionEntry,
-        SelectedOptionsEntry,
-    },
     options_runtime::{
         AlpacaOptionsRuntimeConfig, OptionsCandidateSet, OptionsScanOutcome, OptionsScanReport,
     },
     options_strategy::OptionsCandidateData,
-    regime_features::{
-        RegimeContext, RegimeFeatureConfig, RegimeFeatureData, RegimeFeatureInputs,
-        RegimeRoutingSummary, apply_regime_routing, insert_regime_context,
-        regime_context_from_features, regime_feature_snapshot_from_option_chain,
-    },
-    runtime::{
-        credit_spread_strategy_name, debit_spread_strategy_name, emit_operator_event,
-        naked_option_strategy_name,
-    },
+    runtime::emit_operator_event,
 };
 
 /// Read-only scan settings for candidate discovery from option-chain slices.
@@ -427,17 +428,24 @@ impl DataActor for OptionChainCandidateScanActor {
             .get(&underlying)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        let event_load_events = self
+            .config
+            .scan
+            .event_shock_earnings_events
+            .iter()
+            .map(|event| {
+                RegimeEvent::new(
+                    event.underlying.clone(),
+                    event.report_date,
+                    event.source.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
         let feature_inputs = RegimeFeatureInputs {
             underlying_bars,
-            earnings_events: &self.config.scan.event_shock_earnings_events,
-            event_shock_block_days_before_earnings: self
-                .config
-                .scan
-                .event_shock_block_days_before_earnings,
-            event_shock_block_days_after_earnings: self
-                .config
-                .scan
-                .event_shock_block_days_after_earnings,
+            event_load_events: &event_load_events,
+            event_load_block_days_before: self.config.scan.event_shock_block_days_before_earnings,
+            event_load_block_days_after: self.config.scan.event_shock_block_days_after_earnings,
         };
         let feature_snapshot = regime_feature_snapshot_from_option_chain(
             slice,
