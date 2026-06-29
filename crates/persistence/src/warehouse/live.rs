@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow};
@@ -167,6 +167,17 @@ impl LiveMarketDataDualWriter {
 
     /// Enqueues a QuoteTick for background catalog and ClickHouse writes.
     pub fn write_quote(&self, quote: QuoteTick) {
+        self.try_send_quote(quote);
+    }
+
+    /// Enqueues QuoteTick records for background catalog and ClickHouse writes.
+    pub fn write_quotes(&self, quotes: &[QuoteTick]) {
+        for quote in quotes {
+            self.try_send_quote(*quote);
+        }
+    }
+
+    fn try_send_quote(&self, quote: QuoteTick) {
         let Some(sender) = &self.sender else {
             return;
         };
@@ -224,16 +235,22 @@ impl Worker {
 
     fn run(&mut self, receiver: mpsc::Receiver<QuoteTick>) {
         let mut batch = Vec::with_capacity(self.config.batch_size);
+        let mut next_flush = Instant::now() + self.config.flush_interval;
 
         loop {
-            match receiver.recv_timeout(self.config.flush_interval) {
+            let timeout = next_flush.saturating_duration_since(Instant::now());
+            match receiver.recv_timeout(timeout) {
                 Ok(quote) => {
                     batch.push(quote);
                     if batch.len() >= self.config.batch_size {
                         self.flush(&mut batch);
+                        next_flush = Instant::now() + self.config.flush_interval;
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => self.flush(&mut batch),
+                Err(RecvTimeoutError::Timeout) => {
+                    self.flush(&mut batch);
+                    next_flush = Instant::now() + self.config.flush_interval;
+                }
                 Err(RecvTimeoutError::Disconnected) => {
                     self.flush(&mut batch);
                     break;

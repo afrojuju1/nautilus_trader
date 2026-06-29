@@ -169,10 +169,7 @@ impl EarningsEntryPolicy {
                 self.allow_non_common_symbols || is_common_listed_equity_symbol(&event.underlying)
             })
             .filter(|event| {
-                let days_before = event
-                    .report_date
-                    .signed_duration_since(trade_date)
-                    .num_days();
+                let days_before = days_to_report(event, trade_date);
                 self.min_days_before_report <= days_before
                     && days_before <= self.max_days_before_report
             })
@@ -187,6 +184,25 @@ pub fn production_quality_events(
     trade_date: NaiveDate,
 ) -> Vec<&EarningsEvent> {
     EarningsEntryPolicy::default().eligible_events(events, trade_date)
+}
+
+/// Returns the calendar-day distance from `trade_date` to an earnings report.
+#[must_use]
+pub fn days_to_report(event: &EarningsEvent, trade_date: NaiveDate) -> i64 {
+    event
+        .report_date
+        .signed_duration_since(trade_date)
+        .num_days()
+}
+
+/// Returns whether an earnings report falls inside the configured event-shock window.
+#[must_use]
+pub const fn is_inside_event_shock_window(
+    days_to_report: i64,
+    block_days_before_earnings: i64,
+    block_days_after_earnings: i64,
+) -> bool {
+    -block_days_after_earnings <= days_to_report && days_to_report <= block_days_before_earnings
 }
 
 /// Loads earnings events from a simple CSV file.

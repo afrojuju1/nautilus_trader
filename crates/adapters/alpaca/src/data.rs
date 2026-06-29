@@ -63,9 +63,8 @@ use crate::{
     http::{
         client::AlpacaHttpClient,
         models::{
-            AlpacaOptionBar, AlpacaOptionContract, AlpacaOptionQuote, AlpacaOptionSnapshot,
-            AlpacaOptionType, AlpacaStockBar, OptionBarsRequest, OptionSnapshotsRequest,
-            StockBarsRequest, StockSnapshotsRequest,
+            AlpacaOptionContract, AlpacaOptionQuote, AlpacaOptionSnapshot, AlpacaOptionType,
+            OptionBarsRequest, OptionSnapshotsRequest, StockBarsRequest, StockSnapshotsRequest,
         },
     },
     parse::{
@@ -1698,31 +1697,23 @@ async fn request_option_bars_from_http(
         .option_bars(&request)
         .await
         .context("failed to request Alpaca option bars")?;
-    let source_bars = response
-        .bars
-        .get(&symbol)
-        .or_else(|| {
-            response
-                .bars
-                .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(&symbol))
-                .map(|(_, bars)| bars)
-        })
-        .cloned()
-        .unwrap_or_default();
-
-    let mut bars = source_bars
+    let bars = bars_for_symbol(&response.bars, &symbol)
         .iter()
-        .filter_map(|bar| option_bar(bar_type, &instrument, bar, clock))
+        .filter_map(|bar| {
+            alpaca_historical_bar(
+                bar_type,
+                &instrument,
+                bar.timestamp.as_deref(),
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.volume,
+                clock,
+            )
+        })
         .collect::<Vec<_>>();
-    bars.sort_by_key(|bar| bar.ts_event);
-    if let Some(limit) = limit
-        && bars.len() > limit
-    {
-        bars.truncate(limit);
-    }
-
-    Ok(bars)
+    Ok(sort_and_limit_bars(bars, limit))
 }
 
 async fn request_stock_bars_from_http(
@@ -1779,31 +1770,23 @@ async fn request_stock_bars_from_http(
         .stock_bars(&request)
         .await
         .context("failed to request Alpaca stock bars")?;
-    let source_bars = response
-        .bars
-        .get(&symbol)
-        .or_else(|| {
-            response
-                .bars
-                .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(&symbol))
-                .map(|(_, bars)| bars)
-        })
-        .cloned()
-        .unwrap_or_default();
-
-    let mut bars = source_bars
+    let bars = bars_for_symbol(&response.bars, &symbol)
         .iter()
-        .filter_map(|bar| stock_bar(bar_type, &instrument, bar, clock))
+        .filter_map(|bar| {
+            alpaca_historical_bar(
+                bar_type,
+                &instrument,
+                bar.timestamp.as_deref(),
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.volume,
+                clock,
+            )
+        })
         .collect::<Vec<_>>();
-    bars.sort_by_key(|bar| bar.ts_event);
-    if let Some(limit) = limit
-        && bars.len() > limit
-    {
-        bars.truncate(limit);
-    }
-
-    Ok(bars)
+    Ok(sort_and_limit_bars(bars, limit))
 }
 
 fn alpaca_bar_timeframe(bar_type: BarType, instrument_kind: &str) -> anyhow::Result<String> {
@@ -1819,38 +1802,47 @@ fn alpaca_bar_timeframe(bar_type: BarType, instrument_kind: &str) -> anyhow::Res
     }
 }
 
-fn option_bar(
+fn alpaca_historical_bar(
     bar_type: BarType,
     instrument: &InstrumentAny,
-    bar: &AlpacaOptionBar,
+    timestamp: Option<&str>,
+    open: Option<f64>,
+    high: Option<f64>,
+    low: Option<f64>,
+    close: Option<f64>,
+    volume: Option<u64>,
     clock: &'static AtomicTime,
 ) -> Option<Bar> {
-    let ts_event = bar.timestamp.as_deref().and_then(parse_rfc3339_timestamp)?;
+    let ts_event = timestamp.and_then(parse_rfc3339_timestamp)?;
     let ts_init = clock.get_time_ns();
-    let open = instrument.try_make_price(bar.open?).ok()?;
-    let high = instrument.try_make_price(bar.high?).ok()?;
-    let low = instrument.try_make_price(bar.low?).ok()?;
-    let close = instrument.try_make_price(bar.close?).ok()?;
-    let volume = instrument.try_make_qty(bar.volume? as f64, None).ok()?;
+    let open = instrument.try_make_price(open?).ok()?;
+    let high = instrument.try_make_price(high?).ok()?;
+    let low = instrument.try_make_price(low?).ok()?;
+    let close = instrument.try_make_price(close?).ok()?;
+    let volume = instrument.try_make_qty(volume? as f64, None).ok()?;
 
     Bar::new_checked(bar_type, open, high, low, close, volume, ts_event, ts_init).ok()
 }
 
-fn stock_bar(
-    bar_type: BarType,
-    instrument: &InstrumentAny,
-    bar: &AlpacaStockBar,
-    clock: &'static AtomicTime,
-) -> Option<Bar> {
-    let ts_event = bar.timestamp.as_deref().and_then(parse_rfc3339_timestamp)?;
-    let ts_init = clock.get_time_ns();
-    let open = instrument.try_make_price(bar.open?).ok()?;
-    let high = instrument.try_make_price(bar.high?).ok()?;
-    let low = instrument.try_make_price(bar.low?).ok()?;
-    let close = instrument.try_make_price(bar.close?).ok()?;
-    let volume = instrument.try_make_qty(bar.volume? as f64, None).ok()?;
+fn bars_for_symbol<T: Clone>(bars: &BTreeMap<String, Vec<T>>, symbol: &str) -> Vec<T> {
+    bars.get(symbol)
+        .or_else(|| {
+            bars.iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(symbol))
+                .map(|(_, bars)| bars)
+        })
+        .cloned()
+        .unwrap_or_default()
+}
 
-    Bar::new_checked(bar_type, open, high, low, close, volume, ts_event, ts_init).ok()
+fn sort_and_limit_bars(mut bars: Vec<Bar>, limit: Option<usize>) -> Vec<Bar> {
+    bars.sort_by_key(|bar| bar.ts_event);
+    if let Some(limit) = limit
+        && bars.len() > limit
+    {
+        bars.truncate(limit);
+    }
+    bars
 }
 
 fn stock_bar_instrument(

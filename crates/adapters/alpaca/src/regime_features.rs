@@ -10,7 +10,10 @@ use nautilus_model::data::{
 };
 use serde_json::{Value, json};
 
-use crate::{earnings::EarningsEvent, options_entry::SelectedOptionsEntry};
+use crate::{
+    earnings::{EarningsEvent, days_to_report, is_inside_event_shock_window},
+    options_entry::SelectedOptionsEntry,
+};
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
@@ -929,20 +932,20 @@ fn event_load_features(
 
     for event in events.iter().filter(|event| event.underlying == underlying) {
         underlying_event_count += 1;
-        let days_to_report = event
-            .report_date
-            .signed_duration_since(trade_date)
-            .num_days();
-        nearest_days_to_report = Some(nearest_days_to_report.map_or(days_to_report, |nearest| {
-            if days_to_report.abs() < nearest.abs() {
-                days_to_report
-            } else {
-                nearest
-            }
-        }));
-        if -block_days_after_earnings <= days_to_report
-            && days_to_report <= block_days_before_earnings
-        {
+        let days_until_report = days_to_report(event, trade_date);
+        nearest_days_to_report =
+            Some(nearest_days_to_report.map_or(days_until_report, |nearest| {
+                if days_until_report.abs() < nearest.abs() {
+                    days_until_report
+                } else {
+                    nearest
+                }
+            }));
+        if is_inside_event_shock_window(
+            days_until_report,
+            block_days_before_earnings,
+            block_days_after_earnings,
+        ) {
             active_event_count += 1;
         }
     }

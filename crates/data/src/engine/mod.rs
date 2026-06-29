@@ -3858,6 +3858,11 @@ impl DataEngine {
     }
 
     fn handle_quotes(&self, quotes: &[QuoteTick]) {
+        #[cfg(feature = "warehouse-clickhouse")]
+        if let Some(writer) = &self.live_market_data_writer {
+            writer.write_quotes(quotes);
+        }
+
         if let Err(e) = self.cache.as_ref().borrow_mut().add_quotes(quotes) {
             log_error_on_cache_insert(&e);
         }

@@ -6,7 +6,7 @@ use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 
 use crate::{
-    earnings::EarningsEvent,
+    earnings::{EarningsEvent, days_to_report, is_inside_event_shock_window},
     options_runtime::{
         AlpacaOptionsRuntimeConfig, SelectedOptionsEntry, active_sector_count,
         active_underlying_count,
@@ -565,24 +565,24 @@ fn event_shock_block(
         .iter()
         .filter(|event| event.underlying == underlying)
         .find_map(|event| {
-            let days_to_report = event
-                .report_date
-                .signed_duration_since(trade_date)
-                .num_days();
-            (-config.event_shock_block_days_after_earnings <= days_to_report
-                && days_to_report <= config.event_shock_block_days_before_earnings)
-                .then(|| SubmissionBlock {
-                    reason: "event_shock_earnings".to_string(),
-                    current: None,
-                    limit: None,
-                    details: vec![
-                        format!("underlying={}", event.underlying),
-                        format!("report_date={}", event.report_date),
-                        format!("timing={}", event.timing.as_str()),
-                        format!("source={}", event.source),
-                        format!("days_to_report={days_to_report}"),
-                    ],
-                })
+            let days_until_report = days_to_report(event, trade_date);
+            is_inside_event_shock_window(
+                days_until_report,
+                config.event_shock_block_days_before_earnings,
+                config.event_shock_block_days_after_earnings,
+            )
+            .then(|| SubmissionBlock {
+                reason: "event_shock_earnings".to_string(),
+                current: None,
+                limit: None,
+                details: vec![
+                    format!("underlying={}", event.underlying),
+                    format!("report_date={}", event.report_date),
+                    format!("timing={}", event.timing.as_str()),
+                    format!("source={}", event.source),
+                    format!("days_to_report={days_until_report}"),
+                ],
+            })
         })
 }
 
