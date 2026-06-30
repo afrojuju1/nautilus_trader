@@ -289,7 +289,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 impl OperatorConfig {
     async fn from_env() -> anyhow::Result<Self> {
         let strategy_config =
-            AlpacaOptionsRuntimeConfig::from_runtime_env_with_operational_store().await?;
+            AlpacaOptionsRuntimeConfig::from_runtime_env_with_read_only_operational_store().await?;
         let account_defaults = strategy_config.fleet.as_ref().and_then(|fleet| {
             fleet
                 .current_account()
@@ -417,7 +417,7 @@ impl OperatorConfig {
 
     async fn options_state(&self) -> anyhow::Result<StrategyState> {
         let strategy_config =
-            AlpacaOptionsRuntimeConfig::from_runtime_env_with_operational_store().await?;
+            AlpacaOptionsRuntimeConfig::from_runtime_env_with_read_only_operational_store().await?;
         strategy_config.load_strategy_state().await
     }
 }

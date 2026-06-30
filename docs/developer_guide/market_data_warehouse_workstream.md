@@ -303,8 +303,9 @@ Common fields:
 | `ingest_run_id` | Backfill or live sink run identifier for lineage. |
 
 Operator validation over ClickHouse must be range-bounded. `validate-quotes` should include
-`--start-ns` and `--end-ns` so queries can prune by the `event_date` partition instead of scanning
-the full quote table. Use ingest-run-specific smoke commands for tiny write/read checks.
+`--start-ns` and `--end-ns`, interpreted as `ts_init` bounds, so the warehouse comparison matches
+the catalog query semantics even when venue event timestamps lag ingestion time. Use
+ingest-run-specific smoke commands for tiny write/read checks.
 
 Initial ClickHouse table sketches:
 

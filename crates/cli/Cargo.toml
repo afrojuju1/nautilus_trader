@@ -18,8 +18,14 @@ workspace = true
 
 [features]
 default = []
-alpaca = ["dep:nautilus-alpaca", "nautilus-alpaca/live"]
+alpaca = [
+  "dep:nautilus-alpaca",
+  "high-precision",
+  "nautilus-alpaca/high-precision",
+  "nautilus-alpaca/live",
+]
 defi = ["dep:nautilus-blockchain", "nautilus-model/defi"]
+high-precision = ["nautilus-model/high-precision", "nautilus-persistence/high-precision"]
 
 [package.metadata.docs.rs]
 all-features = true

@@ -19,8 +19,6 @@ use anyhow::Context;
     feature = "clickhouse-migrations"
 ))]
 use anyhow::anyhow;
-#[cfg(feature = "clickhouse-read")]
-use chrono::{DateTime, Utc};
 use clickhouse::{Client, Row};
 use nautilus_core::UnixNanos;
 #[cfg(feature = "clickhouse-catalog")]
@@ -513,15 +511,12 @@ pub async fn read_quote_tick_rows(
 ) -> anyhow::Result<Vec<ClickHouseQuoteTickRow>> {
     ensure_bounded_quote_tick_range(start, end)?;
 
-    let start_event_date = start.map(unix_nanos_utc_date).transpose()?;
-    let end_event_date = end.map(unix_nanos_utc_date).transpose()?;
-
     let mut sql = format!("SELECT ?fields FROM {QUOTE_TICKS_QUALIFIED_TABLE} WHERE source = ?");
     if start.is_some() {
-        sql.push_str(" AND event_date >= toDate(?) AND ts_init >= ?");
+        sql.push_str(" AND ts_init >= ?");
     }
     if end.is_some() {
-        sql.push_str(" AND event_date <= toDate(?) AND ts_init <= ?");
+        sql.push_str(" AND ts_init <= ?");
     }
     if !instrument_ids.is_empty() {
         sql.push_str(" AND instrument_id IN ?");
@@ -529,12 +524,10 @@ pub async fn read_quote_tick_rows(
     sql.push_str(" ORDER BY instrument_id, ts_init, ts_event, ingest_run_id");
 
     let mut query = client.query(&sql).bind(source);
-    if let (Some(event_date), Some(start)) = (start_event_date, start) {
-        query = query.bind(event_date);
+    if let Some(start) = start {
         query = query.bind(start.as_u64());
     }
-    if let (Some(event_date), Some(end)) = (end_event_date, end) {
-        query = query.bind(event_date);
+    if let Some(end) = end {
         query = query.bind(end.as_u64());
     }
     if !instrument_ids.is_empty() {
@@ -555,18 +548,6 @@ fn ensure_bounded_quote_tick_range(
         ));
     }
     Ok(())
-}
-
-#[cfg(feature = "clickhouse-read")]
-fn unix_nanos_utc_date(value: UnixNanos) -> anyhow::Result<String> {
-    let value = value.as_u64();
-    let secs = value / 1_000_000_000;
-    let nanos = (value % 1_000_000_000) as u32;
-    let secs = i64::try_from(secs)
-        .map_err(|err| anyhow!("Unix nanosecond timestamp is outside i64 range: {err}"))?;
-    let datetime = DateTime::<Utc>::from_timestamp(secs, nanos)
-        .ok_or_else(|| anyhow!("Unix nanosecond timestamp is outside UTC datetime range"))?;
-    Ok(datetime.date_naive().format("%Y-%m-%d").to_string())
 }
 
 /// Reads `QuoteTick` data from the configured market-data source.

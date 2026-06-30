@@ -57,6 +57,12 @@ pub use nautilus_trading::options::entries::{
     SelectedNakedOptionEntry, SelectedOptionsEntry,
 };
 
+#[derive(Clone, Copy)]
+enum OperationalStoreConnectionMode {
+    ApplyMigrations,
+    ReadOnly,
+}
+
 mod candidate_ledger;
 mod config;
 
@@ -286,13 +292,43 @@ impl AlpacaOptionsRuntimeConfig {
         Ok(config)
     }
 
+    /// Builds config without positional CLI underlyings and read-only Postgres persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when config or operational-store initialization fails.
+    pub async fn from_runtime_env_with_read_only_operational_store() -> anyhow::Result<Self> {
+        let mut config = Self::from_runtime_env()?;
+        config
+            .connect_operational_store_from_env_with_mode(OperationalStoreConnectionMode::ReadOnly)
+            .await?;
+        Ok(config)
+    }
+
     async fn connect_operational_store_from_env(&mut self) -> anyhow::Result<()> {
+        self.connect_operational_store_from_env_with_mode(
+            OperationalStoreConnectionMode::ApplyMigrations,
+        )
+        .await
+    }
+
+    async fn connect_operational_store_from_env_with_mode(
+        &mut self,
+        mode: OperationalStoreConnectionMode,
+    ) -> anyhow::Result<()> {
         let database_url = env::var("NAUTILUS_OPERATIONAL_DATABASE_URL")
             .map_err(|_| anyhow::anyhow!("NAUTILUS_OPERATIONAL_DATABASE_URL is required"))?;
         let schema = env::var("NAUTILUS_OPERATIONAL_SCHEMA")
             .unwrap_or_else(|_| operational::OPERATIONAL_SCHEMA_DEFAULT.to_string());
-        let repository =
-            Arc::new(OperationalRepository::connect_with_schema(&database_url, &schema).await?);
+        let repository = match mode {
+            OperationalStoreConnectionMode::ApplyMigrations => {
+                OperationalRepository::connect_with_schema(&database_url, &schema).await?
+            }
+            OperationalStoreConnectionMode::ReadOnly => {
+                OperationalRepository::connect_read_only_with_schema(&database_url, &schema).await?
+            }
+        };
+        let repository = Arc::new(repository);
         self.operational_database_url = Some(database_url);
         self.operational_schema = schema;
         self.operational_repository = Some(repository);
