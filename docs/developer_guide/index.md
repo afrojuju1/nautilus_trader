@@ -26,6 +26,7 @@ This approach combines Python's simplicity and ecosystem with Rust's performance
 - [Alpaca Production Complete Plan](alpaca_production_complete_plan.md)
 - [Alpaca TradingNode Gap Plan](alpaca_trading_node_gap_plan.md)
 - [Alpaca Options TradingNode Migration](alpaca_options_trading_node_migration.md)
+- [Alpaca Options Account-Strategy Architecture](alpaca_options_account_strategy_architecture.md)
 - [Nautilus-Native Candidate Scanning](nautilus_native_candidate_scanning.md)
 - [Alpaca Regime Router](alpaca_regime_router.md)
 - [Alpaca Historical Option Replay](alpaca_historical_replay.md)
