@@ -80,6 +80,8 @@ pub mod runtime;
 #[cfg(feature = "live")]
 pub mod runtime_env;
 #[cfg(feature = "live")]
+pub mod spread_plan;
+#[cfg(feature = "live")]
 pub mod state_persistence;
 #[cfg(feature = "live")]
 pub mod state_reconciliation;

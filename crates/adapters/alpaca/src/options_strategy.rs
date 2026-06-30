@@ -10,7 +10,10 @@ use std::{
 
 use chrono::{DateTime, NaiveDate, Utc};
 use nautilus_common::{
-    actor::DataActor, cache::CacheApi, factories::OrderFactory, timer::TimeEvent,
+    actor::{DataActor, DataActorNative},
+    cache::CacheApi,
+    factories::OrderFactory,
+    timer::TimeEvent,
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_infrastructure::sql::operational::StrategyStateMutation;
@@ -53,6 +56,7 @@ use crate::{
         SelectedOptionsEntry,
     },
     runtime::{StrategyState, StrategyStateEntry, StrategyStateEntryDraft, emit_operator_event},
+    spread_plan::{OptionSpreadPlan, selected_entry_spread_plan, spread_quote_subscription_params},
     state_persistence::StrategyStatePersistenceHandle,
     strategy_state_entry::selected_entry_state_entry_draft,
 };
@@ -274,6 +278,7 @@ pub struct AlpacaOptionsStrategy {
     recorded_candidate_alert_keys: BTreeSet<String>,
     active_risk_quote_subscriptions: BTreeSet<InstrumentId>,
     candidate_quote_instrument_ids: BTreeSet<InstrumentId>,
+    candidate_spread_instrument_ids: BTreeSet<InstrumentId>,
 }
 
 impl AlpacaOptionsStrategy {
@@ -292,6 +297,7 @@ impl AlpacaOptionsStrategy {
             recorded_candidate_alert_keys: BTreeSet::new(),
             active_risk_quote_subscriptions: BTreeSet::new(),
             candidate_quote_instrument_ids: BTreeSet::new(),
+            candidate_spread_instrument_ids: BTreeSet::new(),
         }
     }
 
@@ -314,6 +320,7 @@ impl AlpacaOptionsStrategy {
             return Ok(None);
         };
         let regime_context = data.regime_context.as_ref();
+        self.emit_selected_spread_quote_snapshot(&data.candidates.trade_date, &entry);
 
         match entry_gate_decision(&self.config.admission, Utc::now()) {
             EntryGateDecision::Continue => {}
@@ -1144,10 +1151,11 @@ impl AlpacaOptionsStrategy {
     }
 
     fn update_candidate_quote_subscriptions(&mut self, candidates: &OptionsCandidateSet) {
-        self.candidate_quote_instrument_ids = candidate_quote_instrument_ids(
-            candidates,
-            self.config.management.active_risk_candidate_quote_limit,
-        );
+        let candidate_limit = self.config.management.active_risk_candidate_quote_limit;
+        self.candidate_quote_instrument_ids =
+            candidate_quote_instrument_ids(candidates, candidate_limit);
+        self.candidate_spread_instrument_ids =
+            self.register_candidate_spread_instruments(candidates, candidate_limit);
         self.refresh_active_risk_quote_subscriptions();
     }
 
@@ -1168,6 +1176,7 @@ impl AlpacaOptionsStrategy {
                 }
             })
             .chain(self.candidate_quote_instrument_ids.iter().copied())
+            .chain(self.candidate_spread_instrument_ids.iter().copied())
             .collect::<BTreeSet<_>>();
 
         for instrument_id in desired
@@ -1175,7 +1184,11 @@ impl AlpacaOptionsStrategy {
             .copied()
             .collect::<Vec<_>>()
         {
-            self.subscribe_quotes(instrument_id, self.config.client_id, None);
+            self.subscribe_quotes(
+                instrument_id,
+                self.config.client_id,
+                self.quote_subscription_params(instrument_id),
+            );
         }
         for instrument_id in self
             .active_risk_quote_subscriptions
@@ -1191,14 +1204,133 @@ impl AlpacaOptionsStrategy {
                 json!({
                     "active_entry_quote_symbols": active_entry_quote_symbols(&self.state),
                     "candidate_quote_symbols_count": self.candidate_quote_instrument_ids.len(),
+                    "candidate_spread_symbols_count": self.candidate_spread_instrument_ids.len(),
                     "candidate_quote_limit": self.config.management.active_risk_candidate_quote_limit,
                     "candidate_quote_symbols": instrument_symbols(&self.candidate_quote_instrument_ids),
+                    "candidate_spread_symbols": instrument_symbols(&self.candidate_spread_instrument_ids),
                     "subscribed_symbols": instrument_symbols(&desired),
                     "subscribed_count": desired.len(),
                 }),
             );
         }
         self.active_risk_quote_subscriptions = desired;
+    }
+
+    fn quote_subscription_params(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Option<nautilus_core::Params> {
+        self.candidate_spread_instrument_ids
+            .contains(&instrument_id)
+            .then(spread_quote_subscription_params)
+    }
+
+    fn register_candidate_spread_instruments(
+        &mut self,
+        candidates: &OptionsCandidateSet,
+        limit: usize,
+    ) -> BTreeSet<InstrumentId> {
+        if limit == 0 {
+            return BTreeSet::new();
+        }
+
+        let ts_init = self.clock().timestamp_ns();
+        let plans = candidates
+            .ranked_entries()
+            .iter()
+            .take(limit)
+            .filter_map(|entry| match selected_entry_spread_plan(entry, ts_init) {
+                Ok(Some(plan)) => Some(plan),
+                Ok(None) => None,
+                Err(error) => {
+                    log::warn!(
+                        "Failed to build Nautilus spread plan: underlying={} strategy={} symbols={} error={error:#}",
+                        entry.underlying(),
+                        entry.strategy_name(),
+                        entry.option_symbols().join(","),
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if plans.is_empty() {
+            return BTreeSet::new();
+        }
+
+        let cache_rc = DataActorNative::cache_rc(self);
+        let mut cache = cache_rc.borrow_mut();
+        let mut instrument_ids = BTreeSet::new();
+        for plan in plans {
+            if cache.instrument(&plan.instrument_id).is_none()
+                && let Err(error) = cache.add_instrument(plan.instrument.clone())
+            {
+                log::error!(
+                    "Failed to cache Nautilus spread instrument {}: {error:#}",
+                    plan.instrument_id
+                );
+                continue;
+            }
+            instrument_ids.insert(plan.instrument_id);
+        }
+
+        instrument_ids
+    }
+
+    fn emit_selected_spread_quote_snapshot(&self, trade_date: &str, entry: &SelectedOptionsEntry) {
+        let plan = match selected_entry_spread_plan(entry, UnixNanos::default()) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return,
+            Err(error) => {
+                emit_operator_event(
+                    "candidate_spread_quote",
+                    json!({
+                        "action": "unavailable",
+                        "reason": "spread_plan_error",
+                        "trade_date": trade_date,
+                        "underlying": entry.underlying(),
+                        "strategy": entry.strategy_name(),
+                        "symbols": entry.option_symbols(),
+                        "error": error.to_string(),
+                    }),
+                );
+                return;
+            }
+        };
+
+        let cache = self.cache();
+        let quote = cache.quote(&plan.instrument_id);
+        let mut payload = spread_quote_snapshot_payload(trade_date, entry, &plan);
+        match quote {
+            Some(quote) => {
+                let mid = f64::midpoint(quote.bid_price.as_f64(), quote.ask_price.as_f64());
+                insert_value_field(&mut payload, "action", json!("observed"));
+                insert_value_field(
+                    &mut payload,
+                    "pricing_source",
+                    json!("nautilus_spread_quote"),
+                );
+                insert_value_field(&mut payload, "spread_bid", json!(quote.bid_price.as_f64()));
+                insert_value_field(&mut payload, "spread_ask", json!(quote.ask_price.as_f64()));
+                insert_value_field(&mut payload, "spread_mid", json!(mid));
+                insert_value_field(
+                    &mut payload,
+                    "scanner_vs_spread_mid",
+                    json!(plan.scanner_premium - mid.abs()),
+                );
+                insert_value_field(
+                    &mut payload,
+                    "quote_ts_event",
+                    json!(quote.ts_event.as_u64()),
+                );
+                insert_value_field(&mut payload, "quote_ts_init", json!(quote.ts_init.as_u64()));
+            }
+            None => {
+                insert_value_field(&mut payload, "action", json!("unavailable"));
+                insert_value_field(&mut payload, "reason", json!("spread_quote_missing"));
+                insert_value_field(&mut payload, "pricing_source", json!("scanner_snapshot"));
+            }
+        }
+        emit_operator_event("candidate_spread_quote", payload);
     }
 
     fn state_entry(&self, order_list_id: &str) -> Option<&StrategyStateEntry> {
@@ -2062,6 +2194,7 @@ impl DataActor for AlpacaOptionsStrategy {
         }
         self.active_risk_quote_subscriptions.clear();
         self.candidate_quote_instrument_ids.clear();
+        self.candidate_spread_instrument_ids.clear();
         Ok(())
     }
 
@@ -2201,6 +2334,35 @@ fn candidate_quote_instrument_ids(
         .flat_map(SelectedOptionsEntry::option_symbols)
         .filter_map(|symbol| alpaca_instrument_id(symbol).ok())
         .collect()
+}
+
+fn spread_quote_snapshot_payload(
+    trade_date: &str,
+    entry: &SelectedOptionsEntry,
+    plan: &OptionSpreadPlan,
+) -> Value {
+    json!({
+        "trade_date": trade_date,
+        "underlying": plan.underlying.as_str(),
+        "strategy": plan.strategy.as_str(),
+        "symbols": entry.option_symbols(),
+        "spread_instrument_id": plan.instrument_id.to_string(),
+        "spread_symbol": plan.raw_symbol.to_string(),
+        "legs": plan
+            .legs
+            .iter()
+            .map(|leg| {
+                json!({
+                    "symbol": leg.symbol.as_str(),
+                    "instrument_id": leg.instrument_id.to_string(),
+                    "ratio": leg.ratio,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "scanner_premium_kind": plan.scanner_premium_kind.as_str(),
+        "scanner_premium": plan.scanner_premium,
+        "vega_pricing_enabled": false,
+    })
 }
 
 fn active_entry_quote_symbols(state: &StrategyState) -> Vec<String> {

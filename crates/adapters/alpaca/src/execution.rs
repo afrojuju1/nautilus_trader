@@ -79,10 +79,12 @@ use crate::{
     config::AlpacaExecClientConfig,
     http::models::{AlpacaActivity, ListActivitiesRequest, ListOrdersRequest, ReplaceOrderRequest},
     orders::{
-        EquityOrderPayload, SimpleOrderPayload, build_mleg_order_plan, order_side_from_nautilus,
-        position_intent_from_order_side, positive_integer_quantity,
+        EquityOrderPayload, MlegOrderLeg, MlegOrderPayload, SimpleOrderPayload,
+        build_mleg_order_plan, order_side_from_nautilus, position_intent_from_order_side,
+        positive_integer_quantity,
     },
     runtime::emit_operator_event,
+    spread_plan::option_spread_legs_from_instrument_id,
     websocket::{
         client::AlpacaTradeUpdatesWebSocketClient,
         messages::{AlpacaTradeUpdate, AlpacaTradeUpdateLeg, AlpacaWsMessage},
@@ -1417,6 +1419,9 @@ impl ExecutionClient for AlpacaExecutionClient {
                 AlpacaSimplePayload::Option(payload) => {
                     http_client.submit_simple_order(payload).await
                 }
+                AlpacaSimplePayload::OptionSpread(payload) => {
+                    http_client.submit_mleg_order(payload).await
+                }
             };
             match result {
                 Ok(submitted) => {
@@ -1958,6 +1963,7 @@ fn emit_trade_update_reports(
 enum AlpacaSimplePayload {
     Equity(EquityOrderPayload),
     Option(SimpleOrderPayload),
+    OptionSpread(MlegOrderPayload),
 }
 
 #[cfg(feature = "live")]
@@ -1968,6 +1974,7 @@ fn build_simple_payload_from_order(
     match instrument {
         InstrumentAny::Equity(_) => build_equity_payload_from_order(order),
         InstrumentAny::OptionContract(_) => build_option_payload_from_order(order),
+        InstrumentAny::OptionSpread(_) => build_option_spread_payload_from_order(order),
         instrument => anyhow::bail!(
             "Alpaca simple order {} uses unsupported instrument class {:?}",
             order.client_order_id(),
@@ -2012,6 +2019,56 @@ fn build_option_payload_from_order(order: &OrderAny) -> anyhow::Result<AlpacaSim
 }
 
 #[cfg(feature = "live")]
+fn build_option_spread_payload_from_order(order: &OrderAny) -> anyhow::Result<AlpacaSimplePayload> {
+    validate_simple_option_spread_order(order)?;
+    let quantity = positive_integer_quantity(
+        order.quantity(),
+        format!("Alpaca option spread order {}", order.client_order_id()),
+    )?;
+    let signed_limit_price = order
+        .price()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Alpaca option spread order {} missing limit price",
+                order.client_order_id()
+            )
+        })?
+        .as_f64();
+    if signed_limit_price == 0.0 {
+        anyhow::bail!(
+            "Alpaca option spread order {} signed price must be non-zero",
+            order.client_order_id()
+        );
+    }
+
+    let legs = option_spread_legs_from_instrument_id(order.instrument_id())?
+        .into_iter()
+        .map(|leg| {
+            parse_alpaca_option_symbol(&leg.symbol).map_err(|e| {
+                anyhow::anyhow!(
+                    "Alpaca option spread order {} has invalid leg symbol {}: {e}",
+                    order.client_order_id(),
+                    leg.symbol
+                )
+            })?;
+            let side = option_spread_leg_order_side(order.order_side(), leg.ratio)?;
+            let position_intent = position_intent_from_order_side(side, order.is_reduce_only())?;
+            Ok(MlegOrderLeg::new(
+                leg.symbol,
+                position_intent.side(),
+                position_intent,
+                leg.ratio.abs().to_string(),
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    MlegOrderPayload::new_limit(quantity, signed_limit_price, legs)
+        .and_then(|payload| payload.with_client_order_id(order.client_order_id().to_string()))
+        .map(AlpacaSimplePayload::OptionSpread)
+        .map_err(|e| anyhow::anyhow!("invalid Alpaca option spread payload: {e}"))
+}
+
+#[cfg(feature = "live")]
 fn build_equity_payload_from_order(order: &OrderAny) -> anyhow::Result<AlpacaSimplePayload> {
     validate_simple_equity_order(order)?;
     let quantity = positive_integer_quantity(
@@ -2038,6 +2095,15 @@ fn build_equity_payload_from_order(order: &OrderAny) -> anyhow::Result<AlpacaSim
         .and_then(|payload| payload.with_client_order_id(order.client_order_id().to_string()))
         .map(AlpacaSimplePayload::Equity)
         .map_err(|e| anyhow::anyhow!("invalid Alpaca simple payload: {e}"))
+}
+
+#[cfg(feature = "live")]
+fn option_spread_leg_order_side(spread_side: OrderSide, ratio: i64) -> anyhow::Result<OrderSide> {
+    match (spread_side, ratio.is_positive()) {
+        (OrderSide::Buy, true) | (OrderSide::Sell, false) => Ok(OrderSide::Buy),
+        (OrderSide::Buy, false) | (OrderSide::Sell, true) => Ok(OrderSide::Sell),
+        (OrderSide::NoOrderSide, _) => anyhow::bail!("Alpaca option spread order missing side"),
+    }
 }
 
 #[cfg(feature = "live")]
@@ -2110,6 +2176,44 @@ fn validate_simple_option_order(order: &OrderAny) -> anyhow::Result<()> {
     if matches!(order.order_side(), OrderSide::NoOrderSide) {
         anyhow::bail!(
             "Alpaca simple order {} missing order side",
+            order.client_order_id()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "live")]
+fn validate_simple_option_spread_order(order: &OrderAny) -> anyhow::Result<()> {
+    if order.instrument_id().venue != Venue::new(ALPACA_VENUE) {
+        anyhow::bail!(
+            "Alpaca option spread order {} has non-Alpaca instrument {}",
+            order.client_order_id(),
+            order.instrument_id()
+        );
+    }
+    if order.order_type() != OrderType::Limit {
+        anyhow::bail!(
+            "Alpaca option spread order {} must be a limit order, was {:?}",
+            order.client_order_id(),
+            order.order_type()
+        );
+    }
+    if order.time_in_force() != TimeInForce::Day {
+        anyhow::bail!(
+            "Alpaca option spread order {} must use DAY time in force, was {:?}",
+            order.client_order_id(),
+            order.time_in_force()
+        );
+    }
+    if order.is_quote_quantity() {
+        anyhow::bail!(
+            "Alpaca option spread order {} cannot use quote quantity",
+            order.client_order_id()
+        );
+    }
+    if matches!(order.order_side(), OrderSide::NoOrderSide) {
+        anyhow::bail!(
+            "Alpaca option spread order {} missing order side",
             order.client_order_id()
         );
     }
