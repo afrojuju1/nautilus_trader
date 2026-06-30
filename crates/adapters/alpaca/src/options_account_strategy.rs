@@ -2533,6 +2533,16 @@ nautilus_strategy!(AlpacaOptionsAccountStrategy, {
             "entry_denied",
         );
     }
+
+    fn on_order_filled(&mut self, event: &OrderFilled) {
+        self.handle_close_order_filled(event);
+    }
+
+    fn on_order_canceled(&mut self, event: &OrderCanceled) {
+        if !self.handle_close_order_canceled(event) {
+            self.handle_entry_order_canceled(event);
+        }
+    }
 });
 
 impl DataActor for AlpacaOptionsAccountStrategy {
@@ -2583,18 +2593,6 @@ impl DataActor for AlpacaOptionsAccountStrategy {
             return Ok(());
         };
         self.submit_candidate_data(candidates)?;
-        Ok(())
-    }
-
-    fn on_order_filled(&mut self, event: &OrderFilled) -> anyhow::Result<()> {
-        self.handle_close_order_filled(event);
-        Ok(())
-    }
-
-    fn on_order_canceled(&mut self, event: &OrderCanceled) -> anyhow::Result<()> {
-        if !self.handle_close_order_canceled(event) {
-            self.handle_entry_order_canceled(event);
-        }
         Ok(())
     }
 }
