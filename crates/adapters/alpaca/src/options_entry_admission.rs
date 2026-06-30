@@ -865,6 +865,10 @@ mod tests {
             score: 70.0,
             parent_order_id: Some(format!("{underlying}-parent")),
             submitted_at_utc: Some("2026-05-03T14:00:00Z".to_string()),
+            spread_instrument_id: None,
+            spread_raw_symbol: None,
+            spread_legs: Vec::new(),
+            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
         }
     }
 

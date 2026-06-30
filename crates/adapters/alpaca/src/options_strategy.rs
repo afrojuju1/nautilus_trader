@@ -47,7 +47,7 @@ use crate::{
     },
     options_lifecycle::OptionLifecycleRiskHandle,
     options_management::{
-        AlpacaOptionsManagementConfig, CloseQuote, close_attempts_exhausted,
+        AlpacaOptionsManagementConfig, CloseOrderMode, CloseQuote, close_attempts_exhausted,
         close_price_cushion_for_attempt, close_quote_from_ticks, close_reason,
         close_reprice_cooldown_remaining_secs, emit_management_snapshot, management_instrument_ids,
     },
@@ -261,6 +261,7 @@ struct PendingCloseSubmission {
     entry_order_list_id: String,
     close_order_list_id: String,
     close_reason: String,
+    close_order_mode: String,
     order_count: usize,
     accepted: usize,
     rejected: usize,
@@ -850,6 +851,11 @@ impl AlpacaOptionsStrategy {
         }
 
         let close_order_list_id = close_order_list_id(&entry);
+        if self.config.management.close_order_mode == CloseOrderMode::OptionSpread {
+            self.submit_spread_close_entry(entry, trigger, close_order_list_id)?;
+            return Ok(());
+        }
+
         let close_price_cushion = close_price_cushion_for_attempt(&self.config.management, &entry);
         let submit_quote = close_quote.with_price_cushion(close_price_cushion);
         self.submit_close_entry(
@@ -987,6 +993,7 @@ impl AlpacaOptionsStrategy {
             entry.order_list_id.clone(),
             close_order_list_id.clone(),
             close_reason.clone(),
+            CloseOrderMode::LegacyLegOrderList.as_str().to_string(),
             order_count,
             client_order_ids,
         );
@@ -1000,6 +1007,7 @@ impl AlpacaOptionsStrategy {
                 "close_order_list_id": &close_order_list_id,
                 "close_reason": &close_reason,
                 "close_attempt": entry.close_attempts.saturating_add(1),
+                "close_order_mode": CloseOrderMode::LegacyLegOrderList.as_str(),
                 "close_price_cushion": close_price_cushion,
                 "close_reprice_step": self.config.management.close_reprice_step,
                 "max_close_price_cushion": self.config.management.max_close_price_cushion,
@@ -1008,6 +1016,119 @@ impl AlpacaOptionsStrategy {
         );
 
         if let Err(error) = self.submit_close_orders(orders, &close_order_list_id) {
+            self.remove_pending_close_submission(&close_order_list_id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn submit_spread_close_entry(
+        &mut self,
+        entry: StrategyStateEntry,
+        close_reason: String,
+        close_order_list_id: String,
+    ) -> anyhow::Result<()> {
+        let mut draft =
+            match self.vertical_spread_close_order_draft(&entry, &close_order_list_id)? {
+                Some(draft) => draft,
+                None => {
+                    emit_operator_event(
+                        "management_block",
+                        json!({
+                            "action": "close_blocked",
+                            "reason": "spread_close_order_mode_requires_vertical_entry",
+                            "underlying": entry.underlying,
+                            "strategy": entry.strategy,
+                            "order_list_id": entry.order_list_id,
+                            "close_order_list_id": close_order_list_id,
+                            "close_reason": close_reason,
+                            "close_order_mode": CloseOrderMode::OptionSpread.as_str(),
+                            "current_broker_submit_path": "single_option_spread_order",
+                            "fallback_broker_submit_path": "legacy_leg_order_list",
+                            "submitted": false,
+                        }),
+                    );
+                    return Ok(());
+                }
+            };
+        let Some(order) = draft.order.take() else {
+            emit_operator_event(
+                "management_block",
+                json!({
+                    "action": "close_blocked",
+                    "reason": draft
+                        .pricing
+                        .unavailable_reason
+                        .unwrap_or("spread_close_order_unavailable"),
+                    "underlying": entry.underlying,
+                    "strategy": entry.strategy,
+                    "order_list_id": entry.order_list_id,
+                    "close_order_list_id": close_order_list_id,
+                    "close_reason": close_reason,
+                    "close_order_mode": CloseOrderMode::OptionSpread.as_str(),
+                    "spread_instrument_id": draft.plan.instrument_id.to_string(),
+                    "spread_symbol": draft.plan.raw_symbol.to_string(),
+                    "pricing_source": draft.pricing.pricing_source,
+                    "spread_bid": draft.pricing.spread_bid,
+                    "spread_ask": draft.pricing.spread_ask,
+                    "spread_mid": draft.pricing.spread_mid,
+                    "quote_age_secs": draft.pricing.quote_age_secs,
+                    "quote_stale_limit_secs": draft.pricing.quote_stale_limit_secs,
+                    "close_price_cushion": draft.pricing.close_price_cushion,
+                    "submitted": false,
+                }),
+            );
+            return Ok(());
+        };
+        let client_order_id = order.client_order_id().to_string();
+        self.record_pending_close_submission(
+            entry.order_list_id.clone(),
+            close_order_list_id.clone(),
+            close_reason.clone(),
+            CloseOrderMode::OptionSpread.as_str().to_string(),
+            1,
+            vec![client_order_id.clone()],
+        );
+        emit_operator_event(
+            "management_action",
+            json!({
+                "action": "spread_close_submit",
+                "underlying": &entry.underlying,
+                "strategy": &entry.strategy,
+                "order_list_id": &entry.order_list_id,
+                "close_order_list_id": &close_order_list_id,
+                "close_reason": &close_reason,
+                "close_attempt": entry.close_attempts.saturating_add(1),
+                "close_order_mode": CloseOrderMode::OptionSpread.as_str(),
+                "spread_instrument_id": draft.plan.instrument_id.to_string(),
+                "spread_symbol": draft.plan.raw_symbol.to_string(),
+                "legs": draft
+                    .plan
+                    .legs
+                    .iter()
+                    .map(|leg| {
+                        json!({
+                            "symbol": leg.symbol.as_str(),
+                            "instrument_id": leg.instrument_id.to_string(),
+                            "ratio": leg.ratio,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                "client_order_id": client_order_id,
+                "close_side": "sell",
+                "reduce_only": true,
+                "pricing_source": draft.pricing.pricing_source,
+                "signed_close_limit": draft.pricing.signed_limit_price,
+                "close_price_cushion": draft.pricing.close_price_cushion,
+                "spread_bid": draft.pricing.spread_bid,
+                "spread_ask": draft.pricing.spread_ask,
+                "spread_mid": draft.pricing.spread_mid,
+                "quote_age_secs": draft.pricing.quote_age_secs,
+                "quote_stale_limit_secs": draft.pricing.quote_stale_limit_secs,
+            }),
+        );
+
+        if let Err(error) = self.submit_close_orders(vec![order], &close_order_list_id) {
             self.remove_pending_close_submission(&close_order_list_id);
             return Err(error);
         }
@@ -1461,7 +1582,12 @@ impl AlpacaOptionsStrategy {
         match self.vertical_spread_close_order_draft(entry, &close_order_list_id) {
             Ok(Some(draft)) => emit_operator_event(
                 "close_spread_order_draft",
-                vertical_spread_close_order_draft_payload(entry, &close_order_list_id, &draft),
+                vertical_spread_close_order_draft_payload(
+                    entry,
+                    &close_order_list_id,
+                    &draft,
+                    self.config.management.close_order_mode,
+                ),
             ),
             Ok(None) => {}
             Err(error) => emit_operator_event(
@@ -1476,7 +1602,7 @@ impl AlpacaOptionsStrategy {
                     "draft_close_order_list_id": close_order_list_id,
                     "symbols": entry.symbols(),
                     "error": error.to_string(),
-                    "current_broker_submit_path": "legacy_leg_order_list",
+                    "current_broker_submit_path": self.config.management.close_order_mode.as_str(),
                     "draft_broker_submit_path": "single_option_spread_order",
                     "submitted": false,
                 }),
@@ -1498,7 +1624,8 @@ impl AlpacaOptionsStrategy {
         }
 
         self.cache_spread_plan(&plan)?;
-        let pricing = self.spread_close_order_pricing(&plan);
+        let close_price_cushion = close_price_cushion_for_attempt(&self.config.management, entry);
+        let pricing = self.spread_close_order_pricing(&plan, close_price_cushion);
         let order = if let Some(signed_limit_price) = pricing.signed_limit_price {
             let mut order_api = self.order();
             Some(build_vertical_spread_close_order(
@@ -1518,7 +1645,11 @@ impl AlpacaOptionsStrategy {
         }))
     }
 
-    fn spread_close_order_pricing(&self, plan: &OptionSpreadPlan) -> SpreadCloseOrderPricing {
+    fn spread_close_order_pricing(
+        &self,
+        plan: &OptionSpreadPlan,
+        close_price_cushion: f64,
+    ) -> SpreadCloseOrderPricing {
         let cache = self.cache();
         let Some(quote) = cache.quote(&plan.instrument_id) else {
             return SpreadCloseOrderPricing {
@@ -1532,6 +1663,7 @@ impl AlpacaOptionsStrategy {
                 quote_ts_init: None,
                 quote_age_secs: None,
                 quote_stale_limit_secs: Some(self.config.management.active_risk_quote_stale_secs),
+                close_price_cushion,
             };
         };
 
@@ -1551,7 +1683,9 @@ impl AlpacaOptionsStrategy {
 
         SpreadCloseOrderPricing {
             pricing_source: "nautilus_spread_quote",
-            signed_limit_price: unavailable_reason.is_none().then_some(bid),
+            signed_limit_price: unavailable_reason
+                .is_none()
+                .then_some(bid - close_price_cushion),
             unavailable_reason,
             spread_bid: Some(bid),
             spread_ask: Some(ask),
@@ -1560,6 +1694,7 @@ impl AlpacaOptionsStrategy {
             quote_ts_init: Some(quote.ts_init),
             quote_age_secs: quote_age,
             quote_stale_limit_secs: Some(stale_limit),
+            close_price_cushion,
         }
     }
 
@@ -1582,6 +1717,7 @@ impl AlpacaOptionsStrategy {
         entry_order_list_id: String,
         close_order_list_id: String,
         close_reason: String,
+        close_order_mode: String,
         order_count: usize,
         client_order_ids: Vec<String>,
     ) {
@@ -1595,6 +1731,7 @@ impl AlpacaOptionsStrategy {
                 entry_order_list_id,
                 close_order_list_id,
                 close_reason,
+                close_order_mode,
                 order_count,
                 accepted: 0,
                 rejected: 0,
@@ -1630,20 +1767,27 @@ impl AlpacaOptionsStrategy {
                     pending.close_order_list_id.clone(),
                     Some(event.venue_order_id.to_string()),
                     pending.close_reason.clone(),
+                    pending.close_order_mode.clone(),
                 ));
                 pending.recorded = true;
             }
             should_remove = pending.accepted + pending.rejected >= pending.order_count;
         }
 
-        if let Some((entry_order_list_id, close_order_list_id, parent_order_id, close_reason)) =
-            state_update
+        if let Some((
+            entry_order_list_id,
+            close_order_list_id,
+            parent_order_id,
+            close_reason,
+            close_order_mode,
+        )) = state_update
         {
             let mutation = if let Some(entry) = self.state_entry_mut(&entry_order_list_id) {
                 entry.record_close_submission(
                     close_order_list_id.clone(),
                     parent_order_id.clone(),
                     close_reason.clone(),
+                    close_order_mode.clone(),
                 );
                 Some(close_accepted_state_mutation(
                     event,
@@ -1651,6 +1795,7 @@ impl AlpacaOptionsStrategy {
                     &close_order_list_id,
                     parent_order_id.as_deref(),
                     &close_reason,
+                    &close_order_mode,
                 ))
             } else {
                 None
@@ -2623,6 +2768,7 @@ struct SpreadCloseOrderPricing {
     quote_ts_init: Option<UnixNanos>,
     quote_age_secs: Option<u64>,
     quote_stale_limit_secs: Option<u64>,
+    close_price_cushion: f64,
 }
 
 struct VerticalSpreadCloseOrderDraft {
@@ -2699,6 +2845,7 @@ fn vertical_spread_close_order_draft_payload(
     entry: &StrategyStateEntry,
     close_order_list_id: &str,
     draft: &VerticalSpreadCloseOrderDraft,
+    close_order_mode: CloseOrderMode,
 ) -> Value {
     let scanner_signed_entry_price = signed_scanner_spread_price(&draft.plan);
     let action = if draft.order.is_some() {
@@ -2741,12 +2888,13 @@ fn vertical_spread_close_order_draft_payload(
         "order": order,
         "pricing_source": draft.pricing.pricing_source,
         "signed_close_limit": draft.pricing.signed_limit_price,
+        "close_price_cushion": draft.pricing.close_price_cushion,
         "scanner_premium_kind": draft.plan.scanner_premium_kind.as_str(),
         "scanner_premium": draft.plan.scanner_premium,
         "scanner_signed_entry_price": scanner_signed_entry_price,
         "close_side": "sell",
         "reduce_only": true,
-        "current_broker_submit_path": "legacy_leg_order_list",
+        "current_broker_submit_path": close_order_mode.as_str(),
         "draft_broker_submit_path": "single_option_spread_order",
         "submitted": false,
         "vega_pricing_enabled": false,
@@ -3074,14 +3222,16 @@ fn build_vertical_spread_entry_order(
         );
     }
 
-    Ok(orders.option_spread_limit(
+    let mut order = orders.option_spread_limit(
         plan.instrument_id,
         OrderSide::Buy,
         Quantity::new(quantity as f64, 0),
         Price::new(signed_limit_price, 2),
         false,
         labeled_client_order_id(order_list_id, "spread"),
-    ))
+    );
+    order.set_order_list_id(OrderListId::from(order_list_id));
+    Ok(order)
 }
 
 fn build_vertical_spread_close_order(
@@ -3104,14 +3254,16 @@ fn build_vertical_spread_close_order(
         );
     }
 
-    Ok(orders.option_spread_limit(
+    let mut order = orders.option_spread_limit(
         plan.instrument_id,
         OrderSide::Sell,
         Quantity::new(quantity as f64, 0),
         Price::new(signed_limit_price, 2),
         true,
         labeled_client_order_id(order_list_id, "spread-close"),
-    ))
+    );
+    order.set_order_list_id(OrderListId::from(order_list_id));
+    Ok(order)
 }
 
 fn is_vertical_spread_entry(entry: &SelectedOptionsEntry) -> bool {
@@ -3286,6 +3438,7 @@ fn close_accepted_state_mutation(
     close_order_list_id: &str,
     close_parent_order_id: Option<&str>,
     close_reason: &str,
+    close_order_mode: &str,
 ) -> anyhow::Result<StrategyStateMutation> {
     let mut mutation = StrategyStateMutation::new(
         uuid_from_nautilus(event.event_id)?,
@@ -3300,6 +3453,7 @@ fn close_accepted_state_mutation(
             "account_id": event.account_id.to_string(),
             "reconciliation": event.reconciliation,
             "close_reason": close_reason,
+            "close_order_mode": close_order_mode,
             "entry": state_entry_payload(entry),
         }),
     );
@@ -3409,6 +3563,20 @@ fn state_entry_draft_payload(draft: &StrategyStateEntryDraft) -> serde_json::Val
         "score": draft.score,
         "parent_order_id": draft.parent_order_id,
         "submitted_at_utc": draft.submitted_at_utc,
+        "spread_instrument_id": draft.spread_instrument_id,
+        "spread_raw_symbol": draft.spread_raw_symbol,
+        "spread_legs": draft
+            .spread_legs
+            .iter()
+            .map(|leg| {
+                serde_json::json!({
+                    "symbol": leg.symbol.as_str(),
+                    "instrument_id": leg.instrument_id.as_str(),
+                    "ratio": leg.ratio,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "entry_pricing_source": draft.entry_pricing_source,
     })
 }
 
@@ -3429,9 +3597,24 @@ fn state_entry_payload(entry: &StrategyStateEntry) -> serde_json::Value {
         "score": entry.score,
         "parent_order_id": entry.parent_order_id,
         "submitted_at_utc": entry.submitted_at_utc,
+        "spread_instrument_id": entry.spread_instrument_id,
+        "spread_raw_symbol": entry.spread_raw_symbol,
+        "spread_legs": entry
+            .spread_legs
+            .iter()
+            .map(|leg| {
+                serde_json::json!({
+                    "symbol": leg.symbol.as_str(),
+                    "instrument_id": leg.instrument_id.as_str(),
+                    "ratio": leg.ratio,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "entry_pricing_source": entry.entry_pricing_source,
         "close_order_list_id": entry.close_order_list_id,
         "close_parent_order_id": entry.close_parent_order_id,
         "close_reason": entry.close_reason,
+        "close_order_mode": entry.close_order_mode,
         "close_attempts": entry.close_attempts,
         "last_close_submitted_at_utc": entry.last_close_submitted_at_utc,
         "submitted": entry.submitted,

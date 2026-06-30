@@ -45,6 +45,9 @@ deploy/alpaca/alpaca-options-install.sh
 
 Edit the repo-local `.env` and add Alpaca paper credentials. Keep `ALPACA_OPEN_ORDERS=false` and
 `ALPACA_CLOSE_ORDERS=false` until paper proof is intentionally enabled.
+Set `NAUTILUS_ALPACA_ACCOUNT` or an account-specific systemd instance when running against the
+fleet registry; Docker uses `NAUTILUS_ALPACA_DOCKER_ACCOUNT` from the repo `.env` or shell and does
+not assume a fleet account when that value is omitted.
 
 The installed engine, operator status command, and account/order probe auto-load the repo `.env`
 when `NAUTILUS_ALPACA_REPO` points at the checkout or when commands run from the repo tree. Set
@@ -226,11 +229,12 @@ When Docker owns the runtime, prefer the Docker status commands above plus
 when Docker is the active owner.
 
 The Docker defaults keep `ALPACA_OPEN_ORDERS=false` and `ALPACA_CLOSE_ORDERS=false`. To run the
-actual containerized engine, make the paper-trading intent
-explicit in the repo `.env` or shell, point the Docker config mounts at reviewed local configs, keep
-paper endpoints in place, and start only the engine profile:
+actual containerized engine, make the paper-trading intent explicit in the repo `.env` or shell,
+choose the fleet account, point the Docker config mounts at reviewed local configs, keep paper
+endpoints in place, and start only the engine profile:
 
 ```bash
+NAUTILUS_ALPACA_DOCKER_ACCOUNT=paper-put-credit-spy \
 NAUTILUS_ALPACA_DOCKER_BASE_CONFIG=~/.local/share/nautilus-alpaca-docker-config/base-options.toml \
 NAUTILUS_ALPACA_DOCKER_CONFIG=~/.local/share/nautilus-alpaca-docker-config/options.toml \
 NAUTILUS_ALPACA_DOCKER_OPEN_ORDERS=true \
@@ -431,6 +435,11 @@ account's role and strategy set.
 - `ALPACA_CLOSE_ORDERS=true` allows broker orders that close or reduce risk, including stale-order
   cancellation and close submissions.
 - `ALPACA_FORCE_FLATTEN=true` treats every tracked open spread as a close candidate.
+- TOML `management.close_order_mode = "legacy_leg_order_list"` keeps close submission on the
+  established leg order-list path.
+- TOML `management.close_order_mode = "option_spread"` submits one reduce-only Nautilus
+  `OptionSpread` close order expanded to Alpaca MLeg, and should be enabled only in a reviewed
+  vertical paper profile.
 - TOML `runtime.dry_run_families = ["iron_condor"]` lets a strategy scan and emit decisions
   without submitting while other enabled strategies can remain live.
 - TOML `management.close_regular_hours_only = true` blocks non-forced close submissions outside the

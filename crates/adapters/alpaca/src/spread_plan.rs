@@ -1,5 +1,7 @@
 //! Nautilus-native option spread planning for Alpaca candidates.
 
+use std::str::FromStr;
+
 use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
     enums::AssetClass,
@@ -161,6 +163,10 @@ pub fn strategy_state_spread_plan(
     entry: &StrategyStateEntry,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Option<OptionSpreadPlan>> {
+    if let Some(plan) = strategy_state_persisted_spread_plan(entry, ts_init)? {
+        return Ok(Some(plan));
+    }
+
     if entry.is_naked_option()
         || entry.short_symbol.trim().is_empty()
         || entry.long_symbol.trim().is_empty()
@@ -206,6 +212,59 @@ pub fn strategy_state_spread_plan(
         |debit| (EntryPremiumKind::Debit, debit),
     );
 
+    option_spread_plan(
+        legs,
+        ts_init,
+        entry.underlying.clone(),
+        entry.strategy.clone(),
+        scanner_premium_kind,
+        scanner_premium,
+    )
+    .map(Some)
+}
+
+fn strategy_state_persisted_spread_plan(
+    entry: &StrategyStateEntry,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<OptionSpreadPlan>> {
+    let legs = if entry.spread_legs.is_empty() {
+        entry
+            .spread_instrument_id
+            .as_deref()
+            .map(|instrument_id| InstrumentId::from_str(instrument_id))
+            .transpose()?
+            .map(option_spread_legs_from_instrument_id)
+            .transpose()?
+    } else {
+        Some(
+            entry
+                .spread_legs
+                .iter()
+                .map(|leg| {
+                    Ok(OptionSpreadLegPlan {
+                        instrument_id: InstrumentId::from_str(&leg.instrument_id).map_err(
+                            |error| {
+                                anyhow::anyhow!(
+                                    "invalid persisted spread leg instrument_id `{}`: {error}",
+                                    leg.instrument_id
+                                )
+                            },
+                        )?,
+                        symbol: leg.symbol.clone(),
+                        ratio: leg.ratio,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        )
+    };
+    let Some(legs) = legs.filter(|legs| legs.len() >= 2) else {
+        return Ok(None);
+    };
+
+    let (scanner_premium_kind, scanner_premium) = entry.entry_debit().map_or_else(
+        || (EntryPremiumKind::Credit, entry.credit.abs()),
+        |debit| (EntryPremiumKind::Debit, debit),
+    );
     option_spread_plan(
         legs,
         ts_init,

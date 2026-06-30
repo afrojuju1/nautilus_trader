@@ -153,8 +153,8 @@ Work:
 - Add account/position/open-order admission checks. (Runner uses the Alpaca adapter admission gate.)
 - Add deterministic sizing and daily duplicate-entry controls. (Runner uses TOML `index.quantity`
   and persists submitted entries by trade date and underlying.)
-- Build and submit Nautilus `SubmitOrderList` entries directly. (Submission is disabled by default;
-  set TOML `runtime.submit = true` or emergency override `ALPACA_SUBMIT=true` for paper execution.)
+- Build and submit Nautilus orders directly. (Opening broker orders are disabled by default; set
+  TOML `runtime.open_orders = true` or `ALPACA_OPEN_ORDERS=true` for intentional paper execution.)
 - Persist enough local strategy state to avoid duplicate submits after restart. (Default state path
   is `$XDG_STATE_HOME/nautilus_trader/alpaca_options_state.json` or
   `$HOME/.local/state/nautilus_trader/alpaca_options_state.json`.)
@@ -178,7 +178,7 @@ ALPACA_IGNORE_ENTRY_WINDOW=true \
   cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- SPY,QQQ,IWM
 
 # Paper submission path; use cancel-after-accept only for smoke testing.
-ALPACA_SUBMIT=true \
+ALPACA_OPEN_ORDERS=true \
 ALPACA_CANCEL_AFTER_ACCEPT=true \
   cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- SPY,QQQ,IWM
 ```
@@ -220,10 +220,9 @@ Work:
 - Implement close MLeg order-list construction for verticals. (Initial reduce-only close
   `SubmitOrderList` construction complete for credit verticals.)
 - Add cancel stale entry and close orders. (Runner can cancel stale entry orders and submit close
-  orders only when TOML `runtime.manage = true` or `ALPACA_MANAGE=true`; close submission also
-  requires TOML `runtime.close = true` or `ALPACA_CLOSE=true`.)
-- Add manual flatten and global kill switch. (Initial `ALPACA_FORCE_FLATTEN` and
-  `ALPACA_KILL_SWITCH` controls complete.)
+  orders only when TOML `runtime.close_orders = true` or `ALPACA_CLOSE_ORDERS=true`.)
+- Add manual flatten and account/fleet entry blocks. (Initial `ALPACA_FORCE_FLATTEN`,
+  `ALPACA_OPEN_ORDERS=false`, and fleet kill-switch controls complete.)
 - Reconcile close fills and mark positions flat. (Runner marks persisted entries closed after a
   filled close parent order is observed.)
 
@@ -240,18 +239,18 @@ Management controls:
 
 ```bash
 # Evaluate management without broker actions.
-ALPACA_MANAGE=false \
+ALPACA_CLOSE_ORDERS=false \
   cargo run -p nautilus-alpaca --features live --bin alpaca-options-node
 
 # Allow stale-order cancel and close submission when triggers fire.
-ALPACA_MANAGE=true \
-ALPACA_CLOSE=true \
+ALPACA_CLOSE_ORDERS=true \
   cargo run -p nautilus-alpaca --features live --bin alpaca-options-node
 ```
 
 Key controls:
 
-- `ALPACA_KILL_SWITCH=true` blocks new entries.
+- `ALPACA_OPEN_ORDERS=false` blocks broker orders that open new risk.
+- `ALPACA_CLOSE_ORDERS=true` allows broker orders that close or reduce risk.
 - `ALPACA_FORCE_FLATTEN=true` treats every tracked open spread as a close candidate.
 - TOML `management.stale_entry_secs = 900` cancels stale working entries when management is enabled.
 - TOML `management.stale_close_secs = 120` cancels stale working close orders for reprice
@@ -452,8 +451,8 @@ Work:
   file, log directory, lock directory, permissions, and risk budget.
 - Add an account-scoped systemd service template so future accounts can run as separate supervised
   account engines with their own env, config, logs, locks, and strategy state.
-- Add an account env template that defaults extra accounts to `ALPACA_KILL_SWITCH=true`,
-  `ALPACA_SUBMIT=false`, `ALPACA_MANAGE=false`, and `ALPACA_CLOSE=false`.
+- Add an account env template that defaults extra accounts to `ALPACA_OPEN_ORDERS=false` and
+  `ALPACA_CLOSE_ORDERS=false`.
 - Add a fleet status command that checks enabled accounts by running the existing operator status
   command inside a hermetic child process built from each account's env file plus registry service
   and config metadata.

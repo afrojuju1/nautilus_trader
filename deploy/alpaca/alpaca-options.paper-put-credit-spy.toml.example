@@ -20,6 +20,7 @@ entry_end = "10:15"
 min_return_on_risk = 0.16
 
 [management]
+close_order_mode = "option_spread"
 profit_target_close_fraction = 0.50
 stop_loss_close_multiple = 2.0
 max_hold_secs = 14400

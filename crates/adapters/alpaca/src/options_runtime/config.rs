@@ -17,7 +17,9 @@ use nautilus_trading::options::candidates::{
 use serde::Deserialize;
 
 use crate::earnings::load_earnings_events_csv;
-use crate::{fleet::load_fleet_config_from_env, runtime::StrategyState};
+use crate::{
+    fleet::load_fleet_config_from_env, options_management::CloseOrderMode, runtime::StrategyState,
+};
 
 use super::AlpacaOptionsRuntimeConfig;
 
@@ -284,6 +286,7 @@ impl NakedScannerSection {
 struct ManagementSection {
     stale_entry_secs: Option<u64>,
     stale_close_secs: Option<u64>,
+    close_order_mode: Option<String>,
     close_regular_hours_only: Option<bool>,
     close_start: Option<String>,
     close_end: Option<String>,
@@ -305,6 +308,7 @@ impl ManagementSection {
         Self {
             stale_entry_secs: self.stale_entry_secs.or(parent.stale_entry_secs),
             stale_close_secs: self.stale_close_secs.or(parent.stale_close_secs),
+            close_order_mode: self.close_order_mode.or(parent.close_order_mode),
             close_regular_hours_only: self
                 .close_regular_hours_only
                 .or(parent.close_regular_hours_only),
@@ -610,6 +614,12 @@ pub(super) fn build_options_runtime_config(
         close_orders_enabled: env_bool("ALPACA_CLOSE_ORDERS")
             .or(file.runtime.close_orders)
             .unwrap_or(false),
+        close_order_mode: file
+            .management
+            .close_order_mode
+            .as_deref()
+            .unwrap_or(CloseOrderMode::LegacyLegOrderList.as_str())
+            .parse()?,
         close_regular_hours_only: env_bool("ALPACA_CLOSE_REGULAR_HOURS_ONLY")
             .or(file.management.close_regular_hours_only)
             .unwrap_or(true),

@@ -131,6 +131,7 @@ XLU = "utilities"
 SMH = "semiconductors"
 
 [management]
+close_order_mode = "legacy_leg_order_list"
 stale_entry_secs = 900
 stale_close_secs = 120
 close_regular_hours_only = true

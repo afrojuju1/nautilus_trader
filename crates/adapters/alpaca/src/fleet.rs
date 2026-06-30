@@ -234,7 +234,7 @@ impl ResolvedFleetConfig {
     /// Returns the account matching the current process environment.
     #[must_use]
     pub fn current_account(&self) -> Option<&AccountConfig> {
-        let account_id = env::var("NAUTILUS_ALPACA_ACCOUNT").ok();
+        let account_id = non_empty_env("NAUTILUS_ALPACA_ACCOUNT");
         if let Some(account_id) = account_id.as_deref()
             && let Some(account) = self
                 .config
@@ -245,7 +245,7 @@ impl ResolvedFleetConfig {
             return Some(account);
         }
 
-        let service = env::var("NAUTILUS_ALPACA_SERVICE").ok();
+        let service = non_empty_env("NAUTILUS_ALPACA_SERVICE");
         if let Some(service) = service.as_deref()
             && let Some(account) = self
                 .config
@@ -290,6 +290,10 @@ impl ResolvedFleetConfig {
         }
         exposure
     }
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 /// Loads a fleet config from the default or env-configured path if it exists.

@@ -83,6 +83,14 @@ pub struct StrategyStateEntryDraft {
     pub parent_order_id: Option<String>,
     /// Timestamp captured immediately before handing the entry order(s) to Nautilus.
     pub submitted_at_utc: Option<String>,
+    /// Nautilus spread instrument ID for spread-capable entries.
+    pub spread_instrument_id: Option<String>,
+    /// Nautilus generic spread symbol for spread-capable entries.
+    pub spread_raw_symbol: Option<String>,
+    /// Signed spread legs for spread-capable entries.
+    pub spread_legs: Vec<StrategyStateSpreadLeg>,
+    /// Pricing source used for the accepted entry.
+    pub entry_pricing_source: Option<String>,
 }
 
 impl StrategyState {
@@ -204,6 +212,10 @@ impl StrategyState {
             score: candidate.score,
             parent_order_id,
             submitted_at_utc: None,
+            spread_instrument_id: None,
+            spread_raw_symbol: None,
+            spread_legs: Vec::new(),
+            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
         });
     }
 
@@ -235,6 +247,10 @@ impl StrategyState {
             score: candidate.score,
             parent_order_id,
             submitted_at_utc: None,
+            spread_instrument_id: None,
+            spread_raw_symbol: None,
+            spread_legs: Vec::new(),
+            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
         });
     }
 
@@ -267,6 +283,10 @@ impl StrategyState {
             score: candidate.score,
             parent_order_id,
             submitted_at_utc: None,
+            spread_instrument_id: None,
+            spread_raw_symbol: None,
+            spread_legs: Vec::new(),
+            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
         });
     }
 
@@ -297,6 +317,10 @@ impl StrategyState {
             score: candidate.score,
             parent_order_id,
             submitted_at_utc: None,
+            spread_instrument_id: None,
+            spread_raw_symbol: None,
+            spread_legs: Vec::new(),
+            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
         });
     }
 
@@ -321,9 +345,14 @@ impl StrategyState {
             score: draft.score,
             parent_order_id: draft.parent_order_id,
             submitted_at_utc: Some(submitted_at_utc),
+            spread_instrument_id: draft.spread_instrument_id,
+            spread_raw_symbol: draft.spread_raw_symbol,
+            spread_legs: draft.spread_legs,
+            entry_pricing_source: draft.entry_pricing_source,
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
+            close_order_mode: None,
             close_attempts: 0,
             last_close_submitted_at_utc: None,
             submitted: true,
@@ -333,6 +362,17 @@ impl StrategyState {
             closed_at_utc: None,
         });
     }
+}
+
+/// Persisted signed spread leg evidence for one strategy-state entry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StrategyStateSpreadLeg {
+    /// Alpaca option contract symbol.
+    pub symbol: String,
+    /// Alpaca option contract instrument ID.
+    pub instrument_id: String,
+    /// Signed Nautilus spread ratio. Positive legs are bought when buying the spread.
+    pub ratio: i64,
 }
 
 /// Persisted state for one broker-native spread entry.
@@ -375,6 +415,18 @@ pub struct StrategyStateEntry {
     /// Timestamp captured immediately before submitting the entry order(s).
     #[serde(default)]
     pub submitted_at_utc: Option<String>,
+    /// Nautilus spread instrument ID for spread-capable entries.
+    #[serde(default)]
+    pub spread_instrument_id: Option<String>,
+    /// Nautilus generic spread symbol for spread-capable entries.
+    #[serde(default)]
+    pub spread_raw_symbol: Option<String>,
+    /// Signed spread legs for spread-capable entries.
+    #[serde(default)]
+    pub spread_legs: Vec<StrategyStateSpreadLeg>,
+    /// Pricing source used for the accepted entry.
+    #[serde(default)]
+    pub entry_pricing_source: Option<String>,
     /// Close order-list ID, if a close has been submitted.
     #[serde(default)]
     pub close_order_list_id: Option<String>,
@@ -384,6 +436,9 @@ pub struct StrategyStateEntry {
     /// Close trigger reason.
     #[serde(default)]
     pub close_reason: Option<String>,
+    /// Close order construction/submission path.
+    #[serde(default)]
+    pub close_order_mode: Option<String>,
     /// Number of accepted close submissions for this entry.
     #[serde(default)]
     pub close_attempts: u32,
@@ -512,10 +567,12 @@ impl StrategyStateEntry {
         close_order_list_id: String,
         close_parent_order_id: Option<String>,
         close_reason: String,
+        close_order_mode: String,
     ) {
         self.close_order_list_id = Some(close_order_list_id);
         self.close_parent_order_id = close_parent_order_id;
         self.close_reason = Some(close_reason);
+        self.close_order_mode = Some(close_order_mode);
         self.close_attempts = self.close_attempts.saturating_add(1);
         self.last_close_submitted_at_utc = Some(Utc::now().to_rfc3339());
     }
@@ -525,6 +582,7 @@ impl StrategyStateEntry {
         self.close_order_list_id = None;
         self.close_parent_order_id = None;
         self.close_reason = None;
+        self.close_order_mode = None;
     }
 
     /// Marks the entry closed.
@@ -692,9 +750,14 @@ mod tests {
             score: 61.9,
             parent_order_id: Some("parent-1".to_string()),
             submitted_at_utc: Some("2026-05-02T19:30:28Z".to_string()),
+            spread_instrument_id: None,
+            spread_raw_symbol: None,
+            spread_legs: Vec::new(),
+            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
+            close_order_mode: None,
             close_attempts: 0,
             last_close_submitted_at_utc: None,
             submitted: true,
@@ -747,6 +810,7 @@ mod tests {
             "close-list-1".to_string(),
             Some("close-parent-1".to_string()),
             "profit_target".to_string(),
+            "legacy_leg_order_list".to_string(),
         );
         assert!(entry.is_active());
         assert_eq!(entry.close_order_list_id.as_deref(), Some("close-list-1"));
@@ -850,9 +914,14 @@ mod tests {
             score: 60.0,
             parent_order_id: Some("open-parent-1".to_string()),
             submitted_at_utc: Some("2026-05-04T14:00:00Z".to_string()),
+            spread_instrument_id: None,
+            spread_raw_symbol: None,
+            spread_legs: Vec::new(),
+            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
+            close_order_mode: None,
             close_attempts: 0,
             last_close_submitted_at_utc: None,
             submitted: true,
@@ -886,9 +955,14 @@ mod tests {
             score: 60.0,
             parent_order_id: Some("open-parent-1".to_string()),
             submitted_at_utc: Some("2026-05-04T14:00:00Z".to_string()),
+            spread_instrument_id: None,
+            spread_raw_symbol: None,
+            spread_legs: Vec::new(),
+            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
+            close_order_mode: None,
             close_attempts: 0,
             last_close_submitted_at_utc: None,
             submitted: true,
@@ -966,9 +1040,14 @@ mod tests {
             score: 74.5,
             parent_order_id: Some("open-parent-1".to_string()),
             submitted_at_utc: Some("2026-05-04T14:00:00Z".to_string()),
+            spread_instrument_id: None,
+            spread_raw_symbol: None,
+            spread_legs: Vec::new(),
+            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
+            close_order_mode: None,
             close_attempts: 0,
             last_close_submitted_at_utc: None,
             submitted: true,

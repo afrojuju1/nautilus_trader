@@ -83,8 +83,13 @@ Phase 2: Reconciliation read model
 
 Phase 3: Paper close submit for one vertical family
 
-- Enable spread close submission only for a single paper vertical profile.
+- Enable spread close submission only for a single paper vertical profile by setting
+  `management.close_order_mode = "option_spread"` in that account TOML.
 - Keep opening submission on the proven path selected for that profile.
+- Submit one reduce-only Nautilus `OptionSpread` close order, priced from the cached spread
+  `QuoteTick`, and let `AlpacaExecutionClient` expand it to Alpaca MLeg.
+- Keep profiles without `management.close_order_mode = "option_spread"` on the legacy leg
+  `OrderList` close path.
 - Cancel accepted smoke close orders only when explicitly testing.
 
 Phase 4: Startup reconciliation cutover
@@ -110,4 +115,5 @@ Phase 5: Retire leg close path
 
 - Build dry-run spread close order drafts for active vertical entries.
 - Add spread reconciliation preview to operator status or a source-neutral ops command.
-- Cut one vertical paper profile to spread close submission after entry spread-order proof.
+- Cut one vertical paper profile to spread close submission with `management.close_order_mode =
+  "option_spread"` after entry spread-order proof.

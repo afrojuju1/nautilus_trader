@@ -38,7 +38,7 @@ use crate::{
     fleet::ResolvedFleetConfig,
     http::client::AlpacaHttpClient,
     options_lifecycle::OptionLifecycleRiskConfig,
-    options_management::CreditSpreadManagementConfig,
+    options_management::{CloseOrderMode, CreditSpreadManagementConfig},
     runtime::{StrategyState, emit_operator_event},
     strategy::{
         scan_call_credit_underlying, scan_call_debit_underlying, scan_iron_condor_underlying,
@@ -147,6 +147,8 @@ pub struct AlpacaOptionsRuntimeConfig {
     pub stale_close_secs: u64,
     /// Whether broker orders which close or reduce risk are enabled.
     pub close_orders_enabled: bool,
+    /// Close order construction/submission path.
+    pub close_order_mode: CloseOrderMode,
     /// Whether non-forced close submissions are limited to regular options hours.
     pub close_regular_hours_only: bool,
     /// Close window start.
@@ -329,9 +331,8 @@ impl AlpacaOptionsRuntimeConfig {
         self.operational_schema = schema;
         self.operational_repository = Some(repository);
         if self.operational_account_id.is_none() {
-            self.operational_account_id = env::var("NAUTILUS_OPERATIONAL_ACCOUNT_ID")
-                .ok()
-                .or_else(|| env::var("NAUTILUS_ALPACA_ACCOUNT").ok());
+            self.operational_account_id = non_empty_env("NAUTILUS_OPERATIONAL_ACCOUNT_ID")
+                .or_else(|| non_empty_env("NAUTILUS_ALPACA_ACCOUNT"));
         }
         Ok(())
     }
@@ -564,6 +565,10 @@ impl AlpacaOptionsRuntimeConfig {
             .get(&underlying.to_ascii_uppercase())
             .map(String::as_str)
     }
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 /// Result of one configured options family scan for one underlying.
