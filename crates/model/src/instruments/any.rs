@@ -17,13 +17,25 @@ use enum_dispatch::enum_dispatch;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Instrument, betting::BettingInstrument, binary_option::BinaryOption, cfd::Cfd,
-    commodity::Commodity, crypto_future::CryptoFuture, crypto_futures_spread::CryptoFuturesSpread,
-    crypto_option::CryptoOption, crypto_option_spread::CryptoOptionSpread,
-    crypto_perpetual::CryptoPerpetual, currency_pair::CurrencyPair, equity::Equity,
-    futures_contract::FuturesContract, futures_spread::FuturesSpread,
-    index_instrument::IndexInstrument, option_contract::OptionContract,
-    option_spread::OptionSpread, perpetual_contract::PerpetualContract,
+    Instrument,
+    betting::BettingInstrument,
+    binary_option::BinaryOption,
+    cfd::Cfd,
+    commodity::Commodity,
+    crypto_future::CryptoFuture,
+    crypto_futures_spread::CryptoFuturesSpread,
+    crypto_option::CryptoOption,
+    crypto_option_spread::CryptoOptionSpread,
+    crypto_perpetual::CryptoPerpetual,
+    currency_pair::CurrencyPair,
+    equity::Equity,
+    futures_contract::FuturesContract,
+    futures_spread::FuturesSpread,
+    index_instrument::IndexInstrument,
+    option_contract::OptionContract,
+    option_spread::OptionSpread,
+    perpetual_contract::PerpetualContract,
+    spread::{GenericSpreadError, SpreadLeg, generic_spread_legs},
     tokenized_asset::TokenizedAsset,
 };
 use crate::types::{Price, Quantity};
@@ -87,6 +99,19 @@ impl InstrumentAny {
                 | Self::CryptoFuturesSpread(_)
                 | Self::CryptoOptionSpread(_)
         )
+    }
+
+    /// Returns signed generic spread legs for spread instruments.
+    ///
+    /// Returns `None` for non-spread instruments.
+    pub fn spread_legs(&self) -> Option<Result<Vec<SpreadLeg>, GenericSpreadError>> {
+        match self {
+            Self::FuturesSpread(inst) => Some(generic_spread_legs(inst.id)),
+            Self::OptionSpread(inst) => Some(generic_spread_legs(inst.id)),
+            Self::CryptoFuturesSpread(inst) => Some(generic_spread_legs(inst.id)),
+            Self::CryptoOptionSpread(inst) => Some(generic_spread_legs(inst.id)),
+            _ => None,
+        }
     }
 }
 

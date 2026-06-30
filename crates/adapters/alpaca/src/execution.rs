@@ -35,7 +35,7 @@ use nautilus_model::{
     accounts::AccountAny,
     enums::{LiquiditySide, OmsType, PositionSideSpecified},
     identifiers::{ClientId, PositionId, TradeId, Venue},
-    instruments::{Instrument, InstrumentAny},
+    instruments::{Instrument, InstrumentAny, spread_leg_order_side},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money},
@@ -2053,7 +2053,7 @@ fn build_option_spread_payload_from_order(order: &OrderAny) -> anyhow::Result<Al
                     leg.symbol
                 )
             })?;
-            let side = option_spread_leg_order_side(order.order_side(), leg.ratio)?;
+            let side = spread_leg_order_side(order.order_side(), leg.ratio)?;
             let position_intent = position_intent_from_order_side(side, order.is_reduce_only())?;
             Ok(MlegOrderLeg::new(
                 leg.symbol,
@@ -2109,15 +2109,6 @@ fn build_equity_payload_from_order(order: &OrderAny) -> anyhow::Result<AlpacaSim
         .and_then(|payload| payload.with_client_order_id(order.client_order_id().to_string()))
         .map(AlpacaSimplePayload::Equity)
         .map_err(|e| anyhow::anyhow!("invalid Alpaca simple payload: {e}"))
-}
-
-#[cfg(feature = "live")]
-fn option_spread_leg_order_side(spread_side: OrderSide, ratio: i64) -> anyhow::Result<OrderSide> {
-    match (spread_side, ratio.is_positive()) {
-        (OrderSide::Buy, true) | (OrderSide::Sell, false) => Ok(OrderSide::Buy),
-        (OrderSide::Buy, false) | (OrderSide::Sell, true) => Ok(OrderSide::Sell),
-        (OrderSide::NoOrderSide, _) => anyhow::bail!("Alpaca option spread order missing side"),
-    }
 }
 
 #[cfg(feature = "live")]

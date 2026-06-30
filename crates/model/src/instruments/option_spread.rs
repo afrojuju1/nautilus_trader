@@ -26,7 +26,12 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use super::{Instrument, any::InstrumentAny, tick_scheme::check_tick_scheme};
+use super::{
+    Instrument,
+    any::InstrumentAny,
+    spread::{GenericSpreadError, SpreadLeg, generic_spread_legs},
+    tick_scheme::check_tick_scheme,
+};
 use crate::{
     enums::{AssetClass, InstrumentClass, OptionKind},
     identifiers::{InstrumentId, Symbol},
@@ -251,6 +256,15 @@ impl OptionSpread {
             ts_init,
         )
         .expect_display(FAILED)
+    }
+
+    /// Returns the signed generic spread legs encoded in this spread's instrument ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this spread's instrument ID is not valid generic spread syntax.
+    pub fn legs(&self) -> Result<Vec<SpreadLeg>, GenericSpreadError> {
+        generic_spread_legs(self.id)
     }
 
     /// Returns a fluent builder for a [`OptionSpread`] instance.

@@ -5173,12 +5173,7 @@ cdef class OrderMatchingEngine:
 
         # Check reduce-only instruction
         if self._use_reduce_only and order.is_reduce_only and not order.is_closed_c():
-            if (
-                not position
-                or position.is_closed_c()
-                or (order.is_buy_c() and position.is_long_c())
-                or (order.is_sell_c() and position.is_short_c())
-            ):
+            if self._reduce_only_closeable_raw(order, position, account_id) == 0:
                 self._generate_order_rejected(
                     order,
                     f"REDUCE_ONLY {order.type_string_c()} {order.side_string_c()} order "
@@ -6254,7 +6249,7 @@ cdef class OrderMatchingEngine:
         if venue_position_id is not None:
             position = self.cache.position(venue_position_id)
 
-        if self._use_reduce_only and order.is_reduce_only and position is None:
+        if self._use_reduce_only and order.is_reduce_only and self._reduce_only_closeable_raw(order, position, None) == 0:
             self._log.warning(
                 f"Canceling REDUCE_ONLY {order.type_string_c()} "
                 f"as would increase position",
@@ -6691,7 +6686,7 @@ cdef class OrderMatchingEngine:
         if venue_position_id is not None:
             position = self.cache.position(venue_position_id)
 
-        if self._use_reduce_only and order.is_reduce_only and position is None:
+        if self._use_reduce_only and order.is_reduce_only and self._reduce_only_closeable_raw(order, position, None) == 0:
             self._log.warning(
                 f"Canceling REDUCE_ONLY {order.type_string_c()} "
                 f"as would increase position",
@@ -7220,6 +7215,128 @@ cdef class OrderMatchingEngine:
                 self._queue_pending.pop(client_order_id, None)
                 self._queue_ahead[client_order_id] = (order_price_raw, 0)
 
+    cdef AccountId _resolve_order_account_id(self, Order order, AccountId account_id):
+        if account_id is not None:
+            return account_id
+        if order.account_id is not None:
+            return order.account_id
+        if order.trader_id in self._account_ids:
+            return self._account_ids[order.trader_id]
+        return None
+
+    cdef OrderSide _spread_leg_order_side(self, OrderSide spread_side, int ratio):
+        if ratio == 0 or spread_side == OrderSide.NO_ORDER_SIDE:
+            return OrderSide.NO_ORDER_SIDE
+        if spread_side == OrderSide.BUY:
+            return OrderSide.BUY if ratio > 0 else OrderSide.SELL
+        if spread_side == OrderSide.SELL:
+            return OrderSide.SELL if ratio > 0 else OrderSide.BUY
+        return OrderSide.NO_ORDER_SIDE
+
+    cdef QuantityRaw _spread_reduce_only_closeable_raw(self, Order order, AccountId account_id):
+        cdef AccountId effective_account_id = self._resolve_order_account_id(order, account_id)
+        cdef list leg_tuples = self.instrument.legs()
+        if not leg_tuples:
+            return 0
+
+        cdef:
+            InstrumentId leg_instrument_id
+            int ratio
+            int abs_ratio
+            OrderSide leg_order_side
+            PositionSide close_position_side
+            list positions
+            Position leg_position
+            QuantityRaw leg_available_raw
+            QuantityRaw leg_packages_raw
+            QuantityRaw closeable_raw = 0
+            bint initialized = False
+
+        for leg_instrument_id, ratio in leg_tuples:
+            leg_order_side = self._spread_leg_order_side(order.side, ratio)
+            if leg_order_side == OrderSide.NO_ORDER_SIDE:
+                return 0
+
+            close_position_side = (
+                PositionSide.SHORT
+                if leg_order_side == OrderSide.BUY
+                else PositionSide.LONG
+            )
+            positions = self.cache.positions_open(
+                venue=None,
+                instrument_id=leg_instrument_id,
+                strategy_id=order.strategy_id,
+                side=close_position_side,
+                account_id=effective_account_id,
+            )
+            if not positions:
+                return 0
+
+            leg_available_raw = 0
+            for leg_position in positions:
+                leg_available_raw += leg_position.quantity._mem.raw
+
+            abs_ratio = ratio if ratio > 0 else -ratio
+            leg_packages_raw = leg_available_raw // abs_ratio
+            if not initialized or leg_packages_raw < closeable_raw:
+                closeable_raw = leg_packages_raw
+                initialized = True
+
+        return closeable_raw if initialized else 0
+
+    cdef QuantityRaw _reduce_only_closeable_raw(self, Order order, Position position, AccountId account_id):
+        if self.instrument.is_spread():
+            return self._spread_reduce_only_closeable_raw(order, account_id)
+
+        if (
+            position is None
+            or position.is_closed_c()
+            or (order.is_buy_c() and position.is_long_c())
+            or (order.is_sell_c() and position.is_short_c())
+        ):
+            return 0
+
+        return position.quantity._mem.raw
+
+    cdef bint _ensure_spread_leg_fills_available(self, Order order, Price fill_px, Quantity fill_qty):
+        cdef Instrument instrument = self.cache.instrument(order.instrument_id)
+        if instrument is None or not instrument.is_spread():
+            return True
+
+        leg_tuples = instrument.legs()
+        if not leg_tuples or not self._calculate_leg_execution_prices(
+            leg_tuples=leg_tuples,
+            spread_execution_price=fill_px,
+            spread_quantity=fill_qty,
+        ):
+            reason = (
+                f"Cannot generate spread leg fills for {order.instrument_id}: "
+                f"missing leg quotes or instruments"
+            )
+            if order.status_c() == OrderStatus.SUBMITTED:
+                self._generate_order_rejected(order, reason)
+            elif order.is_open_c():
+                self._log.warning(reason)
+                self.cancel_order(order)
+            else:
+                self._log.warning(reason)
+            return False
+
+        return True
+
+    cdef void _generate_applied_spread_leg_fills(
+        self,
+        Order order,
+        list[tuple[Price, Quantity]] fills,
+        LiquiditySide liquidity_side,
+    ):
+        if not fills:
+            return
+
+        cdef Instrument instrument = self.cache.instrument(order.instrument_id)
+        if instrument is not None and instrument.is_spread():
+            self._generate_spread_leg_fills(order, fills, liquidity_side)
+
     cpdef void apply_fills(
         self,
         Order order,
@@ -7289,6 +7406,7 @@ cdef class OrderMatchingEngine:
             QuantityRaw reduce_only_filled_raw = 0
             QuantityRaw reduce_only_target_raw = 0
             bint reduce_only_exhausts_position = False
+            list applied_fills = []
         if not fills:
             # For L1 with consumption tracking, empty fills means liquidity was consumed
             # Allow orders to slip to next level (preserves L1 exhausted book behavior)
@@ -7324,12 +7442,12 @@ cdef class OrderMatchingEngine:
         if self.oms_type == OmsType.NETTING:
             venue_position_id = None  # No position IDs generated by the venue
 
-        if self._use_reduce_only and order.is_reduce_only and position is not None:
+        if self._use_reduce_only and order.is_reduce_only:
             cached_reduce_only_filled = self._cached_filled_qty.get(
                 order.client_order_id,
                 order.filled_qty,
             )
-            reduce_only_remaining_raw = position.quantity._mem.raw
+            reduce_only_remaining_raw = self._reduce_only_closeable_raw(order, position, None)
             reduce_only_filled_raw = cached_reduce_only_filled._mem.raw
 
         if is_logging_initialized():
@@ -7388,6 +7506,7 @@ cdef class OrderMatchingEngine:
 
             if self._use_reduce_only and order.is_reduce_only:
                 if reduce_only_remaining_raw == 0:
+                    self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
                     return  # Done
 
                 reduce_only_exhausts_position = fill_qty._mem.raw >= reduce_only_remaining_raw
@@ -7411,7 +7530,12 @@ cdef class OrderMatchingEngine:
                 if len(fills) == 1 and order.status_c() == OrderStatus.SUBMITTED:
                     self._generate_order_rejected(order, f"no market for {order.instrument_id}")
 
+                self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
                 return  # Done
+
+            if not self._ensure_spread_leg_fills_available(order, fill_px, fill_qty):
+                self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
+                return
 
             self.fill_order(
                 order=order,
@@ -7421,13 +7545,16 @@ cdef class OrderMatchingEngine:
                 venue_position_id=venue_position_id,
                 position=position,
             )
+            applied_fills.append((fill_px, fill_qty))
             if order.order_type == OrderType.MARKET_TO_LIMIT and initial_market_to_limit_fill:
+                self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
                 return  # Filled initial level
 
             last_fill_px = fill_px
 
         if order.time_in_force == TimeInForce.IOC and order.is_open_c():
             # IOC order has filled all available size
+            self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
             self.cancel_order(order)
             return
 
@@ -7457,13 +7584,16 @@ cdef class OrderMatchingEngine:
             # Check protection price boundary for slip fills
             if protection_price is not None:
                 if order.side == OrderSide.BUY and fill_px._mem.raw > protection_price._mem.raw:
+                    self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
                     return  # Slip fill would exceed protection boundary
                 elif order.side == OrderSide.SELL and fill_px._mem.raw < protection_price._mem.raw:
+                    self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
                     return  # Slip fill would exceed protection boundary
 
             fill_qty = order.leaves_qty
             if self._use_reduce_only and order.is_reduce_only:
                 if reduce_only_remaining_raw == 0:
+                    self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
                     return
 
                 reduce_only_exhausts_position = fill_qty._mem.raw >= reduce_only_remaining_raw
@@ -7483,6 +7613,10 @@ cdef class OrderMatchingEngine:
                 reduce_only_remaining_raw -= fill_qty._mem.raw
                 reduce_only_filled_raw += fill_qty._mem.raw
 
+            if not self._ensure_spread_leg_fills_available(order, fill_px, fill_qty):
+                self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
+                return
+
             self.fill_order(
                 order=order,
                 last_px=fill_px,
@@ -7491,6 +7625,7 @@ cdef class OrderMatchingEngine:
                 venue_position_id=venue_position_id,
                 position=position,
             )
+            applied_fills.append((fill_px, fill_qty))
 
         # TODO: Refactor this section - nested conditionals for order types, top-of-book checks,
         # MAKER vs TAKER, liquidity consumption, spread leg generation, and queue cleanup are
@@ -7509,6 +7644,7 @@ cdef class OrderMatchingEngine:
         )
         ):
             if not self._has_targets and ((order.side == OrderSide.BUY and order.price == self._core.ask) or (order.side == OrderSide.SELL and order.price == self._core.bid)):
+                self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
                 return  # Limit price is equal to top-of-book, no further fills
 
             if order.liquidity_side == LiquiditySide.MAKER:
@@ -7522,6 +7658,7 @@ cdef class OrderMatchingEngine:
                     fill_qty = order.leaves_qty
                     if self._use_reduce_only and order.is_reduce_only:
                         if reduce_only_remaining_raw == 0:
+                            self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
                             return
 
                         reduce_only_exhausts_position = fill_qty._mem.raw >= reduce_only_remaining_raw
@@ -7538,6 +7675,14 @@ cdef class OrderMatchingEngine:
                                     trigger_price=None,
                                 )
 
+                    if self._use_reduce_only and order.is_reduce_only:
+                        reduce_only_remaining_raw -= fill_qty._mem.raw
+                        reduce_only_filled_raw += fill_qty._mem.raw
+
+                    if not self._ensure_spread_leg_fills_available(order, fill_px, fill_qty):
+                        self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
+                        return
+
                     self.fill_order(
                         order=order,
                         last_px=fill_px,
@@ -7546,6 +7691,7 @@ cdef class OrderMatchingEngine:
                         venue_position_id=venue_position_id,
                         position=position,
                     )
+                    applied_fills.append((fill_px, fill_qty))
             else:  # Marketable limit order
                 # Exhausted simulated book volume (continue aggressive filling into next level)
                 # This is a very basic implementation of slipping by a single tick, in the future
@@ -7562,6 +7708,7 @@ cdef class OrderMatchingEngine:
                 fill_qty = order.leaves_qty
                 if self._use_reduce_only and order.is_reduce_only:
                     if reduce_only_remaining_raw == 0:
+                        self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
                         return
 
                     reduce_only_exhausts_position = fill_qty._mem.raw >= reduce_only_remaining_raw
@@ -7578,6 +7725,13 @@ cdef class OrderMatchingEngine:
                                 trigger_price=None,
                             )
 
+                    reduce_only_remaining_raw -= fill_qty._mem.raw
+                    reduce_only_filled_raw += fill_qty._mem.raw
+
+                if not self._ensure_spread_leg_fills_available(order, fill_px, fill_qty):
+                    self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
+                    return
+
                 self.fill_order(
                     order=order,
                     last_px=fill_px,
@@ -7586,14 +7740,9 @@ cdef class OrderMatchingEngine:
                     venue_position_id=venue_position_id,
                     position=position,
                 )
+                applied_fills.append((fill_px, fill_qty))
 
-        cdef Instrument instrument = self.cache.instrument(order.instrument_id)
-        if instrument is None:
-            return
-
-        # Generate leg fills for spread orders after normal combo fill processing
-        if instrument.is_spread():
-            self._generate_spread_leg_fills(order, fills, liquidity_side)
+        self._generate_applied_spread_leg_fills(order, applied_fills, liquidity_side)
 
         if self._queue_position and order.is_closed_c():
             self._queue_ahead.pop(order.client_order_id, None)
@@ -7623,103 +7772,126 @@ cdef class OrderMatchingEngine:
         leg_tuples = instrument.legs()
         spread_instrument_ids = [leg[0] for leg in leg_tuples]
 
-        cdef Price spread_fill_px = fills[0][0]
-        cdef Quantity spread_fill_qty = fills[0][1]
+        cdef:
+            int fill_index
+            Price spread_fill_px
+            Quantity spread_fill_qty
+            dict leg_prices
+            InstrumentId leg_instrument_id
+            int ratio
+            Price leg_price
+            Quantity leg_quantity
+            Instrument leg_instrument
+            Price adjusted_leg_price
+            Quantity adjusted_leg_quantity
+            Money commission
+            int leg_position
+            ClientOrderId leg_client_order_id
+            VenueOrderId leg_venue_order_id
+            OrderSide order_side
+            uint64_t ts_now
+            uint64_t leg_hash
+            TradeId leg_trade_id
+            OrderFilled leg_fill
 
-        # Calculate leg execution prices
-        leg_prices = self._calculate_leg_execution_prices(
-            leg_tuples=leg_tuples,
-            spread_execution_price=spread_fill_px,
-            spread_quantity=spread_fill_qty,
-        )
+        for fill_index, (spread_fill_px, spread_fill_qty) in enumerate(fills):
+            # Calculate leg execution prices
+            leg_prices = self._calculate_leg_execution_prices(
+                leg_tuples=leg_tuples,
+                spread_execution_price=spread_fill_px,
+                spread_quantity=spread_fill_qty,
+            )
 
-        if not leg_prices:
-            self._log.warning(f"Could not calculate leg prices for spread {order.instrument_id}")
-            return
-
-        # Generate fills for each leg
-        for leg_instrument_id, ratio in leg_tuples:
-            if leg_instrument_id not in leg_prices:
+            if not leg_prices:
+                self._log.warning(f"Could not calculate leg prices for spread {order.instrument_id}")
                 continue
 
-            leg_price = leg_prices[leg_instrument_id]
+            # Generate fills for each leg
+            for leg_instrument_id, ratio in leg_tuples:
+                if leg_instrument_id not in leg_prices:
+                    continue
 
-            # Calculate leg quantity: spread_quantity * abs(ratio)
-            leg_quantity = Quantity(
-                spread_fill_qty.as_double() * abs(ratio),
-                precision=spread_fill_qty._mem.precision,
-            )
+                leg_price = leg_prices[leg_instrument_id]
 
-            # Get leg instrument for precision validation
-            leg_instrument = self.cache.instrument(leg_instrument_id)
-            if leg_instrument is None:
-                self._log.warning(f"Leg instrument not found in cache: {leg_instrument_id}")
-                continue
+                # Calculate leg quantity: spread_quantity * abs(ratio)
+                leg_quantity = Quantity(
+                    spread_fill_qty.as_double() * abs(ratio),
+                    precision=spread_fill_qty._mem.precision,
+                )
 
-            # Generate synthetic leg fill directly
-            adjusted_leg_price = leg_price
+                # Get leg instrument for precision validation
+                leg_instrument = self.cache.instrument(leg_instrument_id)
+                if leg_instrument is None:
+                    self._log.warning(f"Leg instrument not found in cache: {leg_instrument_id}")
+                    continue
 
-            # Use make_qty for proper size increment rounding
-            adjusted_leg_quantity = leg_instrument.make_qty(
-                leg_quantity.as_double(),
-                round_down=True,  # Round down to ensure valid size
-            )
+                # Generate synthetic leg fill directly
+                adjusted_leg_price = leg_price
 
-            # Calculate commission for the leg
-            commission = self._fee_model.get_commission(
-                order=order,  # Use spread order for fee calculation context
-                fill_qty=adjusted_leg_quantity,
-                fill_px=adjusted_leg_price,
-                instrument=leg_instrument,
-            )
+                # Use make_qty for proper size increment rounding
+                adjusted_leg_quantity = leg_instrument.make_qty(
+                    leg_quantity.as_double(),
+                    round_down=True,  # Round down to ensure valid size
+                )
 
-            # Generate unique IDs for the leg fill (following IB adapter pattern)
-            # Get leg position in spread for unique identification
-            leg_position = spread_instrument_ids.index(leg_instrument_id) if leg_instrument_id in spread_instrument_ids else 0
+                # Calculate commission for the leg
+                commission = self._fee_model.get_commission(
+                    order=order,  # Use spread order for fee calculation context
+                    fill_qty=adjusted_leg_quantity,
+                    fill_px=adjusted_leg_price,
+                    instrument=leg_instrument,
+                )
 
-            # Generate unique client order ID for leg fill (avoids order state conflicts)
-            leg_client_order_id = ClientOrderId(f"{order.client_order_id.value}-LEG-{leg_instrument_id.symbol.value}")
+                # Generate unique IDs for the leg fill (following IB adapter pattern)
+                # Get leg position in spread for unique identification
+                leg_position = spread_instrument_ids.index(leg_instrument_id) if leg_instrument_id in spread_instrument_ids else 0
 
-            # Generate unique venue order ID for leg fill
-            leg_venue_order_id = VenueOrderId(f"{order.venue_order_id.value}-LEG-{leg_position}")
+                # Generate unique client order ID for leg fill (avoids order state conflicts)
+                leg_client_order_id = ClientOrderId(f"{order.client_order_id.value}-LEG-{leg_instrument_id.symbol.value}")
 
-            # Leg side mapping based on spread order direction
-            # If spread BUY: positive ratio = BUY leg, negative = SELL leg
-            # If spread SELL: positive ratio = SELL leg, negative = BUY leg
-            order_side = order.side if ratio > 0 else (OrderSide.SELL if order.side == OrderSide.BUY else OrderSide.BUY)
+                # Generate unique venue order ID for leg fill
+                leg_venue_order_id = VenueOrderId(f"{order.venue_order_id.value}-LEG-{leg_position}")
 
-            # Create OrderFilled event for the leg
-            ts_now = self._clock.timestamp_ns()
+                # Leg side mapping based on spread order direction
+                order_side = self._spread_leg_order_side(order.side, ratio)
+                if order_side == OrderSide.NO_ORDER_SIDE:
+                    continue
 
-            # Generate unique trade ID for the leg fill: reuse the bounded hash
-            # format from `_generate_trade_id_str` and append the leg position
-            # so legs sharing an execution step remain distinguishable.
-            leg_hash = _fnv1a_trade_id_hash(self.venue.to_str(), self.raw_id, ts_now)
-            leg_trade_id = TradeId(f"T-{leg_hash:016x}-{self._execution_count:03d}-{leg_position}")
-            leg_fill = OrderFilled(
-                trader_id=order.trader_id,
-                strategy_id=order.strategy_id,
-                instrument_id=leg_instrument_id,
-                client_order_id=leg_client_order_id,  # Use unique leg client order ID
-                venue_order_id=leg_venue_order_id,  # Use unique leg venue order ID
-                account_id=order.account_id,
-                trade_id=leg_trade_id,
-                order_side=order_side,
-                order_type=order.order_type,
-                last_qty=adjusted_leg_quantity,
-                last_px=adjusted_leg_price,
-                currency=leg_instrument.quote_currency,
-                liquidity_side=liquidity_side,
-                event_id=UUID4(),
-                ts_event=ts_now,
-                ts_init=ts_now,
-                reconciliation=False,
-                position_id=None,
-                commission=commission,
-            )
+                # Create OrderFilled event for the leg
+                ts_now = self._clock.timestamp_ns()
 
-            # Publish the leg fill event (same as regular order fills)
-            self.msgbus.send(endpoint="ExecEngine.process", msg=leg_fill)
+                # Generate unique trade ID for the leg fill: reuse the bounded hash
+                # format from `_generate_trade_id_str` and append enough fill context
+                # so legs sharing an execution step remain distinguishable.
+                leg_hash = _fnv1a_trade_id_hash(self.venue.to_str(), self.raw_id, ts_now)
+                if len(fills) == 1:
+                    leg_trade_id = TradeId(f"T-{leg_hash:016x}-{self._execution_count:03d}-{leg_position}")
+                else:
+                    leg_trade_id = TradeId(f"T-{leg_hash:016x}-{self._execution_count:03d}-{fill_index}-{leg_position}")
+                leg_fill = OrderFilled(
+                    trader_id=order.trader_id,
+                    strategy_id=order.strategy_id,
+                    instrument_id=leg_instrument_id,
+                    client_order_id=leg_client_order_id,  # Use unique leg client order ID
+                    venue_order_id=leg_venue_order_id,  # Use unique leg venue order ID
+                    account_id=order.account_id,
+                    trade_id=leg_trade_id,
+                    order_side=order_side,
+                    order_type=order.order_type,
+                    last_qty=adjusted_leg_quantity,
+                    last_px=adjusted_leg_price,
+                    currency=leg_instrument.quote_currency,
+                    liquidity_side=liquidity_side,
+                    event_id=UUID4(),
+                    ts_event=ts_now,
+                    ts_init=ts_now,
+                    reconciliation=False,
+                    position_id=None,
+                    commission=commission,
+                )
+
+                # Publish the leg fill event (same as regular order fills)
+                self.msgbus.send(endpoint="ExecEngine.process", msg=leg_fill)
 
     cdef dict _calculate_leg_execution_prices(
         self,

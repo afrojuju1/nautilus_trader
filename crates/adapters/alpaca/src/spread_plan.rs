@@ -6,7 +6,9 @@ use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
     enums::AssetClass,
     identifiers::{InstrumentId, Symbol, Venue},
-    instruments::{Instrument, InstrumentAny, OptionSpread},
+    instruments::{
+        Instrument, InstrumentAny, OptionSpread, SpreadLeg, generic_spread_id, generic_spread_legs,
+    },
     types::{Currency, Price, Quantity},
 };
 use nautilus_trading::options::{
@@ -36,6 +38,20 @@ pub struct OptionSpreadLegPlan {
     pub symbol: String,
     /// Signed spread ratio. Positive legs are bought when buying the spread.
     pub ratio: i64,
+}
+
+impl OptionSpreadLegPlan {
+    fn from_spread_leg(leg: SpreadLeg) -> Self {
+        Self {
+            instrument_id: leg.instrument_id,
+            symbol: leg.instrument_id.symbol.to_string(),
+            ratio: leg.ratio,
+        }
+    }
+
+    fn to_spread_leg(&self) -> SpreadLeg {
+        SpreadLeg::new(self.instrument_id, self.ratio)
+    }
 }
 
 /// Nautilus-native option spread plan derived from a selected options candidate.
@@ -80,16 +96,13 @@ pub fn spread_quote_subscription_params() -> Params {
 pub fn option_spread_legs_from_instrument_id(
     instrument_id: InstrumentId,
 ) -> anyhow::Result<Vec<OptionSpreadLegPlan>> {
-    let legs = instrument_id
-        .symbol
-        .as_str()
-        .split("___")
-        .map(|component| parse_generic_spread_leg(component, instrument_id.venue))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    if legs.len() < 2 {
-        anyhow::bail!("option spread {instrument_id} must contain at least two legs");
-    }
-    Ok(legs)
+    generic_spread_legs(instrument_id)
+        .map(|legs| {
+            legs.into_iter()
+                .map(OptionSpreadLegPlan::from_spread_leg)
+                .collect()
+        })
+        .map_err(Into::into)
 }
 
 /// Builds a Nautilus-native option spread plan for a selected candidate.
@@ -279,9 +292,13 @@ fn option_spread_plan(
     scanner_premium_kind: EntryPremiumKind,
     scanner_premium: f64,
 ) -> anyhow::Result<OptionSpreadPlan> {
+    let spread_legs = legs
+        .iter()
+        .map(OptionSpreadLegPlan::to_spread_leg)
+        .collect::<Vec<_>>();
+    let instrument_id = generic_spread_id(&spread_legs)?;
+    let legs = option_spread_legs_from_instrument_id(instrument_id)?;
     let expiration_ns = spread_expiration_ns(&legs)?;
-    let raw_symbol = Symbol::new(generic_spread_symbol(&legs));
-    let instrument_id = InstrumentId::new(raw_symbol, Venue::new(ALPACA_VENUE));
     let raw_symbol = instrument_id.symbol;
     let instrument = OptionSpread::new(
         instrument_id,
@@ -322,54 +339,6 @@ fn option_spread_plan(
         scanner_premium_kind,
         scanner_premium,
     })
-}
-
-fn generic_spread_symbol(legs: &[OptionSpreadLegPlan]) -> String {
-    legs.iter()
-        .map(|leg| {
-            if leg.ratio > 0 {
-                format!("({}){}", leg.ratio, leg.symbol)
-            } else {
-                format!("(({})){}", leg.ratio.abs(), leg.symbol)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("___")
-}
-
-fn parse_generic_spread_leg(component: &str, venue: Venue) -> anyhow::Result<OptionSpreadLegPlan> {
-    let (ratio, symbol) = if let Some(rest) = component.strip_prefix("((") {
-        let (ratio, symbol) = rest
-            .split_once("))")
-            .ok_or_else(|| anyhow::anyhow!("invalid negative spread leg `{component}`"))?;
-        (-parse_positive_ratio(ratio, component)?, symbol)
-    } else {
-        let rest = component
-            .strip_prefix('(')
-            .ok_or_else(|| anyhow::anyhow!("invalid spread leg `{component}`"))?;
-        let (ratio, symbol) = rest
-            .split_once(')')
-            .ok_or_else(|| anyhow::anyhow!("invalid positive spread leg `{component}`"))?;
-        (parse_positive_ratio(ratio, component)?, symbol)
-    };
-    if symbol.is_empty() {
-        anyhow::bail!("spread leg `{component}` has empty symbol");
-    }
-    Ok(OptionSpreadLegPlan {
-        instrument_id: InstrumentId::new(Symbol::new(symbol), venue),
-        symbol: symbol.to_string(),
-        ratio,
-    })
-}
-
-fn parse_positive_ratio(value: &str, component: &str) -> anyhow::Result<i64> {
-    let ratio = value
-        .parse::<i64>()
-        .map_err(|e| anyhow::anyhow!("invalid spread leg ratio `{component}`: {e}"))?;
-    if ratio <= 0 {
-        anyhow::bail!("spread leg ratio must be positive in `{component}`");
-    }
-    Ok(ratio)
 }
 
 fn spread_expiration_ns(legs: &[OptionSpreadLegPlan]) -> anyhow::Result<u64> {

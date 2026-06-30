@@ -514,6 +514,17 @@ cdef class OrderMatchingEngine:
     cdef void _update_limit_if_touched_order(self, Order order, Quantity qty, Price price, Price trigger_price)
     cdef void _update_trailing_stop_market_order(self, Order order, Quantity qty, Price trigger_price)
     cdef void _update_trailing_stop_limit_order(self, Order order, Quantity qty, Price price, Price trigger_price)
+    cdef AccountId _resolve_order_account_id(self, Order order, AccountId account_id)
+    cdef OrderSide _spread_leg_order_side(self, OrderSide spread_side, int ratio)
+    cdef QuantityRaw _spread_reduce_only_closeable_raw(self, Order order, AccountId account_id)
+    cdef QuantityRaw _reduce_only_closeable_raw(self, Order order, Position position, AccountId account_id)
+    cdef bint _ensure_spread_leg_fills_available(self, Order order, Price fill_px, Quantity fill_qty)
+    cdef void _generate_applied_spread_leg_fills(
+        self,
+        Order order,
+        list[tuple[Price, Quantity]] fills,
+        LiquiditySide liquidity_side,
+    )
 
 # -- ORDER PROCESSING -----------------------------------------------------------------------------
 

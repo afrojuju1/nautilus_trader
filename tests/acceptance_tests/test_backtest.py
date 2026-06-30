@@ -2371,8 +2371,10 @@ class TestBacktestNodeWithBacktestDataIterator:
             "trade_id=T-8ba53c03fcdf19ba-001",
             "Order filled: ((1))ESM4___(1)NQM4.XCME, qty=3, price=12930.75, "
             "trade_id=T-8ba53c03fcdf19ba-002",
-            "Order filled: ESM4.XCME, qty=2, price=5199.62, trade_id=T-8ba53c03fcdf19ba-002-0",
-            "Order filled: NQM4.XCME, qty=2, price=18130.12, trade_id=T-8ba53c03fcdf19ba-002-1",
+            "Order filled: ESM4.XCME, qty=2, price=5199.62, trade_id=T-8ba53c03fcdf19ba-002-0-0",
+            "Order filled: NQM4.XCME, qty=2, price=18130.12, trade_id=T-8ba53c03fcdf19ba-002-0-1",
+            "Order filled: ESM4.XCME, qty=3, price=5199.62, trade_id=T-8ba53c03fcdf19ba-002-1-0",
+            "Order filled: NQM4.XCME, qty=3, price=18130.38, trade_id=T-8ba53c03fcdf19ba-002-1-1",
         ]
         assert order_filled_messages == expected_order_filled_messages
 

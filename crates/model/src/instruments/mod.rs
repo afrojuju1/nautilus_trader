@@ -33,6 +33,7 @@ pub mod index_instrument;
 pub mod option_contract;
 pub mod option_spread;
 pub mod perpetual_contract;
+pub mod spread;
 pub mod synthetic;
 pub mod tick_scheme;
 pub mod tokenized_asset;
@@ -74,6 +75,11 @@ pub use crate::instruments::{
     option_contract::OptionContract,
     option_spread::OptionSpread,
     perpetual_contract::PerpetualContract,
+    spread::{
+        GENERIC_SPREAD_ID_SEPARATOR, GenericSpreadError, SpreadLeg, generic_spread_id,
+        generic_spread_legs, generic_spread_total_leg_quantity, is_generic_spread_id,
+        spread_leg_order_side,
+    },
     synthetic::{SyntheticInstrument, SyntheticInstrumentError},
     tick_scheme::{
         FixedTickScheme, TickScheme, TickSchemeError, TickSchemeRule, TieredTickScheme,
