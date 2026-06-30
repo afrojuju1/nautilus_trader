@@ -388,6 +388,11 @@ impl AlpacaOptionsStrategy {
                 &context.explanation_codes,
                 regime_context,
             );
+            self.emit_vertical_spread_order_draft(
+                &data.candidates.trade_date,
+                &entry,
+                "regime_dry_run_only",
+            );
             return Ok(None);
         }
 
@@ -421,6 +426,11 @@ impl AlpacaOptionsStrategy {
                 None,
                 &[],
                 regime_context,
+            );
+            self.emit_vertical_spread_order_draft(
+                &data.candidates.trade_date,
+                &entry,
+                "open_orders_disabled",
             );
             return Ok(None);
         }
@@ -1297,6 +1307,107 @@ impl AlpacaOptionsStrategy {
             }
         }
         emit_operator_event("candidate_spread_quote", payload);
+    }
+
+    fn emit_vertical_spread_order_draft(
+        &mut self,
+        trade_date: &str,
+        entry: &SelectedOptionsEntry,
+        dry_run_reason: &str,
+    ) {
+        if !is_vertical_spread_entry(entry) {
+            return;
+        }
+
+        let order_list_id = entry_order_list_id(trade_date, entry.underlying());
+        match self.vertical_spread_order_draft(entry, &order_list_id) {
+            Ok(Some(draft)) => emit_operator_event(
+                "entry_spread_order_draft",
+                vertical_spread_order_draft_payload(trade_date, entry, dry_run_reason, &draft),
+            ),
+            Ok(None) => {}
+            Err(error) => emit_operator_event(
+                "entry_spread_order_draft",
+                json!({
+                    "action": "unavailable",
+                    "reason": "spread_order_draft_error",
+                    "dry_run_reason": dry_run_reason,
+                    "trade_date": trade_date,
+                    "underlying": entry.underlying(),
+                    "strategy": entry.strategy_name(),
+                    "symbols": entry.option_symbols(),
+                    "error": error.to_string(),
+                }),
+            ),
+        }
+    }
+
+    fn vertical_spread_order_draft(
+        &mut self,
+        entry: &SelectedOptionsEntry,
+        order_list_id: &str,
+    ) -> anyhow::Result<Option<VerticalSpreadOrderDraft>> {
+        let Some(plan) = selected_entry_spread_plan(entry, self.clock().timestamp_ns())? else {
+            return Ok(None);
+        };
+        if !is_vertical_spread_plan(&plan) {
+            return Ok(None);
+        }
+
+        self.cache_spread_plan(&plan)?;
+        let pricing = self.spread_entry_order_pricing(&plan);
+        let mut order_api = self.order();
+        let order = build_vertical_spread_entry_order(
+            &mut order_api,
+            &plan,
+            order_list_id,
+            self.config.quantity,
+            pricing.signed_limit_price,
+        )?;
+        Ok(Some(VerticalSpreadOrderDraft {
+            plan,
+            order,
+            pricing,
+        }))
+    }
+
+    fn cache_spread_plan(&mut self, plan: &OptionSpreadPlan) -> anyhow::Result<()> {
+        let cache_rc = DataActorNative::cache_rc(self);
+        let mut cache = cache_rc.borrow_mut();
+        if cache.instrument(&plan.instrument_id).is_none() {
+            cache.add_instrument(plan.instrument.clone())?;
+        }
+        Ok(())
+    }
+
+    fn spread_entry_order_pricing(&self, plan: &OptionSpreadPlan) -> SpreadEntryOrderPricing {
+        let cache = self.cache();
+        if let Some(quote) = cache.quote(&plan.instrument_id) {
+            let bid = quote.bid_price.as_f64();
+            let ask = quote.ask_price.as_f64();
+            let mid = f64::midpoint(bid, ask);
+            if ask != 0.0 {
+                return SpreadEntryOrderPricing {
+                    pricing_source: "nautilus_spread_quote",
+                    signed_limit_price: ask,
+                    spread_bid: Some(bid),
+                    spread_ask: Some(ask),
+                    spread_mid: Some(mid),
+                    quote_ts_event: Some(quote.ts_event),
+                    quote_ts_init: Some(quote.ts_init),
+                };
+            }
+        }
+
+        SpreadEntryOrderPricing {
+            pricing_source: "scanner_snapshot_fallback",
+            signed_limit_price: signed_scanner_spread_price(plan),
+            spread_bid: None,
+            spread_ask: None,
+            spread_mid: None,
+            quote_ts_event: None,
+            quote_ts_init: None,
+        }
     }
 
     fn state_entry(&self, order_list_id: &str) -> Option<&StrategyStateEntry> {
@@ -2331,6 +2442,86 @@ fn spread_quote_snapshot_payload(
     })
 }
 
+struct SpreadEntryOrderPricing {
+    pricing_source: &'static str,
+    signed_limit_price: f64,
+    spread_bid: Option<f64>,
+    spread_ask: Option<f64>,
+    spread_mid: Option<f64>,
+    quote_ts_event: Option<UnixNanos>,
+    quote_ts_init: Option<UnixNanos>,
+}
+
+struct VerticalSpreadOrderDraft {
+    plan: OptionSpreadPlan,
+    order: OrderAny,
+    pricing: SpreadEntryOrderPricing,
+}
+
+fn vertical_spread_order_draft_payload(
+    trade_date: &str,
+    entry: &SelectedOptionsEntry,
+    dry_run_reason: &str,
+    draft: &VerticalSpreadOrderDraft,
+) -> Value {
+    let scanner_signed_price = signed_scanner_spread_price(&draft.plan);
+    let mut payload = json!({
+        "action": "drafted",
+        "dry_run_reason": dry_run_reason,
+        "trade_date": trade_date,
+        "underlying": draft.plan.underlying.as_str(),
+        "strategy": draft.plan.strategy.as_str(),
+        "symbols": entry.option_symbols(),
+        "spread_instrument_id": draft.plan.instrument_id.to_string(),
+        "spread_symbol": draft.plan.raw_symbol.to_string(),
+        "legs": draft
+            .plan
+            .legs
+            .iter()
+            .map(|leg| {
+                json!({
+                    "symbol": leg.symbol.as_str(),
+                    "instrument_id": leg.instrument_id.to_string(),
+                    "ratio": leg.ratio,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "order": {
+            "client_order_id": draft.order.client_order_id().to_string(),
+            "instrument_id": draft.order.instrument_id().to_string(),
+            "side": format!("{:?}", draft.order.order_side()).to_ascii_lowercase(),
+            "quantity": draft.order.quantity().as_f64(),
+            "signed_limit_price": draft.order.price().map(|price| price.as_f64()),
+            "reduce_only": draft.order.is_reduce_only(),
+        },
+        "pricing_source": draft.pricing.pricing_source,
+        "scanner_premium_kind": draft.plan.scanner_premium_kind.as_str(),
+        "scanner_premium": draft.plan.scanner_premium,
+        "scanner_signed_price": scanner_signed_price,
+        "scanner_vs_order_limit": scanner_signed_price - draft.pricing.signed_limit_price,
+        "current_broker_submit_path": "legacy_leg_order_list",
+        "draft_broker_submit_path": "single_option_spread_order",
+        "submitted": false,
+        "vega_pricing_enabled": false,
+    });
+    if let Some(value) = draft.pricing.spread_bid {
+        insert_value_field(&mut payload, "spread_bid", json!(value));
+    }
+    if let Some(value) = draft.pricing.spread_ask {
+        insert_value_field(&mut payload, "spread_ask", json!(value));
+    }
+    if let Some(value) = draft.pricing.spread_mid {
+        insert_value_field(&mut payload, "spread_mid", json!(value));
+    }
+    if let Some(value) = draft.pricing.quote_ts_event {
+        insert_value_field(&mut payload, "quote_ts_event", json!(value.as_u64()));
+    }
+    if let Some(value) = draft.pricing.quote_ts_init {
+        insert_value_field(&mut payload, "quote_ts_init", json!(value.as_u64()));
+    }
+    payload
+}
+
 fn active_entry_quote_symbols(state: &StrategyState) -> Vec<String> {
     state
         .entries
@@ -2360,6 +2551,17 @@ pub trait OptionsEntryOrderCreator {
     /// Creates a Nautilus limit order for one option leg.
     #[expect(clippy::too_many_arguments)]
     fn option_limit(
+        &mut self,
+        instrument_id: InstrumentId,
+        side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        reduce_only: bool,
+        client_order_id: ClientOrderId,
+    ) -> OrderAny;
+
+    /// Creates a Nautilus limit order for one option spread.
+    fn option_spread_limit(
         &mut self,
         instrument_id: InstrumentId,
         side: OrderSide,
@@ -2399,10 +2601,68 @@ impl OptionsEntryOrderCreator for OrderApi<'_> {
             Some(client_order_id),
         )
     }
+
+    fn option_spread_limit(
+        &mut self,
+        instrument_id: InstrumentId,
+        side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        reduce_only: bool,
+        client_order_id: ClientOrderId,
+    ) -> OrderAny {
+        self.limit(
+            instrument_id,
+            side,
+            quantity,
+            price,
+            Some(TimeInForce::Day),
+            None,
+            None,
+            Some(reduce_only),
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(client_order_id),
+        )
+    }
 }
 
 impl OptionsEntryOrderCreator for OrderFactory {
     fn option_limit(
+        &mut self,
+        instrument_id: InstrumentId,
+        side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        reduce_only: bool,
+        client_order_id: ClientOrderId,
+    ) -> OrderAny {
+        self.limit(
+            instrument_id,
+            side,
+            quantity,
+            price,
+            Some(TimeInForce::Day),
+            None,
+            None,
+            Some(reduce_only),
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(client_order_id),
+        )
+    }
+
+    fn option_spread_limit(
         &mut self,
         instrument_id: InstrumentId,
         side: OrderSide,
@@ -2536,6 +2796,54 @@ pub fn build_selected_entry_orders(
             false,
         )?],
     })
+}
+
+fn build_vertical_spread_entry_order(
+    orders: &mut impl OptionsEntryOrderCreator,
+    plan: &OptionSpreadPlan,
+    order_list_id: &str,
+    quantity: u64,
+    signed_limit_price: f64,
+) -> anyhow::Result<OrderAny> {
+    if quantity == 0 {
+        anyhow::bail!("spread order {order_list_id} quantity must be positive");
+    }
+    if signed_limit_price == 0.0 {
+        anyhow::bail!("spread order {order_list_id} signed limit price must be non-zero");
+    }
+    if !is_vertical_spread_plan(plan) {
+        anyhow::bail!(
+            "spread order {order_list_id} only supports two-leg vertical drafts, got {} legs",
+            plan.legs.len()
+        );
+    }
+
+    Ok(orders.option_spread_limit(
+        plan.instrument_id,
+        OrderSide::Buy,
+        Quantity::new(quantity as f64, 0),
+        Price::new(signed_limit_price, 2),
+        false,
+        labeled_client_order_id(order_list_id, "spread"),
+    ))
+}
+
+fn is_vertical_spread_entry(entry: &SelectedOptionsEntry) -> bool {
+    matches!(
+        entry,
+        SelectedOptionsEntry::Credit(_) | SelectedOptionsEntry::Debit(_)
+    )
+}
+
+fn is_vertical_spread_plan(plan: &OptionSpreadPlan) -> bool {
+    plan.legs.len() == 2
+}
+
+fn signed_scanner_spread_price(plan: &OptionSpreadPlan) -> f64 {
+    match plan.scanner_premium_kind {
+        nautilus_trading::options::entries::EntryPremiumKind::Credit => -plan.scanner_premium,
+        nautilus_trading::options::entries::EntryPremiumKind::Debit => plan.scanner_premium,
+    }
 }
 
 /// Applies a known order-list ID before handing orders to `Strategy::submit_order_list`.
