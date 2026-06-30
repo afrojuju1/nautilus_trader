@@ -49,8 +49,6 @@ impl EntryMode {
 pub enum EntryGateDecision {
     /// New entries may continue through candidate admission.
     Continue,
-    /// New entries are blocked by the kill switch.
-    KillSwitch,
     /// New entries are blocked outside the entry window.
     OutsideEntryWindow,
 }
@@ -80,12 +78,10 @@ pub struct EntryAdmissionSnapshot {
 /// Strategy-owned entry admission configuration derived from [`AlpacaOptionsRuntimeConfig`].
 #[derive(Clone, Debug)]
 pub struct EntryAdmissionConfig {
-    /// Whether live submission is globally enabled.
-    pub submit_enabled: bool,
+    /// Whether broker orders which open new risk are globally enabled.
+    pub open_orders_enabled: bool,
     /// Strategy names that are intentionally scanned but not submitted.
     pub dry_run_strategy_family_names: BTreeMap<String, ()>,
-    /// Whether new entries are blocked.
-    pub kill_switch: bool,
     /// Whether the entry window should be ignored.
     pub ignore_entry_window: bool,
     /// Entry window start.
@@ -134,7 +130,7 @@ pub struct EntryAdmissionConfig {
     pub fleet_sectors: BTreeMap<String, String>,
     /// Fleet current active entries by sector/correlation group.
     pub fleet_active_entries_by_sector: BTreeMap<String, usize>,
-    /// Broker account-level reasons captured before live submit is enabled.
+    /// Broker account-level reasons captured before broker-order submission is enabled.
     pub account_admission_reasons: Vec<String>,
 }
 
@@ -145,13 +141,12 @@ impl EntryAdmissionConfig {
         let fleet_exposure = engine.fleet.as_ref().map(|fleet| fleet.exposure());
         let fleet_section = engine.fleet.as_ref().map(|fleet| &fleet.config.fleet);
         Self {
-            submit_enabled: engine.submit_enabled,
+            open_orders_enabled: engine.open_orders_enabled,
             dry_run_strategy_family_names: engine
                 .dry_run_strategy_family_names()
                 .into_iter()
                 .map(|name| (name.to_string(), ()))
                 .collect(),
-            kill_switch: engine.kill_switch,
             ignore_entry_window: engine.ignore_entry_window,
             entry_start: engine.entry_start,
             entry_end: engine.entry_end,
@@ -205,9 +200,8 @@ impl EntryAdmissionConfig {
 impl Default for EntryAdmissionConfig {
     fn default() -> Self {
         Self {
-            submit_enabled: true,
+            open_orders_enabled: true,
             dry_run_strategy_family_names: BTreeMap::new(),
-            kill_switch: false,
             ignore_entry_window: true,
             entry_start: NaiveTime::MIN,
             entry_end: NaiveTime::from_hms_opt(23, 59, 59).expect("valid terminal day time"),
@@ -237,13 +231,13 @@ impl Default for EntryAdmissionConfig {
     }
 }
 
-/// Returns whether a selected entry may submit live orders under runtime dry-run gates.
+/// Returns whether a selected entry may open broker orders under runtime dry-run gates.
 #[must_use]
-pub fn selected_submit_enabled(
+pub fn selected_open_orders_enabled(
     config: &EntryAdmissionConfig,
     selected: &SelectedOptionsEntry,
 ) -> bool {
-    config.submit_enabled
+    config.open_orders_enabled
         && !config
             .dry_run_strategy_family_names
             .contains_key(selected.strategy_name())
@@ -255,7 +249,7 @@ pub fn selected_entry_mode(
     config: &EntryAdmissionConfig,
     selected: &SelectedOptionsEntry,
 ) -> EntryMode {
-    if selected_submit_enabled(config, selected) {
+    if selected_open_orders_enabled(config, selected) {
         EntryMode::Submit
     } else {
         EntryMode::DryRun
@@ -265,9 +259,7 @@ pub fn selected_entry_mode(
 /// Returns the account-level entry gate decision for `now`.
 #[must_use]
 pub fn entry_gate_decision(config: &EntryAdmissionConfig, now: DateTime<Utc>) -> EntryGateDecision {
-    if config.kill_switch {
-        EntryGateDecision::KillSwitch
-    } else if !config.ignore_entry_window && !inside_entry_window_at(config, now) {
+    if !config.ignore_entry_window && !inside_entry_window_at(config, now) {
         EntryGateDecision::OutsideEntryWindow
     } else {
         EntryGateDecision::Continue

@@ -43,9 +43,8 @@ From the repo root:
 deploy/alpaca/alpaca-options-install.sh
 ```
 
-Edit the repo-local `.env` and add Alpaca paper credentials. Keep
-`ALPACA_KILL_SWITCH=true`, `ALPACA_SUBMIT=false`, `ALPACA_MANAGE=false`, and `ALPACA_CLOSE=false`
-until paper proof is intentionally enabled.
+Edit the repo-local `.env` and add Alpaca paper credentials. Keep `ALPACA_OPEN_ORDERS=false` and
+`ALPACA_CLOSE_ORDERS=false` until paper proof is intentionally enabled.
 
 The installed engine, operator status command, and account/order probe auto-load the repo `.env`
 when `NAUTILUS_ALPACA_REPO` points at the checkout or when commands run from the repo tree. Set
@@ -108,7 +107,7 @@ the fields they support:
 - Strategy/run controls: `ALPACA_STRATEGY_FAMILIES`, `ALPACA_DRY_RUN_FAMILIES`,
   `ALPACA_MAX_ITERATIONS`, `ALPACA_INTERVAL_SECS`, `ALPACA_QTY`,
   `ALPACA_IGNORE_ENTRY_WINDOW`.
-- Safety gates: `ALPACA_SUBMIT`, `ALPACA_MANAGE`, `ALPACA_CLOSE`, `ALPACA_KILL_SWITCH`,
+- Order capability gates: `ALPACA_OPEN_ORDERS`, `ALPACA_CLOSE_ORDERS`,
   `ALPACA_FORCE_FLATTEN`, `ALPACA_CANCEL_AFTER_ACCEPT`.
 - Account caps: `ALPACA_MAX_ACTIVE_ENTRIES`, `ALPACA_MAX_DAILY_SUBMITS`,
   `ALPACA_MAX_OPEN_ORDERS`, `ALPACA_MAX_ACTIVE_ENTRIES_PER_UNDERLYING`,
@@ -128,7 +127,7 @@ missing file is an error. Fleet status uses an even stricter account boundary by
 `ALPACA_*` and `NAUTILUS_ALPACA_*` values before launching each per-account operator-status child.
 
 Fleet policy is applied after TOML and env resolution. Disabled accounts, role/permission
-mismatches, or fleet kill-switch activation force `submit_enabled=false` and `kill_switch=true`.
+mismatches, or fleet kill-switch activation force `open_orders_enabled=false`.
 Fleet account risk budgets can also tighten account limits; they should not be used to loosen the
 account TOML.
 
@@ -226,18 +225,16 @@ When Docker owns the runtime, prefer the Docker status commands above plus
 `alpaca-control fleet` command is systemd-oriented and reports systemd account services as inactive
 when Docker is the active owner.
 
-The Docker defaults keep `ALPACA_SUBMIT=false`, `ALPACA_MANAGE=false`, `ALPACA_CLOSE=false`, and
-`ALPACA_KILL_SWITCH=true`. To run the actual containerized engine, make the paper-trading intent
+The Docker defaults keep `ALPACA_OPEN_ORDERS=false` and `ALPACA_CLOSE_ORDERS=false`. To run the
+actual containerized engine, make the paper-trading intent
 explicit in the repo `.env` or shell, point the Docker config mounts at reviewed local configs, keep
 paper endpoints in place, and start only the engine profile:
 
 ```bash
 NAUTILUS_ALPACA_DOCKER_BASE_CONFIG=~/.local/share/nautilus-alpaca-docker-config/base-options.toml \
 NAUTILUS_ALPACA_DOCKER_CONFIG=~/.local/share/nautilus-alpaca-docker-config/options.toml \
-NAUTILUS_ALPACA_DOCKER_SUBMIT=true \
-NAUTILUS_ALPACA_DOCKER_MANAGE=true \
-NAUTILUS_ALPACA_DOCKER_CLOSE=true \
-NAUTILUS_ALPACA_DOCKER_KILL_SWITCH=false \
+NAUTILUS_ALPACA_DOCKER_OPEN_ORDERS=true \
+NAUTILUS_ALPACA_DOCKER_CLOSE_ORDERS=true \
 docker compose \
   --env-file .env \
   -f deploy/alpaca/compose.yml \
@@ -392,8 +389,8 @@ The hosted strategy names are:
 
 Accounts with credit verticals or iron condors require `defined_risk = true` in the fleet registry.
 Accounts with debit verticals require `long_premium = true`. A mismatch forces
-`submit_enabled=false` and `kill_switch=true` for that runtime while leaving management/close gates
-available for existing tracked exposure.
+`open_orders_enabled=false` for that runtime while leaving close-order capability available for
+existing tracked exposure.
 
 The paper profile manifest documents account intent, but the shell wrapper no longer owns
 DB-backed strategy attribution. Use `nautilus adapters alpaca performance` for Alpaca
@@ -413,10 +410,8 @@ Keep extra accounts disabled in the fleet registry and keep their env gates iner
 permissions, strategy config, and risk budget are reviewed:
 
 ```bash
-ALPACA_SUBMIT=false
-ALPACA_MANAGE=false
-ALPACA_CLOSE=false
-ALPACA_KILL_SWITCH=true
+ALPACA_OPEN_ORDERS=false
+ALPACA_CLOSE_ORDERS=false
 ```
 
 After an account config and any env override are reviewed, the account can be enabled explicitly:
@@ -430,12 +425,11 @@ systemctl --user start alpaca-options@paper-call-credit-qqq.service
 Do not enable new account-instance services on login until paper proof is complete for that
 account's role and strategy set.
 
-## Safety Gates
+## Order Capability Gates
 
-- `ALPACA_KILL_SWITCH=true` blocks new entries.
-- `ALPACA_SUBMIT=true` allows entry submission.
-- `ALPACA_MANAGE=true` allows stale-entry cancellation and management actions.
-- `ALPACA_CLOSE=true` allows close order submission when management is enabled.
+- `ALPACA_OPEN_ORDERS=true` allows broker orders that open new risk.
+- `ALPACA_CLOSE_ORDERS=true` allows broker orders that close or reduce risk, including stale-order
+  cancellation and close submissions.
 - `ALPACA_FORCE_FLATTEN=true` treats every tracked open spread as a close candidate.
 - TOML `runtime.dry_run_families = ["iron_condor"]` lets a strategy scan and emit decisions
   without submitting while other enabled strategies can remain live.

@@ -29,10 +29,8 @@ pub struct CreditSpreadManagementConfig {
 pub struct AlpacaOptionsManagementConfig {
     /// Delay between management evaluations.
     pub interval_secs: u64,
-    /// Whether management actions are enabled.
-    pub manage_enabled: bool,
-    /// Whether close order submission is enabled.
-    pub close_enabled: bool,
+    /// Whether broker orders which close or reduce risk are enabled.
+    pub close_orders_enabled: bool,
     /// Whether every active entry should be flattened.
     pub force_flatten: bool,
     /// Stale entry timeout.
@@ -77,8 +75,7 @@ impl AlpacaOptionsManagementConfig {
     pub fn from_runtime_config(config: &AlpacaOptionsRuntimeConfig) -> Self {
         Self {
             interval_secs: config.interval_secs,
-            manage_enabled: config.manage_enabled,
-            close_enabled: config.close_enabled,
+            close_orders_enabled: config.close_orders_enabled,
             force_flatten: config.force_flatten,
             stale_entry_secs: config.stale_entry_secs,
             stale_close_secs: config.stale_close_secs,
@@ -114,8 +111,7 @@ impl Default for AlpacaOptionsManagementConfig {
     fn default() -> Self {
         Self {
             interval_secs: 60,
-            manage_enabled: false,
-            close_enabled: false,
+            close_orders_enabled: false,
             force_flatten: false,
             stale_entry_secs: 900,
             stale_close_secs: 900,

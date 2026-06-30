@@ -48,10 +48,8 @@ struct OperatorConfig {
     stale_order_secs: i64,
     max_close_attempts: u32,
     trade_date: String,
-    kill_switch: bool,
-    submit_enabled: bool,
-    manage_enabled: bool,
-    close_enabled: bool,
+    open_orders_enabled: bool,
+    close_orders_enabled: bool,
     dry_run_families: Vec<String>,
     max_active_entries: Option<usize>,
     max_daily_submits: Option<usize>,
@@ -118,10 +116,8 @@ struct ServiceStatus {
     lock_file_exists: bool,
     log_file: String,
     log_file_exists: bool,
-    kill_switch: bool,
-    submit_enabled: bool,
-    manage_enabled: bool,
-    close_enabled: bool,
+    open_orders_enabled: bool,
+    close_orders_enabled: bool,
     dry_run_families: Vec<String>,
 }
 
@@ -395,10 +391,8 @@ impl OperatorConfig {
             stale_order_secs: strategy_config.stale_entry_secs as i64,
             max_close_attempts: strategy_config.max_close_attempts,
             trade_date: trade_date.to_string(),
-            kill_switch: strategy_config.kill_switch,
-            submit_enabled: strategy_config.submit_enabled,
-            manage_enabled: strategy_config.manage_enabled,
-            close_enabled: strategy_config.close_enabled,
+            open_orders_enabled: strategy_config.open_orders_enabled,
+            close_orders_enabled: strategy_config.close_orders_enabled,
             dry_run_families,
             max_active_entries: strategy_config.max_active_entries,
             max_daily_submits: strategy_config.max_daily_submits,
@@ -584,10 +578,8 @@ fn build_status(
         lock_file_exists: config.lock_path.exists(),
         log_file: config.log_path.display().to_string(),
         log_file_exists: config.log_path.exists(),
-        kill_switch: config.kill_switch,
-        submit_enabled: config.submit_enabled,
-        manage_enabled: config.manage_enabled,
-        close_enabled: config.close_enabled,
+        open_orders_enabled: config.open_orders_enabled,
+        close_orders_enabled: config.close_orders_enabled,
         dry_run_families: config.dry_run_families.clone(),
     };
 
@@ -698,18 +690,18 @@ fn build_alerts(
             "Alpaca account is blocked or trading is suspended".to_string(),
         ));
     }
-    if config.kill_switch {
+    if !config.open_orders_enabled {
         alerts.push(alert(
             AlertSeverity::Info,
-            "kill_switch_active",
-            "new entries are blocked by ALPACA_KILL_SWITCH=true".to_string(),
+            "open_orders_disabled",
+            "broker orders which open new risk are disabled".to_string(),
         ));
     }
-    if !config.submit_enabled {
+    if !config.close_orders_enabled {
         alerts.push(alert(
             AlertSeverity::Info,
-            "submission_disabled",
-            "entry submission is disabled".to_string(),
+            "close_orders_disabled",
+            "broker orders which close or reduce risk are disabled".to_string(),
         ));
     }
     for block in &config.fleet_policy_blocks {
@@ -951,14 +943,12 @@ fn classify_engine_state(
         .any(|alert| alert.severity == AlertSeverity::Critical)
     {
         EngineState::Broken
-    } else if config.kill_switch
-        || !config.submit_enabled
-        || account.trading_blocked
-        || account.trade_suspended_by_user
-    {
+    } else if account.trading_blocked || account.trade_suspended_by_user {
         EngineState::Blocked
     } else if orders.open > 0 || positions.total > 0 {
         EngineState::Trading
+    } else if !config.open_orders_enabled {
+        EngineState::Blocked
     } else {
         EngineState::Idle
     }
@@ -970,13 +960,11 @@ fn print_human_status(status: &OperatorStatus) {
         status.engine_state, status.checked_at_utc
     );
     println!(
-        "service: name={} active={} kill_switch={} submit={} manage={} close={} dry_run_families={} lock={} log={}",
+        "service: name={} active={} open_orders={} close_orders={} dry_run_families={} lock={} log={}",
         status.service.name,
         status.service.active_state.as_deref().unwrap_or("unknown"),
-        status.service.kill_switch,
-        status.service.submit_enabled,
-        status.service.manage_enabled,
-        status.service.close_enabled,
+        status.service.open_orders_enabled,
+        status.service.close_orders_enabled,
         status.service.dry_run_families.join(","),
         status.service.lock_file,
         status.service.log_file,

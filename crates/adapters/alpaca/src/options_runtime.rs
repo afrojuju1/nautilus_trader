@@ -135,12 +135,8 @@ pub struct AlpacaOptionsRuntimeConfig {
     pub interval_secs: u64,
     /// Strategy quantity.
     pub quantity: u64,
-    /// Whether entry submission is enabled.
-    pub submit_enabled: bool,
-    /// Whether management actions are enabled.
-    pub manage_enabled: bool,
-    /// Whether new entries are blocked.
-    pub kill_switch: bool,
+    /// Whether broker orders which open new risk are enabled.
+    pub open_orders_enabled: bool,
     /// Whether every active entry should be flattened.
     pub force_flatten: bool,
     /// Whether accepted smoke orders should be canceled.
@@ -149,8 +145,8 @@ pub struct AlpacaOptionsRuntimeConfig {
     pub stale_entry_secs: u64,
     /// Stale close timeout.
     pub stale_close_secs: u64,
-    /// Whether close order submission is enabled.
-    pub close_enabled: bool,
+    /// Whether broker orders which close or reduce risk are enabled.
+    pub close_orders_enabled: bool,
     /// Whether non-forced close submissions are limited to regular options hours.
     pub close_regular_hours_only: bool,
     /// Close window start.
@@ -527,28 +523,28 @@ impl AlpacaOptionsRuntimeConfig {
         names
     }
 
-    /// Returns whether a selected credit-spread kind may submit live orders.
+    /// Returns whether a selected credit-spread kind may open broker orders.
     #[must_use]
-    pub fn credit_submit_enabled(&self, kind: CreditSpreadKind) -> bool {
-        self.submit_enabled && !self.dry_run_spread_kinds.contains(&kind)
+    pub fn credit_open_orders_enabled(&self, kind: CreditSpreadKind) -> bool {
+        self.open_orders_enabled && !self.dry_run_spread_kinds.contains(&kind)
     }
 
-    /// Returns whether a selected iron condor may submit live orders.
+    /// Returns whether a selected iron condor may open broker orders.
     #[must_use]
-    pub fn iron_condor_submit_enabled(&self) -> bool {
-        self.submit_enabled && !self.iron_condor_dry_run
+    pub fn iron_condor_open_orders_enabled(&self) -> bool {
+        self.open_orders_enabled && !self.iron_condor_dry_run
     }
 
-    /// Returns whether a selected debit-spread kind may submit live orders.
+    /// Returns whether a selected debit-spread kind may open broker orders.
     #[must_use]
-    pub fn debit_submit_enabled(&self, kind: DebitSpreadKind) -> bool {
-        self.submit_enabled && !self.dry_run_debit_kinds.contains(&kind)
+    pub fn debit_open_orders_enabled(&self, kind: DebitSpreadKind) -> bool {
+        self.open_orders_enabled && !self.dry_run_debit_kinds.contains(&kind)
     }
 
-    /// Returns whether a selected naked-option kind may submit live orders.
+    /// Returns whether a selected naked-option kind may open broker orders.
     #[must_use]
-    pub fn naked_submit_enabled(&self, kind: NakedOptionKind) -> bool {
-        self.submit_enabled && !self.dry_run_naked_kinds.contains(&kind)
+    pub fn naked_open_orders_enabled(&self, kind: NakedOptionKind) -> bool {
+        self.open_orders_enabled && !self.dry_run_naked_kinds.contains(&kind)
     }
 
     /// Returns the scanner config for a naked-option strategy profile.

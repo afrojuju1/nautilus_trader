@@ -98,7 +98,8 @@ pub fn emit_account_capability_preflight(
         "account_capability_preflight",
         json!({
             "result": if preflight.is_ready() { "passed" } else { "blocked" },
-            "submit_enabled": config.submit_enabled,
+            "open_orders_enabled": config.open_orders_enabled,
+            "close_orders_enabled": config.close_orders_enabled,
             "strategy_families": config.enabled_strategy_family_names(),
             "required_options_level": preflight.required_options_level,
             "options_approved_level": preflight.options_approved_level,
@@ -110,17 +111,20 @@ pub fn emit_account_capability_preflight(
 }
 
 fn required_options_level(config: &AlpacaOptionsRuntimeConfig) -> u8 {
+    if !config.open_orders_enabled {
+        return 0;
+    }
     if config.enabled_strategy_family_names().is_empty() {
         0
     } else {
-        // The current strategy families all submit spreads, iron condors, or short option legs.
-        // Alpaca documents these as Level 3-capable strategy families.
+        // Opening risk requires the configured strategy-family approval level. Close-only mode
+        // should remain available for risk reduction when opening permissions are disabled.
         3
     }
 }
 
 fn has_short_option_leg(config: &AlpacaOptionsRuntimeConfig) -> bool {
-    !config.enabled_strategy_family_names().is_empty()
+    config.open_orders_enabled && !config.enabled_strategy_family_names().is_empty()
 }
 
 fn check_level(field: &str, actual: Option<u8>, required: u8, reasons: &mut Vec<String>) {
@@ -192,7 +196,7 @@ mod tests {
 
     fn runtime_config() -> AlpacaOptionsRuntimeConfig {
         let mut config = AlpacaOptionsRuntimeConfig::from_runtime_config_for_tests();
-        config.submit_enabled = true;
+        config.open_orders_enabled = true;
         config
     }
 

@@ -91,7 +91,9 @@ new staged bridge:
 - `alpaca-put-credit-strategy-loop` / `put_credit_strategy_loop.rs`
 - `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED`
 
-Use `ALPACA_SUBMIT` as the runtime submit gate.
+Use `ALPACA_OPEN_ORDERS` for opening broker orders and `ALPACA_CLOSE_ORDERS` for
+risk-reducing broker orders. Do not restore retired runtime gates such as `ALPACA_SUBMIT`,
+`ALPACA_MANAGE`, `ALPACA_CLOSE`, or `ALPACA_KILL_SWITCH`.
 
 Do not turn ClickHouse or warehouse code into an Alpaca-only sync resolution. Warehouse work belongs
 under repo-level ownership such as `nautilus-persistence`, `schema/sql/clickhouse/`, and

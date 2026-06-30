@@ -67,8 +67,9 @@ Rules:
 - Do not restore direct Alpaca MLeg payload diagnostics such as `alpaca-validate-mleg-order`,
   `alpaca-submit-mleg-order`, or `alpaca-paper-execution-harness`. Use the Python options
   `TradingNode` smoke path or `alpaca-options-node` runtime path for execution proof.
-- Use the normal runtime submission gate `ALPACA_SUBMIT`; do not reintroduce
-  `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED`.
+- Use `ALPACA_OPEN_ORDERS` for opening broker orders and `ALPACA_CLOSE_ORDERS` for
+  risk-reducing broker orders; do not reintroduce `ALPACA_SUBMIT`, `ALPACA_MANAGE`,
+  `ALPACA_CLOSE`, `ALPACA_KILL_SWITCH`, or `ALPACA_OPTIONS_LIVE_ENTRY_SUBMIT_ENABLED`.
 - Live submit readiness must keep the Alpaca account capability preflight active. `alpaca-options-node`
   checks account options approval/trading level, account configuration max options level, buying
   power, and account configuration trading blocks before starting broker submission.

@@ -42,7 +42,7 @@ use crate::{
     options_entry_admission::{
         EntryAdmissionConfig, EntryAdmissionSnapshot, EntryGateDecision, SubmissionBlock,
         UNCOVERED_OPTION_PERMISSION_REJECTION_REASON, entry_gate_decision,
-        is_uncovered_option_permission_rejection, selected_submit_enabled,
+        is_uncovered_option_permission_rejection, selected_open_orders_enabled,
         submission_block_for_selected,
     },
     options_lifecycle::OptionLifecycleRiskHandle,
@@ -184,7 +184,7 @@ pub struct AlpacaOptionsStrategyConfig {
     pub admission: EntryAdmissionConfig,
     /// Initial persisted strategy state loaded before the node starts.
     pub initial_state: StrategyState,
-    /// Async state persistence boundary used when live submit is enabled.
+    /// Async state persistence boundary used when broker orders are enabled.
     pub state_persistence: Option<StrategyStatePersistenceHandle>,
     /// Async candidate-ledger persistence boundary used for scanner and strategy evidence.
     pub candidate_ledger_persistence: Option<CandidateLedgerPersistenceHandle>,
@@ -324,36 +324,6 @@ impl AlpacaOptionsStrategy {
 
         match entry_gate_decision(&self.config.admission, Utc::now()) {
             EntryGateDecision::Continue => {}
-            EntryGateDecision::KillSwitch => {
-                log::info!(
-                    "Skipping Alpaca options entry: trade_date={} reason=kill_switch_enabled underlying={} strategy={}",
-                    data.candidates.trade_date,
-                    entry.underlying(),
-                    entry.strategy_name()
-                );
-                emit_operator_event(
-                    "entry_decision",
-                    json!({
-                        "action": "skipped",
-                        "reason": "kill_switch_enabled",
-                        "trade_date": data.candidates.trade_date,
-                        "underlying": entry.underlying(),
-                        "strategy": entry.strategy_name(),
-                    }),
-                );
-                self.record_selected_candidate_alert(
-                    &data.candidates.trade_date,
-                    &entry,
-                    "skipped",
-                    None,
-                    Some("kill_switch_enabled"),
-                    None,
-                    None,
-                    &[],
-                    regime_context,
-                );
-                return Ok(None);
-            }
             EntryGateDecision::OutsideEntryWindow => {
                 log::info!(
                     "Skipping Alpaca options entry: trade_date={} reason=outside_entry_window underlying={} strategy={}",
@@ -421,7 +391,7 @@ impl AlpacaOptionsStrategy {
             return Ok(None);
         }
 
-        if !selected_submit_enabled(&self.config.admission, &entry) {
+        if !selected_open_orders_enabled(&self.config.admission, &entry) {
             log::info!(
                 "Dry-run Alpaca options entry: underlying={} strategy={} symbols={} score={:.1}",
                 entry.underlying(),
@@ -433,7 +403,7 @@ impl AlpacaOptionsStrategy {
                 "entry_decision",
                 json!({
                     "action": "dry_run",
-                    "reason": "submission_disabled",
+                    "reason": "open_orders_disabled",
                     "trade_date": data.candidates.trade_date,
                     "underlying": entry.underlying(),
                     "strategy": entry.strategy_name(),
@@ -446,7 +416,7 @@ impl AlpacaOptionsStrategy {
                 &entry,
                 "dry_run",
                 None,
-                Some("submission_disabled"),
+                Some("open_orders_disabled"),
                 None,
                 None,
                 &[],
@@ -464,7 +434,7 @@ impl AlpacaOptionsStrategy {
             return Ok(None);
         }
 
-        if self.config.admission.submit_enabled && !self.candidate_ledger_persistence_ready() {
+        if self.config.admission.open_orders_enabled && !self.candidate_ledger_persistence_ready() {
             log::error!(
                 "Skipping Alpaca options entry: trade_date={} reason=candidate_ledger_unhealthy underlying={} strategy={} symbols={}",
                 data.candidates.trade_date,
@@ -486,7 +456,7 @@ impl AlpacaOptionsStrategy {
             return Ok(None);
         }
 
-        if self.config.admission.submit_enabled && !self.state_persistence_ready() {
+        if self.config.admission.open_orders_enabled && !self.state_persistence_ready() {
             log::error!(
                 "Skipping Alpaca options entry: trade_date={} reason=state_persistence_unhealthy underlying={} strategy={} symbols={}",
                 data.candidates.trade_date,
@@ -797,22 +767,16 @@ impl AlpacaOptionsStrategy {
             return Ok(());
         };
 
-        if !(self.config.management.manage_enabled && self.config.management.close_enabled) {
-            let reason = if !self.config.management.manage_enabled {
-                "management_disabled"
-            } else {
-                "close_disabled"
-            };
+        if !self.config.management.close_orders_enabled {
             emit_operator_event(
                 "management_block",
                 json!({
                     "action": "close_blocked",
-                    "reason": reason,
+                    "reason": "close_orders_disabled",
                     "underlying": entry.underlying,
                     "strategy": entry.strategy,
                     "trigger": trigger,
-                    "manage_enabled": self.config.management.manage_enabled,
-                    "close_enabled": self.config.management.close_enabled,
+                    "close_orders_enabled": self.config.management.close_orders_enabled,
                 }),
             );
             return Ok(());
@@ -882,7 +846,9 @@ impl AlpacaOptionsStrategy {
     }
 
     fn manage_working_entry_order(&mut self, entry: &StrategyStateEntry) -> anyhow::Result<()> {
-        if !self.config.management.manage_enabled || self.config.management.stale_entry_secs == 0 {
+        if !self.config.management.close_orders_enabled
+            || self.config.management.stale_entry_secs == 0
+        {
             return Ok(());
         }
         let Some(age) = age_secs_from_rfc3339(&entry.recorded_at_utc) else {
@@ -956,7 +922,7 @@ impl AlpacaOptionsStrategy {
         entry: &StrategyStateEntry,
         close_order_list_id: &str,
     ) -> anyhow::Result<()> {
-        if !(self.config.management.manage_enabled && self.config.management.close_enabled)
+        if !self.config.management.close_orders_enabled
             || self.config.management.stale_close_secs == 0
         {
             return Ok(());
@@ -2099,7 +2065,7 @@ impl AlpacaOptionsStrategy {
 
     fn persist_strategy_state_mutation(&self, mutation: anyhow::Result<StrategyStateMutation>) {
         let Some(persistence) = &self.config.state_persistence else {
-            if self.config.admission.submit_enabled {
+            if self.config.admission.open_orders_enabled {
                 log::error!("Alpaca strategy-state persistence is not configured");
             }
             return;

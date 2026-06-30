@@ -142,11 +142,12 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let args = Args::from_env(&runtime_config)?;
-    let live_submit_requested = runtime_config.submit_enabled;
-    let runtime_config = if live_submit_requested {
+    let broker_orders_requested =
+        runtime_config.open_orders_enabled || runtime_config.close_orders_enabled;
+    let runtime_config = if broker_orders_requested {
         AlpacaOptionsRuntimeConfig::from_runtime_env_with_operational_store()
             .await
-            .context("live submit requires operational Postgres readiness")?
+            .context("broker orders require operational Postgres readiness")?
     } else {
         runtime_config
     };
@@ -167,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
         .load_strategy_state()
         .await
         .context("failed to load Alpaca options strategy state")?;
-    let mut live_submit_persistence = if live_submit_requested {
+    let mut live_submit_persistence = if broker_orders_requested {
         Some(
             prepare_state_persistence(&runtime_config, &args)
                 .await
@@ -176,11 +177,11 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    let startup_account_admission_reasons = if live_submit_requested {
+    let startup_account_admission_reasons = if broker_orders_requested {
         let result = async {
             let persistence = live_submit_persistence
                 .as_ref()
-                .context("live submit operational persistence was not prepared")?;
+                .context("broker-order operational persistence was not prepared")?;
             prepare_live_submit_broker_state(
                 &runtime_config,
                 &data_config,
@@ -188,14 +189,14 @@ async fn main() -> anyhow::Result<()> {
                 persistence,
             )
             .await
-            .context("failed to prepare Alpaca live-submit broker state")
+            .context("failed to prepare Alpaca broker-order state")
         }
         .await;
         release_live_submit_persistence_on_error(result, &mut live_submit_persistence).await?
     } else {
         Vec::new()
     };
-    let lifecycle_daemon_result = if live_submit_requested || runtime_config.manage_enabled {
+    let lifecycle_daemon_result = if broker_orders_requested {
         start_lifecycle_risk_daemon(&data_config, lifecycle_risk.clone(), lifecycle_config)
             .await
             .context("failed to start Alpaca option lifecycle risk daemon")
@@ -210,13 +211,14 @@ async fn main() -> anyhow::Result<()> {
     let strategy_state_entry_count = strategy_state.entries.len();
 
     log::info!(
-        "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategies={:?} submit_enabled={} operational_store_required={} strategy_state_entries={}",
+        "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategies={:?} open_orders_enabled={} close_orders_enabled={} operational_store_required={} strategy_state_entries={}",
         series_id,
         args.snapshot_interval_ms,
         args.max_runtime_secs,
         runtime_config.enabled_strategy_family_names(),
-        runtime_config.submit_enabled,
-        live_submit_requested,
+        runtime_config.open_orders_enabled,
+        runtime_config.close_orders_enabled,
+        broker_orders_requested,
         strategy_state_entry_count,
     );
 
@@ -324,7 +326,9 @@ async fn prepare_state_persistence(
     let repository = config
         .operational_repository
         .as_ref()
-        .context("NAUTILUS_OPERATIONAL_DATABASE_URL is required when ALPACA_SUBMIT=true")?
+        .context(
+            "NAUTILUS_OPERATIONAL_DATABASE_URL is required when ALPACA_OPEN_ORDERS=true or ALPACA_CLOSE_ORDERS=true",
+        )?
         .clone();
     let migration_status = repository.migration_status().await?;
     if let Some(dirty_version) = migration_status.dirty_version {
@@ -358,7 +362,7 @@ async fn prepare_state_persistence(
             holder_id: holder_id.clone(),
             run_id,
             service_name: Some(service_name),
-            mode: "live_submit".to_string(),
+            mode: "broker_orders".to_string(),
             ttl,
         },
     )
@@ -433,7 +437,7 @@ async fn prepare_live_submit_broker_state(
             }),
         );
         bail!(
-            "live submit blocked by Alpaca account capability preflight: {}",
+            "broker orders blocked by Alpaca account capability preflight: {}",
             capability_preflight.reasons.join("; ")
         );
     }
@@ -447,7 +451,7 @@ async fn prepare_live_submit_broker_state(
             }),
         );
         bail!(
-            "live submit blocked by Alpaca account admission: {}",
+            "broker orders blocked by Alpaca account admission: {}",
             account_reasons.join("; ")
         );
     }
@@ -461,7 +465,7 @@ async fn prepare_live_submit_broker_state(
     if report.has_unmanaged_broker_state() {
         emit_unmanaged_broker_state_block(&report);
         bail!(
-            "live submit blocked by unmanaged broker state: positions=[{}] open_orders=[{}] partial_positions=[{}]",
+            "broker orders blocked by unmanaged broker state: positions=[{}] open_orders=[{}] partial_positions=[{}]",
             report.unmanaged_position_symbols.join(","),
             report.unmanaged_open_order_symbols.join(","),
             report.partial_position_symbols.join(","),
@@ -794,14 +798,12 @@ fn print_usage() {
 
 fn print_config_check(config: &AlpacaOptionsRuntimeConfig) {
     println!(
-        "alpaca_options_runtime_config: underlyings={} strategy_families={} dry_run_families={} submit_enabled={} manage_enabled={} close_enabled={} kill_switch={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} active_risk_candidate_quote_limit={} active_risk_quote_stale_secs={} expiration_exit_days={} lifecycle_poll_secs={} lifecycle_activity_lookback_hours={} lifecycle_activity_block_hours={} expiration_entry_block_days={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_max_candidates={}",
+        "alpaca_options_runtime_config: underlyings={} strategy_families={} dry_run_families={} open_orders_enabled={} close_orders_enabled={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} active_risk_candidate_quote_limit={} active_risk_quote_stale_secs={} expiration_exit_days={} lifecycle_poll_secs={} lifecycle_activity_lookback_hours={} lifecycle_activity_block_hours={} expiration_entry_block_days={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_max_candidates={}",
         config.underlyings.join(","),
         config.enabled_strategy_family_names().join(","),
         config.dry_run_strategy_family_names().join(","),
-        config.submit_enabled,
-        config.manage_enabled,
-        config.close_enabled,
-        config.kill_switch,
+        config.open_orders_enabled,
+        config.close_orders_enabled,
         config.quantity,
         format_limit(config.max_active_entries),
         format_limit(config.max_daily_submits),

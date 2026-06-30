@@ -7,10 +7,8 @@ extends = "../base-options.toml"
 [runtime]
 strategy_families = ["put_credit", "call_credit"]
 dry_run_families = ["put_credit", "call_credit"]
-submit = true
-manage = true
-close = true
-kill_switch = false
+open_orders = false
+close_orders = true
 state_path = "/home/ade/.local/state/nautilus_trader/alpaca/paper-directional/strategy_state.json"
 
 [universe]

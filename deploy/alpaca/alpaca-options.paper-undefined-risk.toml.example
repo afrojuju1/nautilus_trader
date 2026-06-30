@@ -7,10 +7,8 @@ extends = "../base-options.toml"
 [runtime]
 strategy_families = ["naked_call", "naked_put", "naked_call_1_3dte", "naked_put_1_3dte"]
 dry_run_families = []
-submit = true
-manage = true
-close = true
-kill_switch = false
+open_orders = true
+close_orders = true
 state_path = "/home/ade/.local/state/nautilus_trader/alpaca/paper-undefined-risk/strategy_state.json"
 
 [naked_scanner]

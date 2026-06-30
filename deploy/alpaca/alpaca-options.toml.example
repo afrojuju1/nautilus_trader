@@ -8,10 +8,8 @@ extends = "base-options.toml"
 [runtime]
 strategy_families = ["iron_condor"]
 dry_run_families = ["iron_condor"]
-submit = false
-manage = true
-close = true
-kill_switch = false
+open_orders = false
+close_orders = true
 state_path = "/home/ade/.local/state/nautilus_trader/alpaca_options_state.json"
 
 [universe]

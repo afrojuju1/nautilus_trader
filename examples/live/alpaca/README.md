@@ -237,13 +237,11 @@ cargo run -p nautilus-alpaca --features live --bin alpaca-compare-option-chain-s
 
 ## Check the options runtime config
 
-Keep submission, management, and close handling disabled while checking config:
+Keep broker order capabilities disabled while checking config:
 
 ```bash
-export ALPACA_SUBMIT=false
-export ALPACA_MANAGE=false
-export ALPACA_CLOSE=false
-export ALPACA_KILL_SWITCH=true
+export ALPACA_OPEN_ORDERS=false
+export ALPACA_CLOSE_ORDERS=false
 
 cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- --check-config
 ```
@@ -267,8 +265,8 @@ cp deploy/alpaca/alpaca-options.toml.example \
   "$HOME/.config/nautilus-trader/alpaca/options.toml"
 ```
 
-Do not enable `ALPACA_SUBMIT`, `ALPACA_MANAGE`, or `ALPACA_CLOSE` until paper credentials,
-endpoints, account status, open orders, positions, and risk caps have been verified.
+Do not enable `ALPACA_OPEN_ORDERS` or `ALPACA_CLOSE_ORDERS` until paper credentials, endpoints,
+account status, open orders, positions, and risk caps have been verified.
 
 ## Installed operator commands
 
@@ -288,9 +286,9 @@ alpaca-control performance --all
 The installed config layers are repo `.env`, `base-options.toml`, `options.toml`, and `fleet.toml`.
 `NAUTILUS_ALPACA_ENV_FILE` selects an explicit env-file override; `ALPACA_CONFIG_PATH` selects the
 account TOML; `extends = "base-options.toml"` lets account TOML inherit shared scanner and
-management defaults. Operational env overrides such as
-`ALPACA_SUBMIT`, `ALPACA_MANAGE`, `ALPACA_CLOSE`, `ALPACA_KILL_SWITCH`, and
-`ALPACA_MAX_ITERATIONS` take precedence over TOML for those supported fields.
+management defaults. Operational env overrides such as `ALPACA_OPEN_ORDERS`,
+`ALPACA_CLOSE_ORDERS`, and `ALPACA_MAX_ITERATIONS` take precedence over TOML for those supported
+fields.
 
 Service control is available through either systemd or the wrapper:
 

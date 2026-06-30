@@ -215,13 +215,11 @@ cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca op
 cargo run -p nautilus-alpaca --features live --bin alpaca-compare-option-chain-scan -- --pretty SPY YYYY-MM-DD
 ```
 
-Before running the live node, check config with submission disabled:
+Before running the live node, check config with broker order capabilities disabled:
 
 ```bash
-export ALPACA_SUBMIT=false
-export ALPACA_MANAGE=false
-export ALPACA_CLOSE=false
-export ALPACA_KILL_SWITCH=true
+export ALPACA_OPEN_ORDERS=false
+export ALPACA_CLOSE_ORDERS=false
 
 cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- --check-config
 ```

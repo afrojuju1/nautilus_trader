@@ -68,16 +68,14 @@ impl RuntimeConfigFile {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct RuntimeSection {
     strategy_families: Vec<String>,
     dry_run_families: Vec<String>,
     max_iterations: Option<u64>,
     interval_secs: Option<u64>,
-    submit: Option<bool>,
-    manage: Option<bool>,
-    close: Option<bool>,
-    kill_switch: Option<bool>,
+    open_orders: Option<bool>,
+    close_orders: Option<bool>,
     force_flatten: Option<bool>,
     cancel_after_accept: Option<bool>,
     ignore_entry_window: Option<bool>,
@@ -93,10 +91,8 @@ impl RuntimeSection {
             dry_run_families: merge_vec(self.dry_run_families, parent.dry_run_families),
             max_iterations: self.max_iterations.or(parent.max_iterations),
             interval_secs: self.interval_secs.or(parent.interval_secs),
-            submit: self.submit.or(parent.submit),
-            manage: self.manage.or(parent.manage),
-            close: self.close.or(parent.close),
-            kill_switch: self.kill_switch.or(parent.kill_switch),
+            open_orders: self.open_orders.or(parent.open_orders),
+            close_orders: self.close_orders.or(parent.close_orders),
             force_flatten: self.force_flatten.or(parent.force_flatten),
             cancel_after_accept: self.cancel_after_accept.or(parent.cancel_after_accept),
             ignore_entry_window: self.ignore_entry_window.or(parent.ignore_entry_window),
@@ -522,6 +518,7 @@ pub(super) fn build_options_runtime_config(
     file: RuntimeConfigFile,
     cli_underlyings: Vec<String>,
 ) -> anyhow::Result<AlpacaOptionsRuntimeConfig> {
+    reject_retired_order_capability_env_vars()?;
     let strategy_values = env::var("ALPACA_STRATEGY_FAMILIES")
         .ok()
         .map(|value| split_strings([value]))
@@ -599,14 +596,8 @@ pub(super) fn build_options_runtime_config(
         quantity: env_parse("ALPACA_QTY")
             .or(file.universe.quantity)
             .unwrap_or(1),
-        submit_enabled: env_bool("ALPACA_SUBMIT")
-            .or(file.runtime.submit)
-            .unwrap_or(false),
-        manage_enabled: env_bool("ALPACA_MANAGE")
-            .or(file.runtime.manage)
-            .unwrap_or(false),
-        kill_switch: env_bool("ALPACA_KILL_SWITCH")
-            .or(file.runtime.kill_switch)
+        open_orders_enabled: env_bool("ALPACA_OPEN_ORDERS")
+            .or(file.runtime.open_orders)
             .unwrap_or(false),
         force_flatten: env_bool("ALPACA_FORCE_FLATTEN")
             .or(file.runtime.force_flatten)
@@ -616,8 +607,8 @@ pub(super) fn build_options_runtime_config(
             .unwrap_or(false),
         stale_entry_secs,
         stale_close_secs: file.management.stale_close_secs.unwrap_or(stale_entry_secs),
-        close_enabled: env_bool("ALPACA_CLOSE")
-            .or(file.runtime.close)
+        close_orders_enabled: env_bool("ALPACA_CLOSE_ORDERS")
+            .or(file.runtime.close_orders)
             .unwrap_or(false),
         close_regular_hours_only: env_bool("ALPACA_CLOSE_REGULAR_HOURS_ONLY")
             .or(file.management.close_regular_hours_only)
@@ -866,8 +857,7 @@ fn apply_fleet_policy(config: &mut AlpacaOptionsRuntimeConfig) {
             .push("fleet_kill_switch_enabled".to_string());
     }
     if !config.fleet_policy_blocks.is_empty() {
-        config.kill_switch = true;
-        config.submit_enabled = false;
+        config.open_orders_enabled = false;
     }
 }
 
@@ -1231,6 +1221,26 @@ fn env_bool(name: &str) -> Option<bool> {
     })
 }
 
+fn reject_retired_order_capability_env_vars() -> anyhow::Result<()> {
+    let present = [
+        "ALPACA_SUBMIT",
+        "ALPACA_MANAGE",
+        "ALPACA_CLOSE",
+        "ALPACA_KILL_SWITCH",
+    ]
+    .into_iter()
+    .filter(|name| env::var_os(name).is_some())
+    .collect::<Vec<_>>();
+    if present.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "retired Alpaca order capability env vars are set: {}; use ALPACA_OPEN_ORDERS and ALPACA_CLOSE_ORDERS",
+        present.join(", ")
+    );
+}
+
 fn env_parse<T>(name: &str) -> Option<T>
 where
     T: FromStr,
@@ -1344,10 +1354,8 @@ GDX = "metals"
 strategy_families = ["put", "iron_condor"]
 dry_run_families = ["iron_condor"]
 max_iterations = 0
-submit = false
-manage = true
-close = true
-kill_switch = true
+open_orders = false
+close_orders = true
 state_path = "/tmp/alpaca-state.json"
 candidate_ledger_enabled = true
 candidate_ledger_max_candidates = 7
@@ -1472,6 +1480,8 @@ block_days_after_earnings = 2
 
         assert_eq!(config.runtime.strategy_families, vec!["put", "iron_condor"]);
         assert_eq!(config.runtime.dry_run_families, vec!["iron_condor"]);
+        assert_eq!(config.runtime.open_orders, Some(false));
+        assert_eq!(config.runtime.close_orders, Some(true));
         assert_eq!(config.runtime.candidate_ledger_enabled, Some(true));
         assert_eq!(config.runtime.candidate_ledger_max_candidates, Some(7));
         assert_eq!(config.universe.underlyings, vec!["SPY", "QQQ"]);

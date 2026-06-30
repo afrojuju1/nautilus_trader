@@ -62,9 +62,8 @@ def test_alpaca_docs_keep_public_examples_non_submitting_by_default() -> None:
     examples = _read(ALPACA_EXAMPLE_README)
     integration_doc = _read(ALPACA_INTEGRATION_DOC)
 
-    assert "ALPACA_SUBMIT=false" in examples
-    assert "ALPACA_MANAGE=false" in examples
-    assert "ALPACA_CLOSE=false" in examples
+    assert "ALPACA_OPEN_ORDERS=false" in examples
+    assert "ALPACA_CLOSE_ORDERS=false" in examples
     assert "--check-config" in examples
     assert "--check-config" in integration_doc
 
