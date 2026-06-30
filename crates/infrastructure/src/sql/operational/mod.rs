@@ -25,11 +25,10 @@ pub use performance_ledger::{
 };
 pub use postgres::{OperationalInitError, OperationalMigrationStatus, OperationalRepository};
 pub use state::{
-    StrategyStateIntentSummary, StrategyStateMetadata, StrategyStateMutation,
+    StrategyStateMetadata, StrategyStateMutation, StrategyStateStorageSummary,
     StrategyStateWriteResult, StrategyStateWriteStatus, load_strategy_state,
-    load_strategy_state_intent_payloads, load_strategy_state_intent_summary,
-    load_strategy_state_metadata,
-    load_strategy_state_record, persist_strategy_state_mutation, save_strategy_state,
+    load_strategy_state_metadata, load_strategy_state_payloads, load_strategy_state_record,
+    load_strategy_state_storage_summary, persist_strategy_state_mutation, save_strategy_state,
 };
 
 #[cfg(test)]

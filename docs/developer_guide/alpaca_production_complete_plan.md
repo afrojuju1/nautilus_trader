@@ -306,7 +306,7 @@ Work:
   events when the live engine emits them.)
 - Add structured event logs for strategy decisions and broker state transitions. (Runner emits
   structured `operator_event=` JSON for start, iteration, decision, and submit result events.)
-- Add Discord candidate alerts from the candidate ledger as a sidecar, scoped first to selected
+- Add Discord candidate alerts from the candidate ledger as a scheduled operator command, scoped first to selected
   candidates, high-score candidates, and candidate submit rejections. Keep webhook delivery outside
   the trading loop so alert failures cannot block scanning, entry submission, or management.
 

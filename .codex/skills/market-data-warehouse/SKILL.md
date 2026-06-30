@@ -27,7 +27,7 @@ Read only the docs needed for the task:
 - Keep `ParquetDataCatalog` as the replay/backtest-compatible store.
 - Use ClickHouse for high-volume analytical market data, feature series, range queries, and
   flagged read cutover.
-- Keep Postgres as the slim operational control plane: strategy state snapshots, state events,
+- Keep Postgres as the slim operational control plane: normalized strategy-state rows, state events,
   candidate/performance/outcome ledgers, runtime leases, and small ingest manifests.
 - Do not store bulk quotes, trades, bars, Greeks, or market-data-shaped caches in Postgres.
 - Do not make ClickHouse the source of truth for strategy state, broker evidence, or realized PnL.

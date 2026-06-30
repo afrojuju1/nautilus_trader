@@ -131,7 +131,7 @@ context, and optional account-independent ranking context, then produce `EntryPl
 Nautilus cache and execution state are the live source for orders, positions, accounts, fills, and
 loaded instruments inside the running node.
 
-Postgres is the operational control plane. It stores runtime leases, strategy state snapshots,
+Postgres is the operational control plane. It stores runtime leases, normalized strategy-state rows,
 state events, candidate evidence, performance ledgers, and candidate outcomes. It should not store
 bulk quotes, bars, Greeks, or market-data-shaped feature series.
 
@@ -149,7 +149,7 @@ is not part of order submission, broker truth, or realized PnL.
 | `options_account_strategy.rs` | Split into account strategy, entry admission, close manager, state projector, and event handlers. |
 | `strategy.rs` and `option_chain_candidates.rs` | Move pure candidate ranking toward source-neutral planner modules. |
 | `options_runtime/config.rs` | Replace family string lists with explicit profile strategy blocks. |
-| `runtime.rs` strategy state | Replace the account JSONB snapshot table with normalized spread-intent rows plus account metadata and broker evidence. |
+| `runtime.rs` strategy state | Replace the account JSONB snapshot table with normalized strategy_state rows plus account metadata and broker evidence. |
 | `spread_plan.rs` and `execution.rs` | Continue under `nt-ups`; this lane owns native `OptionSpread` cutover. |
 
 ## Non-Goals
@@ -170,8 +170,8 @@ is not part of order submission, broker truth, or realized PnL.
    projector, and event handlers without changing broker behavior.
 4. Profile strategy blocks. Replace `strategy_families` and `dry_run_families` with explicit
    per-profile strategy blocks.
-5. Spread-intent state replacement. Migrate operational state in place so `strategy_state` stores
-   normalized spread/order intents and `strategy_broker_leg_evidence` stores broker evidence, with
+5. Strategy-state row replacement. Migrate operational state in place so `strategy_state` stores
+   normalized order-state rows and `strategy_broker_leg_evidence` stores broker evidence, with
    backup and rollback instructions.
 6. Validation and cleanup. Keep operators on the replacement read model and retire displaced
    compatibility paths after live dry-run and paper proof.

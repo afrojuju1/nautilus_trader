@@ -39,7 +39,7 @@ DO UPDATE SET
 CREATE TABLE strategy_state (
     account_id TEXT NOT NULL,
     strategy_id TEXT NOT NULL,
-    intent_id TEXT NOT NULL,
+    entry_id TEXT NOT NULL,
     trade_date DATE,
     underlying TEXT,
     status TEXT NOT NULL,
@@ -56,7 +56,7 @@ CREATE TABLE strategy_state (
     payload JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (account_id, strategy_id, intent_id),
+    PRIMARY KEY (account_id, strategy_id, entry_id),
     FOREIGN KEY (account_id)
         REFERENCES strategy_state_account (account_id)
         ON DELETE CASCADE
@@ -84,7 +84,7 @@ normalized AS (
     SELECT
         account_id,
         COALESCE(NULLIF(entry ->> 'strategy', ''), 'unknown') AS strategy_id,
-        COALESCE(NULLIF(entry ->> 'spread_instrument_id', ''), NULLIF(entry ->> 'order_list_id', '')) AS intent_id,
+        COALESCE(NULLIF(entry ->> 'order_list_id', ''), NULLIF(entry ->> 'spread_instrument_id', '')) AS entry_id,
         NULLIF(entry ->> 'trade_date', '')::date AS trade_date,
         NULLIF(entry ->> 'underlying', '') AS underlying,
         CASE
@@ -109,7 +109,7 @@ normalized AS (
 INSERT INTO strategy_state (
     account_id,
     strategy_id,
-    intent_id,
+    entry_id,
     trade_date,
     underlying,
     status,
@@ -129,7 +129,7 @@ INSERT INTO strategy_state (
 SELECT
     account_id,
     strategy_id,
-    intent_id,
+    entry_id,
     trade_date,
     underlying,
     status,
@@ -146,12 +146,12 @@ SELECT
     payload,
     NOW()
 FROM normalized
-WHERE intent_id IS NOT NULL;
+WHERE entry_id IS NOT NULL;
 
 CREATE TABLE strategy_broker_leg_evidence (
     account_id TEXT NOT NULL,
     strategy_id TEXT NOT NULL,
-    intent_id TEXT NOT NULL,
+    entry_id TEXT NOT NULL,
     evidence_id TEXT NOT NULL,
     evidence_type TEXT NOT NULL,
     symbol TEXT,
@@ -166,9 +166,9 @@ CREATE TABLE strategy_broker_leg_evidence (
     payload JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (account_id, strategy_id, intent_id, evidence_id),
-    FOREIGN KEY (account_id, strategy_id, intent_id)
-        REFERENCES strategy_state (account_id, strategy_id, intent_id)
+    PRIMARY KEY (account_id, strategy_id, entry_id, evidence_id),
+    FOREIGN KEY (account_id, strategy_id, entry_id)
+        REFERENCES strategy_state (account_id, strategy_id, entry_id)
         ON DELETE CASCADE
 );
 
@@ -188,7 +188,7 @@ WITH normalized AS (
     SELECT
         account_id,
         strategy_id,
-        intent_id,
+        entry_id,
         order_list_id,
         broker_parent_order_id,
         broker_close_parent_order_id,
@@ -200,7 +200,7 @@ spread_legs AS (
     SELECT
         account_id,
         strategy_id,
-        intent_id,
+        entry_id,
         'spread_leg:' || COALESCE(NULLIF(leg ->> 'symbol', ''), NULLIF(leg ->> 'instrument_id', ''), ordinal::text) AS evidence_id,
         'spread_leg' AS evidence_type,
         NULLIF(leg ->> 'symbol', '') AS symbol,
@@ -217,7 +217,7 @@ strategy_legs AS (
     SELECT
         account_id,
         strategy_id,
-        intent_id,
+        entry_id,
         'strategy_leg:' || leg_key || ':' || symbol AS evidence_id,
         'strategy_leg' AS evidence_type,
         symbol,
@@ -241,7 +241,7 @@ parent_orders AS (
     SELECT
         account_id,
         strategy_id,
-        intent_id,
+        entry_id,
         'entry_parent_order:' || broker_parent_order_id AS evidence_id,
         'entry_parent_order' AS evidence_type,
         NULL::text AS symbol,
@@ -258,7 +258,7 @@ close_parent_orders AS (
     SELECT
         account_id,
         strategy_id,
-        intent_id,
+        entry_id,
         'close_parent_order:' || broker_close_parent_order_id AS evidence_id,
         'close_parent_order' AS evidence_type,
         NULL::text AS symbol,
@@ -283,7 +283,7 @@ all_evidence AS (
 INSERT INTO strategy_broker_leg_evidence (
     account_id,
     strategy_id,
-    intent_id,
+    entry_id,
     evidence_id,
     evidence_type,
     symbol,
@@ -298,7 +298,7 @@ INSERT INTO strategy_broker_leg_evidence (
 SELECT
     account_id,
     strategy_id,
-    intent_id,
+    entry_id,
     evidence_id,
     evidence_type,
     symbol,

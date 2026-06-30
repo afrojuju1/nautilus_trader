@@ -159,5 +159,5 @@ mirror the records into ClickHouse as a reporting copy only. Postgres remains th
 
 - Do not make candidate outcomes a fill simulator.
 - Do not move broker truth out of `performance_ledger`.
-- Do not build a sidecar replay daemon.
+- Do not build a separate replay daemon.
 - Do not let ClickHouse become strategy-state or broker-evidence truth.

@@ -36,8 +36,8 @@ use crate::{
 };
 use chrono::{DateTime, Duration, Utc};
 use nautilus_infrastructure::sql::operational::{
-    CandidateLedgerSummaryFilters, StrategyStateIntentSummary, StrategyStateMetadata,
-    load_strategy_state_intent_summary, load_strategy_state_metadata,
+    CandidateLedgerSummaryFilters, StrategyStateMetadata, StrategyStateStorageSummary,
+    load_strategy_state_metadata, load_strategy_state_storage_summary,
     read_candidate_ledger_records,
 };
 use serde::Serialize;
@@ -66,7 +66,7 @@ struct OperatorConfig {
     fleet_policy_blocks: Vec<String>,
     operational_store: OperationalStoreStatus,
     strategy_state_metadata: Option<StrategyStateMetadata>,
-    strategy_state_intent_summary: Option<StrategyStateIntentSummary>,
+    strategy_state_storage_summary: Option<StrategyStateStorageSummary>,
     candidate_ledger_records: Vec<Value>,
     json_output: bool,
 }
@@ -185,8 +185,8 @@ struct StrategyStateStatus {
     active_entries: usize,
     closed_entries: usize,
     canceled_entries: usize,
-    spread_intents: Option<i64>,
-    active_spread_intents: Option<i64>,
+    db_rows: Option<i64>,
+    active_db_rows: Option<i64>,
     broker_leg_evidence: Option<i64>,
     last_recorded_at_utc: Option<String>,
 }
@@ -339,14 +339,14 @@ impl OperatorConfig {
         let (
             operational_store,
             strategy_state_metadata,
-            strategy_state_intent_summary,
+            strategy_state_storage_summary,
             candidate_ledger_records,
         ) = if let Some(repository) = &strategy_config.operational_repository {
             let status = repository.migration_status().await?;
             let metadata =
                 load_strategy_state_metadata(repository, strategy_config.operational_account_id())
                     .await?;
-            let state_intent_summary = match load_strategy_state_intent_summary(
+            let state_storage_summary = match load_strategy_state_storage_summary(
                 repository,
                 strategy_config.operational_account_id(),
             )
@@ -354,7 +354,7 @@ impl OperatorConfig {
             {
                 Ok(summary) => Some(summary),
                 Err(error) => {
-                    log::warn!("Failed to read Alpaca spread-intent state summary: {error:#}");
+                    log::warn!("Failed to read Alpaca strategy-state storage summary: {error:#}");
                     None
                 }
             };
@@ -384,7 +384,7 @@ impl OperatorConfig {
                     dirty_migration_version: status.dirty_version,
                 },
                 metadata,
-                state_intent_summary,
+                state_storage_summary,
                 records,
             )
         } else {
@@ -431,7 +431,7 @@ impl OperatorConfig {
             fleet_policy_blocks: strategy_config.fleet_policy_blocks,
             operational_store,
             strategy_state_metadata,
-            strategy_state_intent_summary,
+            strategy_state_storage_summary,
             candidate_ledger_records,
             json_output: crate::operator::args().iter().any(|arg| arg == "--json"),
         })
@@ -581,16 +581,16 @@ fn build_status(
             .count(),
         closed_entries: state.entries.iter().filter(|entry| entry.closed).count(),
         canceled_entries: state.entries.iter().filter(|entry| entry.canceled).count(),
-        spread_intents: config
-            .strategy_state_intent_summary
+        db_rows: config
+            .strategy_state_storage_summary
             .as_ref()
-            .map(|summary| summary.spread_intents),
-        active_spread_intents: config
-            .strategy_state_intent_summary
+            .map(|summary| summary.rows),
+        active_db_rows: config
+            .strategy_state_storage_summary
             .as_ref()
-            .map(|summary| summary.active_spread_intents),
+            .map(|summary| summary.active_rows),
         broker_leg_evidence: config
-            .strategy_state_intent_summary
+            .strategy_state_storage_summary
             .as_ref()
             .map(|summary| summary.broker_leg_evidence),
         last_recorded_at_utc: state
@@ -1135,7 +1135,7 @@ fn print_human_status(status: &OperatorStatus) {
         );
     }
     println!(
-        "strategy_state: exists={} db_version={} db_last_event_id={} entries={} active={} closed={} canceled={} spread_intents={} active_spread_intents={} broker_leg_evidence={} path={}",
+        "strategy_state: exists={} db_version={} db_last_event_id={} entries={} active={} closed={} canceled={} db_rows={} active_db_rows={} broker_leg_evidence={} path={}",
         status.strategy_state.exists,
         status
             .strategy_state
@@ -1152,11 +1152,11 @@ fn print_human_status(status: &OperatorStatus) {
         status.strategy_state.canceled_entries,
         status
             .strategy_state
-            .spread_intents
+            .db_rows
             .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
         status
             .strategy_state
-            .active_spread_intents
+            .active_db_rows
             .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
         status
             .strategy_state

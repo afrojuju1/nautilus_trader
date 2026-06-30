@@ -153,7 +153,7 @@ cache entries now belong in the catalog and ClickHouse; tiny operational checkpo
 name that describes the operational responsibility instead of reviving a broad market-cache table.
 
 The detailed operational Postgres plan lives in
-`operational_postgres_plan.md`. That plan owns strategy-state snapshots, state-event
+`operational_postgres_plan.md`. That plan owns normalized strategy-state rows, state-event
 durability, runtime leases, migrations, and live-submit readiness. This warehouse workstream owns
 catalog/ClickHouse market-data persistence and uses Postgres only for small ingest manifests.
 
@@ -608,7 +608,7 @@ real volume, latency, or operational evidence contradicts them.
 | --- | --- | --- |
 | Write model | Write market data to both `ParquetDataCatalog` and ClickHouse. Catalog remains the primary engine-compatible store during the initial rollout. | This gives ClickHouse analytical coverage while preserving Nautilus replay/backtest continuity. |
 | Code ownership | Add ClickHouse support to `nautilus-persistence` behind an optional feature. Keep adapter crates as producers of normalized Nautilus model data. | ClickHouse is a fundamental analytical backend, not an Alpaca feature. |
-| Postgres role | Keep Postgres as the operational control plane: strategy state snapshots, state events, decision/evidence ledgers, outcomes, runtime leases, and ingest manifests. Do not use it for bulk market data. | Postgres gives clean transactional semantics for small mutable records; ClickHouse and the catalog are better homes for high-volume market data. |
+| Postgres role | Keep Postgres as the operational control plane: normalized strategy-state rows, state events, decision/evidence ledgers, outcomes, runtime leases, and ingest manifests. Do not use it for bulk market data. | Postgres gives clean transactional semantics for small mutable records; ClickHouse and the catalog are better homes for high-volume market data. |
 | First production source | Use existing `ParquetDataCatalog` files for historical backfill first. Source-specific historical APIs can fill catalog gaps before ClickHouse backfill, but ClickHouse should ingest from catalog-shaped Nautilus data. | This preserves Nautilus schemas and avoids adapter-specific warehouse loaders with subtly different semantics. |
 | Option and underlying quotes | Store all normalized `QuoteTick`-shaped BBO data in one `market.quote_ticks` table. Add instrument metadata or views for option-specific filtering. | Underlying and option BBO rows have the same core query shape: instrument, event time, bid, ask, sizes. One table simplifies joins, coverage checks, and scanner queries. |
 | Source-specific raw payloads | Out of scope for the initial implementation. Add raw/source tables only with an explicit consumer, schema migration, and retention policy. | Canonical `market.*` tables should mirror Nautilus semantics first; raw vendor archives are easy to add and hard to retire. |

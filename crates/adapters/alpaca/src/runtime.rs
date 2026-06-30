@@ -27,8 +27,7 @@ use serde_json::{Map, Value};
 use crate::parse::{AlpacaOptionSymbolParts, parse_alpaca_option_symbol};
 #[cfg(feature = "live")]
 use nautilus_infrastructure::sql::operational::{
-    OperationalRepository, load_strategy_state_intent_payloads, load_strategy_state_record,
-    save_strategy_state,
+    OperationalRepository, load_strategy_state_record, save_strategy_state,
 };
 use nautilus_trading::options::{
     candidates::{
@@ -618,20 +617,6 @@ pub async fn load_strategy_state_with_storage(
     account_id: &str,
 ) -> anyhow::Result<StrategyState> {
     if let Some(state) = load_strategy_state_record::<StrategyState>(storage, account_id).await? {
-        if state.entries.is_empty()
-            && let Some(rebuilt) =
-                load_strategy_state_from_spread_intents(storage, account_id).await?
-        {
-            save_strategy_state(storage, account_id, &rebuilt).await?;
-            save_strategy_state_atomic(path, &rebuilt)?;
-            return Ok(rebuilt);
-        }
-        save_strategy_state_atomic(path, &state)?;
-        return Ok(state);
-    }
-
-    if let Some(state) = load_strategy_state_from_spread_intents(storage, account_id).await? {
-        save_strategy_state(storage, account_id, &state).await?;
         save_strategy_state_atomic(path, &state)?;
         return Ok(state);
     }
@@ -639,23 +624,6 @@ pub async fn load_strategy_state_with_storage(
     let state = load_strategy_state(path)?;
     save_strategy_state(storage, account_id, &state).await?;
     Ok(state)
-}
-
-#[cfg(feature = "live")]
-async fn load_strategy_state_from_spread_intents(
-    storage: &OperationalRepository,
-    account_id: &str,
-) -> anyhow::Result<Option<StrategyState>> {
-    let payloads = load_strategy_state_intent_payloads(storage, account_id).await?;
-    if payloads.is_empty() {
-        return Ok(None);
-    }
-
-    let mut entries = Vec::with_capacity(payloads.len());
-    for payload in payloads {
-        entries.push(serde_json::from_value::<StrategyStateEntry>(payload)?);
-    }
-    Ok(Some(StrategyState { entries }))
 }
 
 /// Saves strategy state through a same-directory temp file followed by atomic rename.

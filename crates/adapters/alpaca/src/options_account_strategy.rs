@@ -2226,7 +2226,7 @@ impl AlpacaOptionsAccountStrategy {
         entry: &SelectedOptionsEntry,
     ) -> anyhow::Result<EntryAdmissionSnapshot> {
         let cache = self.cache();
-        let open_order_count = open_broker_order_intent_count(&cache);
+        let open_order_count = open_broker_order_group_count(&cache);
         let mut broker_admission_reasons = self.config.admission.account_admission_reasons.clone();
         let symbols = entry.option_symbols();
         let candidate_ids = symbols
@@ -3395,20 +3395,20 @@ fn instrument_underlying_matches(
         })
 }
 
-fn open_broker_order_intent_count(cache: &CacheApi<'_>) -> usize {
-    let mut intent_ids = BTreeSet::new();
+fn open_broker_order_group_count(cache: &CacheApi<'_>) -> usize {
+    let mut order_group_ids = BTreeSet::new();
     for order in cache
         .orders_open(None, None, None, None, None)
         .into_iter()
         .chain(cache.orders_inflight(None, None, None, None, None))
     {
         if let Some(order_list_id) = order.order_list_id() {
-            intent_ids.insert(format!("list:{order_list_id}"));
+            order_group_ids.insert(format!("list:{order_list_id}"));
         } else {
-            intent_ids.insert(format!("client:{}", order.client_order_id()));
+            order_group_ids.insert(format!("client:{}", order.client_order_id()));
         }
     }
-    intent_ids.len()
+    order_group_ids.len()
 }
 
 fn insert_optional_usize(payload: &mut Value, key: &str, value: Option<usize>) {

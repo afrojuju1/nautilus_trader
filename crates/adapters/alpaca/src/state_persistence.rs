@@ -65,7 +65,7 @@ impl StrategyStatePersistenceHandle {
                                     mutation.event_type,
                                     mutation.event_id,
                                     result.status,
-                                    result.snapshot_version
+                                    result.state_version
                                 );
                             }
                             Err(error) => {

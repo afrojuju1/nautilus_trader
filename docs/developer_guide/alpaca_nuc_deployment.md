@@ -72,7 +72,7 @@ operational-state migrations.
 `runtime.candidate_ledger_max_candidates` controls how many ranked candidates per scanner result
 are persisted; `0` records all ranked candidates.
 
-Candidate Discord alerts are emitted by a sidecar command which consumes typed `candidate_alert`
+Candidate Discord alerts are emitted by the operator command which consumes typed `candidate_alert`
 records from the Postgres candidate ledger, not by the trading loop. Put the webhook in
 `~/.config/nautilus-trader/alpaca/alerts.env` as `DISCORD_WEBHOOK_URL=...`; keep the file mode at
 `600`.

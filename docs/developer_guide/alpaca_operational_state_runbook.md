@@ -4,10 +4,13 @@ This runbook covers the operational-state replacement for the Alpaca options run
 
 Postgres is the operational source of truth:
 
-- `strategy_state`: one normalized row per account, strategy, and spread/order intent.
+- `strategy_state`: one normalized order-state row per account, strategy, and spread identity.
 - `strategy_state_account`: account-level version, writer, run, and last-event metadata.
-- `strategy_broker_leg_evidence`: separate leg and broker-order evidence for each intent.
+- `strategy_broker_leg_evidence`: separate leg and broker-order evidence for each state row.
 - `strategy_state_events`: append-only mutation history.
+
+`strategy_state.entry_id` is the durable entry key. It uses `order_list_id` when available and only
+falls back to `spread_instrument_id` for pre-replacement rows without an order-list identity.
 
 The local JSON state file is only a recovery mirror for non-Postgres bootstrap and disaster
 inspection.
@@ -84,7 +87,7 @@ docker compose --env-file .env -f deploy/alpaca/compose.yml exec -T postgres \
 Expected operator signs:
 
 - `operational_store.latest_migration_version` is at least `202606300001`.
-- `strategy_state.spread_intents` is non-null.
+- `strategy_state.db_rows` is non-null.
 - `strategy_state.broker_leg_evidence` is non-null.
 - Existing active broker exposure is represented in `spread_reconciliation_preview`.
 
