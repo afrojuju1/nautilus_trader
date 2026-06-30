@@ -56,7 +56,10 @@ use crate::{
         SelectedOptionsEntry,
     },
     runtime::{StrategyState, StrategyStateEntry, StrategyStateEntryDraft, emit_operator_event},
-    spread_plan::{OptionSpreadPlan, selected_entry_spread_plan, spread_quote_subscription_params},
+    spread_plan::{
+        OptionSpreadPlan, selected_entry_spread_plan, spread_quote_subscription_params,
+        strategy_state_vertical_spread_plan,
+    },
     state_persistence::StrategyStatePersistenceHandle,
     strategy_state_entry::selected_entry_state_entry_draft,
 };
@@ -279,6 +282,7 @@ pub struct AlpacaOptionsStrategy {
     active_risk_quote_subscriptions: BTreeSet<InstrumentId>,
     candidate_quote_instrument_ids: BTreeSet<InstrumentId>,
     candidate_spread_instrument_ids: BTreeSet<InstrumentId>,
+    active_spread_instrument_ids: BTreeSet<InstrumentId>,
 }
 
 impl AlpacaOptionsStrategy {
@@ -298,6 +302,7 @@ impl AlpacaOptionsStrategy {
             active_risk_quote_subscriptions: BTreeSet::new(),
             candidate_quote_instrument_ids: BTreeSet::new(),
             candidate_spread_instrument_ids: BTreeSet::new(),
+            active_spread_instrument_ids: BTreeSet::new(),
         }
     }
 
@@ -740,6 +745,8 @@ impl AlpacaOptionsStrategy {
             }
         }
 
+        self.emit_vertical_spread_close_order_draft(&entry);
+
         let stale_quote_symbols = self.stale_active_risk_quote_symbols(&entry);
         if !stale_quote_symbols.is_empty() {
             emit_operator_event(
@@ -1136,7 +1143,7 @@ impl AlpacaOptionsStrategy {
     }
 
     fn refresh_active_risk_quote_subscriptions(&mut self) {
-        let desired = self
+        let active_quote_instrument_ids = self
             .state
             .entries
             .iter()
@@ -1151,8 +1158,14 @@ impl AlpacaOptionsStrategy {
                     Vec::new()
                 }
             })
+            .collect::<BTreeSet<_>>();
+        self.active_spread_instrument_ids = self.register_active_spread_instruments();
+
+        let desired = active_quote_instrument_ids
+            .into_iter()
             .chain(self.candidate_quote_instrument_ids.iter().copied())
             .chain(self.candidate_spread_instrument_ids.iter().copied())
+            .chain(self.active_spread_instrument_ids.iter().copied())
             .collect::<BTreeSet<_>>();
 
         for instrument_id in desired
@@ -1179,9 +1192,11 @@ impl AlpacaOptionsStrategy {
                 "active_risk_quote_cache",
                 json!({
                     "active_entry_quote_symbols": active_entry_quote_symbols(&self.state),
+                    "active_entry_spread_symbols_count": self.active_spread_instrument_ids.len(),
                     "candidate_quote_symbols_count": self.candidate_quote_instrument_ids.len(),
                     "candidate_spread_symbols_count": self.candidate_spread_instrument_ids.len(),
                     "candidate_quote_limit": self.config.management.active_risk_candidate_quote_limit,
+                    "active_entry_spread_symbols": instrument_symbols(&self.active_spread_instrument_ids),
                     "candidate_quote_symbols": instrument_symbols(&self.candidate_quote_instrument_ids),
                     "candidate_spread_symbols": instrument_symbols(&self.candidate_spread_instrument_ids),
                     "subscribed_symbols": instrument_symbols(&desired),
@@ -1196,9 +1211,36 @@ impl AlpacaOptionsStrategy {
         &self,
         instrument_id: InstrumentId,
     ) -> Option<nautilus_core::Params> {
-        self.candidate_spread_instrument_ids
+        (self
+            .candidate_spread_instrument_ids
             .contains(&instrument_id)
-            .then(spread_quote_subscription_params)
+            || self.active_spread_instrument_ids.contains(&instrument_id))
+        .then(spread_quote_subscription_params)
+    }
+
+    fn register_active_spread_instruments(&mut self) -> BTreeSet<InstrumentId> {
+        let ts_init = self.clock().timestamp_ns();
+        let plans = self
+            .state
+            .entries
+            .iter()
+            .filter(|entry| entry.is_active())
+            .filter_map(|entry| match strategy_state_vertical_spread_plan(entry, ts_init) {
+                Ok(Some(plan)) => Some(plan),
+                Ok(None) => None,
+                Err(error) => {
+                    log::warn!(
+                        "Failed to rebuild active Nautilus spread plan: order_list_id={} underlying={} strategy={} symbols={} error={error:#}",
+                        entry.order_list_id,
+                        entry.underlying,
+                        entry.strategy,
+                        entry.symbols().join(","),
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        self.register_spread_plans(plans)
     }
 
     fn register_candidate_spread_instruments(
@@ -1229,6 +1271,10 @@ impl AlpacaOptionsStrategy {
                 }
             })
             .collect::<Vec<_>>();
+        self.register_spread_plans(plans)
+    }
+
+    fn register_spread_plans(&mut self, plans: Vec<OptionSpreadPlan>) -> BTreeSet<InstrumentId> {
         if plans.is_empty() {
             return BTreeSet::new();
         }
@@ -1407,6 +1453,113 @@ impl AlpacaOptionsStrategy {
             spread_mid: None,
             quote_ts_event: None,
             quote_ts_init: None,
+        }
+    }
+
+    fn emit_vertical_spread_close_order_draft(&mut self, entry: &StrategyStateEntry) {
+        let close_order_list_id = close_order_list_id(entry);
+        match self.vertical_spread_close_order_draft(entry, &close_order_list_id) {
+            Ok(Some(draft)) => emit_operator_event(
+                "close_spread_order_draft",
+                vertical_spread_close_order_draft_payload(entry, &close_order_list_id, &draft),
+            ),
+            Ok(None) => {}
+            Err(error) => emit_operator_event(
+                "close_spread_order_draft",
+                json!({
+                    "action": "unavailable",
+                    "reason": "spread_close_order_draft_error",
+                    "trade_date": entry.trade_date,
+                    "underlying": entry.underlying,
+                    "strategy": entry.strategy,
+                    "entry_order_list_id": entry.order_list_id,
+                    "draft_close_order_list_id": close_order_list_id,
+                    "symbols": entry.symbols(),
+                    "error": error.to_string(),
+                    "current_broker_submit_path": "legacy_leg_order_list",
+                    "draft_broker_submit_path": "single_option_spread_order",
+                    "submitted": false,
+                }),
+            ),
+        }
+    }
+
+    fn vertical_spread_close_order_draft(
+        &mut self,
+        entry: &StrategyStateEntry,
+        close_order_list_id: &str,
+    ) -> anyhow::Result<Option<VerticalSpreadCloseOrderDraft>> {
+        let Some(plan) = strategy_state_vertical_spread_plan(entry, self.clock().timestamp_ns())?
+        else {
+            return Ok(None);
+        };
+        if !is_vertical_spread_plan(&plan) {
+            return Ok(None);
+        }
+
+        self.cache_spread_plan(&plan)?;
+        let pricing = self.spread_close_order_pricing(&plan);
+        let order = if let Some(signed_limit_price) = pricing.signed_limit_price {
+            let mut order_api = self.order();
+            Some(build_vertical_spread_close_order(
+                &mut order_api,
+                &plan,
+                close_order_list_id,
+                entry.quantity,
+                signed_limit_price,
+            )?)
+        } else {
+            None
+        };
+        Ok(Some(VerticalSpreadCloseOrderDraft {
+            plan,
+            order,
+            pricing,
+        }))
+    }
+
+    fn spread_close_order_pricing(&self, plan: &OptionSpreadPlan) -> SpreadCloseOrderPricing {
+        let cache = self.cache();
+        let Some(quote) = cache.quote(&plan.instrument_id) else {
+            return SpreadCloseOrderPricing {
+                pricing_source: "nautilus_spread_quote",
+                signed_limit_price: None,
+                unavailable_reason: Some("spread_quote_missing"),
+                spread_bid: None,
+                spread_ask: None,
+                spread_mid: None,
+                quote_ts_event: None,
+                quote_ts_init: None,
+                quote_age_secs: None,
+                quote_stale_limit_secs: Some(self.config.management.active_risk_quote_stale_secs),
+            };
+        };
+
+        let bid = quote.bid_price.as_f64();
+        let ask = quote.ask_price.as_f64();
+        let mid = f64::midpoint(bid, ask);
+        let quote_age = quote_age_secs(quote.ts_event, Utc::now());
+        let stale_limit = self.config.management.active_risk_quote_stale_secs;
+        let unavailable_reason =
+            if stale_limit > 0 && quote_age.is_some_and(|age| age > stale_limit) {
+                Some("spread_quote_stale")
+            } else if bid == 0.0 {
+                Some("spread_quote_zero_bid")
+            } else {
+                None
+            };
+
+        SpreadCloseOrderPricing {
+            pricing_source: "nautilus_spread_quote",
+            signed_limit_price: unavailable_reason.is_none().then_some(bid),
+            unavailable_reason,
+            spread_bid: Some(bid),
+            spread_ask: Some(ask),
+            spread_mid: Some(mid),
+            quote_ts_event: Some(quote.ts_event),
+            quote_ts_init: Some(quote.ts_init),
+            quote_age_secs: quote_age,
+            quote_stale_limit_secs: Some(stale_limit),
         }
     }
 
@@ -2272,6 +2425,7 @@ impl DataActor for AlpacaOptionsStrategy {
         self.active_risk_quote_subscriptions.clear();
         self.candidate_quote_instrument_ids.clear();
         self.candidate_spread_instrument_ids.clear();
+        self.active_spread_instrument_ids.clear();
         Ok(())
     }
 
@@ -2458,6 +2612,25 @@ struct VerticalSpreadOrderDraft {
     pricing: SpreadEntryOrderPricing,
 }
 
+struct SpreadCloseOrderPricing {
+    pricing_source: &'static str,
+    signed_limit_price: Option<f64>,
+    unavailable_reason: Option<&'static str>,
+    spread_bid: Option<f64>,
+    spread_ask: Option<f64>,
+    spread_mid: Option<f64>,
+    quote_ts_event: Option<UnixNanos>,
+    quote_ts_init: Option<UnixNanos>,
+    quote_age_secs: Option<u64>,
+    quote_stale_limit_secs: Option<u64>,
+}
+
+struct VerticalSpreadCloseOrderDraft {
+    plan: OptionSpreadPlan,
+    order: Option<OrderAny>,
+    pricing: SpreadCloseOrderPricing,
+}
+
 fn vertical_spread_order_draft_payload(
     trade_date: &str,
     entry: &SelectedOptionsEntry,
@@ -2518,6 +2691,89 @@ fn vertical_spread_order_draft_payload(
     }
     if let Some(value) = draft.pricing.quote_ts_init {
         insert_value_field(&mut payload, "quote_ts_init", json!(value.as_u64()));
+    }
+    payload
+}
+
+fn vertical_spread_close_order_draft_payload(
+    entry: &StrategyStateEntry,
+    close_order_list_id: &str,
+    draft: &VerticalSpreadCloseOrderDraft,
+) -> Value {
+    let scanner_signed_entry_price = signed_scanner_spread_price(&draft.plan);
+    let action = if draft.order.is_some() {
+        "drafted"
+    } else {
+        "unavailable"
+    };
+    let order = draft.order.as_ref().map(|order| {
+        json!({
+            "client_order_id": order.client_order_id().to_string(),
+            "instrument_id": order.instrument_id().to_string(),
+            "side": format!("{:?}", order.order_side()).to_ascii_lowercase(),
+            "quantity": order.quantity().as_f64(),
+            "signed_limit_price": order.price().map(|price| price.as_f64()),
+            "reduce_only": order.is_reduce_only(),
+        })
+    });
+    let mut payload = json!({
+        "action": action,
+        "trade_date": entry.trade_date,
+        "underlying": draft.plan.underlying.as_str(),
+        "strategy": draft.plan.strategy.as_str(),
+        "entry_order_list_id": entry.order_list_id,
+        "draft_close_order_list_id": close_order_list_id,
+        "symbols": entry.symbols(),
+        "spread_instrument_id": draft.plan.instrument_id.to_string(),
+        "spread_symbol": draft.plan.raw_symbol.to_string(),
+        "legs": draft
+            .plan
+            .legs
+            .iter()
+            .map(|leg| {
+                json!({
+                    "symbol": leg.symbol.as_str(),
+                    "instrument_id": leg.instrument_id.to_string(),
+                    "ratio": leg.ratio,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "order": order,
+        "pricing_source": draft.pricing.pricing_source,
+        "signed_close_limit": draft.pricing.signed_limit_price,
+        "scanner_premium_kind": draft.plan.scanner_premium_kind.as_str(),
+        "scanner_premium": draft.plan.scanner_premium,
+        "scanner_signed_entry_price": scanner_signed_entry_price,
+        "close_side": "sell",
+        "reduce_only": true,
+        "current_broker_submit_path": "legacy_leg_order_list",
+        "draft_broker_submit_path": "single_option_spread_order",
+        "submitted": false,
+        "vega_pricing_enabled": false,
+    });
+    if let Some(reason) = draft.pricing.unavailable_reason {
+        insert_value_field(&mut payload, "reason", json!(reason));
+    }
+    if let Some(value) = draft.pricing.spread_bid {
+        insert_value_field(&mut payload, "spread_bid", json!(value));
+    }
+    if let Some(value) = draft.pricing.spread_ask {
+        insert_value_field(&mut payload, "spread_ask", json!(value));
+    }
+    if let Some(value) = draft.pricing.spread_mid {
+        insert_value_field(&mut payload, "spread_mid", json!(value));
+    }
+    if let Some(value) = draft.pricing.quote_ts_event {
+        insert_value_field(&mut payload, "quote_ts_event", json!(value.as_u64()));
+    }
+    if let Some(value) = draft.pricing.quote_ts_init {
+        insert_value_field(&mut payload, "quote_ts_init", json!(value.as_u64()));
+    }
+    if let Some(value) = draft.pricing.quote_age_secs {
+        insert_value_field(&mut payload, "quote_age_secs", json!(value));
+    }
+    if let Some(value) = draft.pricing.quote_stale_limit_secs {
+        insert_value_field(&mut payload, "quote_stale_limit_secs", json!(value));
     }
     payload
 }
@@ -2825,6 +3081,36 @@ fn build_vertical_spread_entry_order(
         Price::new(signed_limit_price, 2),
         false,
         labeled_client_order_id(order_list_id, "spread"),
+    ))
+}
+
+fn build_vertical_spread_close_order(
+    orders: &mut impl OptionsEntryOrderCreator,
+    plan: &OptionSpreadPlan,
+    order_list_id: &str,
+    quantity: u64,
+    signed_limit_price: f64,
+) -> anyhow::Result<OrderAny> {
+    if quantity == 0 {
+        anyhow::bail!("spread close order {order_list_id} quantity must be positive");
+    }
+    if signed_limit_price == 0.0 {
+        anyhow::bail!("spread close order {order_list_id} signed limit price must be non-zero");
+    }
+    if !is_vertical_spread_plan(plan) {
+        anyhow::bail!(
+            "spread close order {order_list_id} only supports two-leg vertical drafts, got {} legs",
+            plan.legs.len()
+        );
+    }
+
+    Ok(orders.option_spread_limit(
+        plan.instrument_id,
+        OrderSide::Sell,
+        Quantity::new(quantity as f64, 0),
+        Price::new(signed_limit_price, 2),
+        true,
+        labeled_client_order_id(order_list_id, "spread-close"),
     ))
 }
 

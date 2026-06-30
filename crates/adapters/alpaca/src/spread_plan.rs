@@ -14,7 +14,9 @@ use nautilus_trading::options::{
 use serde_json::json;
 use ustr::Ustr;
 
-use crate::{common::consts::ALPACA_VENUE, parse::parse_option_expiration_ns};
+use crate::{
+    common::consts::ALPACA_VENUE, parse::parse_option_expiration_ns, runtime::StrategyStateEntry,
+};
 
 /// DataEngine param which enables native spread quote aggregation.
 pub const AGGREGATE_SPREAD_QUOTES_PARAM: &str = "aggregate_spread_quotes";
@@ -120,6 +122,84 @@ pub fn selected_entry_spread_plan(
         SelectedOptionsEntry::NakedOption(_) => return Ok(None),
     }
 
+    option_spread_plan(
+        legs,
+        ts_init,
+        descriptor.underlying,
+        descriptor.strategy.to_string(),
+        descriptor.premium_kind,
+        descriptor.premium,
+    )
+    .map(Some)
+}
+
+/// Rebuilds a Nautilus-native vertical spread plan from persisted strategy state.
+///
+/// Returns `Ok(None)` for naked options, iron condors, or entries without both vertical legs.
+///
+/// # Errors
+///
+/// Returns an error if persisted leg expiration metadata cannot be parsed.
+pub fn strategy_state_vertical_spread_plan(
+    entry: &StrategyStateEntry,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<OptionSpreadPlan>> {
+    if entry.is_naked_option()
+        || entry.is_iron_condor()
+        || entry.short_symbol.trim().is_empty()
+        || entry.long_symbol.trim().is_empty()
+    {
+        return Ok(None);
+    }
+
+    let legs = vec![
+        OptionSpreadLegPlan {
+            instrument_id: alpaca_option_instrument_id(&entry.long_symbol),
+            symbol: entry.long_symbol.clone(),
+            ratio: 1,
+        },
+        OptionSpreadLegPlan {
+            instrument_id: alpaca_option_instrument_id(&entry.short_symbol),
+            symbol: entry.short_symbol.clone(),
+            ratio: -1,
+        },
+    ];
+    let (scanner_premium_kind, scanner_premium) = entry.entry_debit().map_or_else(
+        || (EntryPremiumKind::Credit, entry.credit.abs()),
+        |debit| (EntryPremiumKind::Debit, debit),
+    );
+
+    option_spread_plan(
+        legs,
+        ts_init,
+        entry.underlying.clone(),
+        entry.strategy.clone(),
+        scanner_premium_kind,
+        scanner_premium,
+    )
+    .map(Some)
+}
+
+fn push_leg(legs: &mut Vec<OptionSpreadLegPlan>, contract: &ScoredContract, ratio: i64) {
+    legs.push(OptionSpreadLegPlan {
+        instrument_id: alpaca_option_instrument_id(&contract.symbol),
+        symbol: contract.symbol.clone(),
+        ratio,
+    });
+}
+
+fn alpaca_option_instrument_id(symbol: &str) -> InstrumentId {
+    InstrumentId::new(Symbol::new(symbol), Venue::new(ALPACA_VENUE))
+}
+
+fn option_spread_plan(
+    legs: Vec<OptionSpreadLegPlan>,
+    ts_init: UnixNanos,
+    underlying: String,
+    strategy: String,
+    scanner_premium_kind: EntryPremiumKind,
+    scanner_premium: f64,
+) -> anyhow::Result<OptionSpreadPlan> {
     let expiration_ns = spread_expiration_ns(&legs)?;
     let raw_symbol = Symbol::new(generic_spread_symbol(&legs));
     let instrument_id = InstrumentId::new(raw_symbol, Venue::new(ALPACA_VENUE));
@@ -129,8 +209,8 @@ pub fn selected_entry_spread_plan(
         raw_symbol,
         AssetClass::Equity,
         None,
-        Ustr::from(descriptor.underlying.as_str()),
-        Ustr::from(descriptor.strategy),
+        Ustr::from(underlying.as_str()),
+        Ustr::from(strategy.as_str()),
         0.into(),
         expiration_ns.into(),
         Currency::USD(),
@@ -153,28 +233,16 @@ pub fn selected_entry_spread_plan(
     )
     .into_any();
 
-    Ok(Some(OptionSpreadPlan {
+    Ok(OptionSpreadPlan {
         instrument_id,
         raw_symbol,
         legs,
         instrument,
-        strategy: descriptor.strategy.to_string(),
-        underlying: descriptor.underlying,
-        scanner_premium_kind: descriptor.premium_kind,
-        scanner_premium: descriptor.premium,
-    }))
-}
-
-fn push_leg(legs: &mut Vec<OptionSpreadLegPlan>, contract: &ScoredContract, ratio: i64) {
-    legs.push(OptionSpreadLegPlan {
-        instrument_id: alpaca_option_instrument_id(&contract.symbol),
-        symbol: contract.symbol.clone(),
-        ratio,
-    });
-}
-
-fn alpaca_option_instrument_id(symbol: &str) -> InstrumentId {
-    InstrumentId::new(Symbol::new(symbol), Venue::new(ALPACA_VENUE))
+        strategy,
+        underlying,
+        scanner_premium_kind,
+        scanner_premium,
+    })
 }
 
 fn generic_spread_symbol(legs: &[OptionSpreadLegPlan]) -> String {
