@@ -511,25 +511,28 @@ pub async fn read_quote_tick_rows(
 ) -> anyhow::Result<Vec<ClickHouseQuoteTickRow>> {
     ensure_bounded_quote_tick_range(start, end)?;
 
-    let mut sql = format!("SELECT ?fields FROM {QUOTE_TICKS_QUALIFIED_TABLE} WHERE source = ?");
-    if start.is_some() {
-        sql.push_str(" AND ts_init >= ?");
-    }
-    if end.is_some() {
-        sql.push_str(" AND ts_init <= ?");
-    }
+    let start = start.expect("bounded ClickHouse QuoteTick read has start");
+    let end = end.expect("bounded ClickHouse QuoteTick read has end");
+
+    let mut sql = format!(
+        "SELECT ?fields FROM {QUOTE_TICKS_QUALIFIED_TABLE} WHERE source = ? \
+         AND init_date >= toDate(fromUnixTimestamp64Nano(toInt64(?))) \
+         AND init_date <= toDate(fromUnixTimestamp64Nano(toInt64(?))) \
+         AND ts_init >= ? \
+         AND ts_init <= ?"
+    );
     if !instrument_ids.is_empty() {
         sql.push_str(" AND instrument_id IN ?");
     }
     sql.push_str(" ORDER BY instrument_id, ts_init, ts_event, ingest_run_id");
 
-    let mut query = client.query(&sql).bind(source);
-    if let Some(start) = start {
-        query = query.bind(start.as_u64());
-    }
-    if let Some(end) = end {
-        query = query.bind(end.as_u64());
-    }
+    let mut query = client
+        .query(&sql)
+        .bind(source)
+        .bind(start.as_u64())
+        .bind(end.as_u64())
+        .bind(start.as_u64())
+        .bind(end.as_u64());
     if !instrument_ids.is_empty() {
         query = query.bind(instrument_ids.to_vec());
     }

@@ -302,6 +302,10 @@ Common fields:
 | `source` | Source system or adapter such as `alpaca`, `databento`, or another future data source. |
 | `ingest_run_id` | Backfill or live sink run identifier for lineage. |
 
+Use `ts_init` as the serving clock for high-volume raw warehouse tables that support freshness,
+validation, and scanner feature windows. Keep `ts_event` for market semantics and event-time
+analytics, but do not rely on event-date partitions to prune `ts_init`-bounded operational reads.
+
 Operator validation over ClickHouse must be range-bounded. `validate-quotes` should include
 `--start-ns` and `--end-ns`, interpreted as `ts_init` bounds, so the warehouse comparison matches
 the catalog query semantics even when venue event timestamps lag ingestion time. Use
@@ -312,22 +316,27 @@ Initial ClickHouse table sketches:
 ```sql
 CREATE TABLE market.quote_ticks
 (
-    ts_event DateTime64(9, 'UTC'),
-    ts_init DateTime64(9, 'UTC'),
+    ts_event UInt64,
+    ts_init UInt64,
+    init_time DateTime64(9, 'UTC') MATERIALIZED fromUnixTimestamp64Nano(toInt64(ts_init)),
+    init_date Date MATERIALIZED toDate(init_time),
+    event_time DateTime64(9, 'UTC') MATERIALIZED fromUnixTimestamp64Nano(toInt64(ts_event)),
+    event_date Date MATERIALIZED toDate(event_time),
     instrument_id LowCardinality(String),
     venue LowCardinality(String),
     source LowCardinality(String),
-    bid_price_raw Int64,
-    ask_price_raw Int64,
-    bid_size_raw UInt64,
-    ask_size_raw UInt64,
+    bid_price_raw Int128,
+    ask_price_raw Int128,
+    bid_size_raw UInt128,
+    ask_size_raw UInt128,
     price_precision UInt8,
     size_precision UInt8,
-    ingest_run_id UUID
+    ingest_run_id UUID,
+    inserted_at DateTime64(9, 'UTC') DEFAULT now64(9)
 )
 ENGINE = MergeTree
-PARTITION BY toYYYYMMDD(ts_event)
-ORDER BY (instrument_id, ts_event, ts_init);
+PARTITION BY toYYYYMMDD(init_date)
+ORDER BY (source, ts_init, instrument_id, ts_event, ingest_run_id);
 ```
 
 ```sql
@@ -633,9 +642,12 @@ Start with the smallest repo-level path that proves ClickHouse is a real warehou
    volumes, resource limits, local-only ports by default, and smoke commands.
 2. Add `schema/sql/clickhouse/001_market_quote_ticks.sql` for the initial canonical
    `market.quote_ticks` table plus warehouse migration metadata.
-3. Add optional ClickHouse support to `nautilus-persistence`, including config, connection health,
+3. Apply `schema/sql/clickhouse/002_rebuild_quote_ticks_ts_init_layout.sql` so the live
+   `market.quote_ticks` table keeps the same logical name while using `init_date` partitions and
+   `source, ts_init` sorting for receipt-time warehouse reads.
+4. Add optional ClickHouse support to `nautilus-persistence`, including config, connection health,
    and a typed `QuoteTick` row mapper.
-4. Add a durable warehouse operator surface with `health`, `migrate`, `backfill`, and `validate`
+5. Add a durable warehouse operator surface with `health`, `migrate`, `backfill`, and `validate`
    operations. `migrate` applies `schema/sql/clickhouse/` files, records applied versions in
    `warehouse.schema_migrations`, and fails on checksum drift. The first smoke should write a tiny
    `QuoteTick` batch and read counts back through the same surface.
