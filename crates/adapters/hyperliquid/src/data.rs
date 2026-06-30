@@ -38,7 +38,8 @@ use nautilus_common::{
             SubscribeIndexPrices, SubscribeInstrument, SubscribeMarkPrices, SubscribeQuotes,
             SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
             UnsubscribeBookDepth10, UnsubscribeCustomData, UnsubscribeFundingRates,
-            UnsubscribeIndexPrices, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
+            UnsubscribeIndexPrices, UnsubscribeInstrument, UnsubscribeInstruments,
+            UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
@@ -240,7 +241,7 @@ impl HyperliquidDataClient {
             }
         }
 
-        log::info!(
+        log::debug!(
             "Bootstrapped {} instruments with {} coin mappings",
             self.instruments.len(),
             self.coin_to_instrument_id.len()
@@ -266,12 +267,12 @@ impl HyperliquidDataClient {
         let cancellation_token = self.cancellation_token.clone();
 
         let task = get_runtime().spawn(async move {
-            log::info!("Hyperliquid WebSocket consumption loop started");
+            log::debug!("Hyperliquid WebSocket consumption loop started");
 
             loop {
                 tokio::select! {
                     () = cancellation_token.cancelled() => {
-                        log::info!("WebSocket consumption loop cancelled");
+                        log::debug!("WebSocket consumption loop cancelled");
                         break;
                     }
                     msg_opt = ws_client.next_event() => {
@@ -361,12 +362,12 @@ impl HyperliquidDataClient {
                 }
             }
 
-            log::info!("Hyperliquid WebSocket consumption loop finished");
+            log::debug!("Hyperliquid WebSocket consumption loop finished");
         });
 
         let mut slot = self.ws_stream_handle.lock().expect(MUTEX_POISONED);
         *slot = Some(task);
-        log::info!("WebSocket consumption task spawned");
+        log::debug!("WebSocket consumption task spawned");
 
         Ok(())
     }
@@ -708,6 +709,18 @@ impl DataClient for HyperliquidDataClient {
             ws.subscribe_bars(bar_type).await
         });
 
+        Ok(())
+    }
+
+    fn unsubscribe_instrument(&mut self, _cmd: &UnsubscribeInstrument) -> anyhow::Result<()> {
+        // `subscribe_instrument` only emits the cached instrument; it opens no
+        // venue channel, so there is nothing to tear down here.
+        Ok(())
+    }
+
+    fn unsubscribe_instruments(&mut self, _cmd: &UnsubscribeInstruments) -> anyhow::Result<()> {
+        // See `unsubscribe_instrument`: instrument subscriptions carry no
+        // venue-side state to unsubscribe from.
         Ok(())
     }
 
@@ -1304,7 +1317,7 @@ pub(crate) fn parse_l2_book_snapshot(
         book.add(order, 0, (bids_len + i) as u64, ts_event);
     }
 
-    log::info!(
+    log::debug!(
         "Built order book for {instrument_id} with {} bids and {} asks",
         bids.len(),
         asks.len(),

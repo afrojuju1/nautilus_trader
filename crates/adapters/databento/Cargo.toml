@@ -51,7 +51,8 @@ high-precision = [
 ]
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["arrow", "high-precision", "live"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -68,6 +69,8 @@ nautilus-system = { workspace = true, optional = true }
 ahash = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
 databento = { workspace = true }
 fallible-streaming-iterator = { workspace = true }
 indexmap = { workspace = true }
@@ -108,6 +111,7 @@ harness = false
 [[bench]]
 name = "clients"
 harness = false
+required-features = ["live"]
 
 # Run with `cargo run --example databento-data-tester --package nautilus-databento`.
 [[example]]
