@@ -254,6 +254,7 @@ async fn main() -> anyhow::Result<()> {
         client_id: Some(client_id),
         bootstrap_instruments: true,
         scan: scan_config,
+        ..Default::default()
     });
     if let Some(persistence) = &live_submit_persistence {
         actor = actor.with_candidate_ledger_persistence(persistence.candidate_ledger.clone());

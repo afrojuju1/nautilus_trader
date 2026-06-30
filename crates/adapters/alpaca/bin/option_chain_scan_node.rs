@@ -104,6 +104,7 @@ fn main() -> anyhow::Result<()> {
         client_id: None,
         bootstrap_instruments: false,
         scan: scan_config,
+        ..Default::default()
     });
 
     let engine = node

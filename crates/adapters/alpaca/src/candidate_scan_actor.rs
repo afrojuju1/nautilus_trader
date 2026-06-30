@@ -1,8 +1,12 @@
 //! Read-only Nautilus actor for option-chain candidate evidence.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Arc, Condvar, Mutex, MutexGuard, mpsc},
+    thread::{self, JoinHandle},
+    time::{Duration as StdDuration, Instant},
 };
 
 use chrono::{Datelike, Duration, NaiveDate, Utc};
@@ -10,6 +14,7 @@ use chrono_tz::Tz;
 use nautilus_common::{
     actor::{DataActor, DataActorConfig, DataActorCore},
     nautilus_actor,
+    timer::TimeEvent,
 };
 use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
@@ -34,7 +39,7 @@ use nautilus_trading::options::{
     },
     regime::{
         RegimeContext, RegimeEvent, RegimeFeatureConfig, RegimeFeatureData, RegimeFeatureInputs,
-        RegimeRoutingSummary, apply_regime_routing, insert_regime_context,
+        RegimeFeatureSnapshot, RegimeRoutingSummary, apply_regime_routing, insert_regime_context,
         regime_context_from_features, regime_feature_snapshot_from_option_chain,
     },
 };
@@ -48,7 +53,7 @@ use crate::{
     },
     earnings::EarningsEvent,
     option_chain_candidates::{
-        option_chain_candidate_input, scan_credit_spread_option_chain,
+        OptionChainCandidateInput, option_chain_candidate_input, scan_credit_spread_option_chain,
         scan_debit_spread_option_chain, scan_iron_condor_option_chain, scan_naked_option_chain,
     },
     options_runtime::{
@@ -57,6 +62,12 @@ use crate::{
     options_strategy::OptionsCandidateData,
     runtime::emit_operator_event,
 };
+
+const SCAN_RESULT_TIMER: &str = "alpaca_option_chain_scan_results";
+const DEFAULT_SCAN_QUEUE_CAPACITY: usize = 4;
+const DEFAULT_SCAN_WORKER_THREADS: usize = 2;
+const DEFAULT_SCAN_RESULT_DRAIN_INTERVAL_MS: u64 = 250;
+const DEFAULT_SCAN_MAX_RESULT_AGE_MS: u64 = 15_000;
 
 /// Read-only scan settings for candidate discovery from option-chain slices.
 #[derive(Clone, Debug, PartialEq)]
@@ -160,6 +171,14 @@ pub struct OptionChainCandidateScanActorConfig {
     pub bootstrap_instruments: bool,
     /// Candidate scan settings.
     pub scan: OptionChainCandidateScanConfig,
+    /// Maximum pending option-chain scan jobs. When full, the oldest job is dropped.
+    pub scan_queue_capacity: usize,
+    /// Number of background scan worker threads. Values below `1` are treated as `1`.
+    pub scan_worker_threads: usize,
+    /// Interval in milliseconds for draining completed scan results back onto the actor thread.
+    pub scan_result_drain_interval_ms: u64,
+    /// Maximum wall-clock age in milliseconds for a completed scan result. `0` disables age drops.
+    pub scan_max_result_age_ms: u64,
 }
 
 impl Default for OptionChainCandidateScanActorConfig {
@@ -175,6 +194,10 @@ impl Default for OptionChainCandidateScanActorConfig {
             client_id: None,
             bootstrap_instruments: false,
             scan: OptionChainCandidateScanConfig::default(),
+            scan_queue_capacity: DEFAULT_SCAN_QUEUE_CAPACITY,
+            scan_worker_threads: DEFAULT_SCAN_WORKER_THREADS,
+            scan_result_drain_interval_ms: DEFAULT_SCAN_RESULT_DRAIN_INTERVAL_MS,
+            scan_max_result_age_ms: DEFAULT_SCAN_MAX_RESULT_AGE_MS,
         }
     }
 }
@@ -189,6 +212,9 @@ pub struct OptionChainCandidateScanActor {
     underlying_bar_types: BTreeMap<String, BarType>,
     latest_underlying_bars: BTreeMap<String, Vec<Bar>>,
     latest_candidates: Option<OptionsCandidateSet>,
+    scan_workers: Option<ScanWorkerPool>,
+    latest_enqueued_scan_sequence: u64,
+    latest_published_scan_sequence: u64,
 }
 
 nautilus_actor!(OptionChainCandidateScanActor);
@@ -209,6 +235,9 @@ impl OptionChainCandidateScanActor {
             underlying_bar_types: BTreeMap::new(),
             latest_underlying_bars: BTreeMap::new(),
             latest_candidates: None,
+            scan_workers: None,
+            latest_enqueued_scan_sequence: 0,
+            latest_published_scan_sequence: 0,
         }
     }
 
@@ -384,6 +413,264 @@ impl OptionChainCandidateScanActor {
             }
         }
     }
+
+    fn start_scan_workers(&mut self) -> anyhow::Result<()> {
+        if self.scan_workers.is_some() {
+            return Ok(());
+        }
+
+        let queue_capacity = self.config.scan_queue_capacity.max(1);
+        let worker_count = self.config.scan_worker_threads.max(1);
+        self.scan_workers = Some(ScanWorkerPool::start(
+            self.config.scan.clone(),
+            queue_capacity,
+            worker_count,
+        )?);
+        emit_operator_event(
+            "option_chain_scan_worker_pool",
+            json!({
+                "event": "started",
+                "queue_capacity": queue_capacity,
+                "worker_threads": worker_count,
+                "result_drain_interval_ms": self.config.scan_result_drain_interval_ms,
+                "max_result_age_ms": self.config.scan_max_result_age_ms,
+            }),
+        );
+        Ok(())
+    }
+
+    fn stop_scan_workers(&mut self) {
+        let Some(pool) = self.scan_workers.take() else {
+            return;
+        };
+        let worker_count = pool.worker_count();
+        let queue_capacity = pool.queue_capacity();
+        let messages = pool.shutdown();
+        emit_operator_event(
+            "option_chain_scan_worker_pool",
+            json!({
+                "event": "stopped",
+                "queue_capacity": queue_capacity,
+                "worker_threads": worker_count,
+                "drained_results": messages.len(),
+            }),
+        );
+        for message in messages {
+            self.handle_scan_worker_message(message);
+        }
+    }
+
+    fn enqueue_scan_job(
+        &mut self,
+        slice: &OptionChainSlice,
+        trade_date: String,
+        ts_init: UnixNanos,
+    ) {
+        let Some(pool) = &self.scan_workers else {
+            emit_operator_event(
+                "option_chain_scan_worker_error",
+                json!({
+                    "reason": "worker_pool_not_started",
+                    "series_id": slice.series_id.to_string(),
+                    "source_ts_event": slice.ts_event.as_u64(),
+                    "source_ts_init": slice.ts_init.as_u64(),
+                }),
+            );
+            return;
+        };
+
+        self.latest_enqueued_scan_sequence = self.latest_enqueued_scan_sequence.saturating_add(1);
+        let underlying = slice.series_id.underlying.to_string();
+        let job = ScanJob {
+            sequence: self.latest_enqueued_scan_sequence,
+            slice: slice.clone(),
+            trade_date,
+            ts_init,
+            underlying_bars: self
+                .latest_underlying_bars
+                .get(&underlying)
+                .cloned()
+                .unwrap_or_default(),
+            enqueued_at: Instant::now(),
+        };
+        let summary = job.summary();
+        match pool.enqueue(job) {
+            ScanEnqueueOutcome::Enqueued {
+                depth,
+                dropped_oldest,
+            } => {
+                if let Some(dropped) = dropped_oldest {
+                    emit_operator_event(
+                        "option_chain_scan_queue_overflow",
+                        json!({
+                            "overflow_policy": "drop_oldest",
+                            "queue_capacity": pool.queue_capacity(),
+                            "queue_depth": depth,
+                            "dropped_sequence": dropped.sequence,
+                            "dropped_series_id": dropped.series_id,
+                            "dropped_source_ts_event": dropped.source_ts_event.as_u64(),
+                            "dropped_source_ts_init": dropped.source_ts_init.as_u64(),
+                            "enqueued_sequence": summary.sequence,
+                            "enqueued_series_id": summary.series_id,
+                            "enqueued_source_ts_event": summary.source_ts_event.as_u64(),
+                            "enqueued_source_ts_init": summary.source_ts_init.as_u64(),
+                        }),
+                    );
+                }
+                emit_operator_event(
+                    "option_chain_scan_queue",
+                    json!({
+                        "event": "enqueued",
+                        "queue_capacity": pool.queue_capacity(),
+                        "queue_depth": depth,
+                        "sequence": summary.sequence,
+                        "series_id": summary.series_id,
+                        "source_ts_event": summary.source_ts_event.as_u64(),
+                        "source_ts_init": summary.source_ts_init.as_u64(),
+                    }),
+                );
+            }
+            ScanEnqueueOutcome::Closed => {
+                emit_operator_event(
+                    "option_chain_scan_worker_error",
+                    json!({
+                        "reason": "worker_queue_closed",
+                        "sequence": summary.sequence,
+                        "series_id": summary.series_id,
+                        "source_ts_event": summary.source_ts_event.as_u64(),
+                        "source_ts_init": summary.source_ts_init.as_u64(),
+                    }),
+                );
+            }
+        }
+    }
+
+    fn drain_scan_results(&mut self) {
+        loop {
+            let message = self
+                .scan_workers
+                .as_ref()
+                .and_then(ScanWorkerPool::try_recv);
+            let Some(message) = message else {
+                break;
+            };
+            self.handle_scan_worker_message(message);
+        }
+    }
+
+    fn handle_scan_worker_message(&mut self, message: ScanWorkerMessage) {
+        match message {
+            ScanWorkerMessage::Result(result) => self.handle_scan_result(result),
+            ScanWorkerMessage::Error(error) => {
+                emit_operator_event(
+                    "option_chain_scan_worker_error",
+                    json!({
+                        "reason": error.reason,
+                        "worker_index": error.worker_index,
+                        "sequence": error.source.sequence,
+                        "series_id": error.source.series_id,
+                        "source_ts_event": error.source.source_ts_event.as_u64(),
+                        "source_ts_init": error.source.source_ts_init.as_u64(),
+                        "queue_latency_ms": duration_ms_u64(error.started_at.duration_since(error.enqueued_at)),
+                        "worker_latency_ms": duration_ms_u64(error.completed_at.duration_since(error.started_at)),
+                    }),
+                );
+            }
+        }
+    }
+
+    fn handle_scan_result(&mut self, result: ScanWorkerResult) {
+        if let Some(reason) = self.scan_result_drop_reason(&result) {
+            emit_operator_event(
+                "option_chain_scan_result_dropped",
+                json!({
+                    "reason": reason,
+                    "worker_index": result.worker_index,
+                    "sequence": result.source.sequence,
+                    "latest_enqueued_sequence": self.latest_enqueued_scan_sequence,
+                    "latest_published_sequence": self.latest_published_scan_sequence,
+                    "series_id": result.source.series_id.to_string(),
+                    "source_ts_event": result.source.source_ts_event.as_u64(),
+                    "source_ts_init": result.source.source_ts_init.as_u64(),
+                    "candidate_ts_init": result.source.candidate_ts_init.as_u64(),
+                    "queue_latency_ms": duration_ms_u64(result.started_at.duration_since(result.enqueued_at)),
+                    "scan_latency_ms": duration_ms_u64(result.completed_at.duration_since(result.started_at)),
+                    "total_latency_ms": duration_ms_u64(result.completed_at.duration_since(result.enqueued_at)),
+                }),
+            );
+            return;
+        }
+
+        emit_operator_event(
+            "option_chain_scan_result",
+            json!({
+                "event": "published",
+                "worker_index": result.worker_index,
+                "sequence": result.source.sequence,
+                "series_id": result.source.series_id.to_string(),
+                "source_ts_event": result.source.source_ts_event.as_u64(),
+                "source_ts_init": result.source.source_ts_init.as_u64(),
+                "candidate_ts_init": result.source.candidate_ts_init.as_u64(),
+                "queue_latency_ms": duration_ms_u64(result.started_at.duration_since(result.enqueued_at)),
+                "scan_latency_ms": duration_ms_u64(result.completed_at.duration_since(result.started_at)),
+                "total_latency_ms": duration_ms_u64(result.completed_at.duration_since(result.enqueued_at)),
+            }),
+        );
+        self.publish_scan_result(result);
+    }
+
+    fn scan_result_drop_reason(&self, result: &ScanWorkerResult) -> Option<&'static str> {
+        if result.source.sequence <= self.latest_published_scan_sequence {
+            return Some("already_published_or_older");
+        }
+        if result.source.sequence < self.latest_enqueued_scan_sequence {
+            return Some("newer_scan_enqueued");
+        }
+        if self.config.scan_max_result_age_ms > 0
+            && result.completed_at.duration_since(result.enqueued_at)
+                > StdDuration::from_millis(self.config.scan_max_result_age_ms)
+        {
+            return Some("max_result_age_exceeded");
+        }
+        None
+    }
+
+    fn publish_scan_result(&mut self, result: ScanWorkerResult) {
+        let mut candidates = result.candidates;
+        let routing_summary =
+            apply_regime_routing(&mut candidates.ranked_entries, &result.regime_context);
+        let evidence_payload = candidate_event_payload(
+            &result.source,
+            &candidates,
+            &result.regime_context,
+            &routing_summary,
+        );
+
+        emit_operator_event(
+            "regime_feature_snapshot",
+            result.feature_snapshot.to_json_value(),
+        );
+        let regime_data = RegimeFeatureData::new(result.feature_snapshot).into_custom_data();
+        self.publish_data(&regime_data.data_type, &regime_data);
+
+        emit_operator_event("option_chain_candidate_scan", evidence_payload.clone());
+        self.record_candidate_evidence(
+            &result.source.trade_date,
+            &candidates,
+            evidence_payload,
+            &result.regime_context,
+        );
+        let data = OptionsCandidateData::new(
+            candidates.clone(),
+            Some(result.regime_context),
+            result.source.source_ts_event,
+            result.source.candidate_ts_init,
+        )
+        .into_custom_data();
+        self.publish_data(&data.data_type, &data);
+        self.latest_published_scan_sequence = result.source.sequence;
+        self.latest_candidates = Some(candidates);
+    }
 }
 
 impl DataActor for OptionChainCandidateScanActor {
@@ -392,6 +679,17 @@ impl DataActor for OptionChainCandidateScanActor {
             log::warn!("Option-chain candidate scan actor has no series subscriptions");
             return Ok(());
         }
+
+        self.start_scan_workers()?;
+        self.clock().set_timer(
+            SCAN_RESULT_TIMER,
+            StdDuration::from_millis(self.config.scan_result_drain_interval_ms.max(1)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
 
         for series_id in self.config.series.clone() {
             if self.config.bootstrap_instruments {
@@ -420,60 +718,10 @@ impl DataActor for OptionChainCandidateScanActor {
     }
 
     fn on_option_chain(&mut self, slice: &OptionChainSlice) -> anyhow::Result<()> {
+        self.drain_scan_results();
         let trade_date = market_trade_date(self.config.scan.trade_date_timezone);
         let ts_init = self.core.timestamp_ns();
-        let underlying = slice.series_id.underlying.to_string();
-        let underlying_bars = self
-            .latest_underlying_bars
-            .get(&underlying)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let event_load_events = self
-            .config
-            .scan
-            .event_shock_earnings_events
-            .iter()
-            .map(|event| {
-                RegimeEvent::new(
-                    event.underlying.clone(),
-                    event.report_date,
-                    event.source.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let feature_inputs = RegimeFeatureInputs {
-            underlying_bars,
-            event_load_events: &event_load_events,
-            event_load_block_days_before: self.config.scan.event_shock_block_days_before_earnings,
-            event_load_block_days_after: self.config.scan.event_shock_block_days_after_earnings,
-        };
-        let feature_snapshot = regime_feature_snapshot_from_option_chain(
-            slice,
-            &self.config.scan.regime_features,
-            feature_inputs,
-            &trade_date,
-            ts_init,
-        );
-        let regime_context = regime_context_from_features(&feature_snapshot);
-        emit_operator_event("regime_feature_snapshot", feature_snapshot.to_json_value());
-        let regime_data = RegimeFeatureData::new(feature_snapshot).into_custom_data();
-        self.publish_data(&regime_data.data_type, &regime_data);
-
-        let mut candidates = scan_option_chain_candidates(slice, &self.config.scan, &trade_date);
-        let routing_summary = apply_regime_routing(&mut candidates.ranked_entries, &regime_context);
-        let evidence_payload =
-            candidate_event_payload(slice, &candidates, &regime_context, &routing_summary);
-        emit_operator_event("option_chain_candidate_scan", evidence_payload.clone());
-        self.record_candidate_evidence(&trade_date, &candidates, evidence_payload, &regime_context);
-        let data = OptionsCandidateData::new(
-            candidates.clone(),
-            Some(regime_context),
-            slice.ts_event,
-            ts_init,
-        )
-        .into_custom_data();
-        self.publish_data(&data.data_type, &data);
-        self.latest_candidates = Some(candidates);
+        self.enqueue_scan_job(slice, trade_date, ts_init);
         Ok(())
     }
 
@@ -489,7 +737,16 @@ impl DataActor for OptionChainCandidateScanActor {
         Ok(())
     }
 
+    fn on_time_event(&mut self, event: &TimeEvent) -> anyhow::Result<()> {
+        if event.name.as_str() == SCAN_RESULT_TIMER {
+            self.drain_scan_results();
+        }
+        Ok(())
+    }
+
     fn on_stop(&mut self) -> anyhow::Result<()> {
+        self.clock().cancel_timer(SCAN_RESULT_TIMER);
+        self.stop_scan_workers();
         for series_id in self.subscribed_series.iter().copied().collect::<Vec<_>>() {
             self.unsubscribe_option_chain(series_id, self.config.client_id);
         }
@@ -556,7 +813,20 @@ pub fn scan_option_chain_candidates(
     trade_date: &str,
 ) -> OptionsCandidateSet {
     let input = option_chain_candidate_input(slice);
-    let scan_date = scan_date_from_timestamp(slice.ts_event);
+    scan_option_chain_candidate_input(
+        &input,
+        config,
+        trade_date,
+        scan_date_from_timestamp(slice.ts_event),
+    )
+}
+
+fn scan_option_chain_candidate_input(
+    input: &OptionChainCandidateInput,
+    config: &OptionChainCandidateScanConfig,
+    trade_date: &str,
+    scan_date: NaiveDate,
+) -> OptionsCandidateSet {
     let mut candidates = OptionsCandidateSet::new(trade_date);
 
     for kind in &config.spread_kinds {
@@ -671,21 +941,23 @@ fn naked_scanner_for(
 }
 
 fn candidate_event_payload(
-    slice: &OptionChainSlice,
+    source: &ScanSourceSummary,
     candidates: &OptionsCandidateSet,
     regime_context: &RegimeContext,
     routing_summary: &RegimeRoutingSummary,
 ) -> Value {
-    let input = option_chain_candidate_input(slice);
     let mut payload = json!({
         "source": "option_chain",
-        "series_id": slice.series_id.to_string(),
-        "underlying": input.underlying,
+        "series_id": source.series_id.to_string(),
+        "underlying": source.underlying,
         "trade_date": candidates.trade_date,
-        "expiration_date": input.expiration_date,
-        "underlying_price": input.underlying_price,
-        "call_contracts": input.calls.contract_count(),
-        "put_contracts": input.puts.contract_count(),
+        "expiration_date": source.expiration_date,
+        "underlying_price": source.underlying_price,
+        "call_contracts": source.call_contracts,
+        "put_contracts": source.put_contracts,
+        "source_ts_event": source.source_ts_event.as_u64(),
+        "source_ts_init": source.source_ts_init.as_u64(),
+        "candidate_ts_init": source.candidate_ts_init.as_u64(),
         "scans": candidates.scans.iter().map(scan_report_payload).collect::<Vec<_>>(),
         "ranked_entries": candidates.ranked_entries().len(),
         "selected": candidates.selected_entry().map(selected_entry_payload),
@@ -756,4 +1028,341 @@ fn instrument_belongs_to_series(instrument: &InstrumentAny, series_id: &OptionSe
         && instrument.settlement_currency().code == series_id.settlement_currency
         && instrument.strike_price().is_some()
         && instrument.option_kind().is_some()
+}
+
+#[derive(Debug)]
+struct ScanWorkerPool {
+    queue: Arc<ScanJobQueue>,
+    result_rx: mpsc::Receiver<ScanWorkerMessage>,
+    handles: Vec<JoinHandle<()>>,
+    queue_capacity: usize,
+    worker_count: usize,
+}
+
+impl ScanWorkerPool {
+    fn start(
+        scan_config: OptionChainCandidateScanConfig,
+        queue_capacity: usize,
+        worker_count: usize,
+    ) -> anyhow::Result<Self> {
+        let queue = Arc::new(ScanJobQueue::new(queue_capacity));
+        let (result_tx, result_rx) = mpsc::channel();
+        let mut handles = Vec::with_capacity(worker_count);
+
+        for worker_index in 0..worker_count {
+            let worker_queue = Arc::clone(&queue);
+            let worker_result_tx = result_tx.clone();
+            let worker_scan_config = scan_config.clone();
+            let handle = thread::Builder::new()
+                .name(format!("alpaca-option-scan-{worker_index}"))
+                .spawn(move || {
+                    scan_worker_loop(
+                        worker_index,
+                        worker_queue,
+                        worker_result_tx,
+                        worker_scan_config,
+                    );
+                })
+                .map_err(|error| {
+                    queue.close();
+                    anyhow::anyhow!("failed to start Alpaca option-chain scan worker: {error}")
+                })?;
+            handles.push(handle);
+        }
+        drop(result_tx);
+
+        Ok(Self {
+            queue,
+            result_rx,
+            handles,
+            queue_capacity,
+            worker_count,
+        })
+    }
+
+    fn enqueue(&self, job: ScanJob) -> ScanEnqueueOutcome {
+        self.queue.push_latest(job)
+    }
+
+    fn try_recv(&self) -> Option<ScanWorkerMessage> {
+        self.result_rx.try_recv().ok()
+    }
+
+    fn queue_capacity(&self) -> usize {
+        self.queue_capacity
+    }
+
+    fn worker_count(&self) -> usize {
+        self.worker_count
+    }
+
+    fn shutdown(mut self) -> Vec<ScanWorkerMessage> {
+        self.queue.close();
+        for handle in self.handles.drain(..) {
+            if let Err(error) = handle.join() {
+                log::error!("Alpaca option-chain scan worker thread failed: {error:?}");
+            }
+        }
+
+        let mut messages = Vec::new();
+        while let Ok(message) = self.result_rx.try_recv() {
+            messages.push(message);
+        }
+        messages
+    }
+}
+
+#[derive(Debug)]
+struct ScanJobQueue {
+    capacity: usize,
+    state: Mutex<ScanJobQueueState>,
+    available: Condvar,
+}
+
+impl ScanJobQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            state: Mutex::new(ScanJobQueueState {
+                jobs: VecDeque::new(),
+                closed: false,
+            }),
+            available: Condvar::new(),
+        }
+    }
+
+    fn push_latest(&self, job: ScanJob) -> ScanEnqueueOutcome {
+        let mut state = self.lock_state();
+        if state.closed {
+            return ScanEnqueueOutcome::Closed;
+        }
+
+        let dropped_oldest = if state.jobs.len() >= self.capacity {
+            state.jobs.pop_front().map(|dropped| dropped.summary())
+        } else {
+            None
+        };
+        state.jobs.push_back(job);
+        let depth = state.jobs.len();
+        self.available.notify_one();
+        ScanEnqueueOutcome::Enqueued {
+            depth,
+            dropped_oldest,
+        }
+    }
+
+    fn recv(&self) -> Option<ScanJob> {
+        let mut state = self.lock_state();
+        loop {
+            if let Some(job) = state.jobs.pop_front() {
+                return Some(job);
+            }
+            if state.closed {
+                return None;
+            }
+            state = match self.available.wait(state) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.lock_state();
+        state.closed = true;
+        self.available.notify_all();
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, ScanJobQueueState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScanJobQueueState {
+    jobs: VecDeque<ScanJob>,
+    closed: bool,
+}
+
+#[derive(Debug)]
+enum ScanEnqueueOutcome {
+    Enqueued {
+        depth: usize,
+        dropped_oldest: Option<ScanJobSummary>,
+    },
+    Closed,
+}
+
+#[derive(Debug)]
+struct ScanJob {
+    sequence: u64,
+    slice: OptionChainSlice,
+    trade_date: String,
+    ts_init: UnixNanos,
+    underlying_bars: Vec<Bar>,
+    enqueued_at: Instant,
+}
+
+impl ScanJob {
+    fn summary(&self) -> ScanJobSummary {
+        ScanJobSummary {
+            sequence: self.sequence,
+            series_id: self.slice.series_id.to_string(),
+            source_ts_event: self.slice.ts_event,
+            source_ts_init: self.slice.ts_init,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ScanJobSummary {
+    sequence: u64,
+    series_id: String,
+    source_ts_event: UnixNanos,
+    source_ts_init: UnixNanos,
+}
+
+#[derive(Debug)]
+enum ScanWorkerMessage {
+    Result(ScanWorkerResult),
+    Error(ScanWorkerError),
+}
+
+#[derive(Debug)]
+struct ScanWorkerError {
+    worker_index: usize,
+    source: ScanJobSummary,
+    reason: &'static str,
+    enqueued_at: Instant,
+    started_at: Instant,
+    completed_at: Instant,
+}
+
+#[derive(Debug)]
+struct ScanWorkerResult {
+    worker_index: usize,
+    source: ScanSourceSummary,
+    candidates: OptionsCandidateSet,
+    feature_snapshot: RegimeFeatureSnapshot,
+    regime_context: RegimeContext,
+    enqueued_at: Instant,
+    started_at: Instant,
+    completed_at: Instant,
+}
+
+#[derive(Debug)]
+struct ScanSourceSummary {
+    sequence: u64,
+    series_id: OptionSeriesId,
+    source_ts_event: UnixNanos,
+    source_ts_init: UnixNanos,
+    candidate_ts_init: UnixNanos,
+    trade_date: String,
+    underlying: String,
+    expiration_date: String,
+    underlying_price: Option<f64>,
+    call_contracts: usize,
+    put_contracts: usize,
+}
+
+fn scan_worker_loop(
+    worker_index: usize,
+    queue: Arc<ScanJobQueue>,
+    result_tx: mpsc::Sender<ScanWorkerMessage>,
+    scan_config: OptionChainCandidateScanConfig,
+) {
+    while let Some(job) = queue.recv() {
+        let started_at = Instant::now();
+        let summary = job.summary();
+        let enqueued_at = job.enqueued_at;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            scan_worker_job(worker_index, job, &scan_config, started_at)
+        }));
+        let message = match result {
+            Ok(result) => ScanWorkerMessage::Result(result),
+            Err(_) => ScanWorkerMessage::Error(ScanWorkerError {
+                worker_index,
+                source: summary,
+                reason: "scan_worker_panic",
+                enqueued_at,
+                started_at,
+                completed_at: Instant::now(),
+            }),
+        };
+
+        if result_tx.send(message).is_err() {
+            break;
+        }
+    }
+}
+
+fn scan_worker_job(
+    worker_index: usize,
+    job: ScanJob,
+    config: &OptionChainCandidateScanConfig,
+    started_at: Instant,
+) -> ScanWorkerResult {
+    let event_load_events = config
+        .event_shock_earnings_events
+        .iter()
+        .map(|event| {
+            RegimeEvent::new(
+                event.underlying.clone(),
+                event.report_date,
+                event.source.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let feature_inputs = RegimeFeatureInputs {
+        underlying_bars: &job.underlying_bars,
+        event_load_events: &event_load_events,
+        event_load_block_days_before: config.event_shock_block_days_before_earnings,
+        event_load_block_days_after: config.event_shock_block_days_after_earnings,
+    };
+    let feature_snapshot = regime_feature_snapshot_from_option_chain(
+        &job.slice,
+        &config.regime_features,
+        feature_inputs,
+        &job.trade_date,
+        job.ts_init,
+    );
+    let regime_context = regime_context_from_features(&feature_snapshot);
+    let input = option_chain_candidate_input(&job.slice);
+    let candidates = scan_option_chain_candidate_input(
+        &input,
+        config,
+        &job.trade_date,
+        scan_date_from_timestamp(job.slice.ts_event),
+    );
+    let source = ScanSourceSummary {
+        sequence: job.sequence,
+        series_id: job.slice.series_id,
+        source_ts_event: job.slice.ts_event,
+        source_ts_init: job.slice.ts_init,
+        candidate_ts_init: job.ts_init,
+        trade_date: job.trade_date,
+        underlying: input.underlying,
+        expiration_date: input.expiration_date,
+        underlying_price: input.underlying_price,
+        call_contracts: input.calls.contract_count(),
+        put_contracts: input.puts.contract_count(),
+    };
+
+    ScanWorkerResult {
+        worker_index,
+        source,
+        candidates,
+        feature_snapshot,
+        regime_context,
+        enqueued_at: job.enqueued_at,
+        started_at,
+        completed_at: Instant::now(),
+    }
+}
+
+fn duration_ms_u64(duration: StdDuration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
