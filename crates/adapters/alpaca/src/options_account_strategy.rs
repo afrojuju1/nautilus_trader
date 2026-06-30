@@ -69,6 +69,7 @@ use serde_json::{Value, json};
 const SELECTED_CANDIDATE_ALERT: &str = "selected_candidate";
 const CANDIDATE_SUBMIT_REJECTED_ALERT: &str = "candidate_submit_rejected";
 const MANAGEMENT_TIMER: &str = "alpaca_options_management";
+const SINGLE_LEG_ORDER_BROKER_SUBMIT_PATH: &str = "single_leg_order";
 const SPREAD_ORDER_BROKER_SUBMIT_PATH: &str = "single_option_spread_order";
 
 /// Custom data type published by option-chain scanner actors for entry strategies.
@@ -242,6 +243,8 @@ pub struct AlpacaOptionsSubmission {
     pub order_list_id: String,
     /// Number of orders sent through the Nautilus strategy API.
     pub order_count: usize,
+    /// Broker submission path used by the Alpaca execution client.
+    pub broker_submit_path: String,
 }
 
 #[derive(Clone, Debug)]
@@ -250,12 +253,18 @@ struct PendingEntrySubmission {
     trade_date: String,
     order_list_id: String,
     submitted_at_utc: String,
+    broker_submit_path: String,
     quantity: u64,
     order_count: usize,
     accepted: usize,
     rejected: usize,
     recorded: bool,
     rejection_reasons: Vec<String>,
+}
+
+struct EntrySubmissionOrders {
+    orders: Vec<OrderAny>,
+    broker_submit_path: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -629,14 +638,16 @@ impl AlpacaOptionsAccountStrategy {
         entry_plan: AlpacaOptionsEntryPlan,
         order_list_id: &str,
     ) -> anyhow::Result<AlpacaOptionsSubmission> {
-        let orders = self.build_entry_orders(&entry_plan.entry, order_list_id)?;
-        let order_count = orders.len();
-        self.submit_entry_orders(orders, order_list_id)?;
+        let submission_orders = self.build_entry_orders(&entry_plan.entry, order_list_id)?;
+        let order_count = submission_orders.orders.len();
+        let broker_submit_path = submission_orders.broker_submit_path;
+        self.submit_entry_orders(submission_orders.orders, order_list_id)?;
 
         Ok(AlpacaOptionsSubmission {
             entry: entry_plan.entry,
             order_list_id: order_list_id.to_string(),
             order_count,
+            broker_submit_path: broker_submit_path.to_string(),
         })
     }
 
@@ -647,16 +658,19 @@ impl AlpacaOptionsAccountStrategy {
         order_list_id: &str,
         regime_context: Option<&RegimeContext>,
     ) -> anyhow::Result<AlpacaOptionsSubmission> {
-        let orders = self.build_entry_orders(&entry_plan.entry, order_list_id)?;
-        let client_order_ids = orders
+        let submission_orders = self.build_entry_orders(&entry_plan.entry, order_list_id)?;
+        let broker_submit_path = submission_orders.broker_submit_path;
+        let client_order_ids = submission_orders
+            .orders
             .iter()
             .map(|order| order.client_order_id().to_string())
             .collect::<Vec<_>>();
-        let order_count = orders.len();
+        let order_count = submission_orders.orders.len();
         self.record_pending_submission(
             entry_plan.entry.clone(),
             trade_date.to_string(),
             order_list_id.to_string(),
+            broker_submit_path.to_string(),
             order_count,
             client_order_ids,
         );
@@ -672,7 +686,7 @@ impl AlpacaOptionsAccountStrategy {
             regime_context,
         );
 
-        if let Err(error) = self.submit_entry_orders(orders, order_list_id) {
+        if let Err(error) = self.submit_entry_orders(submission_orders.orders, order_list_id) {
             self.remove_pending_submission(order_list_id);
             return Err(error);
         }
@@ -681,6 +695,7 @@ impl AlpacaOptionsAccountStrategy {
             entry: entry_plan.entry,
             order_list_id: order_list_id.to_string(),
             order_count,
+            broker_submit_path: broker_submit_path.to_string(),
         })
     }
 
@@ -688,10 +703,51 @@ impl AlpacaOptionsAccountStrategy {
         &mut self,
         entry: &SelectedOptionsEntry,
         order_list_id: &str,
-    ) -> anyhow::Result<Vec<OrderAny>> {
+    ) -> anyhow::Result<EntrySubmissionOrders> {
         let quantity = self.config.quantity;
+        if let Some(order) = self.build_native_spread_entry_order(entry, order_list_id, quantity)? {
+            return Ok(EntrySubmissionOrders {
+                orders: vec![order],
+                broker_submit_path: SPREAD_ORDER_BROKER_SUBMIT_PATH,
+            });
+        }
+
+        if matches!(entry, SelectedOptionsEntry::NakedOption(_)) {
+            let mut order_api = self.order();
+            let orders =
+                build_selected_entry_orders(&mut order_api, entry, order_list_id, quantity)?;
+            return Ok(EntrySubmissionOrders {
+                orders,
+                broker_submit_path: SINGLE_LEG_ORDER_BROKER_SUBMIT_PATH,
+            });
+        }
+
+        anyhow::bail!(
+            "spread entry {order_list_id} could not be planned as a native Nautilus OptionSpread"
+        );
+    }
+
+    fn build_native_spread_entry_order(
+        &mut self,
+        entry: &SelectedOptionsEntry,
+        order_list_id: &str,
+        quantity: u64,
+    ) -> anyhow::Result<Option<OrderAny>> {
+        let Some(plan) = selected_entry_spread_plan(entry, self.clock().timestamp_ns())? else {
+            return Ok(None);
+        };
+
+        self.cache_spread_plan(&plan)?;
+        let pricing = self.spread_entry_order_pricing(&plan);
         let mut order_api = self.order();
-        build_selected_entry_orders(&mut order_api, entry, order_list_id, quantity)
+        build_spread_entry_order(
+            &mut order_api,
+            &plan,
+            order_list_id,
+            quantity,
+            pricing.signed_limit_price,
+        )
+        .map(Some)
     }
 
     fn submit_entry_orders(
@@ -1472,7 +1528,7 @@ impl AlpacaOptionsAccountStrategy {
         self.cache_spread_plan(&plan)?;
         let pricing = self.spread_entry_order_pricing(&plan);
         let mut order_api = self.order();
-        let order = build_vertical_spread_entry_order(
+        let order = build_spread_entry_order(
             &mut order_api,
             &plan,
             order_list_id,
@@ -1931,6 +1987,7 @@ impl AlpacaOptionsAccountStrategy {
         entry: SelectedOptionsEntry,
         trade_date: String,
         order_list_id: String,
+        broker_submit_path: String,
         order_count: usize,
         client_order_ids: Vec<String>,
     ) {
@@ -1946,6 +2003,7 @@ impl AlpacaOptionsAccountStrategy {
                 trade_date,
                 order_list_id,
                 submitted_at_utc,
+                broker_submit_path,
                 quantity: self.config.quantity,
                 order_count,
                 accepted: 0,
@@ -1972,14 +2030,16 @@ impl AlpacaOptionsAccountStrategy {
         if let Some(pending) = self.pending_submissions.get_mut(&order_list_id) {
             pending.accepted = pending.accepted.saturating_add(1);
             if !pending.recorded {
-                draft = Some(selected_entry_state_entry_draft(
+                let mut state_draft = selected_entry_state_entry_draft(
                     &pending.entry,
                     &pending.trade_date,
                     &pending.order_list_id,
                     pending.quantity,
                     Some(pending.submitted_at_utc.clone()),
                     Some(event.venue_order_id.to_string()),
-                ));
+                );
+                state_draft.entry_pricing_source = Some(pending.broker_submit_path.clone());
+                draft = Some(state_draft);
                 pending.recorded = true;
             }
             should_remove = pending.accepted + pending.rejected >= pending.order_count;
@@ -2037,17 +2097,16 @@ impl AlpacaOptionsAccountStrategy {
                 } else {
                     "entry_rejected"
                 };
-                rejected_state = Some((
-                    selected_entry_state_entry_draft(
-                        &pending.entry,
-                        &pending.trade_date,
-                        &pending.order_list_id,
-                        pending.quantity,
-                        Some(pending.submitted_at_utc.clone()),
-                        None,
-                    ),
-                    close_reason.to_string(),
-                ));
+                let mut state_draft = selected_entry_state_entry_draft(
+                    &pending.entry,
+                    &pending.trade_date,
+                    &pending.order_list_id,
+                    pending.quantity,
+                    Some(pending.submitted_at_utc.clone()),
+                    None,
+                );
+                state_draft.entry_pricing_source = Some(pending.broker_submit_path.clone());
+                rejected_state = Some((state_draft, close_reason.to_string()));
                 pending.recorded = true;
                 terminal_rejection_recorded = true;
             }
@@ -2703,7 +2762,7 @@ fn vertical_spread_order_draft_payload(
         "scanner_premium": draft.plan.scanner_premium,
         "scanner_signed_price": scanner_signed_price,
         "scanner_vs_order_limit": scanner_signed_price - draft.pricing.signed_limit_price,
-        "entry_broker_submit_path": "leg_order_list",
+        "entry_broker_submit_path": SPREAD_ORDER_BROKER_SUBMIT_PATH,
         "spread_order_broker_submit_path": SPREAD_ORDER_BROKER_SUBMIT_PATH,
         "submitted": false,
         "vega_pricing_enabled": false,
@@ -3085,7 +3144,7 @@ pub fn build_selected_entry_orders(
     })
 }
 
-fn build_vertical_spread_entry_order(
+fn build_spread_entry_order(
     orders: &mut impl OptionsEntryOrderCreator,
     plan: &OptionSpreadPlan,
     order_list_id: &str,
@@ -3098,9 +3157,9 @@ fn build_vertical_spread_entry_order(
     if signed_limit_price == 0.0 {
         anyhow::bail!("spread order {order_list_id} signed limit price must be non-zero");
     }
-    if !is_vertical_spread_plan(plan) {
+    if plan.legs.len() < 2 {
         anyhow::bail!(
-            "spread order {order_list_id} only supports two-leg vertical drafts, got {} legs",
+            "spread order {order_list_id} requires at least two spread legs, got {}",
             plan.legs.len()
         );
     }

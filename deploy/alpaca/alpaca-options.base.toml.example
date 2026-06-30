@@ -102,6 +102,8 @@ block_unestimated_risk_capital = true
 [event_shock]
 # Optional approved event source for symbol-level entry blocks.
 # earnings_events_path = "~/.local/state/nautilus_trader/earnings/earnings_events_approved.csv"
+# Container deployments can set ALPACA_EVENT_SHOCK_EARNINGS_EVENTS_PATH to
+# /state/earnings/earnings_events_approved.csv when mounting an approved feed.
 require_earnings_events = false
 block_days_before_earnings = 1
 block_days_after_earnings = 1

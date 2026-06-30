@@ -444,6 +444,12 @@ impl UnderlyingTrendVolFeatures {
 pub struct EventLoadFeatures {
     /// Source that produced the event load.
     pub source: String,
+    /// Total number of approved events available in the feed.
+    pub feed_event_count: usize,
+    /// Earliest event distance in calendar days across the feed.
+    pub feed_min_days_to_event: Option<i64>,
+    /// Latest event distance in calendar days across the feed.
+    pub feed_max_days_to_event: Option<i64>,
     /// Number of approved events for the underlying.
     pub underlying_event_count: usize,
     /// Number of events inside the configured event-load window.
@@ -460,6 +466,9 @@ impl EventLoadFeatures {
     pub fn to_json_value(&self) -> Value {
         json!({
             "source": self.source,
+            "feed_event_count": self.feed_event_count,
+            "feed_min_days_to_event": self.feed_min_days_to_event,
+            "feed_max_days_to_event": self.feed_max_days_to_event,
             "underlying_event_count": self.underlying_event_count,
             "active_event_count": self.active_event_count,
             "nearest_days_to_event": self.nearest_days_to_event,
@@ -785,7 +794,11 @@ pub fn regime_feature_snapshot_from_option_chain(
         inputs.event_load_block_days_before,
         inputs.event_load_block_days_after,
     );
-    let event_load_freshness = event_load_freshness(&event_load, as_of_ts);
+    let event_load_freshness = event_load_freshness(
+        &event_load,
+        as_of_ts,
+        inputs.event_load_block_days_before.max(0),
+    );
     let feature_freshness = vec![
         underlying_bar_freshness,
         underlying_trend_vol_freshness,
@@ -950,9 +963,24 @@ fn event_load_features(
 
     let trade_date = NaiveDate::parse_from_str(trade_date, "%Y-%m-%d").ok()?;
     let underlying = underlying.to_ascii_uppercase();
+    let mut feed_min_days_to_event: Option<i64> = None;
+    let mut feed_max_days_to_event: Option<i64> = None;
     let mut underlying_event_count = 0;
     let mut active_event_count = 0;
     let mut nearest_days_to_event: Option<i64> = None;
+
+    for event in events {
+        let days_to_event = event
+            .event_date
+            .signed_duration_since(trade_date)
+            .num_days();
+        feed_min_days_to_event = Some(
+            feed_min_days_to_event.map_or(days_to_event, |current| current.min(days_to_event)),
+        );
+        feed_max_days_to_event = Some(
+            feed_max_days_to_event.map_or(days_to_event, |current| current.max(days_to_event)),
+        );
+    }
 
     for event in events.iter().filter(|event| event.underlying == underlying) {
         underlying_event_count += 1;
@@ -979,10 +1007,14 @@ fn event_load_features(
     let source = events
         .iter()
         .find(|event| event.underlying == underlying)
+        .or_else(|| events.first())
         .map_or("event_load".to_string(), |event| event.source.clone());
 
     Some(EventLoadFeatures {
         source,
+        feed_event_count: events.len(),
+        feed_min_days_to_event,
+        feed_max_days_to_event,
         underlying_event_count,
         active_event_count,
         nearest_days_to_event,
@@ -1005,10 +1037,26 @@ fn is_inside_event_load_window(
 fn event_load_freshness(
     event_load: &Option<EventLoadFeatures>,
     as_of_ts: UnixNanos,
+    required_future_days: i64,
 ) -> FeatureFreshness {
     let Some(event_load) = event_load else {
         return FeatureFreshness::missing(RegimeFeatureGroup::EventLoad, "event_load");
     };
+    if event_load.feed_max_days_to_event.is_none() {
+        return FeatureFreshness::missing(RegimeFeatureGroup::EventLoad, &event_load.source);
+    }
+    if event_load
+        .feed_max_days_to_event
+        .is_some_and(|max_days| max_days < required_future_days)
+    {
+        return FeatureFreshness::produced(
+            RegimeFeatureGroup::EventLoad,
+            event_load.source.clone(),
+            Some(as_of_ts),
+            Some(0),
+            FeatureFreshnessStatus::Stale,
+        );
+    }
 
     FeatureFreshness::produced(
         RegimeFeatureGroup::EventLoad,

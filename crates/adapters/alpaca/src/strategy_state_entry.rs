@@ -51,7 +51,7 @@ pub fn selected_entry_state_entry_draft(
             spread_legs: spread_state
                 .as_ref()
                 .map_or_else(Vec::new, |state| state.spread_legs.clone()),
-            entry_pricing_source: Some("leg_order_list".to_string()),
+            entry_pricing_source: Some("single_option_spread_order".to_string()),
         },
         SelectedOptionsEntry::IronCondor(entry) => StrategyStateEntryDraft {
             trade_date: trade_date.to_string(),
@@ -78,7 +78,7 @@ pub fn selected_entry_state_entry_draft(
             spread_legs: spread_state
                 .as_ref()
                 .map_or_else(Vec::new, |state| state.spread_legs.clone()),
-            entry_pricing_source: Some("leg_order_list".to_string()),
+            entry_pricing_source: Some("single_option_spread_order".to_string()),
         },
         SelectedOptionsEntry::Debit(entry) => StrategyStateEntryDraft {
             trade_date: trade_date.to_string(),
@@ -105,7 +105,7 @@ pub fn selected_entry_state_entry_draft(
             spread_legs: spread_state
                 .as_ref()
                 .map_or_else(Vec::new, |state| state.spread_legs.clone()),
-            entry_pricing_source: Some("leg_order_list".to_string()),
+            entry_pricing_source: Some("single_option_spread_order".to_string()),
         },
         SelectedOptionsEntry::NakedOption(entry) => StrategyStateEntryDraft {
             trade_date: trade_date.to_string(),

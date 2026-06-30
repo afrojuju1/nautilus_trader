@@ -215,7 +215,7 @@ impl StrategyState {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("leg_order_list".to_string()),
+            entry_pricing_source: Some("single_option_spread_order".to_string()),
         });
     }
 
@@ -250,7 +250,7 @@ impl StrategyState {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("leg_order_list".to_string()),
+            entry_pricing_source: Some("single_option_spread_order".to_string()),
         });
     }
 
@@ -286,7 +286,7 @@ impl StrategyState {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("leg_order_list".to_string()),
+            entry_pricing_source: Some("single_option_spread_order".to_string()),
         });
     }
 
@@ -320,7 +320,7 @@ impl StrategyState {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("leg_order_list".to_string()),
+            entry_pricing_source: Some("single_leg_order".to_string()),
         });
     }
 
@@ -753,7 +753,7 @@ mod tests {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("leg_order_list".to_string()),
+            entry_pricing_source: Some("single_option_spread_order".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
@@ -917,7 +917,7 @@ mod tests {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("leg_order_list".to_string()),
+            entry_pricing_source: Some("single_option_spread_order".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
@@ -958,7 +958,7 @@ mod tests {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("leg_order_list".to_string()),
+            entry_pricing_source: Some("single_option_spread_order".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
@@ -1043,7 +1043,7 @@ mod tests {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("leg_order_list".to_string()),
+            entry_pricing_source: Some("single_option_spread_order".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,

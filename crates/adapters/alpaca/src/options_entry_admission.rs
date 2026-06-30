@@ -868,7 +868,7 @@ mod tests {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("leg_order_list".to_string()),
+            entry_pricing_source: Some("single_option_spread_order".to_string()),
         }
     }
 
