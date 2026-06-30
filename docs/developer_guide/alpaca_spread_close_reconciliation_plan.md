@@ -70,9 +70,9 @@ Cancellation mapping:
 
 Phase 1: Dry-run close draft
 
-- Build a spread close order draft for active vertical entries.
+- Build a spread close order draft for active spread entries.
 - Emit `close_spread_order_draft` with spread instrument, ratios, quote source, signed close limit,
-  and current legacy close path.
+  and broker submit path.
 - Do not submit the spread close order.
 
 Phase 2: Reconciliation read model
@@ -81,39 +81,38 @@ Phase 2: Reconciliation read model
   positions would map to spread identity.
 - Keep the existing startup reconciliation behavior authoritative.
 
-Phase 3: Paper close submit for one vertical family
+Phase 3: Spread close submit cutover
 
-- Enable spread close submission only for a single paper vertical profile by setting
-  `management.close_order_mode = "option_spread"` in that account TOML.
-- Keep opening submission on the proven path selected for that profile.
-- Submit one reduce-only Nautilus `OptionSpread` close order, priced from the cached spread
-  `QuoteTick`, and let `AlpacaExecutionClient` expand it to Alpaca MLeg.
-- Keep profiles without `management.close_order_mode = "option_spread"` on the legacy leg
-  `OrderList` close path.
+- Submit spread-backed closes as one reduce-only Nautilus `OptionSpread` order, priced from the
+  cached spread `QuoteTick`, and let `AlpacaExecutionClient` expand it to Alpaca MLeg.
+- Apply the same path to vertical, debit-spread, and iron-condor entries that carry persisted spread
+  metadata.
+- Block close submission for naked or otherwise non-spread entries until they have an explicitly
+  designed native close path.
 - Cancel accepted smoke close orders only when explicitly testing.
 
 Phase 4: Startup reconciliation cutover
 
 - Make spread identity the primary match key for entries that contain spread metadata.
-- Keep legacy order-list reconciliation only for entries created before the cutover.
+- Keep historical order-list reconciliation only for entries created before the cutover.
 
-Phase 5: Retire leg close path
+Phase 5: Native-only cleanup
 
-- Remove leg-derived close order submission after spread close and reconciliation are proven for
-  verticals, then repeat for debit spreads and iron condors.
+- Keep operator status, events, and docs aligned to the native spread close path so no retired leg
+  close fallback is advertised as operational.
 
 ## Risks
 
 - Incorrect ratio/sign mapping could invert close intent.
 - Alpaca parent/leg order status can diverge from Nautilus cache state.
 - Partial fills may look like unmanaged legs unless grouped by spread identity.
-- Existing state entries do not yet carry all spread fields, so bridge matching is required.
+- Existing state entries without spread fields cannot use the native spread close path.
 - Spread quotes can be missing or stale; close submission must block rather than fall back silently
-  when the target mode is spread-native.
+  to leg-derived broker orders.
 
 ## Follow-Up Beads
 
-- Build dry-run spread close order drafts for active vertical entries.
+- Build dry-run spread close order drafts for active spread entries.
 - Add spread reconciliation preview to operator status or a source-neutral ops command.
-- Cut one vertical paper profile to spread close submission with `management.close_order_mode =
-  "option_spread"` after entry spread-order proof.
+- Capture paper submit/cancel proof for a reduce-only spread close when a safe active position is
+  available.

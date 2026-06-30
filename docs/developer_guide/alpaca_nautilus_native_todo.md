@@ -60,7 +60,7 @@ and strategies.
 - [x] Add a REST-vs-option-chain comparison command for the same symbol, expiry, and scan time.
   - Implemented as `alpaca-compare-option-chain-scan`.
   - It loads one Alpaca REST option snapshot for the requested underlying/expiry, scans the same
-    contracts through the legacy REST normalizer and the Nautilus `OptionChainSlice` normalizer,
+    contracts through the REST snapshot normalizer and the Nautilus `OptionChainSlice` normalizer,
     then emits JSON parity diagnostics without submitting orders.
 - [x] Add a live Nautilus node for Alpaca option-chain candidate evidence and entry strategy wiring.
   - Implemented as `alpaca-options-node`.
@@ -87,8 +87,7 @@ and strategies.
   - `AlpacaOptionsAccountStrategy` owns conversion from `OptionsCandidateSet` /
     `SelectedOptionsEntry` into standard Nautilus orders and submits through `Strategy::submit_order`
     or `Strategy::submit_order_list`.
-  - The live node now owns entry submission and management lifecycle; the legacy
-    `alpaca-options-node` binary is retained only for `--check-config`.
+  - `alpaca-options-node` now owns entry submission, management lifecycle, and `--check-config`.
   - Close, stale-order, force-flatten, and reprice decisions are owned by the same strategy state
     owner that records accepted entries.
 
@@ -263,7 +262,7 @@ loop.
   - Missing active close-leg quotes remain a `close_quote_missing` management block; first-time
     candidate entries are not blocked solely because the subscription cache has not emitted yet.
 - [x] Remove direct management behavior from the account-engine loop once the new owner is proven.
-  - The legacy `options_engine` library module was removed.
+  - The retired `options_engine` library module was removed.
   - `alpaca-options-node` no longer runs a management loop and remains a config-check command.
   - Docker/systemd runner defaults now start `alpaca-options-node`.
 

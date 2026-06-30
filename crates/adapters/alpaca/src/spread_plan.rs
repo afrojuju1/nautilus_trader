@@ -135,23 +135,6 @@ pub fn selected_entry_spread_plan(
     .map(Some)
 }
 
-/// Rebuilds a Nautilus-native vertical spread plan from persisted strategy state.
-///
-/// Returns `Ok(None)` for naked options, iron condors, or entries without both vertical legs.
-///
-/// # Errors
-///
-/// Returns an error if persisted leg expiration metadata cannot be parsed.
-pub fn strategy_state_vertical_spread_plan(
-    entry: &StrategyStateEntry,
-    ts_init: UnixNanos,
-) -> anyhow::Result<Option<OptionSpreadPlan>> {
-    let Some(plan) = strategy_state_spread_plan(entry, ts_init)? else {
-        return Ok(None);
-    };
-    Ok((plan.legs.len() == 2).then_some(plan))
-}
-
 /// Rebuilds a Nautilus-native spread plan from persisted strategy state when possible.
 ///
 /// Returns `Ok(None)` for naked options or entries without enough persisted spread legs.

@@ -74,7 +74,7 @@ const DEFAULT_SCAN_MAX_RESULT_AGE_MS: u64 = 15_000;
 /// Read-only scan settings for candidate discovery from option-chain slices.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OptionChainCandidateScanConfig {
-    /// Resolved strategy profiles. Runtime configs populate this; defaults may use legacy fields.
+    /// Resolved strategy profiles. Runtime configs populate this; defaults mirror family flags.
     pub strategy_profiles: Vec<AlpacaOptionsStrategyProfile>,
     /// Enabled credit-spread kinds.
     pub spread_kinds: Vec<CreditSpreadKind>,

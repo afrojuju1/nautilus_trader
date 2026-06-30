@@ -54,7 +54,6 @@ struct OperatorConfig {
     trade_date: String,
     open_orders_enabled: bool,
     close_orders_enabled: bool,
-    close_order_mode: String,
     strategy_profiles: Vec<String>,
     max_active_entries: Option<usize>,
     max_daily_submits: Option<usize>,
@@ -125,7 +124,6 @@ struct ServiceStatus {
     log_file_exists: bool,
     open_orders_enabled: bool,
     close_orders_enabled: bool,
-    close_order_mode: String,
     strategy_profiles: Vec<String>,
 }
 
@@ -234,7 +232,7 @@ struct ActiveEntryStatus {
     score: f64,
     close_reason: Option<String>,
     close_order_list_id: Option<String>,
-    close_order_mode: Option<String>,
+    close_broker_submit_path: Option<String>,
     spread_instrument_id: Option<String>,
     spread_raw_symbol: Option<String>,
     close_attempts: u32,
@@ -419,7 +417,6 @@ impl OperatorConfig {
             trade_date: trade_date.to_string(),
             open_orders_enabled: strategy_config.open_orders_enabled,
             close_orders_enabled: strategy_config.close_orders_enabled,
-            close_order_mode: strategy_config.close_order_mode.as_str().to_string(),
             strategy_profiles,
             max_active_entries: strategy_config.max_active_entries,
             max_daily_submits: strategy_config.max_daily_submits,
@@ -627,7 +624,6 @@ fn build_status(
         log_file_exists: config.log_path.exists(),
         open_orders_enabled: config.open_orders_enabled,
         close_orders_enabled: config.close_orders_enabled,
-        close_order_mode: config.close_order_mode.clone(),
         strategy_profiles: config.strategy_profiles.clone(),
     };
 
@@ -1009,12 +1005,11 @@ fn print_human_status(status: &OperatorStatus) {
         status.engine_state, status.checked_at_utc
     );
     println!(
-        "service: name={} active={} open_orders={} close_orders={} close_order_mode={} strategy_profiles={} lock={} log={}",
+        "service: name={} active={} open_orders={} close_orders={} strategy_profiles={} lock={} log={}",
         status.service.name,
         status.service.active_state.as_deref().unwrap_or("unknown"),
         status.service.open_orders_enabled,
         status.service.close_orders_enabled,
-        status.service.close_order_mode,
         status.service.strategy_profiles.join(","),
         status.service.lock_file,
         status.service.log_file,
@@ -1166,7 +1161,7 @@ fn print_human_status(status: &OperatorStatus) {
     );
     for entry in &status.active_entries {
         println!(
-            "active_entry: underlying={} strategy={} symbols={} net_premium_kind={} credit={:.2} debit={} spread={} close_attempts={} close_reason={} close_order_mode={} close_order_list_id={} last_close_submitted_at={}",
+            "active_entry: underlying={} strategy={} symbols={} net_premium_kind={} credit={:.2} debit={} spread={} close_attempts={} close_reason={} close_broker_submit_path={} close_order_list_id={} last_close_submitted_at={}",
             entry.underlying,
             entry.strategy,
             entry.symbols.join(","),
@@ -1182,7 +1177,7 @@ fn print_human_status(status: &OperatorStatus) {
                 .unwrap_or("none"),
             entry.close_attempts,
             entry.close_reason.as_deref().unwrap_or("none"),
-            entry.close_order_mode.as_deref().unwrap_or("none"),
+            entry.close_broker_submit_path.as_deref().unwrap_or("none"),
             entry.close_order_list_id.as_deref().unwrap_or("none"),
             entry
                 .last_close_submitted_at_utc
@@ -1590,7 +1585,7 @@ fn active_entry_statuses(state: &StrategyState) -> Vec<ActiveEntryStatus> {
             score: entry.score,
             close_reason: entry.close_reason.clone(),
             close_order_list_id: entry.close_order_list_id.clone(),
-            close_order_mode: entry.close_order_mode.clone(),
+            close_broker_submit_path: entry.close_broker_submit_path.clone(),
             spread_instrument_id: entry.spread_instrument_id.clone(),
             spread_raw_symbol: entry.spread_raw_symbol.clone(),
             close_attempts: entry.close_attempts,

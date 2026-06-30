@@ -440,11 +440,9 @@ account's role and strategy set.
 - `ALPACA_CLOSE_ORDERS=true` allows broker orders that close or reduce risk, including stale-order
   cancellation and close submissions.
 - `ALPACA_FORCE_FLATTEN=true` treats every tracked open spread as a close candidate.
-- TOML `management.close_order_mode = "legacy_leg_order_list"` keeps close submission on the
-  established leg order-list path.
-- TOML `management.close_order_mode = "option_spread"` submits one reduce-only Nautilus
-  `OptionSpread` close order expanded to Alpaca MLeg, and should be enabled only in a reviewed
-  vertical paper profile.
+- Spread-backed close submissions use one reduce-only Nautilus `OptionSpread` order expanded to
+  Alpaca MLeg. Entries without spread metadata block close submission until they have a native close
+  path.
 - TOML strategy profile `mode = "dry_run"` lets a strategy scan and emit decisions without
   submitting while other enabled profiles can remain live.
 - TOML `management.close_regular_hours_only = true` blocks non-forced close submissions outside the

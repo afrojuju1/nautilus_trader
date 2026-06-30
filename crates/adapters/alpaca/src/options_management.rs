@@ -9,38 +9,6 @@ use crate::{
 };
 use serde_json::json;
 
-/// Close-order construction mode for managed active entries.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CloseOrderMode {
-    /// Submit the established leg-based close order list.
-    LegacyLegOrderList,
-    /// Submit one reduce-only Nautilus OptionSpread order expanded to Alpaca MLeg.
-    OptionSpread,
-}
-
-impl CloseOrderMode {
-    /// Stable config/event label.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::LegacyLegOrderList => "legacy_leg_order_list",
-            Self::OptionSpread => "option_spread",
-        }
-    }
-}
-
-impl std::str::FromStr for CloseOrderMode {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "" | "legacy" | "legacy_leg" | "legacy_leg_order_list" => Ok(Self::LegacyLegOrderList),
-            "spread" | "option_spread" | "single_option_spread_order" => Ok(Self::OptionSpread),
-            other => anyhow::bail!("unsupported close_order_mode {other}"),
-        }
-    }
-}
-
 /// Pure management thresholds for one credit-spread strategy runtime.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CreditSpreadManagementConfig {
@@ -63,8 +31,6 @@ pub struct AlpacaOptionsManagementConfig {
     pub interval_secs: u64,
     /// Whether broker orders which close or reduce risk are enabled.
     pub close_orders_enabled: bool,
-    /// Close order construction/submission path.
-    pub close_order_mode: CloseOrderMode,
     /// Whether every active entry should be flattened.
     pub force_flatten: bool,
     /// Stale entry timeout.
@@ -110,7 +76,6 @@ impl AlpacaOptionsManagementConfig {
         Self {
             interval_secs: config.interval_secs,
             close_orders_enabled: config.close_orders_enabled,
-            close_order_mode: config.close_order_mode,
             force_flatten: config.force_flatten,
             stale_entry_secs: config.stale_entry_secs,
             stale_close_secs: config.stale_close_secs,
@@ -147,7 +112,6 @@ impl Default for AlpacaOptionsManagementConfig {
         Self {
             interval_secs: 60,
             close_orders_enabled: false,
-            close_order_mode: CloseOrderMode::LegacyLegOrderList,
             force_flatten: false,
             stale_entry_secs: 900,
             stale_close_secs: 900,
@@ -552,11 +516,11 @@ mod tests {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
+            entry_pricing_source: Some("leg_order_list".to_string()),
             close_order_list_id: Some("close-list".to_string()),
             close_parent_order_id: Some("close-parent".to_string()),
             close_reason: Some("stop_loss".to_string()),
-            close_order_mode: Some("legacy_leg_order_list".to_string()),
+            close_broker_submit_path: Some("leg_order_list".to_string()),
             close_attempts: 0,
             last_close_submitted_at_utc: None,
             submitted: true,

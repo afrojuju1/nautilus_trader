@@ -44,7 +44,7 @@ use crate::{
     fleet::ResolvedFleetConfig,
     http::client::AlpacaHttpClient,
     options_lifecycle::OptionLifecycleRiskConfig,
-    options_management::{CloseOrderMode, CreditSpreadManagementConfig},
+    options_management::CreditSpreadManagementConfig,
     runtime::{StrategyState, emit_operator_event},
     strategy::{
         scan_call_credit_underlying, scan_call_debit_underlying, scan_iron_condor_underlying,
@@ -155,8 +155,6 @@ pub struct AlpacaOptionsRuntimeConfig {
     pub stale_close_secs: u64,
     /// Whether broker orders which close or reduce risk are enabled.
     pub close_orders_enabled: bool,
-    /// Close order construction/submission path.
-    pub close_order_mode: CloseOrderMode,
     /// Whether non-forced close submissions are limited to regular options hours.
     pub close_regular_hours_only: bool,
     /// Close window start.

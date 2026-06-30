@@ -71,7 +71,7 @@ pub struct StrategyStateEntryDraft {
     pub long_call_symbol: Option<String>,
     /// Strategy quantity.
     pub quantity: u64,
-    /// Entry credit. Debits are stored as a negative credit for legacy state readers.
+    /// Entry credit. Debits are stored as a negative credit for older state readers.
     pub credit: f64,
     /// Entry debit for long-premium strategies.
     pub debit: Option<f64>,
@@ -215,7 +215,7 @@ impl StrategyState {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
+            entry_pricing_source: Some("leg_order_list".to_string()),
         });
     }
 
@@ -250,7 +250,7 @@ impl StrategyState {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
+            entry_pricing_source: Some("leg_order_list".to_string()),
         });
     }
 
@@ -286,7 +286,7 @@ impl StrategyState {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
+            entry_pricing_source: Some("leg_order_list".to_string()),
         });
     }
 
@@ -320,7 +320,7 @@ impl StrategyState {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
+            entry_pricing_source: Some("leg_order_list".to_string()),
         });
     }
 
@@ -352,7 +352,7 @@ impl StrategyState {
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
-            close_order_mode: None,
+            close_broker_submit_path: None,
             close_attempts: 0,
             last_close_submitted_at_utc: None,
             submitted: true,
@@ -436,9 +436,9 @@ pub struct StrategyStateEntry {
     /// Close trigger reason.
     #[serde(default)]
     pub close_reason: Option<String>,
-    /// Close order construction/submission path.
+    /// Broker submit path used for the accepted close order.
     #[serde(default)]
-    pub close_order_mode: Option<String>,
+    pub close_broker_submit_path: Option<String>,
     /// Number of accepted close submissions for this entry.
     #[serde(default)]
     pub close_attempts: u32,
@@ -567,12 +567,12 @@ impl StrategyStateEntry {
         close_order_list_id: String,
         close_parent_order_id: Option<String>,
         close_reason: String,
-        close_order_mode: String,
+        close_broker_submit_path: String,
     ) {
         self.close_order_list_id = Some(close_order_list_id);
         self.close_parent_order_id = close_parent_order_id;
         self.close_reason = Some(close_reason);
-        self.close_order_mode = Some(close_order_mode);
+        self.close_broker_submit_path = Some(close_broker_submit_path);
         self.close_attempts = self.close_attempts.saturating_add(1);
         self.last_close_submitted_at_utc = Some(Utc::now().to_rfc3339());
     }
@@ -582,7 +582,7 @@ impl StrategyStateEntry {
         self.close_order_list_id = None;
         self.close_parent_order_id = None;
         self.close_reason = None;
-        self.close_order_mode = None;
+        self.close_broker_submit_path = None;
     }
 
     /// Marks the entry closed.
@@ -753,11 +753,11 @@ mod tests {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
+            entry_pricing_source: Some("leg_order_list".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
-            close_order_mode: None,
+            close_broker_submit_path: None,
             close_attempts: 0,
             last_close_submitted_at_utc: None,
             submitted: true,
@@ -810,7 +810,7 @@ mod tests {
             "close-list-1".to_string(),
             Some("close-parent-1".to_string()),
             "profit_target".to_string(),
-            "legacy_leg_order_list".to_string(),
+            "leg_order_list".to_string(),
         );
         assert!(entry.is_active());
         assert_eq!(entry.close_order_list_id.as_deref(), Some("close-list-1"));
@@ -887,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn debit_strategy_name_recovers_legacy_negative_credit_entry_debit() {
+    fn debit_strategy_name_recovers_missing_debit_from_negative_credit() {
         let mut entry = debit_state_entry("open-list-1");
         entry.debit = None;
 
@@ -917,11 +917,11 @@ mod tests {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
+            entry_pricing_source: Some("leg_order_list".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
-            close_order_mode: None,
+            close_broker_submit_path: None,
             close_attempts: 0,
             last_close_submitted_at_utc: None,
             submitted: true,
@@ -938,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn risk_capital_derives_legacy_credit_and_debit_entries() {
+    fn risk_capital_derives_defined_risk_and_debit_entries() {
         let credit = StrategyStateEntry {
             trade_date: "2026-05-04".to_string(),
             underlying: "SPY".to_string(),
@@ -958,11 +958,11 @@ mod tests {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
+            entry_pricing_source: Some("leg_order_list".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
-            close_order_mode: None,
+            close_broker_submit_path: None,
             close_attempts: 0,
             last_close_submitted_at_utc: None,
             submitted: true,
@@ -1043,11 +1043,11 @@ mod tests {
             spread_instrument_id: None,
             spread_raw_symbol: None,
             spread_legs: Vec::new(),
-            entry_pricing_source: Some("legacy_leg_order_list".to_string()),
+            entry_pricing_source: Some("leg_order_list".to_string()),
             close_order_list_id: None,
             close_parent_order_id: None,
             close_reason: None,
-            close_order_mode: None,
+            close_broker_submit_path: None,
             close_attempts: 0,
             last_close_submitted_at_utc: None,
             submitted: true,

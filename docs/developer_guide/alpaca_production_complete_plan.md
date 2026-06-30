@@ -621,7 +621,7 @@ High-value after the required platform work:
 
 6. Portfolio Greek and stress governor.
    - Status: initial risk-capital stress governor complete in the entry-admission path. It stores
-     per-entry `risk_capital_usd`, derives legacy defined-risk/debit/naked-put estimates where
+     per-entry `risk_capital_usd`, derives older defined-risk/debit/naked-put estimates where
      possible, blocks single-entry and projected portfolio risk-capital excess, and fails closed on
      unknown active exposure when configured. Greek aggregation remains dependent on live Greek
      feature/storage inputs.
