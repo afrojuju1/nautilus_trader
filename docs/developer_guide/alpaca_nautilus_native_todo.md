@@ -78,15 +78,14 @@ and strategies.
   strategy-state writes are in place; do not write Postgres directly from synchronous strategy
   callbacks.
 - [x] Remove the adapter-local order-plan layer from options-runtime submission.
-  - Submission now builds standard Nautilus `OrderAny` values through `OrderFactory`, then derives
-    `SubmitOrder` or `SubmitOrderList` commands for `AlpacaExecutionClient`.
+  - Submission now builds standard Nautilus `OrderAny` values through `OrderFactory`; spread entries
+    and spread-backed closes use single `OptionSpread` orders expanded by `AlpacaExecutionClient`.
   - Alpaca-specific code remains at symbol normalization and execution-client payload translation;
     the account engine still owns broker session lifecycle and submit gates until entry admission
     moves behind a real strategy boundary.
 - [x] Add a Nautilus-native entry strategy boundary.
   - `AlpacaOptionsAccountStrategy` owns conversion from `OptionsCandidateSet` /
-    `SelectedOptionsEntry` into standard Nautilus orders and submits through `Strategy::submit_order`
-    or `Strategy::submit_order_list`.
+    `SelectedOptionsEntry` into standard Nautilus orders and submits through `Strategy::submit_order`.
   - `alpaca-options-node` now owns entry submission, management lifecycle, and `--check-config`.
   - Close, stale-order, force-flatten, and reprice decisions are owned by the same strategy state
     owner that records accepted entries.

@@ -23,8 +23,8 @@ multi-leg execution, and operator lifecycle parity.
   and service name. It does not allocate trades across accounts until a deliberate allocator is
   designed.
 - Strategies are implemented as Nautilus-native strategies or Rust/Python components in this repo.
-- Alpaca option spreads are submitted through Nautilus `SubmitOrderList` and reconciled through
-  trade updates plus REST repair paths.
+- Alpaca option spreads are submitted as native Nautilus `OptionSpread` orders and reconciled
+  through trade updates plus REST repair paths.
 - Every production feature has paper proof before live enablement.
 
 ## Current State
@@ -36,18 +36,18 @@ Completed foundation:
   order lookup, cancel, account activities, and MLeg submission.
 - Alpaca has a native Rust `DataClient` and factory for exact option-instrument loading through the
   standard Nautilus request/subscription interface.
-- Alpaca execution client supports option-spread `SubmitOrderList`; single-order submit is denied
-  for now.
+- Alpaca execution client supports single native `OptionSpread` orders by expanding them to Alpaca
+  MLeg payloads.
 - Trade-update websocket handling maps Alpaca parent and leg updates back to Nautilus leg client
   order IDs.
 - Paper smoke tests have submitted an MLeg spread through Nautilus, observed accepted leg events,
   canceled the parent, and verified zero positions/open orders afterward.
 - The fork has a documented upstream sync workflow in `AGENTS.md`.
-- Native `put_credit` and `call_credit` scanner/entry paths run from the
-  Rust Alpaca runner and submit through Nautilus `SubmitOrderList` when explicitly enabled.
-- Initial credit/debit spread management can cancel stale entries, evaluate close triggers with
-  expiration-risk exits, emit management snapshots with PnL context, build reduce-only close MLegs,
-  and mark filled closes in strategy state.
+- Native `put_credit` and `call_credit` scanner/entry paths run from the Rust Alpaca runner and
+  submit through Nautilus `OptionSpread` orders when explicitly enabled.
+- Credit/debit spread management can cancel stale entries, evaluate close triggers with
+  expiration-risk exits, emit management snapshots with PnL context, submit reduce-only
+  `OptionSpread` closes, and mark filled closes in strategy state.
 - The NUC has a supervised user service, repo-local `.env`, lock, logs, health command, operator
   status command, and kill-switch/submission gates.
 
@@ -57,9 +57,9 @@ Known gaps:
   code, but the account engine still needs a clean strategy-hosting abstraction. Additional
   strategies should plug into one account engine rather than becoming separate account-owning
   runners.
-- The Python/core `OrderList` single-instrument constraint still blocks a simple Python-native MLeg
-  strategy path. Keep the Rust `SubmitOrderList` MLeg path until a deliberate multi-instrument
-  order-list abstraction is designed.
+- The Python strategy path still needs parity proof for option-spread account ownership. Keep hosted
+  paper/live strategy execution in `alpaca-options-node` until Python-node parity has equivalent
+  account, lifecycle, and operator safeguards.
 - Multi-day paper proof with real management closes is still outstanding.
 - Websocket disconnect/reconnect and reconciliation events are wired, but they still need paper
   observation during an actual reconnect or broker event-loss scenario.
@@ -144,7 +144,7 @@ Work:
 
 - Build a Nautilus-native put-credit strategy or strategy runner. (Initial
   `alpaca-options-node` Rust runner complete; it scans, applies broker/state admission,
-  selects one entry, and can submit through the Alpaca `SubmitOrderList` execution path when
+  selects one entry, and can submit through the Alpaca `OptionSpread` execution path when
   explicitly enabled.)
 - Port scanner parameters for underlyings, DTE, width, delta, open interest, leg spread, minimum
   return-on-risk, and credit/debit-to-width floors. (Runner reads these from `ALPACA_CONFIG_PATH`,
@@ -164,8 +164,9 @@ Exit criteria:
 
 - One paper run scans, selects, submits, observes order events, and leaves a coherent Nautilus state.
 
-Status: initial native runner complete. Paper submit proof exists for Nautilus MLeg submission; keep
-strategy submission disabled by default outside intentional paper tests.
+Status: initial native runner complete. Paper submit proof exists for Nautilus MLeg submission, and
+the current runtime submits spreads as native `OptionSpread` orders; keep strategy submission
+disabled by default outside intentional paper tests.
 
 Runner commands:
 
@@ -191,16 +192,10 @@ for SPY and one `call_credit` block for QQQ. Keep submission disabled with
 
 Implementation note:
 
-- The existing Python `OrderList` constructor enforces one `InstrumentId` per list, while Alpaca
-  MLeg entries require distinct option leg instruments. Until that core model constraint is changed
-  or a Python-safe multi-leg abstraction is added, the native Phase 3 submit path lives in the Rust
-  runner where the Alpaca execution client already accepts multi-leg `SubmitOrderList` commands.
-- Recommended submit path for Phase 3 and Phase 4: keep selection, admission, and MLeg submission
-  in the Rust Alpaca runner and standard Nautilus CLI/runtime surfaces. Do not relax Python
-  `OrderList` globally just for Alpaca, and do not add an Alpaca-specific PyO3 submit helper. If
-  Python-native submission becomes necessary, add an explicit Nautilus multi-instrument order-list
-  abstraction after risk, cache, and execution semantics are designed for broker-native option
-  spreads.
+- Recommended submit path for Phase 3 and Phase 4: keep selection, admission, and MLeg expansion in
+  the Rust Alpaca runtime and standard Nautilus CLI/runtime surfaces. Python-native option-spread
+  strategies should submit standard `OptionSpread` orders only after account, lifecycle, and
+  operator parity are proven for that node path.
 
 ## Phase 4: Position Management And Close Path
 
@@ -214,8 +209,8 @@ Work:
 - Add expiration/assignment risk automation: DTE-zero entry block timing, close-before-expiry
   controls, ITM/buying-power checks where data allows, and operator alerts for positions exposed to
   exercise or assignment risk.
-- Implement close MLeg order-list construction for verticals. (Initial reduce-only close
-  `SubmitOrderList` construction complete for credit verticals.)
+- Implement close order construction for verticals. (Reduce-only native `OptionSpread` closes are
+  implemented for spread-backed vertical, debit-spread, and iron-condor entries.)
 - Add cancel stale entry and close orders. (Runner can cancel stale entry orders and submit close
   orders only when TOML `runtime.close_orders = true` or `ALPACA_CLOSE_ORDERS=true`.)
 - Add manual flatten and account/fleet entry blocks. (Initial `ALPACA_FORCE_FLATTEN`,
@@ -396,8 +391,9 @@ Work:
   complete.)
 - Port options into that strategy interface while preserving current behavior and environment
   gates. (Complete for entry decisions; management still runs inside the account engine.)
-- Keep Alpaca broker-native MLeg submission on the Rust `SubmitOrderList` path. Do not relax the
-  Python/core `OrderList` single-instrument assumption just to support Alpaca option spreads.
+- Keep Alpaca broker-native MLeg expansion inside the Alpaca execution client from standard
+  Nautilus `OptionSpread` orders. Do not add a Python/core special case just to support Alpaca
+  option spreads.
 - Represent strategy output as explicit decisions such as skip, submit open, submit close, cancel,
   force flatten, or alert. Broker submission remains account-engine responsibility. (Initial
   `StrategyDecision` covers skip, no-entry, dry-run, and submit-open.)

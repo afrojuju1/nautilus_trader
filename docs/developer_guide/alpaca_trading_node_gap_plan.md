@@ -119,5 +119,5 @@ the Alpaca paper broker account.
    submit/cancel/fill/reconciliation behavior under tiny caps.
 4. Use the Rust `AlpacaDataClient` as the standard option-instrument bridge, then move the
    put-credit spread path into the same architecture after the node can represent option snapshots,
-   `SubmitOrderList` commands, multi-leg broker submission, cancel/close flows, option positions,
+   native `OptionSpread` orders, multi-leg broker submission, cancel/close flows, option positions,
    and account reconciliation without losing Rust runtime safety.

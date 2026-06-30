@@ -10,7 +10,8 @@ The first standard Python node slice is implemented.
 - `AlpacaLiveDataClientFactory` creates an Alpaca data client for static US equity instruments,
   exact OCC option instruments, stock bars, and option snapshot quotes/Greeks.
 - `AlpacaLiveExecClientFactory` creates an Alpaca execution client for simple US equity/ETF `DAY`
-  limit orders and two-to-four-leg option `SubmitOrderList` commands.
+  limit orders and Nautilus option-spread limit orders that the adapter expands to Alpaca MLeg
+  payloads.
 - The options multi-leg Python example registers exact option instruments, subscribes option
   snapshot quotes/Greeks, and can submit/cancel a paper multi-leg order through the standard
   execution client when explicitly confirmed.
@@ -35,7 +36,7 @@ TradingNode
   |     `-- underlying equity context
   |
   |-- Alpaca execution client
-  |     |-- SubmitOrderList -> Alpaca mleg submit
+  |     |-- OptionSpread order -> Alpaca mleg submit
   |     |-- parent and leg order status mapping
   |     |-- cancel/close/reconcile
   |     `-- account, position, activity reports

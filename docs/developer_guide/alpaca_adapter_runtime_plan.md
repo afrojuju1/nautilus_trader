@@ -136,7 +136,7 @@ Initial Phase 3 runner:
 
 - `alpaca-options-node` scans configured underlyings, applies account/position/open-order
   admission checks, enforces daily duplicate-entry state, selects one candidate, and can submit a
-  Nautilus `SubmitOrderList` through the Alpaca execution client when
+  native Nautilus `OptionSpread` order through the Alpaca execution client when
   TOML `runtime.open_orders = true` or `ALPACA_OPEN_ORDERS=true`.
 - The same runner can scan Phase 7A `call_credit` candidates by adding an explicit
   `[[strategies]]` block with `family = "call_credit"` in `ALPACA_CONFIG_PATH`.
@@ -149,9 +149,9 @@ Initial Phase 3 runner:
   `~/.config/nautilus-trader/alpaca/options.toml`; env remains for secrets, endpoints, and
   emergency runtime overrides.
 - Submission is disabled by default so paper soak can run safely before enabling execution.
-- Python strategy submission remains blocked by the current Python `OrderList` invariant that all
-  orders share one `InstrumentId`; Alpaca MLeg entries require distinct option leg instruments, so
-  the first native submit runner is Rust-side.
+- Python option-spread strategy submission should use native `OptionSpread` orders before becoming
+  an account-owning path. The hosted paper runtime remains Rust-side until Python-node parity has
+  equivalent account, lifecycle, and operator safeguards.
 
 ## Strategy Migration
 

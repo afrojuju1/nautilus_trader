@@ -80,7 +80,9 @@ The integration contract should use Nautilus-owned domain objects wherever possi
 
 ## Current Work Items
 
-- Continue the `nt-ups` lane until spread close submission uses Nautilus `OptionSpread` end to end.
+- Keep `nt-ups.6` open for paper broker proof of native spread closes. The runtime close path now
+  submits spread-backed exits as one reduce-only Nautilus `OptionSpread` order; non-spread entries
+  block close submission until a native close path is designed.
 - Keep `docs/developer_guide/alpaca_options_account_strategy_architecture.md` as the active runtime
   architecture.
 - Keep `docs/developer_guide/alpaca_operational_state_runbook.md` as the operational-state migration

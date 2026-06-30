@@ -810,7 +810,7 @@ mod tests {
             "close-list-1".to_string(),
             Some("close-parent-1".to_string()),
             "profit_target".to_string(),
-            "leg_order_list".to_string(),
+            "single_option_spread_order".to_string(),
         );
         assert!(entry.is_active());
         assert_eq!(entry.close_order_list_id.as_deref(), Some("close-list-1"));

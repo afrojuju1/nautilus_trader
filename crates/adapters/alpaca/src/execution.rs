@@ -2025,7 +2025,7 @@ fn build_option_spread_payload_from_order(order: &OrderAny) -> anyhow::Result<Al
         order.quantity(),
         format!("Alpaca option spread order {}", order.client_order_id()),
     )?;
-    let signed_limit_price = order
+    let spread_limit_price = order
         .price()
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -2034,12 +2034,14 @@ fn build_option_spread_payload_from_order(order: &OrderAny) -> anyhow::Result<Al
             )
         })?
         .as_f64();
-    if signed_limit_price == 0.0 {
+    if spread_limit_price == 0.0 {
         anyhow::bail!(
             "Alpaca option spread order {} signed price must be non-zero",
             order.client_order_id()
         );
     }
+    let signed_limit_price =
+        alpaca_signed_limit_price_from_option_spread_order(order.order_side(), spread_limit_price)?;
 
     let legs = option_spread_legs_from_instrument_id(order.instrument_id())?
         .into_iter()
@@ -2066,6 +2068,18 @@ fn build_option_spread_payload_from_order(order: &OrderAny) -> anyhow::Result<Al
         .and_then(|payload| payload.with_client_order_id(order.client_order_id().to_string()))
         .map(AlpacaSimplePayload::OptionSpread)
         .map_err(|e| anyhow::anyhow!("invalid Alpaca option spread payload: {e}"))
+}
+
+#[cfg(feature = "live")]
+fn alpaca_signed_limit_price_from_option_spread_order(
+    spread_side: OrderSide,
+    spread_limit_price: f64,
+) -> anyhow::Result<f64> {
+    match spread_side {
+        OrderSide::Buy => Ok(spread_limit_price),
+        OrderSide::Sell => Ok(-spread_limit_price),
+        OrderSide::NoOrderSide => anyhow::bail!("Alpaca option spread order missing side"),
+    }
 }
 
 #[cfg(feature = "live")]
@@ -3002,6 +3016,111 @@ mod tests {
         assert_eq!(
             payload.legs[1].position_intent,
             AlpacaPositionIntent::BuyToClose
+        );
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn build_option_spread_payload_from_buy_order_preserves_spread_price() {
+        let order = mleg_limit_order(
+            "O-SPREAD-OPEN",
+            "(1)SPY260508P00495000___((1))SPY260508P00500000",
+            OrderSide::Buy,
+            -0.50,
+            false,
+        );
+
+        let payload = build_option_spread_payload_from_order(&order).unwrap();
+        let AlpacaSimplePayload::OptionSpread(payload) = payload else {
+            panic!("expected option spread payload");
+        };
+
+        assert_eq!(payload.client_order_id.as_deref(), Some("O-SPREAD-OPEN"));
+        assert_eq!(payload.qty, "1");
+        assert_eq!(payload.limit_price, "-0.50");
+        assert_eq!(payload.legs.len(), 2);
+        assert_eq!(
+            payload
+                .legs
+                .iter()
+                .map(|leg| leg.position_intent)
+                .collect::<Vec<_>>(),
+            vec![
+                AlpacaPositionIntent::BuyToOpen,
+                AlpacaPositionIntent::SellToOpen,
+            ]
+        );
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn build_option_spread_payload_from_sell_close_inverts_credit_spread_price() {
+        let order = mleg_limit_order(
+            "O-SPREAD-CREDIT-CLOSE",
+            "(1)SPY260508P00495000___((1))SPY260508P00500000",
+            OrderSide::Sell,
+            -0.50,
+            true,
+        );
+
+        let payload = build_option_spread_payload_from_order(&order).unwrap();
+        let AlpacaSimplePayload::OptionSpread(payload) = payload else {
+            panic!("expected option spread payload");
+        };
+
+        assert_eq!(
+            payload.client_order_id.as_deref(),
+            Some("O-SPREAD-CREDIT-CLOSE")
+        );
+        assert_eq!(payload.qty, "1");
+        assert_eq!(payload.limit_price, "0.50");
+        assert_eq!(payload.legs.len(), 2);
+        assert_eq!(
+            payload
+                .legs
+                .iter()
+                .map(|leg| leg.position_intent)
+                .collect::<Vec<_>>(),
+            vec![
+                AlpacaPositionIntent::SellToClose,
+                AlpacaPositionIntent::BuyToClose,
+            ]
+        );
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn build_option_spread_payload_from_sell_close_inverts_debit_spread_price() {
+        let order = mleg_limit_order(
+            "O-SPREAD-DEBIT-CLOSE",
+            "(1)SPY260508C00500000___((1))SPY260508C00505000",
+            OrderSide::Sell,
+            1.15,
+            true,
+        );
+
+        let payload = build_option_spread_payload_from_order(&order).unwrap();
+        let AlpacaSimplePayload::OptionSpread(payload) = payload else {
+            panic!("expected option spread payload");
+        };
+
+        assert_eq!(
+            payload.client_order_id.as_deref(),
+            Some("O-SPREAD-DEBIT-CLOSE")
+        );
+        assert_eq!(payload.qty, "1");
+        assert_eq!(payload.limit_price, "-1.15");
+        assert_eq!(payload.legs.len(), 2);
+        assert_eq!(
+            payload
+                .legs
+                .iter()
+                .map(|leg| leg.position_intent)
+                .collect::<Vec<_>>(),
+            vec![
+                AlpacaPositionIntent::SellToClose,
+                AlpacaPositionIntent::BuyToClose,
+            ]
         );
     }
 
