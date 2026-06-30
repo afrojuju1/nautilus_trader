@@ -11,6 +11,7 @@ mod load_option_snapshots;
 mod operator_status;
 mod performance_report;
 mod reconciliation_probe;
+mod spread_reconciliation_preview;
 mod sync_strategy_state;
 mod watch_trade_updates;
 

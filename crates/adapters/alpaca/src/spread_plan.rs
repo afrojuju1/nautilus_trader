@@ -144,15 +144,31 @@ pub fn strategy_state_vertical_spread_plan(
     entry: &StrategyStateEntry,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Option<OptionSpreadPlan>> {
+    let Some(plan) = strategy_state_spread_plan(entry, ts_init)? else {
+        return Ok(None);
+    };
+    Ok((plan.legs.len() == 2).then_some(plan))
+}
+
+/// Rebuilds a Nautilus-native spread plan from persisted strategy state when possible.
+///
+/// Returns `Ok(None)` for naked options or entries without enough persisted spread legs.
+///
+/// # Errors
+///
+/// Returns an error if persisted leg expiration metadata cannot be parsed.
+pub fn strategy_state_spread_plan(
+    entry: &StrategyStateEntry,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<OptionSpreadPlan>> {
     if entry.is_naked_option()
-        || entry.is_iron_condor()
         || entry.short_symbol.trim().is_empty()
         || entry.long_symbol.trim().is_empty()
     {
         return Ok(None);
     }
 
-    let legs = vec![
+    let mut legs = vec![
         OptionSpreadLegPlan {
             instrument_id: alpaca_option_instrument_id(&entry.long_symbol),
             symbol: entry.long_symbol.clone(),
@@ -164,6 +180,27 @@ pub fn strategy_state_vertical_spread_plan(
             ratio: -1,
         },
     ];
+    if let (Some(long_call_symbol), Some(short_call_symbol)) = (
+        entry
+            .long_call_symbol
+            .as_ref()
+            .filter(|symbol| !symbol.trim().is_empty()),
+        entry
+            .short_call_symbol
+            .as_ref()
+            .filter(|symbol| !symbol.trim().is_empty()),
+    ) {
+        legs.push(OptionSpreadLegPlan {
+            instrument_id: alpaca_option_instrument_id(long_call_symbol),
+            symbol: long_call_symbol.clone(),
+            ratio: 1,
+        });
+        legs.push(OptionSpreadLegPlan {
+            instrument_id: alpaca_option_instrument_id(short_call_symbol),
+            symbol: short_call_symbol.clone(),
+            ratio: -1,
+        });
+    }
     let (scanner_premium_kind, scanner_premium) = entry.entry_debit().map_or_else(
         || (EntryPremiumKind::Credit, entry.credit.abs()),
         |debit| (EntryPremiumKind::Debit, debit),

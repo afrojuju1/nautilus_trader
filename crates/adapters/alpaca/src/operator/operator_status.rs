@@ -22,6 +22,9 @@ use std::{
     process::Command,
 };
 
+use super::spread_reconciliation_preview::{
+    SpreadReconciliationPreview, build_spread_reconciliation_preview,
+};
 use crate::{
     config::AlpacaDataClientConfig,
     http::{
@@ -81,6 +84,7 @@ struct OperatorStatus {
     account: AccountStatus,
     orders: OrdersStatus,
     positions: PositionsStatus,
+    spread_reconciliation_preview: SpreadReconciliationPreview,
     strategy_state: StrategyStateStatus,
     active_entries: Vec<ActiveEntryStatus>,
     risk: RiskStatus,
@@ -518,6 +522,13 @@ fn build_status(
             .count(),
         unmanaged: unmanaged_positions,
     };
+    let spread_reconciliation_preview = build_spread_reconciliation_preview(
+        state,
+        positions,
+        open_orders,
+        recent_orders,
+        activities,
+    );
 
     let strategy_state = StrategyStateStatus {
         path: config.state_path.display().to_string(),
@@ -638,6 +649,7 @@ fn build_status(
         account: account_status,
         orders: orders_status,
         positions: positions_status,
+        spread_reconciliation_preview,
         strategy_state,
         active_entries,
         risk,
@@ -1023,6 +1035,68 @@ fn print_human_status(status: &OperatorStatus) {
         status.positions.unmanaged,
     );
     println!(
+        "spread_reconciliation_preview: state_spreads={} matched={} partial={} missing={} broker_mleg_orders={} broker_position_legs={} unmanaged_extra_legs={} unknown_parent_leg_mappings={}",
+        status.spread_reconciliation_preview.summary.state_spreads,
+        status.spread_reconciliation_preview.summary.matched_spreads,
+        status.spread_reconciliation_preview.summary.partial_spreads,
+        status.spread_reconciliation_preview.summary.missing_spreads,
+        status
+            .spread_reconciliation_preview
+            .summary
+            .broker_mleg_orders,
+        status
+            .spread_reconciliation_preview
+            .summary
+            .broker_position_legs,
+        status
+            .spread_reconciliation_preview
+            .summary
+            .unmanaged_extra_legs,
+        status
+            .spread_reconciliation_preview
+            .summary
+            .unknown_parent_leg_mappings,
+    );
+    for spread in &status.spread_reconciliation_preview.state_spreads {
+        println!(
+            "spread_preview: status={} underlying={} strategy={} order_list_id={} spread_symbol={} position_status={} open_order_status={} missing_symbols={} open_orders={} recent_activities={}",
+            spread.status,
+            spread.underlying,
+            spread.strategy,
+            spread.order_list_id,
+            spread.spread_symbol,
+            spread.position_status,
+            spread.open_order_status,
+            format_strings(&spread.missing_symbols),
+            spread.open_orders.len(),
+            spread.recent_activities.len(),
+        );
+    }
+    for leg in &status.spread_reconciliation_preview.unmanaged_extra_legs {
+        println!(
+            "spread_preview_unmanaged_leg: source={} symbol={} qty={} side={} order_id={} status={}",
+            leg.source,
+            leg.symbol,
+            leg.qty.as_deref().unwrap_or("none"),
+            leg.side.as_deref().unwrap_or("none"),
+            leg.order_id.as_deref().unwrap_or("none"),
+            leg.status.as_deref().unwrap_or("none"),
+        );
+    }
+    for mapping in &status
+        .spread_reconciliation_preview
+        .unknown_parent_leg_mappings
+    {
+        println!(
+            "spread_preview_unknown_mapping: reason={} order_id={} client_order_id={} symbols={} candidates={}",
+            mapping.reason,
+            mapping.id.as_deref().unwrap_or("none"),
+            mapping.client_order_id.as_deref().unwrap_or("none"),
+            format_strings(&mapping.symbols),
+            format_strings(&mapping.candidate_order_list_ids),
+        );
+    }
+    println!(
         "strategy_state: exists={} db_version={} db_last_event_id={} entries={} active={} closed={} canceled={} path={}",
         status.strategy_state.exists,
         status
@@ -1153,6 +1227,14 @@ fn print_human_status(status: &OperatorStatus) {
 
 fn format_limit(limit: Option<usize>) -> String {
     limit.map_or_else(|| "unlimited".to_string(), |value| value.to_string())
+}
+
+fn format_strings(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(",")
+    }
 }
 
 fn open_orders_request() -> ListOrdersRequest {
