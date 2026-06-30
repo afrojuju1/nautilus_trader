@@ -36,7 +36,8 @@ use crate::{
 };
 use chrono::{DateTime, Duration, Utc};
 use nautilus_infrastructure::sql::operational::{
-    CandidateLedgerSummaryFilters, StrategyStateMetadata, load_strategy_state_metadata,
+    CandidateLedgerSummaryFilters, StrategyStateIntentSummary, StrategyStateMetadata,
+    load_strategy_state_intent_summary, load_strategy_state_metadata,
     read_candidate_ledger_records,
 };
 use serde::Serialize;
@@ -54,7 +55,7 @@ struct OperatorConfig {
     open_orders_enabled: bool,
     close_orders_enabled: bool,
     close_order_mode: String,
-    dry_run_families: Vec<String>,
+    strategy_profiles: Vec<String>,
     max_active_entries: Option<usize>,
     max_daily_submits: Option<usize>,
     max_open_orders: Option<usize>,
@@ -65,6 +66,7 @@ struct OperatorConfig {
     fleet_policy_blocks: Vec<String>,
     operational_store: OperationalStoreStatus,
     strategy_state_metadata: Option<StrategyStateMetadata>,
+    strategy_state_intent_summary: Option<StrategyStateIntentSummary>,
     candidate_ledger_records: Vec<Value>,
     json_output: bool,
 }
@@ -124,7 +126,7 @@ struct ServiceStatus {
     open_orders_enabled: bool,
     close_orders_enabled: bool,
     close_order_mode: String,
-    dry_run_families: Vec<String>,
+    strategy_profiles: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -183,6 +185,9 @@ struct StrategyStateStatus {
     active_entries: usize,
     closed_entries: usize,
     canceled_entries: usize,
+    spread_intents: Option<i64>,
+    active_spread_intents: Option<i64>,
+    broker_leg_evidence: Option<i64>,
     last_recorded_at_utc: Option<String>,
 }
 
@@ -326,64 +331,76 @@ impl OperatorConfig {
                     .and_then(|defaults| defaults.lock_dir.clone())
             })
             .unwrap_or_else(|| default_state_dir.join("locks"));
-        let dry_run_families = strategy_config
-            .dry_run_strategy_family_names()
-            .into_iter()
-            .map(ToString::to_string)
-            .collect();
+        let strategy_profiles = strategy_config.strategy_profile_summaries();
         let trade_date = Utc::now()
             .with_timezone(&strategy_config.entry_timezone)
             .date_naive();
 
-        let (operational_store, strategy_state_metadata, candidate_ledger_records) =
-            if let Some(repository) = &strategy_config.operational_repository {
-                let status = repository.migration_status().await?;
-                let metadata = load_strategy_state_metadata(
-                    repository,
-                    strategy_config.operational_account_id(),
-                )
-                .await?;
-                let filters = CandidateLedgerSummaryFilters {
-                    since: trade_date.checked_sub_signed(Duration::days(7)),
-                    until: None,
-                };
-                let records = match read_candidate_ledger_records(
-                    repository,
-                    strategy_config.operational_account_id(),
-                    filters,
-                )
-                .await
-                {
-                    Ok(records) => records,
-                    Err(error) => {
-                        log::warn!("Failed to read Alpaca candidate-ledger records: {error:#}");
-                        Vec::new()
-                    }
-                };
-                (
-                    OperationalStoreStatus {
-                        enabled: true,
-                        schema: repository.schema().to_string(),
-                        applied_migrations: Some(status.applied_count),
-                        latest_migration_version: status.latest_version,
-                        dirty_migration_version: status.dirty_version,
-                    },
-                    metadata,
-                    records,
-                )
-            } else {
-                (
-                    OperationalStoreStatus {
-                        enabled: false,
-                        schema: strategy_config.operational_schema.clone(),
-                        applied_migrations: None,
-                        latest_migration_version: None,
-                        dirty_migration_version: None,
-                    },
-                    None,
-                    Vec::new(),
-                )
+        let (
+            operational_store,
+            strategy_state_metadata,
+            strategy_state_intent_summary,
+            candidate_ledger_records,
+        ) = if let Some(repository) = &strategy_config.operational_repository {
+            let status = repository.migration_status().await?;
+            let metadata =
+                load_strategy_state_metadata(repository, strategy_config.operational_account_id())
+                    .await?;
+            let state_intent_summary = match load_strategy_state_intent_summary(
+                repository,
+                strategy_config.operational_account_id(),
+            )
+            .await
+            {
+                Ok(summary) => Some(summary),
+                Err(error) => {
+                    log::warn!("Failed to read Alpaca spread-intent state summary: {error:#}");
+                    None
+                }
             };
+            let filters = CandidateLedgerSummaryFilters {
+                since: trade_date.checked_sub_signed(Duration::days(7)),
+                until: None,
+            };
+            let records = match read_candidate_ledger_records(
+                repository,
+                strategy_config.operational_account_id(),
+                filters,
+            )
+            .await
+            {
+                Ok(records) => records,
+                Err(error) => {
+                    log::warn!("Failed to read Alpaca candidate-ledger records: {error:#}");
+                    Vec::new()
+                }
+            };
+            (
+                OperationalStoreStatus {
+                    enabled: true,
+                    schema: repository.schema().to_string(),
+                    applied_migrations: Some(status.applied_count),
+                    latest_migration_version: status.latest_version,
+                    dirty_migration_version: status.dirty_version,
+                },
+                metadata,
+                state_intent_summary,
+                records,
+            )
+        } else {
+            (
+                OperationalStoreStatus {
+                    enabled: false,
+                    schema: strategy_config.operational_schema.clone(),
+                    applied_migrations: None,
+                    latest_migration_version: None,
+                    dirty_migration_version: None,
+                },
+                None,
+                None,
+                Vec::new(),
+            )
+        };
 
         Ok(Self {
             service_name: env::var("NAUTILUS_ALPACA_SERVICE")
@@ -403,7 +420,7 @@ impl OperatorConfig {
             open_orders_enabled: strategy_config.open_orders_enabled,
             close_orders_enabled: strategy_config.close_orders_enabled,
             close_order_mode: strategy_config.close_order_mode.as_str().to_string(),
-            dry_run_families,
+            strategy_profiles,
             max_active_entries: strategy_config.max_active_entries,
             max_daily_submits: strategy_config.max_daily_submits,
             max_open_orders: strategy_config.max_open_orders,
@@ -414,6 +431,7 @@ impl OperatorConfig {
             fleet_policy_blocks: strategy_config.fleet_policy_blocks,
             operational_store,
             strategy_state_metadata,
+            strategy_state_intent_summary,
             candidate_ledger_records,
             json_output: crate::operator::args().iter().any(|arg| arg == "--json"),
         })
@@ -563,6 +581,18 @@ fn build_status(
             .count(),
         closed_entries: state.entries.iter().filter(|entry| entry.closed).count(),
         canceled_entries: state.entries.iter().filter(|entry| entry.canceled).count(),
+        spread_intents: config
+            .strategy_state_intent_summary
+            .as_ref()
+            .map(|summary| summary.spread_intents),
+        active_spread_intents: config
+            .strategy_state_intent_summary
+            .as_ref()
+            .map(|summary| summary.active_spread_intents),
+        broker_leg_evidence: config
+            .strategy_state_intent_summary
+            .as_ref()
+            .map(|summary| summary.broker_leg_evidence),
         last_recorded_at_utc: state
             .entries
             .iter()
@@ -598,7 +628,7 @@ fn build_status(
         open_orders_enabled: config.open_orders_enabled,
         close_orders_enabled: config.close_orders_enabled,
         close_order_mode: config.close_order_mode.clone(),
-        dry_run_families: config.dry_run_families.clone(),
+        strategy_profiles: config.strategy_profiles.clone(),
     };
 
     let last_scan = latest_event(events, "option_chain_candidate_scan")
@@ -979,13 +1009,13 @@ fn print_human_status(status: &OperatorStatus) {
         status.engine_state, status.checked_at_utc
     );
     println!(
-        "service: name={} active={} open_orders={} close_orders={} close_order_mode={} dry_run_families={} lock={} log={}",
+        "service: name={} active={} open_orders={} close_orders={} close_order_mode={} strategy_profiles={} lock={} log={}",
         status.service.name,
         status.service.active_state.as_deref().unwrap_or("unknown"),
         status.service.open_orders_enabled,
         status.service.close_orders_enabled,
         status.service.close_order_mode,
-        status.service.dry_run_families.join(","),
+        status.service.strategy_profiles.join(","),
         status.service.lock_file,
         status.service.log_file,
     );
@@ -1105,7 +1135,7 @@ fn print_human_status(status: &OperatorStatus) {
         );
     }
     println!(
-        "strategy_state: exists={} db_version={} db_last_event_id={} entries={} active={} closed={} canceled={} path={}",
+        "strategy_state: exists={} db_version={} db_last_event_id={} entries={} active={} closed={} canceled={} spread_intents={} active_spread_intents={} broker_leg_evidence={} path={}",
         status.strategy_state.exists,
         status
             .strategy_state
@@ -1120,6 +1150,18 @@ fn print_human_status(status: &OperatorStatus) {
         status.strategy_state.active_entries,
         status.strategy_state.closed_entries,
         status.strategy_state.canceled_entries,
+        status
+            .strategy_state
+            .spread_intents
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        status
+            .strategy_state
+            .active_spread_intents
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        status
+            .strategy_state
+            .broker_leg_evidence
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
         status.strategy_state.path,
     );
     for entry in &status.active_entries {

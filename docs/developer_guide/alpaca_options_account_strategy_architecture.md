@@ -40,7 +40,7 @@ The fork is already aligned with this at the outer boundary:
 - `crates/adapters/alpaca/bin/options_node.rs` builds the live node and registers Alpaca clients.
 - `crates/adapters/alpaca/src/candidate_scan_actor.rs` subscribes to option chains and publishes
   candidate data.
-- `crates/adapters/alpaca/src/options_strategy.rs` consumes candidates and submits through Nautilus
+- `crates/adapters/alpaca/src/options_account_strategy.rs` consumes candidates and submits through Nautilus
   strategy APIs.
 - `crates/adapters/alpaca/src/execution.rs` maps Nautilus orders to Alpaca execution payloads.
 - `crates/adapters/alpaca/src/spread_plan.rs` is moving spread identity toward Nautilus
@@ -146,10 +146,10 @@ is not part of order submission, broker truth, or realized PnL.
 | --- | --- |
 | `options_node.rs` | Keep as process assembly; shrink business logic over time. |
 | `candidate_scan_actor.rs` | Keep as subscription actor; move scan/rank work to bounded workers. |
-| `options_strategy.rs` | Split into account strategy, entry admission, close manager, state projector, and event handlers. |
+| `options_account_strategy.rs` | Split into account strategy, entry admission, close manager, state projector, and event handlers. |
 | `strategy.rs` and `option_chain_candidates.rs` | Move pure candidate ranking toward source-neutral planner modules. |
 | `options_runtime/config.rs` | Replace family string lists with explicit profile strategy blocks. |
-| `runtime.rs` strategy state | Migrate to spread-intent v2 plus broker leg evidence. |
+| `runtime.rs` strategy state | Replace the account JSONB snapshot table with normalized spread-intent rows plus account metadata and broker evidence. |
 | `spread_plan.rs` and `execution.rs` | Continue under `nt-ups`; this lane owns native `OptionSpread` cutover. |
 
 ## Non-Goals
@@ -170,9 +170,11 @@ is not part of order submission, broker truth, or realized PnL.
    projector, and event handlers without changing broker behavior.
 4. Profile strategy blocks. Replace `strategy_families` and `dry_run_families` with explicit
    per-profile strategy blocks.
-5. Spread-intent state v2. Migrate operational state in place to spread intent plus broker leg
-   evidence, with backup and rollback instructions.
-6. Validation and cleanup. Retire displaced compatibility paths after live dry-run and paper proof.
+5. Spread-intent state replacement. Migrate operational state in place so `strategy_state` stores
+   normalized spread/order intents and `strategy_broker_leg_evidence` stores broker evidence, with
+   backup and rollback instructions.
+6. Validation and cleanup. Keep operators on the replacement read model and retire displaced
+   compatibility paths after live dry-run and paper proof.
 
 ## Validation Gates
 

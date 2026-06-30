@@ -185,12 +185,9 @@ ALPACA_CANCEL_AFTER_ACCEPT=true \
 
 Phase 7A call-credit mode:
 
-```bash
-# Scan both index put-credit and index call-credit candidates; submission still disabled.
-ALPACA_IGNORE_ENTRY_WINDOW=true \
-ALPACA_STRATEGY_FAMILIES=both \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- SPY,QQQ,IWM
-```
+Add explicit `[[strategies]]` blocks in `ALPACA_CONFIG_PATH`, for example one `put_credit` block
+for SPY and one `call_credit` block for QQQ. Keep submission disabled with
+`runtime.open_orders = false` or `ALPACA_OPEN_ORDERS=false` for watchlist scans.
 
 Implementation note:
 
@@ -478,7 +475,7 @@ policy blocks in operator status. This is not yet a full allocator.
 Migration order:
 
 1. `put_credit` (initial native runner complete)
-2. `call_credit` (Phase 7A scanner path complete through `ALPACA_STRATEGY_FAMILIES=call|both`)
+2. `call_credit` (Phase 7A scanner path complete through explicit `[[strategies]]` profile blocks)
 3. `call_debit` / `put_debit` for the directional paper account (hosted
    scanner, submit, state, and debit-spread close-management path complete; paper proof pending)
 4. `earnings_call_debit_entry` / `earnings_put_debit_entry` (debit-spread Alpaca MLeg order payload
@@ -538,8 +535,8 @@ Phase 7 blockers:
   skipped for the current scanner expansion.
 - Iron condors now have native candidate construction, four-leg Alpaca MLeg open/close payload
   builders, hosted account-engine selection, dry-run decision emission, persisted four-leg state,
-  four-leg close construction, and `runtime.dry_run_families` gating so iron condors can scan
-  without submitting while other strategies submit. On 2026-05-03, a real Alpaca dry-run scan
+  four-leg close construction, and profile `mode = "dry_run"` gating so iron condors can scan
+  without submitting while other profiles submit. On 2026-05-03, a real Alpaca dry-run scan
   selected an SPY iron condor with submission disabled and the follow-up broker check showed zero
   positions and zero open orders. They still need management-rule review, submit-with-cancel paper
   proof, and full open/close paper proof before live enablement.
@@ -573,12 +570,12 @@ Required before promoting beyond experimental:
    - Keep manual DNE and exercise instructions as documented operator procedures unless an explicit
      API-backed workflow is designed and paper-proven.
    - Implemented through `options_lifecycle`, the node-level account-activity poller, and
-     `AlpacaOptionsStrategy` lifecycle entry blocks. Performance-ledger attribution remains
+     `AlpacaOptionsAccountStrategy` lifecycle entry blocks. Performance-ledger attribution remains
      reporting work, not an order-path safety blocker.
 
 3. Active-risk option quote cache. **Status: runtime implementation complete on the current
    Nautilus quote subscription path.**
-   - `AlpacaOptionsStrategy` subscribes explicit active-entry option legs and top-ranked candidate
+   - `AlpacaOptionsAccountStrategy` subscribes explicit active-entry option legs and top-ranked candidate
      option legs through Nautilus `subscribe_quotes`.
    - `AlpacaDataClient` satisfies those subscriptions with Alpaca option market-data WebSocket
      quotes when available, falls back to REST snapshots when the stream is unavailable, and emits

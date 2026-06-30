@@ -36,12 +36,9 @@ x-alpaca-runtime: &alpaca-runtime
     ALPACA_CLOSE_ORDERS: ${NAUTILUS_ALPACA_DOCKER_CLOSE_ORDERS:-${ALPACA_CLOSE_ORDERS:-false}}
     ALPACA_FORCE_FLATTEN: ${NAUTILUS_ALPACA_DOCKER_FORCE_FLATTEN:-${ALPACA_FORCE_FLATTEN:-false}}
     ALPACA_CANCEL_AFTER_ACCEPT: ${NAUTILUS_ALPACA_DOCKER_CANCEL_AFTER_ACCEPT:-${ALPACA_CANCEL_AFTER_ACCEPT:-false}}
-    ALPACA_STRATEGY_FAMILIES: ${ALPACA_STRATEGY_FAMILIES:-}
-    ALPACA_DRY_RUN_FAMILIES: ${ALPACA_DRY_RUN_FAMILIES:-}
     ALPACA_MAX_ITERATIONS: ${ALPACA_MAX_ITERATIONS:-}
     ALPACA_INTERVAL_SECS: ${ALPACA_INTERVAL_SECS:-}
     ALPACA_IGNORE_ENTRY_WINDOW: ${ALPACA_IGNORE_ENTRY_WINDOW:-}
-    ALPACA_QTY: ${ALPACA_QTY:-}
     ALPACA_MAX_ACTIVE_ENTRIES: ${ALPACA_MAX_ACTIVE_ENTRIES:-}
     ALPACA_MAX_DAILY_SUBMITS: ${ALPACA_MAX_DAILY_SUBMITS:-}
     ALPACA_MAX_OPEN_ORDERS: ${ALPACA_MAX_OPEN_ORDERS:-}
@@ -76,6 +73,7 @@ x-alpaca-runtime: &alpaca-runtime
   volumes:
     - alpaca-state:/state
     - ${NAUTILUS_ALPACA_DOCKER_BASE_CONFIG:-./alpaca-options.base.toml.example}:/config/base-options.toml:ro
+    - ${NAUTILUS_ALPACA_DOCKER_BASE_CONFIG:-./alpaca-options.base.toml.example}:/config/base-options-engine.toml:ro
     - ${NAUTILUS_ALPACA_DOCKER_CONFIG:-./alpaca-options.toml.example}:/config/options.toml:ro
 
 x-alpaca-tools-runtime: &alpaca-tools-runtime

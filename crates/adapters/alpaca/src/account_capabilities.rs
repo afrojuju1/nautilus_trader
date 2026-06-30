@@ -100,7 +100,7 @@ pub fn emit_account_capability_preflight(
             "result": if preflight.is_ready() { "passed" } else { "blocked" },
             "open_orders_enabled": config.open_orders_enabled,
             "close_orders_enabled": config.close_orders_enabled,
-            "strategy_families": config.enabled_strategy_family_names(),
+            "strategy_profiles": config.strategy_profile_summaries(),
             "required_options_level": preflight.required_options_level,
             "options_approved_level": preflight.options_approved_level,
             "options_trading_level": preflight.options_trading_level,

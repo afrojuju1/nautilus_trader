@@ -45,6 +45,7 @@ use crate::{
         is_uncovered_option_permission_rejection, selected_open_orders_enabled,
         submission_block_for_selected,
     },
+    options_entry_planner::{AlpacaOptionsEntryPlan, plan_selected_candidate, plan_selected_entry},
     options_lifecycle::OptionLifecycleRiskHandle,
     options_management::{
         AlpacaOptionsManagementConfig, CloseOrderMode, CloseQuote, close_attempts_exhausted,
@@ -174,9 +175,9 @@ impl CustomDataTrait for OptionsCandidateData {
     }
 }
 
-/// Configuration for [`AlpacaOptionsStrategy`].
+/// Configuration for [`AlpacaOptionsAccountStrategy`].
 #[derive(Clone, Debug)]
-pub struct AlpacaOptionsStrategyConfig {
+pub struct AlpacaOptionsAccountStrategyConfig {
     /// Nautilus base strategy configuration.
     pub base: StrategyConfig,
     /// Contract quantity per leg.
@@ -197,7 +198,7 @@ pub struct AlpacaOptionsStrategyConfig {
     pub management: AlpacaOptionsManagementConfig,
 }
 
-impl AlpacaOptionsStrategyConfig {
+impl AlpacaOptionsAccountStrategyConfig {
     /// Builds a config from a base strategy config and contract quantity.
     #[must_use]
     pub fn new(base: StrategyConfig, quantity: u64) -> Self {
@@ -270,9 +271,9 @@ struct PendingCloseSubmission {
 
 /// Nautilus strategy responsible for converting selected option candidates into orders.
 #[derive(Debug)]
-pub struct AlpacaOptionsStrategy {
+pub struct AlpacaOptionsAccountStrategy {
     core: StrategyCore,
-    config: AlpacaOptionsStrategyConfig,
+    config: AlpacaOptionsAccountStrategyConfig,
     state: StrategyState,
     pending_submissions: BTreeMap<String, PendingEntrySubmission>,
     pending_client_order_ids: BTreeMap<String, String>,
@@ -286,10 +287,10 @@ pub struct AlpacaOptionsStrategy {
     active_spread_instrument_ids: BTreeSet<InstrumentId>,
 }
 
-impl AlpacaOptionsStrategy {
-    /// Creates a new [`AlpacaOptionsStrategy`].
+impl AlpacaOptionsAccountStrategy {
+    /// Creates a new [`AlpacaOptionsAccountStrategy`].
     #[must_use]
-    pub fn new(config: AlpacaOptionsStrategyConfig) -> Self {
+    pub fn new(config: AlpacaOptionsAccountStrategyConfig) -> Self {
         Self {
             core: StrategyCore::new(config.base.clone()),
             state: config.initial_state.clone(),
@@ -322,11 +323,12 @@ impl AlpacaOptionsStrategy {
         data: &OptionsCandidateData,
     ) -> anyhow::Result<Option<AlpacaOptionsSubmission>> {
         self.update_candidate_quote_subscriptions(&data.candidates);
-        let Some(entry) = data.candidates.selected_entry().cloned() else {
+        let Some(entry_plan) = plan_selected_candidate(&data.candidates) else {
             return Ok(None);
         };
+        let entry = &entry_plan.entry;
         let regime_context = data.regime_context.as_ref();
-        self.emit_selected_spread_quote_snapshot(&data.candidates.trade_date, &entry);
+        self.emit_selected_spread_quote_snapshot(&data.candidates.trade_date, &entry_plan);
 
         match entry_gate_decision(&self.config.admission, Utc::now()) {
             EntryGateDecision::Continue => {}
@@ -334,8 +336,8 @@ impl AlpacaOptionsStrategy {
                 log::info!(
                     "Skipping Alpaca options entry: trade_date={} reason=outside_entry_window underlying={} strategy={}",
                     data.candidates.trade_date,
-                    entry.underlying(),
-                    entry.strategy_name()
+                    entry_plan.underlying,
+                    entry_plan.strategy
                 );
                 emit_operator_event(
                     "entry_decision",
@@ -343,13 +345,13 @@ impl AlpacaOptionsStrategy {
                         "action": "skipped",
                         "reason": "outside_entry_window",
                         "trade_date": data.candidates.trade_date,
-                        "underlying": entry.underlying(),
-                        "strategy": entry.strategy_name(),
+                        "underlying": entry_plan.underlying.as_str(),
+                        "strategy": entry_plan.strategy,
                     }),
                 );
                 self.record_selected_candidate_alert(
                     &data.candidates.trade_date,
-                    &entry,
+                    entry,
                     "skipped",
                     None,
                     Some("outside_entry_window"),
@@ -366,9 +368,9 @@ impl AlpacaOptionsStrategy {
             log::info!(
                 "Regime dry-run Alpaca options entry: trade_date={} underlying={} strategy={} symbols={} label={} codes={}",
                 data.candidates.trade_date,
-                entry.underlying(),
-                entry.strategy_name(),
-                entry.option_symbols().join(","),
+                entry_plan.underlying,
+                entry_plan.strategy,
+                entry_plan.symbols.join(","),
                 context.label.as_str(),
                 context.explanation_codes.join(",")
             );
@@ -376,16 +378,18 @@ impl AlpacaOptionsStrategy {
                 "action": "dry_run",
                 "reason": "regime_dry_run_only",
                 "trade_date": data.candidates.trade_date,
-                "underlying": entry.underlying(),
-                "strategy": entry.strategy_name(),
-                "symbols": entry.option_symbols(),
-                "score": entry.score(),
+                "underlying": entry_plan.underlying.as_str(),
+                "strategy": entry_plan.strategy,
+                "strategy_family": entry_plan.family.as_str(),
+                "symbols": entry_plan.symbols.clone(),
+                "planned_order_legs": entry_plan_payload_legs(&entry_plan),
+                "score": entry_plan.score,
             });
             insert_regime_context(&mut payload, Some(context));
             emit_operator_event("entry_decision", payload);
             self.record_selected_candidate_alert(
                 &data.candidates.trade_date,
-                &entry,
+                entry,
                 "dry_run",
                 None,
                 Some("regime_dry_run_only"),
@@ -396,19 +400,19 @@ impl AlpacaOptionsStrategy {
             );
             self.emit_vertical_spread_order_draft(
                 &data.candidates.trade_date,
-                &entry,
+                &entry_plan,
                 "regime_dry_run_only",
             );
             return Ok(None);
         }
 
-        if !selected_open_orders_enabled(&self.config.admission, &entry) {
+        if !selected_open_orders_enabled(&self.config.admission, entry) {
             log::info!(
                 "Dry-run Alpaca options entry: underlying={} strategy={} symbols={} score={:.1}",
-                entry.underlying(),
-                entry.strategy_name(),
-                entry.option_symbols().join(","),
-                entry.score()
+                entry_plan.underlying,
+                entry_plan.strategy,
+                entry_plan.symbols.join(","),
+                entry_plan.score
             );
             emit_operator_event(
                 "entry_decision",
@@ -416,15 +420,17 @@ impl AlpacaOptionsStrategy {
                     "action": "dry_run",
                     "reason": "open_orders_disabled",
                     "trade_date": data.candidates.trade_date,
-                    "underlying": entry.underlying(),
-                    "strategy": entry.strategy_name(),
-                    "symbols": entry.option_symbols(),
-                    "score": entry.score(),
+                    "underlying": entry_plan.underlying.as_str(),
+                    "strategy": entry_plan.strategy,
+                    "strategy_family": entry_plan.family.as_str(),
+                    "symbols": entry_plan.symbols.clone(),
+                    "planned_order_legs": entry_plan_payload_legs(&entry_plan),
+                    "score": entry_plan.score,
                 }),
             );
             self.record_selected_candidate_alert(
                 &data.candidates.trade_date,
-                &entry,
+                entry,
                 "dry_run",
                 None,
                 Some("open_orders_disabled"),
@@ -435,18 +441,18 @@ impl AlpacaOptionsStrategy {
             );
             self.emit_vertical_spread_order_draft(
                 &data.candidates.trade_date,
-                &entry,
+                &entry_plan,
                 "open_orders_disabled",
             );
             return Ok(None);
         }
 
-        if let Some(block) = self.lifecycle_submission_block(&entry) {
-            self.log_entry_block(&data.candidates.trade_date, &entry, &block, regime_context);
+        if let Some(block) = self.lifecycle_submission_block(entry) {
+            self.log_entry_block(&data.candidates.trade_date, entry, &block, regime_context);
             return Ok(None);
         }
-        if let Some(block) = self.selected_entry_quote_freshness_block(&entry) {
-            self.log_entry_block(&data.candidates.trade_date, &entry, &block, regime_context);
+        if let Some(block) = self.selected_entry_quote_freshness_block(entry) {
+            self.log_entry_block(&data.candidates.trade_date, entry, &block, regime_context);
             return Ok(None);
         }
 
@@ -454,9 +460,9 @@ impl AlpacaOptionsStrategy {
             log::error!(
                 "Skipping Alpaca options entry: trade_date={} reason=candidate_ledger_unhealthy underlying={} strategy={} symbols={}",
                 data.candidates.trade_date,
-                entry.underlying(),
-                entry.strategy_name(),
-                entry.option_symbols().join(",")
+                entry_plan.underlying,
+                entry_plan.strategy,
+                entry_plan.symbols.join(",")
             );
             emit_operator_event(
                 "entry_decision",
@@ -464,9 +470,11 @@ impl AlpacaOptionsStrategy {
                     "action": "skipped",
                     "reason": "candidate_ledger_unhealthy",
                     "trade_date": data.candidates.trade_date,
-                    "underlying": entry.underlying(),
-                    "strategy": entry.strategy_name(),
-                    "symbols": entry.option_symbols(),
+                    "underlying": entry_plan.underlying.as_str(),
+                    "strategy": entry_plan.strategy,
+                    "strategy_family": entry_plan.family.as_str(),
+                    "symbols": entry_plan.symbols.clone(),
+                    "planned_order_legs": entry_plan_payload_legs(&entry_plan),
                 }),
             );
             return Ok(None);
@@ -476,9 +484,9 @@ impl AlpacaOptionsStrategy {
             log::error!(
                 "Skipping Alpaca options entry: trade_date={} reason=state_persistence_unhealthy underlying={} strategy={} symbols={}",
                 data.candidates.trade_date,
-                entry.underlying(),
-                entry.strategy_name(),
-                entry.option_symbols().join(",")
+                entry_plan.underlying,
+                entry_plan.strategy,
+                entry_plan.symbols.join(",")
             );
             emit_operator_event(
                 "entry_decision",
@@ -486,14 +494,16 @@ impl AlpacaOptionsStrategy {
                     "action": "skipped",
                     "reason": "state_persistence_unhealthy",
                     "trade_date": data.candidates.trade_date,
-                    "underlying": entry.underlying(),
-                    "strategy": entry.strategy_name(),
-                    "symbols": entry.option_symbols(),
+                    "underlying": entry_plan.underlying.as_str(),
+                    "strategy": entry_plan.strategy,
+                    "strategy_family": entry_plan.family.as_str(),
+                    "symbols": entry_plan.symbols.clone(),
+                    "planned_order_legs": entry_plan_payload_legs(&entry_plan),
                 }),
             );
             self.record_selected_candidate_alert(
                 &data.candidates.trade_date,
-                &entry,
+                entry,
                 "skipped",
                 None,
                 Some("state_persistence_unhealthy"),
@@ -505,19 +515,19 @@ impl AlpacaOptionsStrategy {
             return Ok(None);
         }
 
-        let snapshot = self.entry_admission_snapshot(&entry)?;
+        let snapshot = self.entry_admission_snapshot(entry)?;
         if let Some(block) = submission_block_for_selected(
             &self.config.admission,
             &self.state,
-            &entry,
+            entry,
             &data.candidates.trade_date,
             &snapshot,
         ) {
-            self.log_entry_block(&data.candidates.trade_date, &entry, &block, regime_context);
+            self.log_entry_block(&data.candidates.trade_date, entry, &block, regime_context);
             return Ok(None);
         }
 
-        let underlying_key = submitted_underlying_key(&data.candidates.trade_date, &entry);
+        let underlying_key = submitted_underlying_key(&data.candidates.trade_date, entry);
         if !self
             .submitted_underlying_keys
             .insert(underlying_key.clone())
@@ -525,8 +535,8 @@ impl AlpacaOptionsStrategy {
             log::info!(
                 "Skipping duplicate Alpaca options entry: key={} strategy={} symbols={}",
                 underlying_key,
-                entry.strategy_name(),
-                entry.option_symbols().join(",")
+                entry_plan.strategy,
+                entry_plan.symbols.join(",")
             );
             emit_operator_event(
                 "entry_decision",
@@ -535,14 +545,16 @@ impl AlpacaOptionsStrategy {
                     "reason": "duplicate_pending_submission",
                     "key": underlying_key,
                     "trade_date": data.candidates.trade_date,
-                    "underlying": entry.underlying(),
-                    "strategy": entry.strategy_name(),
-                    "symbols": entry.option_symbols(),
+                    "underlying": entry_plan.underlying.as_str(),
+                    "strategy": entry_plan.strategy,
+                    "strategy_family": entry_plan.family.as_str(),
+                    "symbols": entry_plan.symbols.clone(),
+                    "planned_order_legs": entry_plan_payload_legs(&entry_plan),
                 }),
             );
             self.record_selected_candidate_alert(
                 &data.candidates.trade_date,
-                &entry,
+                entry,
                 "skipped",
                 None,
                 Some("duplicate_pending_submission"),
@@ -554,9 +566,10 @@ impl AlpacaOptionsStrategy {
             return Ok(None);
         }
 
-        let order_list_id = entry_order_list_id(&data.candidates.trade_date, entry.underlying());
-        match self.submit_selected_entry_with_trade_date(
-            entry,
+        let order_list_id =
+            entry_order_list_id(&data.candidates.trade_date, &entry_plan.underlying);
+        match self.submit_entry_plan_with_trade_date(
+            entry_plan,
             &data.candidates.trade_date,
             &order_list_id,
             regime_context,
@@ -584,10 +597,10 @@ impl AlpacaOptionsStrategy {
         candidates: OptionsCandidateSet,
         order_list_id: &str,
     ) -> anyhow::Result<Option<AlpacaOptionsSubmission>> {
-        let Some(entry) = candidates.into_selected_entry() else {
+        let Some(entry_plan) = plan_selected_candidate(&candidates) else {
             return Ok(None);
         };
-        self.submit_selected_entry(entry, order_list_id).map(Some)
+        self.submit_entry_plan(entry_plan, order_list_id).map(Some)
     }
 
     /// Submits one selected entry through the standard Nautilus strategy order flow.
@@ -604,32 +617,43 @@ impl AlpacaOptionsStrategy {
         entry: SelectedOptionsEntry,
         order_list_id: &str,
     ) -> anyhow::Result<AlpacaOptionsSubmission> {
-        let orders = self.build_entry_orders(&entry, order_list_id)?;
+        let Some(entry_plan) = plan_selected_entry(entry) else {
+            anyhow::bail!("selected entry could not be planned");
+        };
+        self.submit_entry_plan(entry_plan, order_list_id)
+    }
+
+    fn submit_entry_plan(
+        &mut self,
+        entry_plan: AlpacaOptionsEntryPlan,
+        order_list_id: &str,
+    ) -> anyhow::Result<AlpacaOptionsSubmission> {
+        let orders = self.build_entry_orders(&entry_plan.entry, order_list_id)?;
         let order_count = orders.len();
         self.submit_entry_orders(orders, order_list_id)?;
 
         Ok(AlpacaOptionsSubmission {
-            entry,
+            entry: entry_plan.entry,
             order_list_id: order_list_id.to_string(),
             order_count,
         })
     }
 
-    fn submit_selected_entry_with_trade_date(
+    fn submit_entry_plan_with_trade_date(
         &mut self,
-        entry: SelectedOptionsEntry,
+        entry_plan: AlpacaOptionsEntryPlan,
         trade_date: &str,
         order_list_id: &str,
         regime_context: Option<&RegimeContext>,
     ) -> anyhow::Result<AlpacaOptionsSubmission> {
-        let orders = self.build_entry_orders(&entry, order_list_id)?;
+        let orders = self.build_entry_orders(&entry_plan.entry, order_list_id)?;
         let client_order_ids = orders
             .iter()
             .map(|order| order.client_order_id().to_string())
             .collect::<Vec<_>>();
         let order_count = orders.len();
         self.record_pending_submission(
-            entry.clone(),
+            entry_plan.entry.clone(),
             trade_date.to_string(),
             order_list_id.to_string(),
             order_count,
@@ -637,7 +661,7 @@ impl AlpacaOptionsStrategy {
         );
         self.record_selected_candidate_alert(
             trade_date,
-            &entry,
+            &entry_plan.entry,
             "submitted",
             Some(order_list_id),
             None,
@@ -653,7 +677,7 @@ impl AlpacaOptionsStrategy {
         }
 
         Ok(AlpacaOptionsSubmission {
-            entry,
+            entry: entry_plan.entry,
             order_list_id: order_list_id.to_string(),
             order_count,
         })
@@ -1419,7 +1443,12 @@ impl AlpacaOptionsStrategy {
         instrument_ids
     }
 
-    fn emit_selected_spread_quote_snapshot(&self, trade_date: &str, entry: &SelectedOptionsEntry) {
+    fn emit_selected_spread_quote_snapshot(
+        &self,
+        trade_date: &str,
+        entry_plan: &AlpacaOptionsEntryPlan,
+    ) {
+        let entry = &entry_plan.entry;
         let plan = match selected_entry_spread_plan(entry, UnixNanos::default()) {
             Ok(Some(plan)) => plan,
             Ok(None) => return,
@@ -1430,9 +1459,11 @@ impl AlpacaOptionsStrategy {
                         "action": "unavailable",
                         "reason": "spread_plan_error",
                         "trade_date": trade_date,
-                        "underlying": entry.underlying(),
-                        "strategy": entry.strategy_name(),
-                        "symbols": entry.option_symbols(),
+                        "underlying": entry_plan.underlying.as_str(),
+                        "strategy": entry_plan.strategy,
+                        "strategy_family": entry_plan.family.as_str(),
+                        "symbols": entry_plan.symbols.clone(),
+                        "planned_order_legs": entry_plan_payload_legs(entry_plan),
                         "error": error.to_string(),
                     }),
                 );
@@ -1442,7 +1473,7 @@ impl AlpacaOptionsStrategy {
 
         let cache = self.cache();
         let quote = cache.quote(&plan.instrument_id);
-        let mut payload = spread_quote_snapshot_payload(trade_date, entry, &plan);
+        let mut payload = spread_quote_snapshot_payload(trade_date, entry_plan, &plan);
         match quote {
             Some(quote) => {
                 let mid = f64::midpoint(quote.bid_price.as_f64(), quote.ask_price.as_f64());
@@ -1479,18 +1510,19 @@ impl AlpacaOptionsStrategy {
     fn emit_vertical_spread_order_draft(
         &mut self,
         trade_date: &str,
-        entry: &SelectedOptionsEntry,
+        entry_plan: &AlpacaOptionsEntryPlan,
         dry_run_reason: &str,
     ) {
-        if !is_vertical_spread_entry(entry) {
+        if !entry_plan.is_vertical_spread() {
             return;
         }
 
-        let order_list_id = entry_order_list_id(trade_date, entry.underlying());
+        let entry = &entry_plan.entry;
+        let order_list_id = entry_order_list_id(trade_date, &entry_plan.underlying);
         match self.vertical_spread_order_draft(entry, &order_list_id) {
             Ok(Some(draft)) => emit_operator_event(
                 "entry_spread_order_draft",
-                vertical_spread_order_draft_payload(trade_date, entry, dry_run_reason, &draft),
+                vertical_spread_order_draft_payload(trade_date, entry_plan, dry_run_reason, &draft),
             ),
             Ok(None) => {}
             Err(error) => emit_operator_event(
@@ -1500,9 +1532,11 @@ impl AlpacaOptionsStrategy {
                     "reason": "spread_order_draft_error",
                     "dry_run_reason": dry_run_reason,
                     "trade_date": trade_date,
-                    "underlying": entry.underlying(),
-                    "strategy": entry.strategy_name(),
-                    "symbols": entry.option_symbols(),
+                    "underlying": entry_plan.underlying.as_str(),
+                    "strategy": entry_plan.strategy,
+                    "strategy_family": entry_plan.family.as_str(),
+                    "symbols": entry_plan.symbols.clone(),
+                    "planned_order_legs": entry_plan_payload_legs(entry_plan),
                     "error": error.to_string(),
                 }),
             ),
@@ -2499,7 +2533,7 @@ impl AlpacaOptionsStrategy {
     }
 }
 
-nautilus_strategy!(AlpacaOptionsStrategy, {
+nautilus_strategy!(AlpacaOptionsAccountStrategy, {
     fn external_order_claims(&self) -> Option<Vec<InstrumentId>> {
         let claims = self
             .state
@@ -2538,7 +2572,7 @@ nautilus_strategy!(AlpacaOptionsStrategy, {
     }
 });
 
-impl DataActor for AlpacaOptionsStrategy {
+impl DataActor for AlpacaOptionsAccountStrategy {
     fn on_start(&mut self) -> anyhow::Result<()> {
         self.subscribe_data(OptionsCandidateData::data_type(), None, None);
         self.refresh_active_risk_quote_subscriptions();
@@ -2712,16 +2746,31 @@ fn candidate_quote_instrument_ids(
         .collect()
 }
 
+fn entry_plan_payload_legs(entry_plan: &AlpacaOptionsEntryPlan) -> Vec<Value> {
+    entry_plan
+        .order_legs
+        .iter()
+        .map(|leg| {
+            json!({
+                "symbol": leg.symbol.as_str(),
+                "side": leg.side.as_str(),
+            })
+        })
+        .collect()
+}
+
 fn spread_quote_snapshot_payload(
     trade_date: &str,
-    entry: &SelectedOptionsEntry,
+    entry_plan: &AlpacaOptionsEntryPlan,
     plan: &OptionSpreadPlan,
 ) -> Value {
     json!({
         "trade_date": trade_date,
         "underlying": plan.underlying.as_str(),
         "strategy": plan.strategy.as_str(),
-        "symbols": entry.option_symbols(),
+        "strategy_family": entry_plan.family.as_str(),
+        "symbols": entry_plan.symbols.clone(),
+        "planned_order_legs": entry_plan_payload_legs(entry_plan),
         "spread_instrument_id": plan.instrument_id.to_string(),
         "spread_symbol": plan.raw_symbol.to_string(),
         "legs": plan
@@ -2779,7 +2828,7 @@ struct VerticalSpreadCloseOrderDraft {
 
 fn vertical_spread_order_draft_payload(
     trade_date: &str,
-    entry: &SelectedOptionsEntry,
+    entry_plan: &AlpacaOptionsEntryPlan,
     dry_run_reason: &str,
     draft: &VerticalSpreadOrderDraft,
 ) -> Value {
@@ -2790,7 +2839,9 @@ fn vertical_spread_order_draft_payload(
         "trade_date": trade_date,
         "underlying": draft.plan.underlying.as_str(),
         "strategy": draft.plan.strategy.as_str(),
-        "symbols": entry.option_symbols(),
+        "strategy_family": entry_plan.family.as_str(),
+        "symbols": entry_plan.symbols.clone(),
+        "planned_order_legs": entry_plan_payload_legs(entry_plan),
         "spread_instrument_id": draft.plan.instrument_id.to_string(),
         "spread_symbol": draft.plan.raw_symbol.to_string(),
         "legs": draft
@@ -3264,13 +3315,6 @@ fn build_vertical_spread_close_order(
     );
     order.set_order_list_id(OrderListId::from(order_list_id));
     Ok(order)
-}
-
-fn is_vertical_spread_entry(entry: &SelectedOptionsEntry) -> bool {
-    matches!(
-        entry,
-        SelectedOptionsEntry::Credit(_) | SelectedOptionsEntry::Debit(_)
-    )
 }
 
 fn is_vertical_spread_plan(plan: &OptionSpreadPlan) -> bool {

@@ -16,13 +16,13 @@ use nautilus_alpaca::{
     execution::account_entry_admission_reasons,
     factories::{AlpacaDataClientFactory, AlpacaExecutionClientFactory},
     http::{client::AlpacaHttpClient, models::AlpacaAccount},
+    options_account_strategy::{AlpacaOptionsAccountStrategy, AlpacaOptionsAccountStrategyConfig},
     options_lifecycle::{
         OptionLifecycleRiskConfig, OptionLifecycleRiskHandle, emit_lifecycle_poll,
         emit_lifecycle_poll_error, lifecycle_events_from_activities,
         option_lifecycle_activity_request,
     },
     options_runtime::AlpacaOptionsRuntimeConfig,
-    options_strategy::{AlpacaOptionsStrategy, AlpacaOptionsStrategyConfig},
     parse::parse_option_series_id,
     runtime::{StrategyState, emit_operator_event, save_strategy_state_atomic},
     state_persistence::{StrategyStatePersistenceHandle, start_runtime_lease_heartbeat},
@@ -211,11 +211,11 @@ async fn main() -> anyhow::Result<()> {
     let strategy_state_entry_count = strategy_state.entries.len();
 
     log::info!(
-        "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategies={:?} open_orders_enabled={} close_orders_enabled={} operational_store_required={} strategy_state_entries={}",
+        "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategy_profiles={:?} open_orders_enabled={} close_orders_enabled={} operational_store_required={} strategy_state_entries={}",
         series_id,
         args.snapshot_interval_ms,
         args.max_runtime_secs,
-        runtime_config.enabled_strategy_family_names(),
+        runtime_config.strategy_profile_summaries(),
         runtime_config.open_orders_enabled,
         runtime_config.close_orders_enabled,
         broker_orders_requested,
@@ -271,7 +271,7 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let mut entry_config =
-        AlpacaOptionsStrategyConfig::from_runtime_config(strategy_config, &runtime_config);
+        AlpacaOptionsAccountStrategyConfig::from_runtime_config(strategy_config, &runtime_config);
     entry_config.admission.account_admission_reasons = startup_account_admission_reasons;
     entry_config.initial_state = strategy_state;
     entry_config.state_persistence = live_submit_persistence
@@ -281,7 +281,7 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(|persistence| persistence.candidate_ledger.clone());
     entry_config.lifecycle_risk = Some(lifecycle_risk);
-    let strategy = AlpacaOptionsStrategy::new(entry_config);
+    let strategy = AlpacaOptionsAccountStrategy::new(entry_config);
     release_live_submit_persistence_on_error(
         node.add_strategy(strategy).map_err(anyhow::Error::from),
         &mut live_submit_persistence,
@@ -799,10 +799,9 @@ fn print_usage() {
 
 fn print_config_check(config: &AlpacaOptionsRuntimeConfig) {
     println!(
-        "alpaca_options_runtime_config: underlyings={} strategy_families={} dry_run_families={} open_orders_enabled={} close_orders_enabled={} close_order_mode={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} active_risk_candidate_quote_limit={} active_risk_quote_stale_secs={} expiration_exit_days={} lifecycle_poll_secs={} lifecycle_activity_lookback_hours={} lifecycle_activity_block_hours={} expiration_entry_block_days={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_max_candidates={}",
+        "alpaca_options_runtime_config: underlyings={} strategy_profiles={} open_orders_enabled={} close_orders_enabled={} close_order_mode={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} active_risk_candidate_quote_limit={} active_risk_quote_stale_secs={} expiration_exit_days={} lifecycle_poll_secs={} lifecycle_activity_lookback_hours={} lifecycle_activity_block_hours={} expiration_entry_block_days={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_max_candidates={}",
         config.underlyings.join(","),
-        config.enabled_strategy_family_names().join(","),
-        config.dry_run_strategy_family_names().join(","),
+        config.strategy_profile_summaries().join(","),
         config.open_orders_enabled,
         config.close_orders_enabled,
         config.close_order_mode.as_str(),

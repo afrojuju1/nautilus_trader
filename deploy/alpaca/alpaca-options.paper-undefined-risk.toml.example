@@ -5,16 +5,44 @@
 extends = "../base-options.toml"
 
 [runtime]
-strategy_families = ["naked_call", "naked_put", "naked_call_1_3dte", "naked_put_1_3dte"]
-dry_run_families = []
 open_orders = true
 close_orders = true
 state_path = "/home/ade/.local/state/nautilus_trader/alpaca/paper-undefined-risk/strategy_state.json"
 
-[naked_scanner]
+[[strategies]]
+id = "naked_call_short_premium"
+family = "naked_call"
+mode = "live"
+quantity = 1
+
+[strategies.scanner]
 max_buying_power_usage_pct = 0.03
 
-[naked_1_3dte_scanner]
+[[strategies]]
+id = "naked_put_short_premium"
+family = "naked_put"
+mode = "live"
+quantity = 1
+
+[strategies.scanner]
+max_buying_power_usage_pct = 0.03
+
+[[strategies]]
+id = "naked_call_1_3dte_short_premium"
+family = "naked_call_1_3dte"
+mode = "live"
+quantity = 1
+
+[strategies.scanner]
+max_buying_power_usage_pct = 0.03
+
+[[strategies]]
+id = "naked_put_1_3dte_short_premium"
+family = "naked_put_1_3dte"
+mode = "live"
+quantity = 1
+
+[strategies.scanner]
 max_buying_power_usage_pct = 0.03
 
 [risk]

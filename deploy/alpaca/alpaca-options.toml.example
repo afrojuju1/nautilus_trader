@@ -6,11 +6,16 @@
 extends = "base-options.toml"
 
 [runtime]
-strategy_families = ["iron_condor"]
-dry_run_families = ["iron_condor"]
 open_orders = false
 close_orders = true
 state_path = "/home/ade/.local/state/nautilus_trader/alpaca_options_state.json"
+
+[[strategies]]
+id = "iron_condor_watchlist"
+family = "iron_condor"
+mode = "dry_run"
+underlyings = ["SPY", "QQQ", "IWM", "DIA", "GLD", "GDX", "SLV", "TLT", "XLE", "XLF", "XLK", "XLV", "XLY", "XLI", "XLP", "XLU", "XLB", "XLC", "SMH", "USO", "XOP", "XOM"]
+quantity = 1
 
 [universe]
 entry_start = "10:00"

@@ -16,6 +16,7 @@ log/
 logs/
 
 # Profiler and database
+*.dump
 *.prof
 *.rdb
 *.sqlite

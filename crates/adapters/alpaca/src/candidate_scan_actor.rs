@@ -56,10 +56,12 @@ use crate::{
         OptionChainCandidateInput, option_chain_candidate_input, scan_credit_spread_option_chain,
         scan_debit_spread_option_chain, scan_iron_condor_option_chain, scan_naked_option_chain,
     },
+    options_account_strategy::OptionsCandidateData,
     options_runtime::{
-        AlpacaOptionsRuntimeConfig, OptionsCandidateSet, OptionsScanOutcome, OptionsScanReport,
+        AlpacaOptionsRuntimeConfig, AlpacaOptionsStrategyFamily, AlpacaOptionsStrategyProfile,
+        AlpacaOptionsStrategyScannerConfig, OptionsCandidateSet, OptionsScanOutcome,
+        OptionsScanReport,
     },
-    options_strategy::OptionsCandidateData,
     runtime::emit_operator_event,
 };
 
@@ -72,6 +74,8 @@ const DEFAULT_SCAN_MAX_RESULT_AGE_MS: u64 = 15_000;
 /// Read-only scan settings for candidate discovery from option-chain slices.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OptionChainCandidateScanConfig {
+    /// Resolved strategy profiles. Runtime configs populate this; defaults may use legacy fields.
+    pub strategy_profiles: Vec<AlpacaOptionsStrategyProfile>,
     /// Enabled credit-spread kinds.
     pub spread_kinds: Vec<CreditSpreadKind>,
     /// Whether to scan iron-condor candidates.
@@ -115,6 +119,7 @@ pub struct OptionChainCandidateScanConfig {
 impl Default for OptionChainCandidateScanConfig {
     fn default() -> Self {
         Self {
+            strategy_profiles: Vec::new(),
             spread_kinds: vec![CreditSpreadKind::Put],
             iron_condor_enabled: false,
             debit_kinds: Vec::new(),
@@ -764,6 +769,7 @@ pub fn candidate_scan_config_from_runtime(
     options_buying_power: Option<f64>,
 ) -> OptionChainCandidateScanConfig {
     OptionChainCandidateScanConfig {
+        strategy_profiles: config.strategy_profiles.clone(),
         spread_kinds: config.spread_kinds.clone(),
         iron_condor_enabled: config.iron_condor_enabled,
         debit_kinds: config.debit_kinds.clone(),
@@ -828,6 +834,123 @@ fn scan_option_chain_candidate_input(
     scan_date: NaiveDate,
 ) -> OptionsCandidateSet {
     let mut candidates = OptionsCandidateSet::new(trade_date);
+
+    if !config.strategy_profiles.is_empty() {
+        for profile in config
+            .strategy_profiles
+            .iter()
+            .filter(|profile| profile.scans_underlying(&input.underlying))
+        {
+            if let (Some(kind), AlpacaOptionsStrategyScannerConfig::Credit(scanner)) =
+                (credit_kind_from_family(profile.family), &profile.scanner)
+            {
+                let result = scan_credit_spread_option_chain(&input, scanner, kind, scan_date);
+                let strategy_name = credit_spread_strategy_name(kind);
+                candidates.push_scan(OptionsScanReport::new(
+                    &input.underlying,
+                    strategy_name,
+                    result.candidates.len(),
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                    result.rejection_counts.clone(),
+                ));
+                if let Some(best) = result.candidates.first() {
+                    candidates.consider_candidate(SelectedOptionsEntry::Credit(SelectedEntry {
+                        underlying: input.underlying.clone(),
+                        kind,
+                        candidate: best.clone(),
+                    }));
+                }
+            }
+
+            if matches!(profile.family, AlpacaOptionsStrategyFamily::IronCondor) {
+                let AlpacaOptionsStrategyScannerConfig::IronCondor(scanner) = &profile.scanner
+                else {
+                    continue;
+                };
+                let result = scan_iron_condor_option_chain(&input, scanner, scan_date);
+                candidates.push_scan(OptionsScanReport::new(
+                    &input.underlying,
+                    "iron_condor",
+                    result.candidates.len(),
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                    result.rejection_counts.clone(),
+                ));
+                if let Some(best) = result.candidates.first() {
+                    candidates.consider_candidate(SelectedOptionsEntry::IronCondor(
+                        SelectedIronCondorEntry {
+                            underlying: input.underlying.clone(),
+                            candidate: best.clone(),
+                        },
+                    ));
+                }
+            }
+
+            if let (Some(kind), AlpacaOptionsStrategyScannerConfig::Debit(scanner)) =
+                (debit_kind_from_family(profile.family), &profile.scanner)
+            {
+                let result = scan_debit_spread_option_chain(&input, scanner, kind, scan_date);
+                let strategy_name = debit_spread_strategy_name(kind);
+                candidates.push_scan(OptionsScanReport::new(
+                    &input.underlying,
+                    strategy_name,
+                    result.candidates.len(),
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                    result.rejection_counts.clone(),
+                ));
+                if let Some(best) = result.candidates.first() {
+                    candidates.consider_candidate(SelectedOptionsEntry::Debit(
+                        SelectedDebitEntry {
+                            underlying: input.underlying.clone(),
+                            kind,
+                            candidate: best.clone(),
+                        },
+                    ));
+                }
+            }
+
+            if let (Some(kind), AlpacaOptionsStrategyScannerConfig::Naked(scanner)) =
+                (naked_kind_from_family(profile.family), &profile.scanner)
+            {
+                let result = scan_naked_option_chain(
+                    &input,
+                    scanner,
+                    kind,
+                    Some(NakedOptionCapitalContext {
+                        options_buying_power: config.options_buying_power,
+                        quantity: profile.quantity,
+                    }),
+                    scan_date,
+                );
+                let strategy_name = naked_option_strategy_name(kind);
+                candidates.push_scan(OptionsScanReport::new(
+                    &input.underlying,
+                    strategy_name,
+                    result.candidates.len(),
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                    result.rejection_counts.clone(),
+                ));
+                if let Some(best) = result.candidates.first() {
+                    candidates.consider_candidate(SelectedOptionsEntry::NakedOption(
+                        SelectedNakedOptionEntry {
+                            underlying: input.underlying.clone(),
+                            kind,
+                            candidate: best.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+
+        return candidates;
+    }
 
     for kind in &config.spread_kinds {
         let result =
@@ -937,6 +1060,36 @@ fn naked_scanner_for(
         &config.naked_1_3dte_scanner
     } else {
         &config.naked_scanner
+    }
+}
+
+fn credit_kind_from_family(family: AlpacaOptionsStrategyFamily) -> Option<CreditSpreadKind> {
+    match family {
+        AlpacaOptionsStrategyFamily::PutCredit => Some(CreditSpreadKind::Put),
+        AlpacaOptionsStrategyFamily::CallCredit => Some(CreditSpreadKind::Call),
+        _ => None,
+    }
+}
+
+fn debit_kind_from_family(family: AlpacaOptionsStrategyFamily) -> Option<DebitSpreadKind> {
+    match family {
+        AlpacaOptionsStrategyFamily::PutDebit => Some(DebitSpreadKind::Put),
+        AlpacaOptionsStrategyFamily::CallDebit => Some(DebitSpreadKind::Call),
+        _ => None,
+    }
+}
+
+fn naked_kind_from_family(family: AlpacaOptionsStrategyFamily) -> Option<NakedOptionKind> {
+    match family {
+        AlpacaOptionsStrategyFamily::NakedPut => Some(NakedOptionKind::Put),
+        AlpacaOptionsStrategyFamily::NakedCall => Some(NakedOptionKind::Call),
+        AlpacaOptionsStrategyFamily::NakedPutOneToThreeDte => {
+            Some(NakedOptionKind::PutOneToThreeDte)
+        }
+        AlpacaOptionsStrategyFamily::NakedCallOneToThreeDte => {
+            Some(NakedOptionKind::CallOneToThreeDte)
+        }
+        _ => None,
     }
 }
 

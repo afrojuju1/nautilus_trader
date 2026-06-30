@@ -65,7 +65,7 @@ and strategies.
 - [x] Add a live Nautilus node for Alpaca option-chain candidate evidence and entry strategy wiring.
   - Implemented as `alpaca-options-node`.
   - The node registers `AlpacaDataClientFactory`, `AlpacaExecutionClientFactory`,
-    `OptionChainCandidateScanActor`, and `AlpacaOptionsStrategy`.
+    `OptionChainCandidateScanActor`, and `AlpacaOptionsAccountStrategy`.
   - The scan actor publishes typed `OptionsCandidateData`; the strategy subscribes through
     the Nautilus data bus and submits standard Nautilus orders only when the runtime submit/window
     gates allow it.
@@ -84,7 +84,7 @@ and strategies.
     the account engine still owns broker session lifecycle and submit gates until entry admission
     moves behind a real strategy boundary.
 - [x] Add a Nautilus-native entry strategy boundary.
-  - `AlpacaOptionsStrategy` owns conversion from `OptionsCandidateSet` /
+  - `AlpacaOptionsAccountStrategy` owns conversion from `OptionsCandidateSet` /
     `SelectedOptionsEntry` into standard Nautilus orders and submits through `Strategy::submit_order`
     or `Strategy::submit_order_list`.
   - The live node now owns entry submission and management lifecycle; the legacy
@@ -136,7 +136,7 @@ validation and operational cleanup, not keeping a second account-engine owner al
 
 ### 2. Entry Admission Cutover
 
-Target: `AlpacaOptionsStrategy` owns entry admission before any order is submitted. The old
+Target: `AlpacaOptionsAccountStrategy` owns entry admission before any order is submitted. The old
 account-engine entry owner has been removed; remaining work is market-hours proof that the strategy
 path refuses entries using the same durable state and broker constraints.
 
@@ -146,7 +146,7 @@ path refuses entries using the same durable state and broker constraints.
   - [x] Keep reason strings stable so operator events, alerts, and ledgers remain comparable during
     cutover.
 - [x] Feed admission with durable strategy state.
-  - [x] Load `StrategyState` for the live node before constructing `AlpacaOptionsStrategy`.
+  - [x] Load `StrategyState` for the live node before constructing `AlpacaOptionsAccountStrategy`.
   - [x] Require storage-backed state when `ALPACA_OPEN_ORDERS=true`; dry-run
     cutover proof can keep the current no-storage live-node path.
   - [x] Preserve same-day duplicate checks, active-entry limits, daily-submit limits, per-underlying
@@ -164,7 +164,7 @@ path refuses entries using the same durable state and broker constraints.
   - [x] Selected dry-runs must record `submission_disabled`.
   - [x] Blocks must include reason, current, limit, and details where available.
   - [x] The cutover proof showed decision parity before the old entry loop was removed.
-- [ ] Done when `AlpacaOptionsStrategy` refuses every entry the account engine would have
+- [ ] Done when `AlpacaOptionsAccountStrategy` refuses every entry the account engine would have
   refused, using the same persisted state and live broker constraints.
 
 ### 3. Entry State Recording
@@ -247,14 +247,14 @@ loop.
 
 - [x] Move close, flatten, stale-order, and reprice lifecycle into a Nautilus-owned
   strategy/component.
-  - `AlpacaOptionsStrategy` owns active-entry management on a Nautilus timer, subscribes to
+  - `AlpacaOptionsAccountStrategy` owns active-entry management on a Nautilus timer, subscribes to
     close-leg quotes, claims persisted active-entry instruments for reconciliation, and submits
     close orders through `Strategy::submit_order` / `Strategy::submit_order_list`.
 - [x] Keep broker reconciliation, close decisions, and operator events visible during cutover.
   - Startup broker reconciliation remains in the live-node readiness path.
   - Management emits `management_snapshot` and `management_block` events from the strategy path.
 - [x] Keep active-risk option quotes in the Nautilus strategy/cache path.
-  - `AlpacaOptionsStrategy` subscribes active-entry close legs and top-ranked candidate legs through
+  - `AlpacaOptionsAccountStrategy` subscribes active-entry close legs and top-ranked candidate legs through
     `subscribe_quotes`.
   - Cached `QuoteTick` timestamps drive stale-quote close blocks, selected-candidate freshness
     blocks when a stale cached quote exists, and `nautilus adapters alpaca status` quote-cache/stale alerts.

@@ -63,10 +63,12 @@ limits. TOML `runtime.max_iterations = 0` is continuous service mode. Set
 Candidate-ledger evidence is enabled by default with `runtime.candidate_ledger_enabled = true`.
 Live runtime state, candidate ledgers, performance ledgers, and candidate outcomes are stored in
 Postgres through `NAUTILUS_OPERATIONAL_DATABASE_URL`.
-If an account has no Postgres `strategy_state` row yet, the runtime bootstraps that row from the
-configured local strategy-state JSON file once, then continues from Postgres.
-State mutations are recorded in Postgres `strategy_state_events`; `strategy_state` remains the
-current JSONB snapshot with version, writer, run, and last-event metadata.
+Strategy spread identity is stored directly in normalized `strategy_state` rows, with account
+metadata in `strategy_state_account` and separate broker leg/order evidence in
+`strategy_broker_leg_evidence`. State mutations are recorded in `strategy_state_events`. The local
+JSON state file is a recovery mirror, not the primary operator source. Use
+`docs/developer_guide/alpaca_operational_state_runbook.md` before applying or restoring
+operational-state migrations.
 `runtime.candidate_ledger_max_candidates` controls how many ranked candidates per scanner result
 are persisted; `0` records all ranked candidates.
 
@@ -107,9 +109,9 @@ and account-level caps in the account config.
 Environment overrides are intentionally narrow and operational. They take precedence over TOML for
 the fields they support:
 
-- Strategy/run controls: `ALPACA_STRATEGY_FAMILIES`, `ALPACA_DRY_RUN_FAMILIES`,
-  `ALPACA_MAX_ITERATIONS`, `ALPACA_INTERVAL_SECS`, `ALPACA_QTY`,
-  `ALPACA_IGNORE_ENTRY_WINDOW`.
+- Runtime controls: `ALPACA_MAX_ITERATIONS`, `ALPACA_INTERVAL_SECS`,
+  `ALPACA_IGNORE_ENTRY_WINDOW`. Strategy composition, per-profile quantity, scanner thresholds,
+  and normal risk settings live in `ALPACA_CONFIG_PATH` as `[[strategies]]` blocks.
 - Order capability gates: `ALPACA_OPEN_ORDERS`, `ALPACA_CLOSE_ORDERS`,
   `ALPACA_FORCE_FLATTEN`, `ALPACA_CANCEL_AFTER_ACCEPT`.
 - Account caps: `ALPACA_MAX_ACTIVE_ENTRIES`, `ALPACA_MAX_DAILY_SUBMITS`,
@@ -307,14 +309,17 @@ Default state files from the env template:
 
 - Logs: `~/.local/state/nautilus_trader/logs/alpaca-options.log`
 - Lock: `~/.local/state/nautilus_trader/locks/alpaca-options.lock`
-- Strategy state: `~/.local/state/nautilus_trader/alpaca_options_state.json`
-- Candidate ledger: Postgres `alpaca.candidate_ledger`
-- Strategy-state events: Postgres `alpaca.strategy_state_events`
-- Runtime lease: Postgres `alpaca.runtime_lease`
+- Strategy-state mirror: `~/.local/state/nautilus_trader/alpaca_options_state.json`
+- Spread intents: Postgres `trading_ops.strategy_state`
+- Strategy-state account metadata: Postgres `trading_ops.strategy_state_account`
+- Broker leg evidence: Postgres `trading_ops.strategy_broker_leg_evidence`
+- Candidate ledger: Postgres `trading_ops.candidate_ledger`
+- Strategy-state events: Postgres `trading_ops.strategy_state_events`
+- Runtime lease: Postgres `trading_ops.runtime_lease`
 - Candidate-alert dedupe state:
   `~/.local/state/nautilus_trader/alpaca/<account-id>/alerts/candidate-discord-state.json`
-- Performance ledger: Postgres `alpaca.performance_ledger`
-- Candidate outcomes: Postgres `alpaca.candidate_outcome`
+- Performance ledger: Postgres `trading_ops.performance_ledger`
+- Candidate outcomes: Postgres `trading_ops.candidate_outcome`
 
 The runner wrapper takes an exclusive non-blocking lock. If another process already owns the lock,
 the service exits without starting another Alpaca account owner.
@@ -440,8 +445,8 @@ account's role and strategy set.
 - TOML `management.close_order_mode = "option_spread"` submits one reduce-only Nautilus
   `OptionSpread` close order expanded to Alpaca MLeg, and should be enabled only in a reviewed
   vertical paper profile.
-- TOML `runtime.dry_run_families = ["iron_condor"]` lets a strategy scan and emit decisions
-  without submitting while other enabled strategies can remain live.
+- TOML strategy profile `mode = "dry_run"` lets a strategy scan and emit decisions without
+  submitting while other enabled profiles can remain live.
 - TOML `management.close_regular_hours_only = true` blocks non-forced close submissions outside the
   configured close window. `ALPACA_FORCE_FLATTEN=true` bypasses this guard for explicit flattening.
 - TOML `management.stale_close_secs` controls close-order cancel/reprice timing separately from

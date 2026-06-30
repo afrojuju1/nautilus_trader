@@ -2,7 +2,7 @@
 
 pub const OPERATIONAL_SCHEMA_DEFAULT: &str = "trading_ops";
 pub const OPERATIONAL_ACCOUNT_ID_DEFAULT: &str = "default";
-pub const STRATEGY_STATE_MIGRATION_VERSION: i64 = 202606230002;
+pub const STRATEGY_STATE_MIGRATION_VERSION: i64 = 202606300001;
 
 mod postgres;
 
@@ -25,8 +25,10 @@ pub use performance_ledger::{
 };
 pub use postgres::{OperationalInitError, OperationalMigrationStatus, OperationalRepository};
 pub use state::{
-    StrategyStateMetadata, StrategyStateMutation, StrategyStateWriteResult,
-    StrategyStateWriteStatus, load_strategy_state, load_strategy_state_metadata,
+    StrategyStateIntentSummary, StrategyStateMetadata, StrategyStateMutation,
+    StrategyStateWriteResult, StrategyStateWriteStatus, load_strategy_state,
+    load_strategy_state_intent_payloads, load_strategy_state_intent_summary,
+    load_strategy_state_metadata,
     load_strategy_state_record, persist_strategy_state_mutation, save_strategy_state,
 };
 

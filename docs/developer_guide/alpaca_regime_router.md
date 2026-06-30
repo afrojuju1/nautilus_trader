@@ -84,7 +84,7 @@ flowchart LR
         CandidateEngine["CandidateEngine"]
         SelectionPolicy["SelectionPolicy"]
         RiskAdmission["RiskAdmission"]
-        EntryStrategy["AlpacaOptionsStrategy"]
+        EntryStrategy["AlpacaOptionsAccountStrategy"]
     end
 
     subgraph Storage ["Evidence and Features"]
@@ -440,7 +440,7 @@ Minimum validation reports:
 - Current routing behavior: the scanner computes a pure `RegimeContext` from the feature snapshot,
   filters blocked strategy families before candidate selection, writes the context into scanner and
   candidate ledgers, and passes the same context through `OptionsCandidateData`.
-- Current order behavior: `AlpacaOptionsStrategy` honors `dry_run_only` from the context before
+- Current order behavior: `AlpacaOptionsAccountStrategy` honors `dry_run_only` from the context before
   normal submission gates. Current routing still stays fail-conservative until market-hours
   validation proves feature freshness and thresholds are intentionally promoted.
 - Current operator visibility: `nautilus adapters alpaca status` reports the latest regime feature coverage from

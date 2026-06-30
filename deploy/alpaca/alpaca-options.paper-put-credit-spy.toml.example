@@ -5,19 +5,23 @@
 extends = "../base-options.toml"
 
 [runtime]
-strategy_families = ["put_credit"]
-dry_run_families = []
 open_orders = true
 close_orders = true
 state_path = "/home/ade/.local/state/nautilus_trader/alpaca/paper-put-credit-spy/strategy_state.json"
 
-[universe]
+[[strategies]]
+id = "put_credit_spy_strict"
+family = "put_credit"
+mode = "live"
 underlyings = ["SPY"]
+quantity = 1
+
+[strategies.scanner]
+min_return_on_risk = 0.16
+
+[universe]
 entry_start = "09:45"
 entry_end = "10:15"
-
-[scanner]
-min_return_on_risk = 0.16
 
 [management]
 close_order_mode = "option_spread"

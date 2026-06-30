@@ -2,7 +2,7 @@
 
 Status: implemented for the Alpaca Nautilus-native runtime path, with market-hours proof still
 deferred. The pure candidate engine, option-chain input path, candidate evidence actor, and
-`AlpacaOptionsStrategy` now exist in the Rust runtime. The remaining cutover blocker is regular
+`AlpacaOptionsAccountStrategy` now exist in the Rust runtime. The remaining cutover blocker is regular
 market-hours paper-submit validation through the Nautilus strategy path, tracked outside this
 architecture note.
 
@@ -66,7 +66,7 @@ flowchart LR
     subgraph Runtime ["Runtime Components"]
         RegimeActor["RegimeFeatureActor<br/>read-only"]
         ScanActor["CandidateScanActor<br/>read-only"]
-        EntryStrategy["AlpacaOptionsStrategy<br/>can submit"]
+        EntryStrategy["AlpacaOptionsAccountStrategy<br/>can submit"]
         ManagementStrategy["OptionsManagementStrategy"]
     end
 
@@ -132,7 +132,7 @@ sequenceDiagram
     participant Data as DataEngine
     participant Chain as OptionChainManager
     participant Regime as RegimeRouter
-    participant Strategy as AlpacaOptionsStrategy
+    participant Strategy as AlpacaOptionsAccountStrategy
     participant Candidate as CandidateEngine
     participant Risk as RiskAdmission
     participant Ledger as CandidateLedger
@@ -184,7 +184,7 @@ signals. It should not read environment variables, call Alpaca, submit orders, o
 `CandidateScanActor` is the read-only runtime surface. It can run scheduled scans, publish alerts,
 and record evidence, but it does not submit orders.
 
-`AlpacaOptionsStrategy` is the order-capable runtime surface. It consumes the same pure candidate
+`AlpacaOptionsAccountStrategy` is the order-capable runtime surface. It consumes the same pure candidate
 engine, applies strategy state and risk admission, then uses standard Nautilus order submission.
 
 `OptionsManagementStrategy` owns lifecycle management for accepted entries: profit targets, stop
@@ -250,7 +250,7 @@ ownership.
 | 5. Regime router boundary | Reusable strategy-family routing. | Add pure `RegimeInput`, `RegimeContext`, and routing-policy types with threshold-based labels and explanation codes. | Candidate ranking can accept regime context without calling venue APIs or reading operator config. |
 | 6. Regime feature actor | Native feature surface. | Add a read-only actor or service that computes feature snapshots from Nautilus data, catalog/ClickHouse history, and external signals. | A scan records regime label, feature freshness, and routing decision in the candidate ledger. |
 | 7. Read-only scan actor | Native scan and alert surface. | Add an `CandidateScanActor` that runs scheduled or event-driven scans, records ledgers, and publishes alerts without order submission. | One-shot and interval scans can run inside a `TradingNode` without the standalone scanner loop. |
-| 8. Entry strategy | Standard order-capable path. | Add an `AlpacaOptionsStrategy` that consumes candidate sets, applies regime routing, selection, and risk admission, then submits through Nautilus order flow. | Paper dry-run and paper submit paths use the strategy path instead of bespoke scanner submission glue. |
+| 8. Entry strategy | Standard order-capable path. | Add an `AlpacaOptionsAccountStrategy` that consumes candidate sets, applies regime routing, selection, and risk admission, then submits through Nautilus order flow. | Paper dry-run and paper submit paths use the strategy path instead of bespoke scanner submission glue. |
 | 9. Management and cleanup | Slim runtime with fewer parallel paths. | Move close/flatten lifecycle into an `OptionsManagementStrategy`; retire one-off scanner binaries once operator commands use actor/strategy surfaces. | Active docs and operator commands point at the Nautilus-native path, with REST-only scanners kept only where they remain useful diagnostics. |
 
 Ordering rule: do not build a new order-capable runtime surface before the candidate engine boundary
@@ -264,7 +264,7 @@ candidate engine plus Nautilus actors and strategies around it.
 
 The candidate-engine extraction and Nautilus-native runtime wiring are now in place for Alpaca
 options. The direct refactor replaced REST-shaped scoring dependencies with owned candidate-engine
-types, and the order-capable entry owner is now `AlpacaOptionsStrategy` rather than the retired
+types, and the order-capable entry owner is now `AlpacaOptionsAccountStrategy` rather than the retired
 account-engine entry loop.
 
 Target model:
@@ -301,7 +301,7 @@ Current code ownership:
   inputs, and pure routing.
 - `crates/adapters/alpaca/src/strategy.rs`: REST data-acquisition and input-adapter surface.
 - `crates/adapters/alpaca/src/candidate_scan_actor.rs`: read-only candidate evidence actor.
-- `crates/adapters/alpaca/src/options_strategy.rs`: order-capable Nautilus strategy owner.
+- `crates/adapters/alpaca/src/options_account_strategy.rs`: order-capable Nautilus strategy owner.
 - `crates/adapters/alpaca/src/options_runtime.rs`: legacy-compatible candidate-output assembly and
   supporting runtime contracts.
 - `crates/adapters/alpaca/src/strategy_state_entry.rs`: Alpaca-only conversion from selected entry
@@ -326,7 +326,7 @@ Acceptance criteria:
 Next implementation slices:
 
 1. Run the deferred market-hours cutover proof: non-submit parity first, then bounded paper submit
-   through `AlpacaOptionsStrategy`.
+   through `AlpacaOptionsAccountStrategy`.
 2. Implement the regime router types and read-only feature actor from the focused v1 input contract
    before wiring regime metadata into live decisions.
 
@@ -352,7 +352,7 @@ Still deferred:
 7. Retire one-off scanner binaries once the actor/strategy path gives equal or better observability.
 
 Most of this migration path is implemented for the Alpaca runtime: the candidate engine,
-option-chain scan actor, and order-capable `AlpacaOptionsStrategy` now exist, and the displaced
+option-chain scan actor, and order-capable `AlpacaOptionsAccountStrategy` now exist, and the displaced
 account-engine entry loop has been retired. Regime routing remains intentionally blocked until real
 feature inputs exist. Do not reintroduce account-engine entry submission or standalone scanner loops
 while working on the remaining proof and analytics gaps.
@@ -360,7 +360,7 @@ while working on the remaining proof and analytics gaps.
 ## Architecture Decisions
 
 The read-only scan actor and order-capable strategy should be separate runtime components.
-`CandidateScanActor` owns discovery, diagnostics, alerts, and evidence. `AlpacaOptionsStrategy`
+`CandidateScanActor` owns discovery, diagnostics, alerts, and evidence. `AlpacaOptionsAccountStrategy`
 owns order-capable decisions. They should share the candidate engine, candidate-set types, and
 configuration model, but a read-only actor should not become order-capable through a submit-mode
 toggle.

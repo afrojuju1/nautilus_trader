@@ -15,7 +15,13 @@
 
 //! Alpaca options runtime configuration and candidate selection.
 
-use std::{collections::BTreeMap, env, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+};
 
 use chrono::NaiveTime;
 use chrono_tz::Tz;
@@ -89,6 +95,8 @@ const CANDIDATE_ALERT_DEBIT_MIN_SCORE: f64 = 80.0;
 pub struct AlpacaOptionsRuntimeConfig {
     /// Underlyings to scan.
     pub underlyings: Vec<String>,
+    /// Resolved strategy profiles that define scan composition.
+    pub strategy_profiles: Vec<AlpacaOptionsStrategyProfile>,
     /// Enabled spread kinds.
     pub spread_kinds: Vec<CreditSpreadKind>,
     /// Whether the iron-condor strategy is enabled.
@@ -223,6 +231,210 @@ pub struct AlpacaOptionsRuntimeConfig {
     pub operational_schema: String,
     /// Optional account ID override for persisted records.
     pub operational_account_id: Option<String>,
+}
+
+/// Runtime strategy profile mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlpacaOptionsStrategyMode {
+    /// Candidate can submit broker orders when account-level order gates allow it.
+    Live,
+    /// Candidate scans and records evidence but cannot submit opening broker orders.
+    DryRun,
+}
+
+impl AlpacaOptionsStrategyMode {
+    /// Returns the stable config/status label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::DryRun => "dry_run",
+        }
+    }
+}
+
+impl FromStr for AlpacaOptionsStrategyMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "live" | "enabled" | "submit" => Ok(Self::Live),
+            "dry_run" | "dry-run" | "watchlist" | "paper_watch" => Ok(Self::DryRun),
+            other => Err(format!("unsupported Alpaca strategy mode {other}")),
+        }
+    }
+}
+
+/// Stable strategy family for one Alpaca options profile.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum AlpacaOptionsStrategyFamily {
+    /// Put credit spread.
+    PutCredit,
+    /// Call credit spread.
+    CallCredit,
+    /// Iron condor.
+    IronCondor,
+    /// Put debit spread.
+    PutDebit,
+    /// Call debit spread.
+    CallDebit,
+    /// Naked short put.
+    NakedPut,
+    /// Naked short call.
+    NakedCall,
+    /// 1-3 DTE naked short put.
+    NakedPutOneToThreeDte,
+    /// 1-3 DTE naked short call.
+    NakedCallOneToThreeDte,
+}
+
+impl AlpacaOptionsStrategyFamily {
+    /// Returns the stable strategy label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PutCredit => "put_credit",
+            Self::CallCredit => "call_credit",
+            Self::IronCondor => "iron_condor",
+            Self::PutDebit => "put_debit",
+            Self::CallDebit => "call_debit",
+            Self::NakedPut => "naked_put",
+            Self::NakedCall => "naked_call",
+            Self::NakedPutOneToThreeDte => "naked_put_1_3dte",
+            Self::NakedCallOneToThreeDte => "naked_call_1_3dte",
+        }
+    }
+}
+
+impl FromStr for AlpacaOptionsStrategyFamily {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "put" | "put_credit" => Ok(Self::PutCredit),
+            "call" | "call_credit" => Ok(Self::CallCredit),
+            "iron_condor" | "condor" => Ok(Self::IronCondor),
+            "put_debit" | "earnings_put_debit_entry" => Ok(Self::PutDebit),
+            "call_debit" | "earnings_call_debit_entry" => Ok(Self::CallDebit),
+            "naked_put" | "short_put" => Ok(Self::NakedPut),
+            "naked_call" | "short_call" => Ok(Self::NakedCall),
+            "naked_put_1_3dte" | "short_put_1_3dte" => Ok(Self::NakedPutOneToThreeDte),
+            "naked_call_1_3dte" | "short_call_1_3dte" => Ok(Self::NakedCallOneToThreeDte),
+            other => Err(format!("unsupported Alpaca strategy family {other}")),
+        }
+    }
+}
+
+/// Resolved scanner config for one Alpaca options strategy profile.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlpacaOptionsStrategyScannerConfig {
+    /// Credit-spread scanner config.
+    Credit(PutCreditScannerConfig),
+    /// Iron-condor scanner config.
+    IronCondor(IronCondorScannerConfig),
+    /// Debit-spread scanner config.
+    Debit(DebitSpreadScannerConfig),
+    /// Naked-option scanner config.
+    Naked(NakedOptionScannerConfig),
+}
+
+/// Profile-local risk overrides read from config.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AlpacaOptionsStrategyRiskOverrides {
+    /// Maximum active entries for this profile. Enforced by future profile-owned admission state.
+    pub max_active_entries: Option<usize>,
+    /// Maximum accepted submissions for this profile and trade date.
+    pub max_daily_submits: Option<usize>,
+    /// Maximum active entries for one profile underlying.
+    pub max_active_entries_per_underlying: Option<usize>,
+    /// Maximum selected-entry risk capital in USD.
+    pub max_single_entry_risk_capital_usd: Option<f64>,
+}
+
+/// Resolved strategy profile used by scanners and operator status.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlpacaOptionsStrategyProfile {
+    /// Stable profile identifier.
+    pub id: String,
+    /// Strategy family scanned by this profile.
+    pub family: AlpacaOptionsStrategyFamily,
+    /// Opening-order mode for this profile.
+    pub mode: AlpacaOptionsStrategyMode,
+    /// Underlyings scanned by this profile.
+    pub underlyings: Vec<String>,
+    /// Contract quantity for this profile.
+    pub quantity: u64,
+    /// Resolved scanner config for this profile.
+    pub scanner: AlpacaOptionsStrategyScannerConfig,
+    /// Profile-local risk overrides from config.
+    pub risk: AlpacaOptionsStrategyRiskOverrides,
+}
+
+impl AlpacaOptionsStrategyProfile {
+    /// Returns the stable strategy label.
+    #[must_use]
+    pub const fn strategy_name(&self) -> &'static str {
+        self.family.as_str()
+    }
+
+    /// Returns whether this profile is a dry-run/watchlist profile.
+    #[must_use]
+    pub const fn is_dry_run(&self) -> bool {
+        matches!(self.mode, AlpacaOptionsStrategyMode::DryRun)
+    }
+
+    /// Returns whether this profile scans the supplied underlying.
+    #[must_use]
+    pub fn scans_underlying(&self, underlying: &str) -> bool {
+        self.underlyings
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(underlying))
+    }
+
+    /// Returns a compact config-check/status summary.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let risk = self.risk.summary();
+        if risk.is_empty() {
+            format!(
+                "{}:{}:{}:{}:qty={}",
+                self.id,
+                self.family.as_str(),
+                self.mode.as_str(),
+                self.underlyings.join("|"),
+                self.quantity,
+            )
+        } else {
+            format!(
+                "{}:{}:{}:{}:qty={}:risk={}",
+                self.id,
+                self.family.as_str(),
+                self.mode.as_str(),
+                self.underlyings.join("|"),
+                self.quantity,
+                risk,
+            )
+        }
+    }
+}
+
+impl AlpacaOptionsStrategyRiskOverrides {
+    fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(value) = self.max_active_entries {
+            parts.push(format!("max_active_entries={value}"));
+        }
+        if let Some(value) = self.max_daily_submits {
+            parts.push(format!("max_daily_submits={value}"));
+        }
+        if let Some(value) = self.max_active_entries_per_underlying {
+            parts.push(format!("max_active_entries_per_underlying={value}"));
+        }
+        if let Some(value) = self.max_single_entry_risk_capital_usd {
+            parts.push(format!("max_single_entry_risk_capital_usd={value:.2}"));
+        }
+        parts.join("|")
+    }
 }
 
 impl AlpacaOptionsRuntimeConfig {
@@ -479,49 +691,31 @@ impl AlpacaOptionsRuntimeConfig {
     /// Returns enabled strategy names for operator logs.
     #[must_use]
     pub fn enabled_strategy_family_names(&self) -> Vec<&'static str> {
-        let mut names = self
-            .spread_kinds
-            .iter()
-            .map(|kind| credit_spread_strategy_name(*kind))
-            .collect::<Vec<_>>();
-        if self.iron_condor_enabled {
-            names.push("iron_condor");
-        }
-        names.extend(
-            self.debit_kinds
+        unique_strategy_names(
+            self.strategy_profiles
                 .iter()
-                .map(|kind| debit_spread_strategy_name(*kind)),
-        );
-        names.extend(
-            self.naked_kinds
-                .iter()
-                .map(|kind| naked_option_strategy_name(*kind)),
-        );
-        names
+                .map(AlpacaOptionsStrategyProfile::strategy_name),
+        )
     }
 
     /// Returns strategy names which are configured for dry-run selection only.
     #[must_use]
     pub fn dry_run_strategy_family_names(&self) -> Vec<&'static str> {
-        let mut names = self
-            .dry_run_spread_kinds
+        unique_strategy_names(
+            self.strategy_profiles
+                .iter()
+                .filter(|profile| profile.is_dry_run())
+                .map(AlpacaOptionsStrategyProfile::strategy_name),
+        )
+    }
+
+    /// Returns compact resolved strategy profile summaries.
+    #[must_use]
+    pub fn strategy_profile_summaries(&self) -> Vec<String> {
+        self.strategy_profiles
             .iter()
-            .map(|kind| credit_spread_strategy_name(*kind))
-            .collect::<Vec<_>>();
-        if self.iron_condor_dry_run {
-            names.push("iron_condor");
-        }
-        names.extend(
-            self.dry_run_debit_kinds
-                .iter()
-                .map(|kind| debit_spread_strategy_name(*kind)),
-        );
-        names.extend(
-            self.dry_run_naked_kinds
-                .iter()
-                .map(|kind| naked_option_strategy_name(*kind)),
-        );
-        names
+            .map(AlpacaOptionsStrategyProfile::summary)
+            .collect()
     }
 
     /// Returns whether a selected credit-spread kind may open broker orders.
@@ -565,6 +759,14 @@ impl AlpacaOptionsRuntimeConfig {
             .get(&underlying.to_ascii_uppercase())
             .map(String::as_str)
     }
+}
+
+fn unique_strategy_names(names: impl IntoIterator<Item = &'static str>) -> Vec<&'static str> {
+    let mut seen = BTreeSet::new();
+    names
+        .into_iter()
+        .filter(|name| seen.insert(*name))
+        .collect()
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -699,27 +901,29 @@ pub async fn scan_options_candidates(
     let options_buying_power = account_options_buying_power(&account);
     let mut candidates = OptionsCandidateSet::new(trade_date);
 
-    for underlying in &config.underlyings {
-        for kind in &config.spread_kinds {
-            let result = match kind {
-                CreditSpreadKind::Put => {
-                    scan_put_credit_underlying(client, data_config, &config.scanner, underlying)
-                        .await?
-                }
-                CreditSpreadKind::Call => {
-                    scan_call_credit_underlying(client, data_config, &config.scanner, underlying)
-                        .await?
-                }
-            };
-            let strategy_name = credit_spread_strategy_name(*kind);
-            let scanner_reason = result.candidates.is_empty().then(|| {
-                no_candidate_reason(
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                )
-            });
-            record_scanner_ledger_result(
+    for profile in &config.strategy_profiles {
+        for underlying in &profile.underlyings {
+            if let (Some(kind), AlpacaOptionsStrategyScannerConfig::Credit(scanner)) =
+                (credit_kind_from_family(profile.family), &profile.scanner)
+            {
+                let result = match kind {
+                    CreditSpreadKind::Put => {
+                        scan_put_credit_underlying(client, data_config, scanner, underlying).await?
+                    }
+                    CreditSpreadKind::Call => {
+                        scan_call_credit_underlying(client, data_config, scanner, underlying)
+                            .await?
+                    }
+                };
+                let strategy_name = credit_spread_strategy_name(kind);
+                let scanner_reason = result.candidates.is_empty().then(|| {
+                    no_candidate_reason(
+                        result.contract_count,
+                        result.snapshot_count,
+                        result.scoreable_count,
+                    )
+                });
+                record_scanner_ledger_result(
                 config,
                 trade_date,
                 json!({
@@ -731,104 +935,109 @@ pub async fn scan_options_candidates(
                     "snapshots": result.snapshot_count,
                     "scoreable": result.scoreable_count,
                     "rejections": &result.rejection_counts,
+                    "profile_id": &profile.id,
+                    "profile_mode": profile.mode.as_str(),
                 }),
             )
             .await;
-            record_credit_candidate_ledger(
-                config,
-                trade_date,
-                underlying,
-                strategy_name,
-                &result.candidates,
-            )
-            .await;
-            candidates.push_scan(OptionsScanReport::new(
-                underlying,
-                strategy_name,
-                result.candidates.len(),
-                result.contract_count,
-                result.snapshot_count,
-                result.scoreable_count,
-                result.rejection_counts.clone(),
-            ));
-            let Some(best) = result.candidates.first() else {
-                let reason = no_candidate_reason(
+                record_credit_candidate_ledger(
+                    config,
+                    trade_date,
+                    underlying,
+                    strategy_name,
+                    &result.candidates,
+                )
+                .await;
+                candidates.push_scan(OptionsScanReport::new(
+                    underlying,
+                    strategy_name,
+                    result.candidates.len(),
                     result.contract_count,
                     result.snapshot_count,
                     result.scoreable_count,
-                );
+                    result.rejection_counts.clone(),
+                ));
+                let Some(best) = result.candidates.first() else {
+                    let reason = no_candidate_reason(
+                        result.contract_count,
+                        result.snapshot_count,
+                        result.scoreable_count,
+                    );
+                    println!(
+                        "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={} rejections={}",
+                        credit_spread_strategy_name(kind),
+                        reason,
+                        result.contract_count,
+                        result.snapshot_count,
+                        result.scoreable_count,
+                        format_rejection_counts(&result.rejection_counts),
+                    );
+                    emit_operator_event(
+                        "scanner_diagnostic",
+                        json!({
+                            "underlying": underlying,
+                            "strategy": credit_spread_strategy_name(kind),
+                            "result": "no_candidate",
+                            "reason": reason,
+                            "contracts": result.contract_count,
+                            "snapshots": result.snapshot_count,
+                            "scoreable": result.scoreable_count,
+                            "rejections": &result.rejection_counts,
+                            "profile_id": &profile.id,
+                            "profile_mode": profile.mode.as_str(),
+                        }),
+                    );
+                    continue;
+                };
+
                 println!(
-                    "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={} rejections={}",
-                    credit_spread_strategy_name(*kind),
-                    reason,
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                    format_rejection_counts(&result.rejection_counts),
+                    "{underlying}: candidate strategy={} short={} long={} credit={:.2} ror={:.1}% score={:.1}",
+                    credit_spread_strategy_name(kind),
+                    best.short.symbol,
+                    best.long.symbol,
+                    best.credit,
+                    best.return_on_risk * 100.0,
+                    best.score,
                 );
                 emit_operator_event(
                     "scanner_diagnostic",
                     json!({
                         "underlying": underlying,
-                        "strategy": credit_spread_strategy_name(*kind),
-                        "result": "no_candidate",
-                        "reason": reason,
-                        "contracts": result.contract_count,
-                        "snapshots": result.snapshot_count,
-                        "scoreable": result.scoreable_count,
+                        "strategy": credit_spread_strategy_name(kind),
+                        "result": "candidate",
+                        "short_symbol": &best.short.symbol,
+                        "long_symbol": &best.long.symbol,
+                        "credit": best.credit,
+                        "return_on_risk": best.return_on_risk,
+                        "score": best.score,
                         "rejections": &result.rejection_counts,
+                        "profile_id": &profile.id,
+                        "profile_mode": profile.mode.as_str(),
                     }),
                 );
-                continue;
-            };
 
-            println!(
-                "{underlying}: candidate strategy={} short={} long={} credit={:.2} ror={:.1}% score={:.1}",
-                credit_spread_strategy_name(*kind),
-                best.short.symbol,
-                best.long.symbol,
-                best.credit,
-                best.return_on_risk * 100.0,
-                best.score,
-            );
-            emit_operator_event(
-                "scanner_diagnostic",
-                json!({
-                    "underlying": underlying,
-                    "strategy": credit_spread_strategy_name(*kind),
-                    "result": "candidate",
-                    "short_symbol": &best.short.symbol,
-                    "long_symbol": &best.long.symbol,
-                    "credit": best.credit,
-                    "return_on_risk": best.return_on_risk,
-                    "score": best.score,
-                    "rejections": &result.rejection_counts,
-                }),
-            );
+                candidates.consider_candidate(SelectedOptionsEntry::Credit(SelectedEntry {
+                    underlying: underlying.clone(),
+                    kind,
+                    candidate: best.clone(),
+                }));
+            }
 
-            candidates.consider_candidate(SelectedOptionsEntry::Credit(SelectedEntry {
-                underlying: underlying.clone(),
-                kind: *kind,
-                candidate: best.clone(),
-            }));
-        }
-
-        if config.iron_condor_enabled {
-            let result = scan_iron_condor_underlying(
-                client,
-                data_config,
-                &config.iron_condor_scanner,
-                underlying,
-            )
-            .await?;
-            let scanner_reason = result.candidates.is_empty().then(|| {
-                no_candidate_reason(
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                )
-            });
-            record_scanner_ledger_result(
+            if matches!(profile.family, AlpacaOptionsStrategyFamily::IronCondor) {
+                let AlpacaOptionsStrategyScannerConfig::IronCondor(scanner) = &profile.scanner
+                else {
+                    continue;
+                };
+                let result =
+                    scan_iron_condor_underlying(client, data_config, scanner, underlying).await?;
+                let scanner_reason = result.candidates.is_empty().then(|| {
+                    no_candidate_reason(
+                        result.contract_count,
+                        result.snapshot_count,
+                        result.scoreable_count,
+                    )
+                });
+                record_scanner_ledger_result(
                 config,
                 trade_date,
                 json!({
@@ -840,379 +1049,425 @@ pub async fn scan_options_candidates(
                     "snapshots": result.snapshot_count,
                     "scoreable": result.scoreable_count,
                     "rejections": &result.rejection_counts,
+                    "profile_id": &profile.id,
+                    "profile_mode": profile.mode.as_str(),
                 }),
             )
             .await;
-            record_iron_condor_candidate_ledger(config, trade_date, underlying, &result.candidates)
+                record_iron_condor_candidate_ledger(
+                    config,
+                    trade_date,
+                    underlying,
+                    &result.candidates,
+                )
                 .await;
-            candidates.push_scan(OptionsScanReport::new(
-                underlying,
-                "iron_condor",
-                result.candidates.len(),
-                result.contract_count,
-                result.snapshot_count,
-                result.scoreable_count,
-                result.rejection_counts.clone(),
-            ));
-            let Some(best) = result.candidates.first() else {
-                let reason = no_candidate_reason(
+                candidates.push_scan(OptionsScanReport::new(
+                    underlying,
+                    "iron_condor",
+                    result.candidates.len(),
                     result.contract_count,
                     result.snapshot_count,
                     result.scoreable_count,
-                );
+                    result.rejection_counts.clone(),
+                ));
+                let Some(best) = result.candidates.first() else {
+                    let reason = no_candidate_reason(
+                        result.contract_count,
+                        result.snapshot_count,
+                        result.scoreable_count,
+                    );
+                    println!(
+                        "{underlying}: no_candidate strategy=iron_condor reason={} contracts={} snapshots={} scoreable={} rejections={}",
+                        reason,
+                        result.contract_count,
+                        result.snapshot_count,
+                        result.scoreable_count,
+                        format_rejection_counts(&result.rejection_counts),
+                    );
+                    emit_operator_event(
+                        "scanner_diagnostic",
+                        json!({
+                            "underlying": underlying,
+                            "strategy": "iron_condor",
+                            "result": "no_candidate",
+                            "reason": reason,
+                            "contracts": result.contract_count,
+                            "snapshots": result.snapshot_count,
+                            "scoreable": result.scoreable_count,
+                            "rejections": &result.rejection_counts,
+                            "profile_id": &profile.id,
+                            "profile_mode": profile.mode.as_str(),
+                        }),
+                    );
+                    continue;
+                };
+
                 println!(
-                    "{underlying}: no_candidate strategy=iron_condor reason={} contracts={} snapshots={} scoreable={} rejections={}",
-                    reason,
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                    format_rejection_counts(&result.rejection_counts),
+                    "{underlying}: candidate strategy=iron_condor short_put={} long_put={} short_call={} long_call={} credit={:.2} ror={:.1}% score={:.1}",
+                    best.put.short.symbol,
+                    best.put.long.symbol,
+                    best.call.short.symbol,
+                    best.call.long.symbol,
+                    best.credit,
+                    best.return_on_risk * 100.0,
+                    best.score,
                 );
                 emit_operator_event(
                     "scanner_diagnostic",
                     json!({
                         "underlying": underlying,
                         "strategy": "iron_condor",
-                        "result": "no_candidate",
-                        "reason": reason,
-                        "contracts": result.contract_count,
-                        "snapshots": result.snapshot_count,
-                        "scoreable": result.scoreable_count,
+                        "result": "candidate",
+                        "short_put_symbol": &best.put.short.symbol,
+                        "long_put_symbol": &best.put.long.symbol,
+                        "short_call_symbol": &best.call.short.symbol,
+                        "long_call_symbol": &best.call.long.symbol,
+                        "credit": best.credit,
+                        "return_on_risk": best.return_on_risk,
+                        "score": best.score,
                         "rejections": &result.rejection_counts,
+                        "profile_id": &profile.id,
+                        "profile_mode": profile.mode.as_str(),
                     }),
                 );
-                continue;
-            };
 
-            println!(
-                "{underlying}: candidate strategy=iron_condor short_put={} long_put={} short_call={} long_call={} credit={:.2} ror={:.1}% score={:.1}",
-                best.put.short.symbol,
-                best.put.long.symbol,
-                best.call.short.symbol,
-                best.call.long.symbol,
-                best.credit,
-                best.return_on_risk * 100.0,
-                best.score,
-            );
-            emit_operator_event(
-                "scanner_diagnostic",
-                json!({
-                    "underlying": underlying,
-                    "strategy": "iron_condor",
-                    "result": "candidate",
-                    "short_put_symbol": &best.put.short.symbol,
-                    "long_put_symbol": &best.put.long.symbol,
-                    "short_call_symbol": &best.call.short.symbol,
-                    "long_call_symbol": &best.call.long.symbol,
-                    "credit": best.credit,
-                    "return_on_risk": best.return_on_risk,
-                    "score": best.score,
-                    "rejections": &result.rejection_counts,
-                }),
-            );
-
-            candidates.consider_candidate(SelectedOptionsEntry::IronCondor(
-                SelectedIronCondorEntry {
-                    underlying: underlying.clone(),
-                    candidate: best.clone(),
-                },
-            ));
-        }
-
-        for kind in &config.debit_kinds {
-            let result = match kind {
-                DebitSpreadKind::Call => {
-                    scan_call_debit_underlying(
-                        client,
-                        data_config,
-                        &config.debit_scanner,
-                        underlying,
-                    )
-                    .await?
-                }
-                DebitSpreadKind::Put => {
-                    scan_put_debit_underlying(
-                        client,
-                        data_config,
-                        &config.debit_scanner,
-                        underlying,
-                    )
-                    .await?
-                }
-            };
-            let strategy_name = debit_spread_strategy_name(*kind);
-            let scanner_reason = result.candidates.is_empty().then(|| {
-                no_candidate_reason(
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                )
-            });
-            record_scanner_ledger_result(
-                config,
-                trade_date,
-                json!({
-                    "underlying": underlying,
-                    "strategy": strategy_name,
-                    "result": if result.candidates.is_empty() { "no_candidate" } else { "candidate" },
-                    "reason": scanner_reason,
-                    "contracts": result.contract_count,
-                    "snapshots": result.snapshot_count,
-                    "scoreable": result.scoreable_count,
-                    "rejections": &result.rejection_counts,
-                }),
-            )
-            .await;
-            record_debit_candidate_ledger(
-                config,
-                trade_date,
-                underlying,
-                strategy_name,
-                &result.candidates,
-            )
-            .await;
-            candidates.push_scan(OptionsScanReport::new(
-                underlying,
-                strategy_name,
-                result.candidates.len(),
-                result.contract_count,
-                result.snapshot_count,
-                result.scoreable_count,
-                result.rejection_counts.clone(),
-            ));
-            let Some(best) = result.candidates.first() else {
-                let reason = no_candidate_reason(
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                );
-                println!(
-                    "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={} rejections={}",
-                    debit_spread_strategy_name(*kind),
-                    reason,
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                    format_rejection_counts(&result.rejection_counts),
-                );
-                emit_operator_event(
-                    "scanner_diagnostic",
-                    json!({
-                        "underlying": underlying,
-                        "strategy": debit_spread_strategy_name(*kind),
-                        "result": "no_candidate",
-                        "reason": reason,
-                        "contracts": result.contract_count,
-                        "snapshots": result.snapshot_count,
-                        "scoreable": result.scoreable_count,
-                        "rejections": &result.rejection_counts,
-                    }),
-                );
-                continue;
-            };
-
-            println!(
-                "{underlying}: candidate strategy={} long={} short={} debit={:.2} rtr={:.1}% score={:.1}",
-                debit_spread_strategy_name(*kind),
-                best.long.symbol,
-                best.short.symbol,
-                best.debit,
-                best.reward_to_risk * 100.0,
-                best.score,
-            );
-            emit_operator_event(
-                "scanner_diagnostic",
-                json!({
-                    "underlying": underlying,
-                    "strategy": debit_spread_strategy_name(*kind),
-                    "result": "candidate",
-                    "long_symbol": &best.long.symbol,
-                    "short_symbol": &best.short.symbol,
-                    "debit": best.debit,
-                    "reward_to_risk": best.reward_to_risk,
-                    "score": best.score,
-                    "rejections": &result.rejection_counts,
-                }),
-            );
-
-            candidates.consider_candidate(SelectedOptionsEntry::Debit(SelectedDebitEntry {
-                underlying: underlying.clone(),
-                kind: *kind,
-                candidate: best.clone(),
-            }));
-        }
-
-        for kind in &config.naked_kinds {
-            let result = scan_naked_option_underlying_with_capital(
-                client,
-                data_config,
-                config.naked_scanner_for(*kind),
-                underlying,
-                *kind,
-                Some(NakedOptionCapitalContext {
-                    options_buying_power,
-                    quantity: config.quantity,
-                }),
-            )
-            .await?;
-            let strategy_name = naked_option_strategy_name(*kind);
-            let scanner_reason = result.candidates.is_empty().then(|| {
-                no_candidate_reason(
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                )
-            });
-            record_scanner_ledger_result(
-                config,
-                trade_date,
-                json!({
-                    "underlying": underlying,
-                    "strategy": strategy_name,
-                    "result": if result.candidates.is_empty() { "no_candidate" } else { "candidate" },
-                    "reason": scanner_reason,
-                    "contracts": result.contract_count,
-                    "snapshots": result.snapshot_count,
-                    "scoreable": result.scoreable_count,
-                    "rejections": &result.rejection_counts,
-                }),
-            )
-            .await;
-            record_naked_candidate_ledger(
-                config,
-                trade_date,
-                underlying,
-                strategy_name,
-                options_buying_power,
-                &result.candidates,
-            )
-            .await;
-            candidates.push_scan(OptionsScanReport::new(
-                underlying,
-                strategy_name,
-                result.candidates.len(),
-                result.contract_count,
-                result.snapshot_count,
-                result.scoreable_count,
-                result.rejection_counts.clone(),
-            ));
-            let Some(best) = result.candidates.first() else {
-                let reason = no_candidate_reason(
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                );
-                println!(
-                    "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={} rejections={}",
-                    naked_option_strategy_name(*kind),
-                    reason,
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                    format_rejection_counts(&result.rejection_counts),
-                );
-                emit_operator_event(
-                    "scanner_diagnostic",
-                    json!({
-                        "underlying": underlying,
-                        "strategy": naked_option_strategy_name(*kind),
-                        "result": "no_candidate",
-                        "reason": reason,
-                        "contracts": result.contract_count,
-                        "snapshots": result.snapshot_count,
-                        "scoreable": result.scoreable_count,
-                        "rejections": &result.rejection_counts,
-                    }),
-                );
-                continue;
-            };
-
-            let metrics = best.short.metrics.as_ref();
-            if let Some(metrics) = metrics {
-                println!(
-                    "{underlying}: candidate strategy={} short={} credit={:.2} delta={:.2} pop={:.1}% touch={:.1}% be_dist={:.1}% em_cov={:.2} bpr=${:.0} bp_use={} rbp={:.3}% score={:.1}",
-                    naked_option_strategy_name(*kind),
-                    best.short.symbol,
-                    best.credit,
-                    best.short.delta_abs,
-                    metrics.breakeven_pop * 100.0,
-                    metrics.probability_of_touch_est * 100.0,
-                    metrics.distance_to_breakeven_pct * 100.0,
-                    metrics.expected_move_coverage,
-                    best.estimated_buying_power_requirement,
-                    format_optional_pct(best.buying_power_usage_pct),
-                    best.return_on_buying_power * 100.0,
-                    best.score,
-                );
-            } else {
-                println!(
-                    "{underlying}: candidate strategy={} short={} credit={:.2} delta={:.2} bpr=${:.0} bp_use={} rbp={:.3}% score={:.1}",
-                    naked_option_strategy_name(*kind),
-                    best.short.symbol,
-                    best.credit,
-                    best.short.delta_abs,
-                    best.estimated_buying_power_requirement,
-                    format_optional_pct(best.buying_power_usage_pct),
-                    best.return_on_buying_power * 100.0,
-                    best.score,
-                );
+                candidates.consider_candidate(SelectedOptionsEntry::IronCondor(
+                    SelectedIronCondorEntry {
+                        underlying: underlying.clone(),
+                        candidate: best.clone(),
+                    },
+                ));
             }
-            emit_operator_event(
-                "scanner_diagnostic",
+
+            if let (Some(kind), AlpacaOptionsStrategyScannerConfig::Debit(scanner)) =
+                (debit_kind_from_family(profile.family), &profile.scanner)
+            {
+                let result = match kind {
+                    DebitSpreadKind::Call => {
+                        scan_call_debit_underlying(client, data_config, scanner, underlying).await?
+                    }
+                    DebitSpreadKind::Put => {
+                        scan_put_debit_underlying(client, data_config, scanner, underlying).await?
+                    }
+                };
+                let strategy_name = debit_spread_strategy_name(kind);
+                let scanner_reason = result.candidates.is_empty().then(|| {
+                    no_candidate_reason(
+                        result.contract_count,
+                        result.snapshot_count,
+                        result.scoreable_count,
+                    )
+                });
+                record_scanner_ledger_result(
+                config,
+                trade_date,
                 json!({
                     "underlying": underlying,
-                    "strategy": naked_option_strategy_name(*kind),
-                    "result": "candidate",
-                    "short_symbol": &best.short.symbol,
-                    "credit": best.credit,
-                    "delta_abs": best.short.delta_abs,
-                    "dte": best.short.dte,
-                    "strike": best.short.strike,
-                    "spread_pct": best.short.spread_pct,
-                    "bid_size": best.short.bid_size,
-                    "ask_size": best.short.ask_size,
-                    "volume": best.short.volume,
-                    "open_interest": best.short.open_interest,
-                    "implied_volatility": best.short.implied_volatility,
-                    "account_options_buying_power": options_buying_power,
-                    "capital_requirement_model": best.capital_requirement_model.as_str(),
-                    "estimated_buying_power_requirement": best.estimated_buying_power_requirement,
-                    "buying_power_usage_pct": best.buying_power_usage_pct,
-                    "return_on_buying_power": best.return_on_buying_power,
-                    "annualized_premium_yield": annualized_premium_yield(
-                        best.credit,
-                        best.short.strike,
-                        best.short.dte,
-                    ),
-                    "underlying_price": metrics.map(|metrics| metrics.underlying_price),
-                    "breakeven": metrics.map(|metrics| metrics.breakeven),
-                    "strike_itm_probability": metrics.map(|metrics| metrics.strike_itm_probability),
-                    "delta_pop_proxy": metrics.map(|metrics| metrics.delta_pop_proxy),
-                    "breakeven_pop": metrics.map(|metrics| metrics.breakeven_pop),
-                    "probability_of_touch_est": metrics.map(|metrics| metrics.probability_of_touch_est),
-                    "expected_move": metrics.map(|metrics| metrics.expected_move),
-                    "expected_move_pct": metrics.map(|metrics| metrics.expected_move_pct),
-                    "distance_to_strike_pct": metrics.map(|metrics| metrics.distance_to_strike_pct),
-                    "distance_to_breakeven_pct": metrics.map(|metrics| metrics.distance_to_breakeven_pct),
-                    "expected_move_coverage": metrics.map(|metrics| metrics.expected_move_coverage),
-                    "model_delta_abs": metrics.map(|metrics| metrics.model_delta_abs),
-                    "model_gamma": metrics.map(|metrics| metrics.model_gamma),
-                    "model_theta": metrics.map(|metrics| metrics.model_theta),
-                    "model_vega": metrics.map(|metrics| metrics.model_vega),
-                    "score": best.score,
+                    "strategy": strategy_name,
+                    "result": if result.candidates.is_empty() { "no_candidate" } else { "candidate" },
+                    "reason": scanner_reason,
+                    "contracts": result.contract_count,
+                    "snapshots": result.snapshot_count,
+                    "scoreable": result.scoreable_count,
                     "rejections": &result.rejection_counts,
+                    "profile_id": &profile.id,
+                    "profile_mode": profile.mode.as_str(),
                 }),
-            );
+            )
+            .await;
+                record_debit_candidate_ledger(
+                    config,
+                    trade_date,
+                    underlying,
+                    strategy_name,
+                    &result.candidates,
+                )
+                .await;
+                candidates.push_scan(OptionsScanReport::new(
+                    underlying,
+                    strategy_name,
+                    result.candidates.len(),
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                    result.rejection_counts.clone(),
+                ));
+                let Some(best) = result.candidates.first() else {
+                    let reason = no_candidate_reason(
+                        result.contract_count,
+                        result.snapshot_count,
+                        result.scoreable_count,
+                    );
+                    println!(
+                        "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={} rejections={}",
+                        debit_spread_strategy_name(kind),
+                        reason,
+                        result.contract_count,
+                        result.snapshot_count,
+                        result.scoreable_count,
+                        format_rejection_counts(&result.rejection_counts),
+                    );
+                    emit_operator_event(
+                        "scanner_diagnostic",
+                        json!({
+                            "underlying": underlying,
+                            "strategy": debit_spread_strategy_name(kind),
+                            "result": "no_candidate",
+                            "reason": reason,
+                            "contracts": result.contract_count,
+                            "snapshots": result.snapshot_count,
+                            "scoreable": result.scoreable_count,
+                            "rejections": &result.rejection_counts,
+                            "profile_id": &profile.id,
+                            "profile_mode": profile.mode.as_str(),
+                        }),
+                    );
+                    continue;
+                };
 
-            candidates.consider_candidate(SelectedOptionsEntry::NakedOption(
-                SelectedNakedOptionEntry {
+                println!(
+                    "{underlying}: candidate strategy={} long={} short={} debit={:.2} rtr={:.1}% score={:.1}",
+                    debit_spread_strategy_name(kind),
+                    best.long.symbol,
+                    best.short.symbol,
+                    best.debit,
+                    best.reward_to_risk * 100.0,
+                    best.score,
+                );
+                emit_operator_event(
+                    "scanner_diagnostic",
+                    json!({
+                        "underlying": underlying,
+                        "strategy": debit_spread_strategy_name(kind),
+                        "result": "candidate",
+                        "long_symbol": &best.long.symbol,
+                        "short_symbol": &best.short.symbol,
+                        "debit": best.debit,
+                        "reward_to_risk": best.reward_to_risk,
+                        "score": best.score,
+                        "rejections": &result.rejection_counts,
+                        "profile_id": &profile.id,
+                        "profile_mode": profile.mode.as_str(),
+                    }),
+                );
+
+                candidates.consider_candidate(SelectedOptionsEntry::Debit(SelectedDebitEntry {
                     underlying: underlying.clone(),
-                    kind: *kind,
+                    kind,
                     candidate: best.clone(),
-                },
-            ));
+                }));
+            }
+
+            if let (Some(kind), AlpacaOptionsStrategyScannerConfig::Naked(scanner)) =
+                (naked_kind_from_family(profile.family), &profile.scanner)
+            {
+                let result = scan_naked_option_underlying_with_capital(
+                    client,
+                    data_config,
+                    scanner,
+                    underlying,
+                    kind,
+                    Some(NakedOptionCapitalContext {
+                        options_buying_power,
+                        quantity: profile.quantity,
+                    }),
+                )
+                .await?;
+                let strategy_name = naked_option_strategy_name(kind);
+                let scanner_reason = result.candidates.is_empty().then(|| {
+                    no_candidate_reason(
+                        result.contract_count,
+                        result.snapshot_count,
+                        result.scoreable_count,
+                    )
+                });
+                record_scanner_ledger_result(
+                config,
+                trade_date,
+                json!({
+                    "underlying": underlying,
+                    "strategy": strategy_name,
+                    "result": if result.candidates.is_empty() { "no_candidate" } else { "candidate" },
+                    "reason": scanner_reason,
+                    "contracts": result.contract_count,
+                    "snapshots": result.snapshot_count,
+                    "scoreable": result.scoreable_count,
+                    "rejections": &result.rejection_counts,
+                    "profile_id": &profile.id,
+                    "profile_mode": profile.mode.as_str(),
+                }),
+            )
+            .await;
+                record_naked_candidate_ledger(
+                    config,
+                    trade_date,
+                    underlying,
+                    strategy_name,
+                    options_buying_power,
+                    &result.candidates,
+                )
+                .await;
+                candidates.push_scan(OptionsScanReport::new(
+                    underlying,
+                    strategy_name,
+                    result.candidates.len(),
+                    result.contract_count,
+                    result.snapshot_count,
+                    result.scoreable_count,
+                    result.rejection_counts.clone(),
+                ));
+                let Some(best) = result.candidates.first() else {
+                    let reason = no_candidate_reason(
+                        result.contract_count,
+                        result.snapshot_count,
+                        result.scoreable_count,
+                    );
+                    println!(
+                        "{underlying}: no_candidate strategy={} reason={} contracts={} snapshots={} scoreable={} rejections={}",
+                        naked_option_strategy_name(kind),
+                        reason,
+                        result.contract_count,
+                        result.snapshot_count,
+                        result.scoreable_count,
+                        format_rejection_counts(&result.rejection_counts),
+                    );
+                    emit_operator_event(
+                        "scanner_diagnostic",
+                        json!({
+                            "underlying": underlying,
+                            "strategy": naked_option_strategy_name(kind),
+                            "result": "no_candidate",
+                            "reason": reason,
+                            "contracts": result.contract_count,
+                            "snapshots": result.snapshot_count,
+                            "scoreable": result.scoreable_count,
+                            "rejections": &result.rejection_counts,
+                            "profile_id": &profile.id,
+                            "profile_mode": profile.mode.as_str(),
+                        }),
+                    );
+                    continue;
+                };
+
+                let metrics = best.short.metrics.as_ref();
+                if let Some(metrics) = metrics {
+                    println!(
+                        "{underlying}: candidate strategy={} short={} credit={:.2} delta={:.2} pop={:.1}% touch={:.1}% be_dist={:.1}% em_cov={:.2} bpr=${:.0} bp_use={} rbp={:.3}% score={:.1}",
+                        naked_option_strategy_name(kind),
+                        best.short.symbol,
+                        best.credit,
+                        best.short.delta_abs,
+                        metrics.breakeven_pop * 100.0,
+                        metrics.probability_of_touch_est * 100.0,
+                        metrics.distance_to_breakeven_pct * 100.0,
+                        metrics.expected_move_coverage,
+                        best.estimated_buying_power_requirement,
+                        format_optional_pct(best.buying_power_usage_pct),
+                        best.return_on_buying_power * 100.0,
+                        best.score,
+                    );
+                } else {
+                    println!(
+                        "{underlying}: candidate strategy={} short={} credit={:.2} delta={:.2} bpr=${:.0} bp_use={} rbp={:.3}% score={:.1}",
+                        naked_option_strategy_name(kind),
+                        best.short.symbol,
+                        best.credit,
+                        best.short.delta_abs,
+                        best.estimated_buying_power_requirement,
+                        format_optional_pct(best.buying_power_usage_pct),
+                        best.return_on_buying_power * 100.0,
+                        best.score,
+                    );
+                }
+                emit_operator_event(
+                    "scanner_diagnostic",
+                    json!({
+                        "underlying": underlying,
+                        "strategy": naked_option_strategy_name(kind),
+                        "result": "candidate",
+                        "short_symbol": &best.short.symbol,
+                        "credit": best.credit,
+                        "delta_abs": best.short.delta_abs,
+                        "dte": best.short.dte,
+                        "strike": best.short.strike,
+                        "spread_pct": best.short.spread_pct,
+                        "bid_size": best.short.bid_size,
+                        "ask_size": best.short.ask_size,
+                        "volume": best.short.volume,
+                        "open_interest": best.short.open_interest,
+                        "implied_volatility": best.short.implied_volatility,
+                        "account_options_buying_power": options_buying_power,
+                        "capital_requirement_model": best.capital_requirement_model.as_str(),
+                        "estimated_buying_power_requirement": best.estimated_buying_power_requirement,
+                        "buying_power_usage_pct": best.buying_power_usage_pct,
+                        "return_on_buying_power": best.return_on_buying_power,
+                        "annualized_premium_yield": annualized_premium_yield(
+                            best.credit,
+                            best.short.strike,
+                            best.short.dte,
+                        ),
+                        "underlying_price": metrics.map(|metrics| metrics.underlying_price),
+                        "breakeven": metrics.map(|metrics| metrics.breakeven),
+                        "strike_itm_probability": metrics.map(|metrics| metrics.strike_itm_probability),
+                        "delta_pop_proxy": metrics.map(|metrics| metrics.delta_pop_proxy),
+                        "breakeven_pop": metrics.map(|metrics| metrics.breakeven_pop),
+                        "probability_of_touch_est": metrics.map(|metrics| metrics.probability_of_touch_est),
+                        "expected_move": metrics.map(|metrics| metrics.expected_move),
+                        "expected_move_pct": metrics.map(|metrics| metrics.expected_move_pct),
+                        "distance_to_strike_pct": metrics.map(|metrics| metrics.distance_to_strike_pct),
+                        "distance_to_breakeven_pct": metrics.map(|metrics| metrics.distance_to_breakeven_pct),
+                        "expected_move_coverage": metrics.map(|metrics| metrics.expected_move_coverage),
+                        "model_delta_abs": metrics.map(|metrics| metrics.model_delta_abs),
+                        "model_gamma": metrics.map(|metrics| metrics.model_gamma),
+                        "model_theta": metrics.map(|metrics| metrics.model_theta),
+                        "model_vega": metrics.map(|metrics| metrics.model_vega),
+                        "score": best.score,
+                        "rejections": &result.rejection_counts,
+                        "profile_id": &profile.id,
+                        "profile_mode": profile.mode.as_str(),
+                    }),
+                );
+
+                candidates.consider_candidate(SelectedOptionsEntry::NakedOption(
+                    SelectedNakedOptionEntry {
+                        underlying: underlying.clone(),
+                        kind,
+                        candidate: best.clone(),
+                    },
+                ));
+            }
         }
     }
 
     Ok(candidates)
+}
+
+fn credit_kind_from_family(family: AlpacaOptionsStrategyFamily) -> Option<CreditSpreadKind> {
+    match family {
+        AlpacaOptionsStrategyFamily::PutCredit => Some(CreditSpreadKind::Put),
+        AlpacaOptionsStrategyFamily::CallCredit => Some(CreditSpreadKind::Call),
+        _ => None,
+    }
+}
+
+fn debit_kind_from_family(family: AlpacaOptionsStrategyFamily) -> Option<DebitSpreadKind> {
+    match family {
+        AlpacaOptionsStrategyFamily::PutDebit => Some(DebitSpreadKind::Put),
+        AlpacaOptionsStrategyFamily::CallDebit => Some(DebitSpreadKind::Call),
+        _ => None,
+    }
+}
+
+fn naked_kind_from_family(family: AlpacaOptionsStrategyFamily) -> Option<NakedOptionKind> {
+    match family {
+        AlpacaOptionsStrategyFamily::NakedPut => Some(NakedOptionKind::Put),
+        AlpacaOptionsStrategyFamily::NakedCall => Some(NakedOptionKind::Call),
+        AlpacaOptionsStrategyFamily::NakedPutOneToThreeDte => {
+            Some(NakedOptionKind::PutOneToThreeDte)
+        }
+        AlpacaOptionsStrategyFamily::NakedCallOneToThreeDte => {
+            Some(NakedOptionKind::CallOneToThreeDte)
+        }
+        _ => None,
+    }
 }

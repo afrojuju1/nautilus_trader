@@ -5,19 +5,33 @@
 extends = "../base-options.toml"
 
 [runtime]
-strategy_families = ["put_credit", "call_credit"]
-dry_run_families = ["put_credit", "call_credit"]
 open_orders = false
 close_orders = true
 state_path = "/home/ade/.local/state/nautilus_trader/alpaca/paper-directional/strategy_state.json"
 
+[[strategies]]
+id = "put_credit_spy_watch"
+family = "put_credit"
+mode = "dry_run"
+underlyings = ["SPY"]
+quantity = 1
+
+[strategies.scanner]
+min_return_on_risk = 0.16
+
+[[strategies]]
+id = "call_credit_qqq_watch"
+family = "call_credit"
+mode = "dry_run"
+underlyings = ["QQQ"]
+quantity = 1
+
+[strategies.scanner]
+min_return_on_risk = 0.16
+
 [universe]
-underlyings = ["SPY", "QQQ"]
 entry_start = "09:45"
 entry_end = "10:15"
-
-[scanner]
-min_return_on_risk = 0.16
 
 [management]
 profit_target_close_fraction = 0.50

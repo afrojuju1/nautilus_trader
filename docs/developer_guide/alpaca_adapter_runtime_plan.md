@@ -138,8 +138,8 @@ Initial Phase 3 runner:
   admission checks, enforces daily duplicate-entry state, selects one candidate, and can submit a
   Nautilus `SubmitOrderList` through the Alpaca execution client when
   TOML `runtime.open_orders = true` or `ALPACA_OPEN_ORDERS=true`.
-- The same runner can scan Phase 7A `call_credit` candidates by setting
-  `ALPACA_STRATEGY_FAMILIES=call` or scan both vertical-credit directions with `both`.
+- The same runner can scan Phase 7A `call_credit` candidates by adding an explicit
+  `[[strategies]]` block with `family = "call_credit"` in `ALPACA_CONFIG_PATH`.
 - The runner evaluates stale entry cancellation and close triggers from persisted state. Broker
   close/reduce-risk actions are disabled unless TOML `runtime.close_orders = true` or
   `ALPACA_CLOSE_ORDERS=true`.

@@ -21,7 +21,11 @@ use crate::{
     fleet::load_fleet_config_from_env, options_management::CloseOrderMode, runtime::StrategyState,
 };
 
-use super::AlpacaOptionsRuntimeConfig;
+use super::{
+    AlpacaOptionsRuntimeConfig, AlpacaOptionsStrategyFamily, AlpacaOptionsStrategyMode,
+    AlpacaOptionsStrategyProfile, AlpacaOptionsStrategyRiskOverrides,
+    AlpacaOptionsStrategyScannerConfig,
+};
 
 #[derive(Clone, Debug)]
 struct StrategyFamilyConfig {
@@ -36,6 +40,7 @@ struct StrategyFamilyConfig {
 pub(super) struct RuntimeConfigFile {
     extends: Option<PathBuf>,
     runtime: RuntimeSection,
+    strategies: Vec<StrategyBlockSection>,
     universe: UniverseSection,
     scanner: ScannerSection,
     iron_condor: IronCondorSection,
@@ -53,6 +58,7 @@ impl RuntimeConfigFile {
         Self {
             extends: None,
             runtime: self.runtime.merge_parent(parent.runtime),
+            strategies: merge_vec(self.strategies, parent.strategies),
             universe: self.universe.merge_parent(parent.universe),
             scanner: self.scanner.merge_parent(parent.scanner),
             iron_condor: self.iron_condor.merge_parent(parent.iron_condor),
@@ -72,8 +78,6 @@ impl RuntimeConfigFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RuntimeSection {
-    strategy_families: Vec<String>,
-    dry_run_families: Vec<String>,
     max_iterations: Option<u64>,
     interval_secs: Option<u64>,
     open_orders: Option<bool>,
@@ -89,8 +93,6 @@ struct RuntimeSection {
 impl RuntimeSection {
     fn merge_parent(self, parent: Self) -> Self {
         Self {
-            strategy_families: merge_vec(self.strategy_families, parent.strategy_families),
-            dry_run_families: merge_vec(self.dry_run_families, parent.dry_run_families),
             max_iterations: self.max_iterations.or(parent.max_iterations),
             interval_secs: self.interval_secs.or(parent.interval_secs),
             open_orders: self.open_orders.or(parent.open_orders),
@@ -107,6 +109,63 @@ impl RuntimeSection {
                 .or(parent.candidate_ledger_max_candidates),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StrategyBlockSection {
+    id: Option<String>,
+    family: Option<String>,
+    mode: Option<String>,
+    underlyings: Vec<String>,
+    quantity: Option<u64>,
+    scanner: StrategyScannerSection,
+    risk: StrategyRiskOverrideSection,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StrategyScannerSection {
+    min_dte: Option<i64>,
+    max_dte: Option<i64>,
+    short_delta_min: Option<f64>,
+    short_delta_max: Option<f64>,
+    long_delta_min: Option<f64>,
+    long_delta_max: Option<f64>,
+    widths: Option<Vec<f64>>,
+    min_open_interest: Option<u64>,
+    max_leg_spread_pct: Option<f64>,
+    min_return_on_risk: Option<f64>,
+    min_credit_to_width: Option<f64>,
+    wing_min_return_on_risk: Option<f64>,
+    require_equal_widths: Option<bool>,
+    max_debit_to_width: Option<f64>,
+    min_debit_to_width: Option<f64>,
+    min_reward_to_risk: Option<f64>,
+    max_spread_pct: Option<f64>,
+    min_credit: Option<f64>,
+    min_bid_size: Option<u64>,
+    min_ask_size: Option<u64>,
+    min_daily_volume: Option<u64>,
+    min_implied_volatility: Option<f64>,
+    max_implied_volatility: Option<f64>,
+    min_annualized_premium_yield: Option<f64>,
+    max_buying_power_usage_pct: Option<f64>,
+    min_return_on_buying_power: Option<f64>,
+    min_breakeven_pop: Option<f64>,
+    max_probability_of_touch: Option<f64>,
+    min_distance_to_breakeven_pct: Option<f64>,
+    min_expected_move_coverage: Option<f64>,
+    min_score: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StrategyRiskOverrideSection {
+    max_active_entries: Option<usize>,
+    max_daily_submits: Option<usize>,
+    max_active_entries_per_underlying: Option<usize>,
+    max_single_entry_risk_capital_usd: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -523,30 +582,36 @@ pub(super) fn build_options_runtime_config(
     cli_underlyings: Vec<String>,
 ) -> anyhow::Result<AlpacaOptionsRuntimeConfig> {
     reject_retired_order_capability_env_vars()?;
-    let strategy_values = env::var("ALPACA_STRATEGY_FAMILIES")
-        .ok()
-        .map(|value| split_strings([value]))
-        .filter(|values| !values.is_empty())
-        .unwrap_or_else(|| {
-            if file.runtime.strategy_families.is_empty() {
-                vec!["put".to_string()]
-            } else {
-                file.runtime.strategy_families.clone()
-            }
-        });
-    let strategy_config = strategy_family_config_from_values(strategy_values)?;
-    let dry_run_strategy_values = env::var("ALPACA_DRY_RUN_FAMILIES")
-        .ok()
-        .map(|value| split_strings([value]))
-        .filter(|values| !values.is_empty())
-        .unwrap_or_else(|| file.runtime.dry_run_families.clone());
-    let dry_run_strategy_config =
-        dry_run_strategy_family_config_from_values(dry_run_strategy_values)?;
+    reject_retired_strategy_composition_env_vars()?;
     let scanner = scanner_config_from_file(&file.scanner);
+    let iron_condor_scanner = iron_condor_scanner_config_from_file(&scanner, &file.iron_condor);
+    let debit_scanner = debit_scanner_config_from_file(&file.debit_scanner);
+    let naked_scanner = naked_scanner_config_from_file(&file.naked_scanner);
+    let naked_1_3dte_scanner = naked_1_3dte_scanner_config_from_file(&file.naked_1_3dte_scanner);
     let stale_entry_secs = file.management.stale_entry_secs.unwrap_or(900);
     let interval_secs = env_parse("ALPACA_INTERVAL_SECS")
         .or(file.runtime.interval_secs)
         .unwrap_or(300);
+    let underlyings = underlyings_from_sources(cli_underlyings, &file.universe);
+    let default_quantity = file.universe.quantity.unwrap_or(1);
+    anyhow::ensure!(
+        default_quantity > 0,
+        "Alpaca strategy quantity must be positive"
+    );
+    let strategy_profiles = strategy_profiles_from_file(
+        file.strategies,
+        &underlyings,
+        default_quantity,
+        &scanner,
+        &iron_condor_scanner,
+        &debit_scanner,
+        &naked_scanner,
+        &naked_1_3dte_scanner,
+    )?;
+    let quantity = uniform_strategy_profile_quantity(&strategy_profiles)?;
+    let strategy_config = strategy_family_config_from_profiles(&strategy_profiles);
+    let dry_run_strategy_config = dry_run_strategy_family_config_from_profiles(&strategy_profiles);
+    let profile_underlyings = underlyings_from_profiles(&strategy_profiles);
     let event_shock_earnings_events = load_event_shock_earnings_events(&file.event_shock)?;
     let close_price_cushion = env_parse("ALPACA_CLOSE_PRICE_CUSHION")
         .or(file.management.close_price_cushion)
@@ -554,7 +619,8 @@ pub(super) fn build_options_runtime_config(
         .max(0.0);
     let fleet = load_fleet_config_from_env()?;
     let mut config = AlpacaOptionsRuntimeConfig {
-        underlyings: underlyings_from_sources(cli_underlyings, &file.universe),
+        underlyings: profile_underlyings,
+        strategy_profiles,
         spread_kinds: strategy_config.credit_kinds,
         iron_condor_enabled: strategy_config.iron_condor_enabled,
         debit_kinds: strategy_config.debit_kinds,
@@ -597,9 +663,7 @@ pub(super) fn build_options_runtime_config(
             .or(file.runtime.max_iterations)
             .unwrap_or(1),
         interval_secs,
-        quantity: env_parse("ALPACA_QTY")
-            .or(file.universe.quantity)
-            .unwrap_or(1),
+        quantity,
         open_orders_enabled: env_bool("ALPACA_OPEN_ORDERS")
             .or(file.runtime.open_orders)
             .unwrap_or(false),
@@ -680,10 +744,10 @@ pub(super) fn build_options_runtime_config(
             .unwrap_or_else(default_state_path),
         candidate_ledger_enabled: file.runtime.candidate_ledger_enabled.unwrap_or(true),
         candidate_ledger_max_candidates: file.runtime.candidate_ledger_max_candidates.unwrap_or(10),
-        iron_condor_scanner: iron_condor_scanner_config_from_file(&scanner, &file.iron_condor),
-        debit_scanner: debit_scanner_config_from_file(&file.debit_scanner),
-        naked_scanner: naked_scanner_config_from_file(&file.naked_scanner),
-        naked_1_3dte_scanner: naked_1_3dte_scanner_config_from_file(&file.naked_1_3dte_scanner),
+        iron_condor_scanner,
+        debit_scanner,
+        naked_scanner,
+        naked_1_3dte_scanner,
         scanner,
         fleet,
         fleet_account_id: None,
@@ -697,90 +761,355 @@ pub(super) fn build_options_runtime_config(
     Ok(config)
 }
 
-fn strategy_family_config_from_values(values: Vec<String>) -> anyhow::Result<StrategyFamilyConfig> {
+fn strategy_profiles_from_file(
+    strategies: Vec<StrategyBlockSection>,
+    default_underlyings: &[String],
+    default_quantity: u64,
+    credit_scanner: &PutCreditScannerConfig,
+    iron_condor_scanner: &IronCondorScannerConfig,
+    debit_scanner: &DebitSpreadScannerConfig,
+    naked_scanner: &NakedOptionScannerConfig,
+    naked_1_3dte_scanner: &NakedOptionScannerConfig,
+) -> anyhow::Result<Vec<AlpacaOptionsStrategyProfile>> {
+    let strategies = if strategies.is_empty() {
+        vec![StrategyBlockSection {
+            id: Some("put_credit_default".to_string()),
+            family: Some("put_credit".to_string()),
+            mode: Some("live".to_string()),
+            underlyings: default_underlyings.to_vec(),
+            quantity: Some(default_quantity),
+            scanner: StrategyScannerSection::default(),
+            risk: StrategyRiskOverrideSection::default(),
+        }]
+    } else {
+        strategies
+    };
+
+    let mut profiles = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
+    let mut family_underlyings = std::collections::BTreeSet::new();
+    for strategy in strategies {
+        let id = strategy
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .ok_or_else(|| anyhow::anyhow!("every [[strategies]] block requires a non-empty id"))?;
+        anyhow::ensure!(
+            ids.insert(id.clone()),
+            "duplicate Alpaca strategy profile id {id}"
+        );
+        let family = strategy
+            .family
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Alpaca strategy profile {id} requires a family field"))?
+            .parse::<AlpacaOptionsStrategyFamily>()
+            .map_err(|error| anyhow::anyhow!("{error} in profile {id}"))?;
+        let mode = strategy
+            .mode
+            .as_deref()
+            .unwrap_or(AlpacaOptionsStrategyMode::Live.as_str())
+            .parse::<AlpacaOptionsStrategyMode>()
+            .map_err(|error| anyhow::anyhow!("{error} in profile {id}"))?;
+        let underlyings = split_strings(strategy.underlyings)
+            .into_iter()
+            .map(|value| value.to_ascii_uppercase())
+            .collect::<Vec<_>>();
+        let underlyings = if underlyings.is_empty() {
+            default_underlyings.to_vec()
+        } else {
+            underlyings
+        };
+        anyhow::ensure!(
+            !underlyings.is_empty(),
+            "Alpaca strategy profile {id} resolved no underlyings"
+        );
+        let quantity = strategy.quantity.unwrap_or(default_quantity);
+        anyhow::ensure!(
+            quantity > 0,
+            "Alpaca strategy profile {id} quantity must be positive"
+        );
+        for underlying in &underlyings {
+            let key = (family, underlying.clone());
+            anyhow::ensure!(
+                family_underlyings.insert(key),
+                "duplicate Alpaca strategy profile for family {} and underlying {}",
+                family.as_str(),
+                underlying
+            );
+        }
+        let scanner = strategy_scanner_config(
+            family,
+            strategy.scanner,
+            credit_scanner,
+            iron_condor_scanner,
+            debit_scanner,
+            naked_scanner,
+            naked_1_3dte_scanner,
+        );
+        let risk = AlpacaOptionsStrategyRiskOverrides {
+            max_active_entries: strategy.risk.max_active_entries,
+            max_daily_submits: strategy.risk.max_daily_submits,
+            max_active_entries_per_underlying: strategy.risk.max_active_entries_per_underlying,
+            max_single_entry_risk_capital_usd: strategy.risk.max_single_entry_risk_capital_usd,
+        };
+        profiles.push(AlpacaOptionsStrategyProfile {
+            id,
+            family,
+            mode,
+            underlyings,
+            quantity,
+            scanner,
+            risk,
+        });
+    }
+
+    Ok(profiles)
+}
+
+fn strategy_scanner_config(
+    family: AlpacaOptionsStrategyFamily,
+    scanner: StrategyScannerSection,
+    credit_scanner: &PutCreditScannerConfig,
+    iron_condor_scanner: &IronCondorScannerConfig,
+    debit_scanner: &DebitSpreadScannerConfig,
+    naked_scanner: &NakedOptionScannerConfig,
+    naked_1_3dte_scanner: &NakedOptionScannerConfig,
+) -> AlpacaOptionsStrategyScannerConfig {
+    match family {
+        AlpacaOptionsStrategyFamily::PutCredit | AlpacaOptionsStrategyFamily::CallCredit => {
+            AlpacaOptionsStrategyScannerConfig::Credit(apply_credit_scanner_overrides(
+                credit_scanner.clone(),
+                &scanner,
+            ))
+        }
+        AlpacaOptionsStrategyFamily::IronCondor => AlpacaOptionsStrategyScannerConfig::IronCondor(
+            apply_iron_condor_overrides(iron_condor_scanner.clone(), &scanner),
+        ),
+        AlpacaOptionsStrategyFamily::PutDebit | AlpacaOptionsStrategyFamily::CallDebit => {
+            AlpacaOptionsStrategyScannerConfig::Debit(apply_debit_scanner_overrides(
+                debit_scanner.clone(),
+                &scanner,
+            ))
+        }
+        AlpacaOptionsStrategyFamily::NakedPut | AlpacaOptionsStrategyFamily::NakedCall => {
+            AlpacaOptionsStrategyScannerConfig::Naked(apply_naked_scanner_overrides(
+                naked_scanner.clone(),
+                &scanner,
+            ))
+        }
+        AlpacaOptionsStrategyFamily::NakedPutOneToThreeDte
+        | AlpacaOptionsStrategyFamily::NakedCallOneToThreeDte => {
+            AlpacaOptionsStrategyScannerConfig::Naked(apply_naked_scanner_overrides(
+                naked_1_3dte_scanner.clone(),
+                &scanner,
+            ))
+        }
+    }
+}
+
+fn apply_credit_scanner_overrides(
+    mut config: PutCreditScannerConfig,
+    overrides: &StrategyScannerSection,
+) -> PutCreditScannerConfig {
+    if let Some(value) = overrides.min_dte {
+        config.min_dte = value;
+    }
+    if let Some(value) = overrides.max_dte {
+        config.max_dte = value;
+    }
+    if let Some(value) = overrides.short_delta_min {
+        config.short_delta_min = value;
+    }
+    if let Some(value) = overrides.short_delta_max {
+        config.short_delta_max = value;
+    }
+    if let Some(value) = overrides.widths.clone() {
+        config.widths = value;
+    }
+    if let Some(value) = overrides.min_open_interest {
+        config.min_open_interest = value;
+    }
+    if let Some(value) = overrides.max_leg_spread_pct {
+        config.max_leg_spread_pct = value;
+    }
+    if let Some(value) = overrides.min_return_on_risk {
+        config.min_return_on_risk = value;
+    }
+    if let Some(value) = overrides.min_credit_to_width {
+        config.min_credit_to_width = value;
+    }
+    config
+}
+
+fn apply_iron_condor_overrides(
+    mut config: IronCondorScannerConfig,
+    overrides: &StrategyScannerSection,
+) -> IronCondorScannerConfig {
+    if let Some(value) = overrides.min_dte {
+        config.credit.min_dte = value;
+    }
+    if let Some(value) = overrides.max_dte {
+        config.credit.max_dte = value;
+    }
+    if let Some(value) = overrides.short_delta_min {
+        config.credit.short_delta_min = value;
+    }
+    if let Some(value) = overrides.short_delta_max {
+        config.credit.short_delta_max = value;
+    }
+    if let Some(value) = overrides.widths.clone() {
+        config.credit.widths = value;
+    }
+    if let Some(value) = overrides.min_open_interest {
+        config.credit.min_open_interest = value;
+    }
+    if let Some(value) = overrides.max_leg_spread_pct {
+        config.credit.max_leg_spread_pct = value;
+    }
+    if let Some(value) = overrides.min_return_on_risk {
+        config.min_return_on_risk = value;
+    }
+    if let Some(value) = overrides.wing_min_return_on_risk {
+        config.credit.min_return_on_risk = value;
+    }
+    if let Some(value) = overrides.require_equal_widths {
+        config.require_equal_widths = value;
+    }
+    config
+}
+
+fn apply_debit_scanner_overrides(
+    mut config: DebitSpreadScannerConfig,
+    overrides: &StrategyScannerSection,
+) -> DebitSpreadScannerConfig {
+    if let Some(value) = overrides.min_dte {
+        config.min_dte = value;
+    }
+    if let Some(value) = overrides.max_dte {
+        config.max_dte = value;
+    }
+    if let Some(value) = overrides.long_delta_min {
+        config.long_delta_min = value;
+    }
+    if let Some(value) = overrides.long_delta_max {
+        config.long_delta_max = value;
+    }
+    if let Some(value) = overrides.widths.clone() {
+        config.widths = value;
+    }
+    if let Some(value) = overrides.min_open_interest {
+        config.min_open_interest = value;
+    }
+    if let Some(value) = overrides.max_leg_spread_pct {
+        config.max_leg_spread_pct = value;
+    }
+    if let Some(value) = overrides.max_debit_to_width {
+        config.max_debit_to_width = value;
+    }
+    if let Some(value) = overrides.min_debit_to_width {
+        config.min_debit_to_width = value;
+    }
+    if let Some(value) = overrides.min_reward_to_risk {
+        config.min_reward_to_risk = value;
+    }
+    config
+}
+
+fn apply_naked_scanner_overrides(
+    mut config: NakedOptionScannerConfig,
+    overrides: &StrategyScannerSection,
+) -> NakedOptionScannerConfig {
+    if let Some(value) = overrides.min_dte {
+        config.min_dte = value;
+    }
+    if let Some(value) = overrides.max_dte {
+        config.max_dte = value;
+    }
+    if let Some(value) = overrides.short_delta_min {
+        config.short_delta_min = value;
+    }
+    if let Some(value) = overrides.short_delta_max {
+        config.short_delta_max = value;
+    }
+    if let Some(value) = overrides.min_open_interest {
+        config.min_open_interest = value;
+    }
+    if let Some(value) = overrides.max_spread_pct {
+        config.max_spread_pct = value;
+    }
+    if let Some(value) = overrides.min_credit {
+        config.min_credit = value;
+    }
+    if let Some(value) = overrides.min_bid_size {
+        config.min_bid_size = value;
+    }
+    if let Some(value) = overrides.min_ask_size {
+        config.min_ask_size = value;
+    }
+    if let Some(value) = overrides.min_daily_volume {
+        config.min_daily_volume = value;
+    }
+    if let Some(value) = overrides.min_implied_volatility {
+        config.min_implied_volatility = value;
+    }
+    if let Some(value) = overrides.max_implied_volatility {
+        config.max_implied_volatility = value;
+    }
+    if let Some(value) = overrides.min_annualized_premium_yield {
+        config.min_annualized_premium_yield = value;
+    }
+    if let Some(value) = overrides.max_buying_power_usage_pct {
+        config.max_buying_power_usage_pct = value;
+    }
+    if let Some(value) = overrides.min_return_on_buying_power {
+        config.min_return_on_buying_power = value;
+    }
+    if let Some(value) = overrides.min_breakeven_pop {
+        config.min_breakeven_pop = value;
+    }
+    if let Some(value) = overrides.max_probability_of_touch {
+        config.max_probability_of_touch = value;
+    }
+    if let Some(value) = overrides.min_distance_to_breakeven_pct {
+        config.min_distance_to_breakeven_pct = value;
+    }
+    if let Some(value) = overrides.min_expected_move_coverage {
+        config.min_expected_move_coverage = value;
+    }
+    if let Some(value) = overrides.min_score {
+        config.min_score = value;
+    }
+    config
+}
+
+fn strategy_family_config_from_profiles(
+    profiles: &[AlpacaOptionsStrategyProfile],
+) -> StrategyFamilyConfig {
     let mut kinds = Vec::new();
     let mut iron_condor_enabled = false;
     let mut debit_kinds = Vec::new();
     let mut naked_kinds = Vec::new();
-    for raw in values
-        .into_iter()
-        .flat_map(|value| split_strings([value]))
-        .map(|value| value.to_ascii_lowercase())
-    {
-        match raw.as_str() {
-            "put" | "put_credit" => {
-                kinds.push(CreditSpreadKind::Put);
-            }
-            "call" | "call_credit" => {
-                kinds.push(CreditSpreadKind::Call);
-            }
-            "both" => {
-                kinds.push(CreditSpreadKind::Put);
-                kinds.push(CreditSpreadKind::Call);
-            }
-            "all" => {
-                kinds.push(CreditSpreadKind::Put);
-                kinds.push(CreditSpreadKind::Call);
-                iron_condor_enabled = true;
-            }
-            "iron_condor" | "condor" => {
-                iron_condor_enabled = true;
-            }
-            "call_debit" | "earnings_call_debit_entry" => {
-                debit_kinds.push(DebitSpreadKind::Call);
-            }
-            "put_debit" | "earnings_put_debit_entry" => {
-                debit_kinds.push(DebitSpreadKind::Put);
-            }
-            "debit" | "long_premium" | "directional" => {
-                debit_kinds.push(DebitSpreadKind::Call);
-                debit_kinds.push(DebitSpreadKind::Put);
-            }
-            "naked_call" | "short_call" => {
-                naked_kinds.push(NakedOptionKind::Call);
-            }
-            "naked_put" | "short_put" => {
-                naked_kinds.push(NakedOptionKind::Put);
-            }
-            "naked_call_1_3dte" | "short_call_1_3dte" => {
-                naked_kinds.push(NakedOptionKind::CallOneToThreeDte);
-            }
-            "naked_put_1_3dte" | "short_put_1_3dte" => {
+
+    for profile in profiles {
+        match profile.family {
+            AlpacaOptionsStrategyFamily::PutCredit => kinds.push(CreditSpreadKind::Put),
+            AlpacaOptionsStrategyFamily::CallCredit => kinds.push(CreditSpreadKind::Call),
+            AlpacaOptionsStrategyFamily::IronCondor => iron_condor_enabled = true,
+            AlpacaOptionsStrategyFamily::PutDebit => debit_kinds.push(DebitSpreadKind::Put),
+            AlpacaOptionsStrategyFamily::CallDebit => debit_kinds.push(DebitSpreadKind::Call),
+            AlpacaOptionsStrategyFamily::NakedPut => naked_kinds.push(NakedOptionKind::Put),
+            AlpacaOptionsStrategyFamily::NakedCall => naked_kinds.push(NakedOptionKind::Call),
+            AlpacaOptionsStrategyFamily::NakedPutOneToThreeDte => {
                 naked_kinds.push(NakedOptionKind::PutOneToThreeDte);
             }
-            "naked_1_3dte" | "undefined_risk_1_3dte" | "short_premium_1_3dte" => {
+            AlpacaOptionsStrategyFamily::NakedCallOneToThreeDte => {
                 naked_kinds.push(NakedOptionKind::CallOneToThreeDte);
-                naked_kinds.push(NakedOptionKind::PutOneToThreeDte);
             }
-            "naked" | "undefined_risk" | "short_premium_undefined" => {
-                naked_kinds.push(NakedOptionKind::Call);
-                naked_kinds.push(NakedOptionKind::Put);
-            }
-            other => anyhow::bail!("unsupported Alpaca strategy family value {other}"),
         }
     }
-    if kinds.is_empty() && !iron_condor_enabled && debit_kinds.is_empty() && naked_kinds.is_empty()
-    {
-        kinds.push(CreditSpreadKind::Put);
-    }
-    kinds.sort_by_key(|kind| match kind {
-        CreditSpreadKind::Put => 0,
-        CreditSpreadKind::Call => 1,
-    });
-    kinds.dedup();
-    debit_kinds.sort_by_key(|kind| match kind {
-        DebitSpreadKind::Call => 0,
-        DebitSpreadKind::Put => 1,
-    });
-    debit_kinds.dedup();
-    naked_kinds.sort_by_key(|kind| match kind {
-        NakedOptionKind::Call => 0,
-        NakedOptionKind::Put => 1,
-        NakedOptionKind::CallOneToThreeDte => 2,
-        NakedOptionKind::PutOneToThreeDte => 3,
-    });
-    naked_kinds.dedup();
-    Ok(StrategyFamilyConfig {
+    dedup_strategy_family_config(StrategyFamilyConfig {
         credit_kinds: kinds,
         iron_condor_enabled,
         debit_kinds,
@@ -788,18 +1117,72 @@ fn strategy_family_config_from_values(values: Vec<String>) -> anyhow::Result<Str
     })
 }
 
-fn dry_run_strategy_family_config_from_values(
-    values: Vec<String>,
-) -> anyhow::Result<StrategyFamilyConfig> {
-    if values.is_empty() {
-        return Ok(StrategyFamilyConfig {
-            credit_kinds: Vec::new(),
-            iron_condor_enabled: false,
-            debit_kinds: Vec::new(),
-            naked_kinds: Vec::new(),
-        });
+fn dry_run_strategy_family_config_from_profiles(
+    profiles: &[AlpacaOptionsStrategyProfile],
+) -> StrategyFamilyConfig {
+    strategy_family_config_from_profiles(
+        &profiles
+            .iter()
+            .filter(|profile| profile.is_dry_run())
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn dedup_strategy_family_config(mut config: StrategyFamilyConfig) -> StrategyFamilyConfig {
+    let kinds = &mut config.credit_kinds;
+    kinds.sort_by_key(|kind| match kind {
+        CreditSpreadKind::Put => 0,
+        CreditSpreadKind::Call => 1,
+    });
+    kinds.dedup();
+    config.debit_kinds.sort_by_key(|kind| match kind {
+        DebitSpreadKind::Call => 0,
+        DebitSpreadKind::Put => 1,
+    });
+    config.debit_kinds.dedup();
+    config.naked_kinds.sort_by_key(|kind| match kind {
+        NakedOptionKind::Call => 0,
+        NakedOptionKind::Put => 1,
+        NakedOptionKind::CallOneToThreeDte => 2,
+        NakedOptionKind::PutOneToThreeDte => 3,
+    });
+    config.naked_kinds.dedup();
+    config
+}
+
+fn underlyings_from_profiles(profiles: &[AlpacaOptionsStrategyProfile]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    profiles
+        .iter()
+        .flat_map(|profile| profile.underlyings.iter())
+        .filter_map(|underlying| {
+            if seen.insert(underlying.clone()) {
+                Some(underlying.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn uniform_strategy_profile_quantity(
+    profiles: &[AlpacaOptionsStrategyProfile],
+) -> anyhow::Result<u64> {
+    let Some(first) = profiles.first() else {
+        return Ok(1);
+    };
+    let quantity = first.quantity;
+    for profile in profiles.iter().skip(1) {
+        anyhow::ensure!(
+            profile.quantity == quantity,
+            "Alpaca strategy profiles must use one shared quantity until profile-scoped order sizing is wired; profile {} has quantity {}, expected {}",
+            profile.id,
+            profile.quantity,
+            quantity
+        );
     }
-    strategy_family_config_from_values(values)
+    Ok(quantity)
 }
 
 fn apply_fleet_policy(config: &mut AlpacaOptionsRuntimeConfig) {
@@ -1251,6 +1634,25 @@ fn reject_retired_order_capability_env_vars() -> anyhow::Result<()> {
     );
 }
 
+fn reject_retired_strategy_composition_env_vars() -> anyhow::Result<()> {
+    let present = [
+        "ALPACA_STRATEGY_FAMILIES",
+        "ALPACA_DRY_RUN_FAMILIES",
+        "ALPACA_QTY",
+    ]
+    .into_iter()
+    .filter(|name| env::var_os(name).is_some())
+    .collect::<Vec<_>>();
+    if present.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "retired Alpaca strategy composition env vars are set: {}; configure [[strategies]] blocks in ALPACA_CONFIG_PATH instead",
+        present.join(", ")
+    );
+}
+
 fn env_parse<T>(name: &str) -> Option<T>
 where
     T: FromStr,
@@ -1309,8 +1711,13 @@ GLD = "metals"
 extends = "base.toml"
 
 [runtime]
-strategy_families = ["naked_put"]
 candidate_ledger_max_candidates = 20
+
+[[strategies]]
+id = "naked_put_watch"
+family = "naked_put"
+mode = "dry_run"
+underlyings = ["GLD"]
 
 [naked_scanner]
 max_buying_power_usage_pct = 0.03
@@ -1328,7 +1735,10 @@ GDX = "metals"
         let merged = child.merge_parent(parent);
 
         assert!(merged.extends.is_none());
-        assert_eq!(merged.runtime.strategy_families, vec!["naked_put"]);
+        assert_eq!(merged.strategies.len(), 1);
+        assert_eq!(merged.strategies[0].id.as_deref(), Some("naked_put_watch"));
+        assert_eq!(merged.strategies[0].family.as_deref(), Some("naked_put"));
+        assert_eq!(merged.strategies[0].mode.as_deref(), Some("dry_run"));
         assert_eq!(merged.runtime.max_iterations, Some(0));
         assert_eq!(merged.runtime.candidate_ledger_enabled, Some(true));
         assert_eq!(merged.runtime.candidate_ledger_max_candidates, Some(20));
@@ -1361,14 +1771,33 @@ GDX = "metals"
         let config = parse_runtime_config(
             r#"
 [runtime]
-strategy_families = ["put", "iron_condor"]
-dry_run_families = ["iron_condor"]
 max_iterations = 0
 open_orders = false
 close_orders = true
 state_path = "/tmp/alpaca-state.json"
 candidate_ledger_enabled = true
 candidate_ledger_max_candidates = 7
+
+[[strategies]]
+id = "put_credit_spy"
+family = "put_credit"
+mode = "live"
+underlyings = ["SPY"]
+quantity = 2
+
+[[strategies]]
+id = "iron_condor_qqq_watch"
+family = "iron_condor"
+mode = "dry_run"
+underlyings = ["QQQ"]
+quantity = 2
+
+[strategies.scanner]
+min_return_on_risk = 0.21
+
+[strategies.risk]
+max_active_entries = 1
+max_daily_submits = 1
 
 [universe]
 underlyings = ["SPY", "QQQ"]
@@ -1488,8 +1917,20 @@ block_days_after_earnings = 2
         )
         .unwrap();
 
-        assert_eq!(config.runtime.strategy_families, vec!["put", "iron_condor"]);
-        assert_eq!(config.runtime.dry_run_families, vec!["iron_condor"]);
+        assert_eq!(config.strategies.len(), 2);
+        assert_eq!(config.strategies[0].id.as_deref(), Some("put_credit_spy"));
+        assert_eq!(config.strategies[0].family.as_deref(), Some("put_credit"));
+        assert_eq!(config.strategies[0].mode.as_deref(), Some("live"));
+        assert_eq!(config.strategies[0].underlyings, vec!["SPY"]);
+        assert_eq!(
+            config.strategies[1].id.as_deref(),
+            Some("iron_condor_qqq_watch")
+        );
+        assert_eq!(config.strategies[1].family.as_deref(), Some("iron_condor"));
+        assert_eq!(config.strategies[1].mode.as_deref(), Some("dry_run"));
+        assert_eq!(config.strategies[1].scanner.min_return_on_risk, Some(0.21));
+        assert_eq!(config.strategies[1].risk.max_active_entries, Some(1));
+        assert_eq!(config.strategies[1].risk.max_daily_submits, Some(1));
         assert_eq!(config.runtime.open_orders, Some(false));
         assert_eq!(config.runtime.close_orders, Some(true));
         assert_eq!(config.runtime.candidate_ledger_enabled, Some(true));
@@ -1574,9 +2015,25 @@ block_days_after_earnings = 2
     }
 
     #[test]
-    fn strategy_config_accepts_combined_four_leg_strategy() {
-        let config =
-            strategy_family_config_from_values(vec!["both,iron_condor".to_string()]).unwrap();
+    fn profile_strategy_config_accepts_defined_risk_strategies() {
+        let profiles = resolved_test_profiles(
+            r#"
+[[strategies]]
+id = "put"
+family = "put_credit"
+
+[[strategies]]
+id = "call"
+family = "call_credit"
+
+[[strategies]]
+id = "condor"
+family = "iron_condor"
+mode = "dry_run"
+"#,
+        );
+        let config = strategy_family_config_from_profiles(&profiles);
+        let dry_run = dry_run_strategy_family_config_from_profiles(&profiles);
 
         assert_eq!(
             config.credit_kinds,
@@ -1585,12 +2042,24 @@ block_days_after_earnings = 2
         assert!(config.iron_condor_enabled);
         assert!(config.debit_kinds.is_empty());
         assert!(config.naked_kinds.is_empty());
+        assert!(dry_run.credit_kinds.is_empty());
+        assert!(dry_run.iron_condor_enabled);
     }
 
     #[test]
-    fn strategy_config_accepts_debit_strategies() {
-        let config =
-            strategy_family_config_from_values(vec!["call_debit,put_debit".to_string()]).unwrap();
+    fn profile_strategy_config_accepts_debit_strategies() {
+        let profiles = resolved_test_profiles(
+            r#"
+[[strategies]]
+id = "call_debit"
+family = "call_debit"
+
+[[strategies]]
+id = "put_debit"
+family = "put_debit"
+"#,
+        );
+        let config = strategy_family_config_from_profiles(&profiles);
 
         assert!(config.credit_kinds.is_empty());
         assert!(!config.iron_condor_enabled);
@@ -1602,11 +2071,27 @@ block_days_after_earnings = 2
     }
 
     #[test]
-    fn strategy_config_accepts_naked_strategies() {
-        let config = strategy_family_config_from_values(vec![
-            "naked_call,naked_put,naked_call_1_3dte,naked_put_1_3dte".to_string(),
-        ])
-        .unwrap();
+    fn profile_strategy_config_accepts_naked_strategies() {
+        let profiles = resolved_test_profiles(
+            r#"
+[[strategies]]
+id = "naked_call"
+family = "naked_call"
+
+[[strategies]]
+id = "naked_put"
+family = "naked_put"
+
+[[strategies]]
+id = "naked_call_1_3dte"
+family = "naked_call_1_3dte"
+
+[[strategies]]
+id = "naked_put_1_3dte"
+family = "naked_put_1_3dte"
+"#,
+        );
+        let config = strategy_family_config_from_profiles(&profiles);
 
         assert!(config.credit_kinds.is_empty());
         assert!(!config.iron_condor_enabled);
@@ -1623,18 +2108,54 @@ block_days_after_earnings = 2
     }
 
     #[test]
-    fn dry_run_strategy_config_has_no_default_strategy() {
-        let config = dry_run_strategy_family_config_from_values(Vec::new()).unwrap();
+    fn profile_strategy_config_has_no_default_dry_run_strategy() {
+        let profiles = resolved_test_profiles(
+            r#"
+[[strategies]]
+id = "put"
+family = "put_credit"
+"#,
+        );
+        let config = dry_run_strategy_family_config_from_profiles(&profiles);
 
         assert!(config.credit_kinds.is_empty());
         assert!(!config.iron_condor_enabled);
         assert!(config.debit_kinds.is_empty());
         assert!(config.naked_kinds.is_empty());
 
-        let config = dry_run_strategy_family_config_from_values(vec!["put".to_string()]).unwrap();
+        let profiles = resolved_test_profiles(
+            r#"
+[[strategies]]
+id = "put"
+family = "put_credit"
+mode = "dry_run"
+"#,
+        );
+        let config = dry_run_strategy_family_config_from_profiles(&profiles);
         assert_eq!(config.credit_kinds, vec![CreditSpreadKind::Put]);
         assert!(!config.iron_condor_enabled);
         assert!(config.debit_kinds.is_empty());
         assert!(config.naked_kinds.is_empty());
+    }
+
+    fn resolved_test_profiles(raw: &str) -> Vec<AlpacaOptionsStrategyProfile> {
+        let file = parse_runtime_config(raw).unwrap();
+        let scanner = scanner_config_from_file(&file.scanner);
+        let iron_condor_scanner = iron_condor_scanner_config_from_file(&scanner, &file.iron_condor);
+        let debit_scanner = debit_scanner_config_from_file(&file.debit_scanner);
+        let naked_scanner = naked_scanner_config_from_file(&file.naked_scanner);
+        let naked_1_3dte_scanner =
+            naked_1_3dte_scanner_config_from_file(&file.naked_1_3dte_scanner);
+        strategy_profiles_from_file(
+            file.strategies,
+            &["SPY".to_string()],
+            1,
+            &scanner,
+            &iron_condor_scanner,
+            &debit_scanner,
+            &naked_scanner,
+            &naked_1_3dte_scanner,
+        )
+        .unwrap()
     }
 }
