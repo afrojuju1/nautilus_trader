@@ -8,11 +8,15 @@ use nautilus_trading::options::{
     },
 };
 
-use crate::options_runtime::OptionsCandidateSet;
+use crate::options_runtime::{
+    AlpacaOptionsCandidateProfile, OptionsCandidateSet, ProfiledOptionsEntry,
+};
 
 /// Pure account-strategy entry plan produced from scanner-selected candidates.
 #[derive(Clone, Debug)]
 pub struct AlpacaOptionsEntryPlan {
+    /// Originating scanner profile, when the plan came from scanner candidate data.
+    pub profile: Option<AlpacaOptionsCandidateProfile>,
     /// Selected strategy-family candidate.
     pub entry: SelectedOptionsEntry,
     /// Stable family metadata.
@@ -37,16 +41,25 @@ impl AlpacaOptionsEntryPlan {
     fn from_entry(entry: SelectedOptionsEntry, family: AlpacaOptionsEntryFamily) -> Self {
         let descriptor = entry.descriptor();
         let order_legs = planned_order_legs(&entry);
-        Self::from_parts(entry, family, descriptor, order_legs)
+        Self::from_parts(None, entry, family, descriptor, order_legs)
+    }
+
+    fn from_profiled_entry(entry: ProfiledOptionsEntry, family: AlpacaOptionsEntryFamily) -> Self {
+        let descriptor = entry.descriptor();
+        let order_legs = planned_order_legs(entry.selected_entry());
+        let ProfiledOptionsEntry { profile, entry } = entry;
+        Self::from_parts(Some(profile), entry, family, descriptor, order_legs)
     }
 
     fn from_parts(
+        profile: Option<AlpacaOptionsCandidateProfile>,
         entry: SelectedOptionsEntry,
         family: AlpacaOptionsEntryFamily,
         descriptor: OptionEntryDescriptor,
         order_legs: Vec<AlpacaOptionsEntryPlanLeg>,
     ) -> Self {
         Self {
+            profile,
             entry,
             family,
             underlying: descriptor.underlying,
@@ -145,7 +158,7 @@ pub struct AlpacaOptionsEntryPlanLeg {
 /// Plans the selected candidate from a scanner candidate set.
 #[must_use]
 pub fn plan_selected_candidate(candidates: &OptionsCandidateSet) -> Option<AlpacaOptionsEntryPlan> {
-    plan_selected_entry(candidates.selected_entry()?.clone())
+    plan_profiled_selected_entry(candidates.selected_entry()?.clone())
 }
 
 /// Plans one selected entry without reading account state or submitting orders.
@@ -170,6 +183,32 @@ pub fn plan_selected_entry(entry: SelectedOptionsEntry) -> Option<AlpacaOptionsE
     }
 }
 
+/// Plans one profiled selected entry without reading account state or submitting orders.
+#[must_use]
+pub fn plan_profiled_selected_entry(entry: ProfiledOptionsEntry) -> Option<AlpacaOptionsEntryPlan> {
+    match entry.selected_entry() {
+        SelectedOptionsEntry::Credit(selected) => match selected.kind {
+            CreditSpreadKind::Put => Some(put_credit::plan_profiled(entry)),
+            CreditSpreadKind::Call => Some(call_credit::plan_profiled(entry)),
+        },
+        SelectedOptionsEntry::IronCondor(_) => Some(iron_condor::plan_profiled(entry)),
+        SelectedOptionsEntry::Debit(selected) => match selected.kind {
+            DebitSpreadKind::Put => Some(put_debit::plan_profiled(entry)),
+            DebitSpreadKind::Call => Some(call_debit::plan_profiled(entry)),
+        },
+        SelectedOptionsEntry::NakedOption(selected) => match selected.kind {
+            NakedOptionKind::Put => Some(naked_option::plan_put_profiled(entry)),
+            NakedOptionKind::Call => Some(naked_option::plan_call_profiled(entry)),
+            NakedOptionKind::PutOneToThreeDte => {
+                Some(naked_option::plan_put_1_3dte_profiled(entry))
+            }
+            NakedOptionKind::CallOneToThreeDte => {
+                Some(naked_option::plan_call_1_3dte_profiled(entry))
+            }
+        },
+    }
+}
+
 /// Pure put-credit planner.
 pub mod put_credit {
     use super::*;
@@ -181,6 +220,12 @@ pub mod put_credit {
             SelectedOptionsEntry::Credit(entry),
             AlpacaOptionsEntryFamily::PutCredit,
         )
+    }
+
+    /// Plans a profiled put-credit selected entry.
+    #[must_use]
+    pub fn plan_profiled(entry: ProfiledOptionsEntry) -> AlpacaOptionsEntryPlan {
+        AlpacaOptionsEntryPlan::from_profiled_entry(entry, AlpacaOptionsEntryFamily::PutCredit)
     }
 }
 
@@ -196,6 +241,12 @@ pub mod call_credit {
             AlpacaOptionsEntryFamily::CallCredit,
         )
     }
+
+    /// Plans a profiled call-credit selected entry.
+    #[must_use]
+    pub fn plan_profiled(entry: ProfiledOptionsEntry) -> AlpacaOptionsEntryPlan {
+        AlpacaOptionsEntryPlan::from_profiled_entry(entry, AlpacaOptionsEntryFamily::CallCredit)
+    }
 }
 
 /// Pure iron-condor planner.
@@ -209,6 +260,12 @@ pub mod iron_condor {
             SelectedOptionsEntry::IronCondor(entry),
             AlpacaOptionsEntryFamily::IronCondor,
         )
+    }
+
+    /// Plans a profiled iron-condor selected entry.
+    #[must_use]
+    pub fn plan_profiled(entry: ProfiledOptionsEntry) -> AlpacaOptionsEntryPlan {
+        AlpacaOptionsEntryPlan::from_profiled_entry(entry, AlpacaOptionsEntryFamily::IronCondor)
     }
 }
 
@@ -224,6 +281,12 @@ pub mod put_debit {
             AlpacaOptionsEntryFamily::PutDebit,
         )
     }
+
+    /// Plans a profiled put-debit selected entry.
+    #[must_use]
+    pub fn plan_profiled(entry: ProfiledOptionsEntry) -> AlpacaOptionsEntryPlan {
+        AlpacaOptionsEntryPlan::from_profiled_entry(entry, AlpacaOptionsEntryFamily::PutDebit)
+    }
 }
 
 /// Pure call-debit planner.
@@ -237,6 +300,12 @@ pub mod call_debit {
             SelectedOptionsEntry::Debit(entry),
             AlpacaOptionsEntryFamily::CallDebit,
         )
+    }
+
+    /// Plans a profiled call-debit selected entry.
+    #[must_use]
+    pub fn plan_profiled(entry: ProfiledOptionsEntry) -> AlpacaOptionsEntryPlan {
+        AlpacaOptionsEntryPlan::from_profiled_entry(entry, AlpacaOptionsEntryFamily::CallDebit)
     }
 }
 
@@ -253,6 +322,12 @@ pub mod naked_option {
         )
     }
 
+    /// Plans a profiled naked short-put selected entry.
+    #[must_use]
+    pub fn plan_put_profiled(entry: ProfiledOptionsEntry) -> AlpacaOptionsEntryPlan {
+        AlpacaOptionsEntryPlan::from_profiled_entry(entry, AlpacaOptionsEntryFamily::NakedPut)
+    }
+
     /// Plans a naked short-call selected entry.
     #[must_use]
     pub fn plan_call(entry: SelectedNakedOptionEntry) -> AlpacaOptionsEntryPlan {
@@ -260,6 +335,12 @@ pub mod naked_option {
             SelectedOptionsEntry::NakedOption(entry),
             AlpacaOptionsEntryFamily::NakedCall,
         )
+    }
+
+    /// Plans a profiled naked short-call selected entry.
+    #[must_use]
+    pub fn plan_call_profiled(entry: ProfiledOptionsEntry) -> AlpacaOptionsEntryPlan {
+        AlpacaOptionsEntryPlan::from_profiled_entry(entry, AlpacaOptionsEntryFamily::NakedCall)
     }
 
     /// Plans a 1-3 DTE naked short-put selected entry.
@@ -271,11 +352,29 @@ pub mod naked_option {
         )
     }
 
+    /// Plans a profiled 1-3 DTE naked short-put selected entry.
+    #[must_use]
+    pub fn plan_put_1_3dte_profiled(entry: ProfiledOptionsEntry) -> AlpacaOptionsEntryPlan {
+        AlpacaOptionsEntryPlan::from_profiled_entry(
+            entry,
+            AlpacaOptionsEntryFamily::NakedPutOneToThreeDte,
+        )
+    }
+
     /// Plans a 1-3 DTE naked short-call selected entry.
     #[must_use]
     pub fn plan_call_1_3dte(entry: SelectedNakedOptionEntry) -> AlpacaOptionsEntryPlan {
         AlpacaOptionsEntryPlan::from_entry(
             SelectedOptionsEntry::NakedOption(entry),
+            AlpacaOptionsEntryFamily::NakedCallOneToThreeDte,
+        )
+    }
+
+    /// Plans a profiled 1-3 DTE naked short-call selected entry.
+    #[must_use]
+    pub fn plan_call_1_3dte_profiled(entry: ProfiledOptionsEntry) -> AlpacaOptionsEntryPlan {
+        AlpacaOptionsEntryPlan::from_profiled_entry(
+            entry,
             AlpacaOptionsEntryFamily::NakedCallOneToThreeDte,
         )
     }

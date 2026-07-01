@@ -56,8 +56,8 @@ use crate::{
         close_reprice_cooldown_remaining_secs, emit_management_snapshot, management_instrument_ids,
     },
     options_runtime::{
-        AlpacaOptionsRuntimeConfig, OptionsCandidateSet, OptionsScanOutcome, OptionsScanReport,
-        SelectedOptionsEntry,
+        AlpacaOptionsCandidateProfile, AlpacaOptionsRuntimeConfig, OptionsCandidateSet,
+        OptionsScanOutcome, OptionsScanReport, ProfiledOptionsEntry, SelectedOptionsEntry,
     },
     runtime::{StrategyState, StrategyStateEntry, StrategyStateEntryDraft, emit_operator_event},
     spread_plan::{
@@ -365,6 +365,7 @@ impl AlpacaOptionsAccountStrategy {
                 self.record_selected_candidate_alert(
                     &data.candidates.trade_date,
                     entry,
+                    entry_plan.profile.as_ref(),
                     "skipped",
                     None,
                     Some("outside_entry_window"),
@@ -403,6 +404,7 @@ impl AlpacaOptionsAccountStrategy {
             self.record_selected_candidate_alert(
                 &data.candidates.trade_date,
                 entry,
+                entry_plan.profile.as_ref(),
                 "dry_run",
                 None,
                 Some("regime_dry_run_only"),
@@ -444,6 +446,7 @@ impl AlpacaOptionsAccountStrategy {
             self.record_selected_candidate_alert(
                 &data.candidates.trade_date,
                 entry,
+                entry_plan.profile.as_ref(),
                 "dry_run",
                 None,
                 Some("open_orders_disabled"),
@@ -461,11 +464,21 @@ impl AlpacaOptionsAccountStrategy {
         }
 
         if let Some(block) = self.lifecycle_submission_block(entry) {
-            self.log_entry_block(&data.candidates.trade_date, entry, &block, regime_context);
+            self.log_entry_block(
+                &data.candidates.trade_date,
+                &entry_plan,
+                &block,
+                regime_context,
+            );
             return Ok(None);
         }
         if let Some(block) = self.selected_entry_quote_freshness_block(entry) {
-            self.log_entry_block(&data.candidates.trade_date, entry, &block, regime_context);
+            self.log_entry_block(
+                &data.candidates.trade_date,
+                &entry_plan,
+                &block,
+                regime_context,
+            );
             return Ok(None);
         }
 
@@ -517,6 +530,7 @@ impl AlpacaOptionsAccountStrategy {
             self.record_selected_candidate_alert(
                 &data.candidates.trade_date,
                 entry,
+                entry_plan.profile.as_ref(),
                 "skipped",
                 None,
                 Some("state_persistence_unhealthy"),
@@ -536,7 +550,12 @@ impl AlpacaOptionsAccountStrategy {
             &data.candidates.trade_date,
             &snapshot,
         ) {
-            self.log_entry_block(&data.candidates.trade_date, entry, &block, regime_context);
+            self.log_entry_block(
+                &data.candidates.trade_date,
+                &entry_plan,
+                &block,
+                regime_context,
+            );
             return Ok(None);
         }
 
@@ -568,6 +587,7 @@ impl AlpacaOptionsAccountStrategy {
             self.record_selected_candidate_alert(
                 &data.candidates.trade_date,
                 entry,
+                entry_plan.profile.as_ref(),
                 "skipped",
                 None,
                 Some("duplicate_pending_submission"),
@@ -680,6 +700,7 @@ impl AlpacaOptionsAccountStrategy {
         self.record_selected_candidate_alert(
             trade_date,
             &entry_plan.entry,
+            entry_plan.profile.as_ref(),
             "submitted",
             Some(order_list_id),
             None,
@@ -1390,7 +1411,7 @@ impl AlpacaOptionsAccountStrategy {
             .ranked_entries()
             .iter()
             .take(limit)
-            .filter_map(|entry| match selected_entry_spread_plan(entry, ts_init) {
+            .filter_map(|entry| match selected_entry_spread_plan(entry.selected_entry(), ts_init) {
                 Ok(Some(plan)) => Some(plan),
                 Ok(None) => None,
                 Err(error) => {
@@ -2331,10 +2352,11 @@ impl AlpacaOptionsAccountStrategy {
     fn log_entry_block(
         &mut self,
         trade_date: &str,
-        entry: &SelectedOptionsEntry,
+        entry_plan: &AlpacaOptionsEntryPlan,
         block: &SubmissionBlock,
         regime_context: Option<&RegimeContext>,
     ) {
+        let entry = &entry_plan.entry;
         log::info!(
             "Skipping Alpaca options entry: trade_date={} reason={} current={:?} limit={:?} details={:?} underlying={} strategy={} symbols={}",
             trade_date,
@@ -2355,14 +2377,20 @@ impl AlpacaOptionsAccountStrategy {
             "details": block.details.clone(),
             "underlying": entry.underlying(),
             "strategy": entry.strategy_name(),
+            "strategy_family": entry_plan.family.as_str(),
             "symbols": entry.option_symbols(),
+            "planned_order_legs": entry_plan_payload_legs(entry_plan),
             "score": entry.score(),
         });
+        if let Some(profile) = entry_plan.profile.as_ref() {
+            profile.insert_json_fields(&mut payload);
+        }
         insert_regime_context(&mut payload, regime_context);
         emit_operator_event("entry_decision", payload);
         self.record_selected_candidate_alert(
             trade_date,
             entry,
+            entry_plan.profile.as_ref(),
             "selected_but_blocked",
             None,
             Some(&block.reason),
@@ -2378,6 +2406,7 @@ impl AlpacaOptionsAccountStrategy {
         &mut self,
         trade_date: &str,
         entry: &SelectedOptionsEntry,
+        profile: Option<&AlpacaOptionsCandidateProfile>,
         action: &str,
         order_list_id: Option<&str>,
         reason: Option<&str>,
@@ -2397,6 +2426,9 @@ impl AlpacaOptionsAccountStrategy {
             order_list_id,
             self.config.quantity,
         );
+        if let Some(profile) = profile {
+            profile.insert_json_fields(&mut payload);
+        }
         let alert_key = candidate_alert_key(SELECTED_CANDIDATE_ALERT, &identity_key);
         if !self
             .recorded_candidate_alert_keys
@@ -2650,7 +2682,7 @@ fn candidate_quote_instrument_ids(
         .ranked_entries()
         .iter()
         .take(limit)
-        .flat_map(SelectedOptionsEntry::option_symbols)
+        .flat_map(ProfiledOptionsEntry::option_symbols)
         .filter_map(|symbol| alpaca_instrument_id(symbol).ok())
         .collect()
 }
@@ -3589,7 +3621,7 @@ fn age_secs_from_rfc3339(value: &str) -> Option<u64> {
 }
 
 fn scan_report_payload(report: &OptionsScanReport) -> serde_json::Value {
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "underlying": report.underlying,
         "strategy": report.strategy,
         "outcome": match report.outcome {
@@ -3602,12 +3634,14 @@ fn scan_report_payload(report: &OptionsScanReport) -> serde_json::Value {
         "snapshots": report.snapshot_count,
         "scoreable": report.scoreable_count,
         "rejections": report.rejection_counts,
-    })
+    });
+    report.profile.insert_json_fields(&mut payload);
+    payload
 }
 
-fn selected_entry_payload(entry: &SelectedOptionsEntry) -> serde_json::Value {
+fn selected_entry_payload(entry: &ProfiledOptionsEntry) -> serde_json::Value {
     let descriptor = entry.descriptor();
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "strategy": descriptor.strategy,
         "underlying": descriptor.underlying,
         "candidate_type": descriptor.candidate_type,
@@ -3615,5 +3649,7 @@ fn selected_entry_payload(entry: &SelectedOptionsEntry) -> serde_json::Value {
         "score": descriptor.score,
         "premium_kind": descriptor.premium_kind.as_str(),
         "premium": descriptor.premium,
-    })
+    });
+    entry.insert_profile_json_fields(&mut payload);
+    payload
 }

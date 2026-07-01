@@ -417,6 +417,40 @@ impl AlpacaOptionsStrategyProfile {
 }
 
 impl AlpacaOptionsStrategyRiskOverrides {
+    /// Returns whether this profile carries any local risk override.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.max_active_entries.is_none()
+            && self.max_daily_submits.is_none()
+            && self.max_active_entries_per_underlying.is_none()
+            && self.max_single_entry_risk_capital_usd.is_none()
+    }
+
+    /// Returns profile-local risk overrides as compact operator JSON.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        let mut fields = Map::new();
+        if let Some(value) = self.max_active_entries {
+            fields.insert("max_active_entries".to_string(), json!(value));
+        }
+        if let Some(value) = self.max_daily_submits {
+            fields.insert("max_daily_submits".to_string(), json!(value));
+        }
+        if let Some(value) = self.max_active_entries_per_underlying {
+            fields.insert(
+                "max_active_entries_per_underlying".to_string(),
+                json!(value),
+            );
+        }
+        if let Some(value) = self.max_single_entry_risk_capital_usd {
+            fields.insert(
+                "max_single_entry_risk_capital_usd".to_string(),
+                json!(value),
+            );
+        }
+        Value::Object(fields)
+    }
+
     fn summary(&self) -> String {
         let mut parts = Vec::new();
         if let Some(value) = self.max_active_entries {
@@ -432,6 +466,155 @@ impl AlpacaOptionsStrategyRiskOverrides {
             parts.push(format!("max_single_entry_risk_capital_usd={value:.2}"));
         }
         parts.join("|")
+    }
+}
+
+/// Profile context carried with Alpaca scanner-selected candidates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlpacaOptionsCandidateProfile {
+    /// Stable profile identifier.
+    pub id: String,
+    /// Strategy family scanned by this profile.
+    pub family: AlpacaOptionsStrategyFamily,
+    /// Opening-order mode for this profile.
+    pub mode: AlpacaOptionsStrategyMode,
+    /// Contract quantity configured for this profile.
+    pub quantity: u64,
+    /// Profile-local risk overrides.
+    pub risk: AlpacaOptionsStrategyRiskOverrides,
+}
+
+impl AlpacaOptionsCandidateProfile {
+    /// Builds candidate profile metadata from a resolved strategy profile.
+    #[must_use]
+    pub fn from_strategy_profile(profile: &AlpacaOptionsStrategyProfile) -> Self {
+        Self {
+            id: profile.id.clone(),
+            family: profile.family,
+            mode: profile.mode,
+            quantity: profile.quantity,
+            risk: profile.risk.clone(),
+        }
+    }
+
+    /// Builds profile metadata for legacy diagnostic paths that have no resolved profile.
+    #[must_use]
+    pub fn synthetic(
+        id: impl Into<String>,
+        family: AlpacaOptionsStrategyFamily,
+        quantity: u64,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            family,
+            mode: AlpacaOptionsStrategyMode::Live,
+            quantity: quantity.max(1),
+            risk: AlpacaOptionsStrategyRiskOverrides::default(),
+        }
+    }
+
+    /// Inserts profile fields into an operator JSON payload.
+    pub fn insert_json_fields(&self, payload: &mut Value) {
+        let Value::Object(fields) = payload else {
+            return;
+        };
+        fields.insert("profile_id".to_string(), json!(self.id));
+        fields.insert("profile_family".to_string(), json!(self.family.as_str()));
+        fields.insert("profile_mode".to_string(), json!(self.mode.as_str()));
+        fields.insert("profile_quantity".to_string(), json!(self.quantity));
+        if !self.risk.is_empty() {
+            fields.insert("profile_risk".to_string(), self.risk.to_json_value());
+        }
+    }
+
+    /// Returns profile fields as compact operator JSON.
+    #[must_use]
+    pub fn to_json_value(&self) -> Value {
+        let mut payload = json!({});
+        self.insert_json_fields(&mut payload);
+        payload
+    }
+}
+
+/// Alpaca-owned wrapper for a selected option entry and its originating profile.
+#[derive(Clone, Debug)]
+pub struct ProfiledOptionsEntry {
+    /// Profile that produced this candidate.
+    pub profile: AlpacaOptionsCandidateProfile,
+    /// Source-neutral selected option entry.
+    pub entry: SelectedOptionsEntry,
+}
+
+impl ProfiledOptionsEntry {
+    /// Creates a profiled selected entry.
+    #[must_use]
+    pub fn new(profile: AlpacaOptionsCandidateProfile, entry: SelectedOptionsEntry) -> Self {
+        Self { profile, entry }
+    }
+
+    /// Returns the source-neutral selected entry.
+    #[must_use]
+    pub fn selected_entry(&self) -> &SelectedOptionsEntry {
+        &self.entry
+    }
+
+    /// Consumes the wrapper and returns the source-neutral selected entry.
+    #[must_use]
+    pub fn into_selected_entry(self) -> SelectedOptionsEntry {
+        self.entry
+    }
+
+    /// Returns shared selected-entry metadata.
+    #[must_use]
+    pub fn descriptor(&self) -> OptionEntryDescriptor {
+        self.entry.descriptor()
+    }
+
+    /// Returns the scanner score.
+    #[must_use]
+    pub fn score(&self) -> f64 {
+        self.entry.score()
+    }
+
+    /// Returns the underlying symbol.
+    #[must_use]
+    pub fn underlying(&self) -> &str {
+        self.entry.underlying()
+    }
+
+    /// Returns the stable strategy family name.
+    #[must_use]
+    pub fn strategy_name(&self) -> &'static str {
+        self.entry.strategy_name()
+    }
+
+    /// Returns the candidate option symbols.
+    #[must_use]
+    pub fn option_symbols(&self) -> Vec<&str> {
+        self.entry.option_symbols()
+    }
+
+    /// Returns whether the selected entry is a single-leg naked option.
+    #[must_use]
+    pub const fn is_naked_option(&self) -> bool {
+        self.entry.is_naked_option()
+    }
+
+    /// Returns the entry premium kind.
+    #[must_use]
+    pub fn entry_premium_kind(&self) -> &'static str {
+        self.entry.entry_premium_kind()
+    }
+
+    /// Returns the entry premium per spread or option.
+    #[must_use]
+    pub fn entry_premium(&self) -> f64 {
+        self.entry.entry_premium()
+    }
+
+    /// Inserts the originating profile fields into an operator JSON payload.
+    pub fn insert_profile_json_fields(&self, payload: &mut Value) {
+        self.profile.insert_json_fields(payload);
     }
 }
 
@@ -774,6 +957,8 @@ fn non_empty_env(name: &str) -> Option<String> {
 /// Result of one configured options family scan for one underlying.
 #[derive(Clone, Debug)]
 pub struct OptionsScanReport {
+    /// Profile that produced this scan report.
+    pub profile: AlpacaOptionsCandidateProfile,
     /// Underlying symbol.
     pub underlying: String,
     /// Stable strategy name.
@@ -796,6 +981,7 @@ pub struct OptionsScanReport {
 
 impl OptionsScanReport {
     pub fn new(
+        profile: AlpacaOptionsCandidateProfile,
         underlying: &str,
         strategy: &'static str,
         candidate_count: usize,
@@ -813,6 +999,7 @@ impl OptionsScanReport {
             no_candidate_reason(contract_count, snapshot_count, scoreable_count).to_string()
         });
         Self {
+            profile,
             underlying: underlying.to_string(),
             strategy,
             outcome,
@@ -842,8 +1029,8 @@ pub struct OptionsCandidateSet {
     pub trade_date: String,
     /// Per-underlying, per-strategy scanner diagnostics.
     pub scans: Vec<OptionsScanReport>,
-    /// Ranked candidate entries across all enabled strategy families.
-    pub ranked_entries: Vec<SelectedOptionsEntry>,
+    /// Ranked candidate entries across all enabled strategy profiles.
+    pub ranked_entries: Vec<ProfiledOptionsEntry>,
 }
 
 impl OptionsCandidateSet {
@@ -859,27 +1046,27 @@ impl OptionsCandidateSet {
         self.scans.push(report);
     }
 
-    pub fn consider_candidate(&mut self, candidate: SelectedOptionsEntry) {
+    pub fn consider_candidate(&mut self, candidate: ProfiledOptionsEntry) {
         self.ranked_entries.push(candidate);
         self.ranked_entries
             .sort_by(|left, right| right.score().total_cmp(&left.score()));
     }
 
-    /// Returns the ranked entry candidates across all enabled strategy families.
+    /// Returns the ranked entry candidates across all enabled strategy profiles.
     #[must_use]
-    pub fn ranked_entries(&self) -> &[SelectedOptionsEntry] {
+    pub fn ranked_entries(&self) -> &[ProfiledOptionsEntry] {
         &self.ranked_entries
     }
 
     /// Returns the highest-scoring selected entry candidate, if any.
     #[must_use]
-    pub fn selected_entry(&self) -> Option<&SelectedOptionsEntry> {
+    pub fn selected_entry(&self) -> Option<&ProfiledOptionsEntry> {
         self.ranked_entries.first()
     }
 
     /// Consumes the candidate set and returns the selected entry candidate.
     #[must_use]
-    pub fn into_selected_entry(self) -> Option<SelectedOptionsEntry> {
+    pub fn into_selected_entry(self) -> Option<ProfiledOptionsEntry> {
         self.ranked_entries.into_iter().next()
     }
 }
@@ -900,6 +1087,7 @@ pub async fn scan_options_candidates(
     let mut candidates = OptionsCandidateSet::new(trade_date);
 
     for profile in &config.strategy_profiles {
+        let profile_context = AlpacaOptionsCandidateProfile::from_strategy_profile(profile);
         for underlying in &profile.underlyings {
             if let (Some(kind), AlpacaOptionsStrategyScannerConfig::Credit(scanner)) =
                 (credit_kind_from_family(profile.family), &profile.scanner)
@@ -947,6 +1135,7 @@ pub async fn scan_options_candidates(
                 )
                 .await;
                 candidates.push_scan(OptionsScanReport::new(
+                    profile_context.clone(),
                     underlying,
                     strategy_name,
                     result.candidates.len(),
@@ -1014,11 +1203,14 @@ pub async fn scan_options_candidates(
                     }),
                 );
 
-                candidates.consider_candidate(SelectedOptionsEntry::Credit(SelectedEntry {
-                    underlying: underlying.clone(),
-                    kind,
-                    candidate: best.clone(),
-                }));
+                candidates.consider_candidate(ProfiledOptionsEntry::new(
+                    profile_context.clone(),
+                    SelectedOptionsEntry::Credit(SelectedEntry {
+                        underlying: underlying.clone(),
+                        kind,
+                        candidate: best.clone(),
+                    }),
+                ));
             }
 
             if matches!(profile.family, AlpacaOptionsStrategyFamily::IronCondor) {
@@ -1060,6 +1252,7 @@ pub async fn scan_options_candidates(
                 )
                 .await;
                 candidates.push_scan(OptionsScanReport::new(
+                    profile_context.clone(),
                     underlying,
                     "iron_condor",
                     result.candidates.len(),
@@ -1129,11 +1322,12 @@ pub async fn scan_options_candidates(
                     }),
                 );
 
-                candidates.consider_candidate(SelectedOptionsEntry::IronCondor(
-                    SelectedIronCondorEntry {
+                candidates.consider_candidate(ProfiledOptionsEntry::new(
+                    profile_context.clone(),
+                    SelectedOptionsEntry::IronCondor(SelectedIronCondorEntry {
                         underlying: underlying.clone(),
                         candidate: best.clone(),
-                    },
+                    }),
                 ));
             }
 
@@ -1182,6 +1376,7 @@ pub async fn scan_options_candidates(
                 )
                 .await;
                 candidates.push_scan(OptionsScanReport::new(
+                    profile_context.clone(),
                     underlying,
                     strategy_name,
                     result.candidates.len(),
@@ -1249,11 +1444,14 @@ pub async fn scan_options_candidates(
                     }),
                 );
 
-                candidates.consider_candidate(SelectedOptionsEntry::Debit(SelectedDebitEntry {
-                    underlying: underlying.clone(),
-                    kind,
-                    candidate: best.clone(),
-                }));
+                candidates.consider_candidate(ProfiledOptionsEntry::new(
+                    profile_context.clone(),
+                    SelectedOptionsEntry::Debit(SelectedDebitEntry {
+                        underlying: underlying.clone(),
+                        kind,
+                        candidate: best.clone(),
+                    }),
+                ));
             }
 
             if let (Some(kind), AlpacaOptionsStrategyScannerConfig::Naked(scanner)) =
@@ -1306,6 +1504,7 @@ pub async fn scan_options_candidates(
                 )
                 .await;
                 candidates.push_scan(OptionsScanReport::new(
+                    profile_context.clone(),
                     underlying,
                     strategy_name,
                     result.candidates.len(),
@@ -1426,12 +1625,13 @@ pub async fn scan_options_candidates(
                     }),
                 );
 
-                candidates.consider_candidate(SelectedOptionsEntry::NakedOption(
-                    SelectedNakedOptionEntry {
+                candidates.consider_candidate(ProfiledOptionsEntry::new(
+                    profile_context.clone(),
+                    SelectedOptionsEntry::NakedOption(SelectedNakedOptionEntry {
                         underlying: underlying.clone(),
                         kind,
                         candidate: best.clone(),
-                    },
+                    }),
                 ));
             }
         }
