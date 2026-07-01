@@ -22,6 +22,8 @@ checks.
 - For "pull it in", "proceed", "sync it", or similar requests, run the merge workflow.
 - Commit or push only when Ade explicitly asks. A merge commit is acceptable when Ade has explicitly
   asked to proceed with the sync.
+- After any successful upstream merge, produce the upstream improvement report in this skill without
+  waiting for Ade to ask "what changed?".
 
 ## Preflight
 
@@ -171,6 +173,40 @@ or config checks. If live/paper Alpaca validation is requested, use paper creden
 state before and after, and cancel accepted smoke orders unless Ade explicitly asks to leave them
 open.
 
+## Mandatory Post-Merge Report
+
+After `git merge upstream/develop` succeeds, inspect the newly merged upstream commits before
+pushing or ending the turn. This report is part of the sync workflow, not a separate optional
+follow-up.
+
+Prefer the `old_upstream` ref captured during preflight:
+
+```bash
+git log --oneline --reverse "${old_upstream}..upstream/develop"
+git show --stat --oneline $(git log --format=%H --reverse "${old_upstream}..upstream/develop")
+```
+
+If `old_upstream` was unavailable but the current `HEAD` is the merge commit, use merge parents:
+
+```bash
+git log --oneline --reverse HEAD^1..HEAD^2
+git show --stat --oneline $(git log --format=%H --reverse HEAD^1..HEAD^2)
+```
+
+Then summarize the changes by practical impact for the fork:
+
+- **What is new**: upstream features, fixes, config knobs, APIs, tests, or docs that landed.
+- **What we can use**: platform capabilities or patterns that can simplify Alpaca/runtime/warehouse
+  work, such as execution, live node, data, msgbus, persistence, transport, or monitoring changes.
+- **What to watch**: behavior changes that may shift validation output, PnL/backtest/accounting,
+  deployment config, runtime health signals, or merge-conflict risk next time.
+- **Direct Alpaca impact**: only say this when upstream actually changed Alpaca-owned files or
+  contracts used by Alpaca. Otherwise say there was no direct Alpaca change.
+
+Keep this report concise. Do not list every file. Name the important commits or domains and explain
+why Ade should care. If a change deserves durable follow-up, create a Bead before the final response
+and mention it in the report.
+
 ## Finish
 
 Before push:
@@ -186,11 +222,10 @@ Push only when Ade asks:
 git push origin develop
 ```
 
-## Upstream Improvement Summary
+## Final Upstream Improvement Summary
 
-After a completed sync, include a short operator-facing summary of upstream improvements that the
-fork can build on for Alpaca work. Keep it concise and grouped by practical relevance, not by every
-commit.
+After a completed sync, include the post-merge report in the final response too. Keep it concise and
+grouped by practical relevance, not by every commit.
 
 Use the previous upstream ref captured during preflight when available:
 
@@ -218,10 +253,9 @@ Prefer this shape in the final response:
 Pushed. Worktree clean.
 
 New upstream/base improvements now available to build on for Alpaca:
-- Live/runtime: ...
-- Strategy/execution: ...
-- Data/persistence: ...
-- Build/CI/deps: ...
+- What is new: ...
+- What we can use: ...
+- What to watch: ...
 
 Direct Alpaca changes: none found / <brief note>.
 ```
