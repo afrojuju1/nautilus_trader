@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
 
     let runtime_config = AlpacaOptionsRuntimeConfig::from_runtime_env()?;
     if env::args().skip(1).any(|arg| arg == "--check-config") {
-        print_config_check(&runtime_config);
+        print_config_check(&runtime_config)?;
         return Ok(());
     }
     let args = Args::from_env(&runtime_config)?;
@@ -162,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
     let client_id = ClientId::from(ALPACA_CLIENT_ID);
     let data_config = AlpacaDataClientConfig {
         snapshot_greeks_poll_secs: args.snapshot_greeks_poll_secs,
+        option_market_data_max_quote_symbols: option_stream_max_quote_symbols_from_env()?,
         ..Default::default()
     };
     let lifecycle_config = runtime_config.lifecycle_risk_config();
@@ -820,9 +821,10 @@ fn print_usage() {
     );
 }
 
-fn print_config_check(config: &AlpacaOptionsRuntimeConfig) {
+fn print_config_check(config: &AlpacaOptionsRuntimeConfig) -> anyhow::Result<()> {
+    let option_stream_max_quote_symbols = option_stream_max_quote_symbols_from_env()?;
     println!(
-        "alpaca_options_runtime_config: underlyings={} strategy_profiles={} open_orders_enabled={} close_orders_enabled={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} active_risk_candidate_quote_limit={} active_risk_quote_stale_secs={} expiration_exit_days={} lifecycle_poll_secs={} lifecycle_activity_lookback_hours={} lifecycle_activity_block_hours={} expiration_entry_block_days={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_max_candidates={}",
+        "alpaca_options_runtime_config: underlyings={} strategy_profiles={} open_orders_enabled={} close_orders_enabled={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} active_risk_candidate_quote_limit={} active_risk_quote_stale_secs={} option_stream_max_quote_symbols={} expiration_exit_days={} lifecycle_poll_secs={} lifecycle_activity_lookback_hours={} lifecycle_activity_block_hours={} expiration_entry_block_days={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_max_candidates={}",
         config.underlyings.join(","),
         config.strategy_profile_summaries().join(","),
         config.open_orders_enabled,
@@ -848,6 +850,7 @@ fn print_config_check(config: &AlpacaOptionsRuntimeConfig) {
         config.close_reprice_cooldown_secs,
         config.active_risk_candidate_quote_limit,
         config.active_risk_quote_stale_secs,
+        option_stream_max_quote_symbols,
         config.expiration_exit_days,
         config.lifecycle_poll_secs,
         config.lifecycle_activity_lookback_hours,
@@ -859,6 +862,15 @@ fn print_config_check(config: &AlpacaOptionsRuntimeConfig) {
         config.candidate_ledger_enabled,
         config.candidate_ledger_max_candidates,
     );
+    Ok(())
+}
+
+fn option_stream_max_quote_symbols_from_env() -> anyhow::Result<usize> {
+    Ok(
+        optional_usize_env("ALPACA_OPTION_STREAM_MAX_QUOTE_SYMBOLS")?.unwrap_or_else(|| {
+            AlpacaDataClientConfig::default().option_market_data_max_quote_symbols
+        }),
+    )
 }
 
 fn format_limit(limit: Option<usize>) -> String {

@@ -49,7 +49,10 @@ use crate::{
     candidate_ledger_persistence::CandidateLedgerPersistenceHandle,
     candidate_payloads::selected_entry_candidate_ledger_payload,
     common::consts::{
-        ALPACA_OPTION_CHAIN_EXPIRATION_PARAM, ALPACA_OPTION_CHAIN_UNDERLYING_PARAM, ALPACA_VENUE,
+        ALPACA_OPTION_CHAIN_EXPIRATION_PARAM, ALPACA_OPTION_CHAIN_UNDERLYING_PARAM,
+        ALPACA_OPTION_QUOTE_INTEREST_CHAIN_SCAN, ALPACA_OPTION_QUOTE_INTEREST_PARAM,
+        ALPACA_OPTION_QUOTE_STREAM_POLICY_PARAM, ALPACA_OPTION_QUOTE_STREAM_POLICY_SNAPSHOT_ONLY,
+        ALPACA_VENUE,
     },
     earnings::EarningsEvent,
     option_chain_candidates::{
@@ -282,7 +285,7 @@ impl OptionChainCandidateScanActor {
             self.config.strike_range.clone(),
             self.config.snapshot_interval_ms,
             self.config.client_id,
-            None,
+            Some(option_chain_quote_params()),
         );
     }
 
@@ -793,6 +796,19 @@ pub fn candidate_scan_config_from_runtime(
         event_shock_block_days_before_earnings: config.event_shock_block_days_before_earnings,
         event_shock_block_days_after_earnings: config.event_shock_block_days_after_earnings,
     }
+}
+
+fn option_chain_quote_params() -> Params {
+    let mut params = Params::new();
+    params.insert(
+        ALPACA_OPTION_QUOTE_INTEREST_PARAM.to_string(),
+        json!(ALPACA_OPTION_QUOTE_INTEREST_CHAIN_SCAN),
+    );
+    params.insert(
+        ALPACA_OPTION_QUOTE_STREAM_POLICY_PARAM.to_string(),
+        json!(ALPACA_OPTION_QUOTE_STREAM_POLICY_SNAPSHOT_ONLY),
+    );
+    params
 }
 
 fn underlying_daily_bar_type(underlying: &str) -> BarType {

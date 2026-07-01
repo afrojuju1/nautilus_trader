@@ -55,7 +55,11 @@ use crate::{
         consts::{
             ALPACA_OPEN_INTEREST_INFO_KEY, ALPACA_OPTION_CHAIN_EXPIRATION_PARAM,
             ALPACA_OPTION_CHAIN_MAX_EXPIRATION_PARAM, ALPACA_OPTION_CHAIN_MIN_EXPIRATION_PARAM,
-            ALPACA_OPTION_CHAIN_TYPE_PARAM, ALPACA_OPTION_CHAIN_UNDERLYING_PARAM, ALPACA_VENUE,
+            ALPACA_OPTION_CHAIN_TYPE_PARAM, ALPACA_OPTION_CHAIN_UNDERLYING_PARAM,
+            ALPACA_OPTION_QUOTE_INTEREST_ACTIVE_RISK, ALPACA_OPTION_QUOTE_INTEREST_CANDIDATE,
+            ALPACA_OPTION_QUOTE_INTEREST_PARAM, ALPACA_OPTION_QUOTE_INTEREST_SPREAD,
+            ALPACA_OPTION_QUOTE_STREAM_POLICY_PARAM,
+            ALPACA_OPTION_QUOTE_STREAM_POLICY_SNAPSHOT_ONLY, ALPACA_VENUE,
         },
         credentials::AlpacaCredential,
     },
@@ -85,10 +89,11 @@ const OPTION_MARKET_DATA_RECONNECT_DELAY_INITIAL_MS: u64 = 1_000;
 const OPTION_MARKET_DATA_RECONNECT_DELAY_MAX_MS: u64 = 30_000;
 const OPTION_MARKET_DATA_RECONNECT_BACKOFF_FACTOR: f64 = 2.0;
 const OPTION_MARKET_DATA_RECONNECT_JITTER_MS: u64 = 250;
+const OPTION_QUOTE_INTEREST_DEFAULT: &str = "default";
 
 #[derive(Debug, Default)]
 struct OptionSnapshotSubscriptions {
-    quote_instrument_ids: BTreeSet<InstrumentId>,
+    quote_instrument_ids: BTreeMap<InstrumentId, BTreeSet<String>>,
     greeks_instrument_ids: BTreeSet<InstrumentId>,
     is_polling: bool,
 }
@@ -101,16 +106,40 @@ impl OptionSnapshotSubscriptions {
     fn instrument_ids(&self, include_quote_snapshots: bool) -> Vec<InstrumentId> {
         if include_quote_snapshots {
             self.quote_instrument_ids
-                .union(&self.greeks_instrument_ids)
+                .keys()
                 .copied()
+                .chain(self.greeks_instrument_ids.iter().copied())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .collect()
         } else {
             self.greeks_instrument_ids.iter().copied().collect()
         }
     }
 
+    fn insert_quote(&mut self, instrument_id: InstrumentId, interest: &str) {
+        self.quote_instrument_ids
+            .entry(instrument_id)
+            .or_default()
+            .insert(interest.to_string());
+    }
+
+    fn remove_quote(&mut self, instrument_id: InstrumentId, interest: &str) {
+        let Some(interests) = self.quote_instrument_ids.get_mut(&instrument_id) else {
+            return;
+        };
+        interests.remove(interest);
+        if interests.is_empty() {
+            self.quote_instrument_ids.remove(&instrument_id);
+        }
+    }
+
+    fn quote_count(&self) -> usize {
+        self.quote_instrument_ids.len()
+    }
+
     fn should_emit_quote(&self, instrument_id: &InstrumentId) -> bool {
-        self.quote_instrument_ids.contains(instrument_id)
+        self.quote_instrument_ids.contains_key(instrument_id)
     }
 
     fn should_emit_greeks(&self, instrument_id: &InstrumentId) -> bool {
@@ -120,34 +149,310 @@ impl OptionSnapshotSubscriptions {
 
 #[derive(Debug, Default)]
 struct OptionMarketDataSubscriptions {
-    quote_instrument_ids: BTreeSet<InstrumentId>,
+    quote_stream_interests: BTreeMap<InstrumentId, BTreeSet<String>>,
+    quote_overflow_interests: BTreeMap<InstrumentId, BTreeSet<String>>,
     trade_instrument_ids: BTreeSet<InstrumentId>,
+    max_quote_subscriptions: usize,
     is_streaming: bool,
     cmd_tx: Option<mpsc::UnboundedSender<OptionMarketDataCommand>>,
 }
 
 impl OptionMarketDataSubscriptions {
+    fn with_max_quote_subscriptions(max_quote_subscriptions: usize) -> Self {
+        Self {
+            max_quote_subscriptions,
+            ..Self::default()
+        }
+    }
+
     fn is_empty(&self) -> bool {
-        self.quote_instrument_ids.is_empty() && self.trade_instrument_ids.is_empty()
+        self.quote_stream_interests.is_empty() && self.trade_instrument_ids.is_empty()
     }
 
     fn quote_symbols(&self) -> Vec<String> {
-        instrument_symbols_for_stream(&self.quote_instrument_ids)
+        instrument_symbols_for_stream(&self.quote_stream_instrument_ids())
     }
 
     fn trade_symbols(&self) -> Vec<String> {
         instrument_symbols_for_stream(&self.trade_instrument_ids)
     }
 
+    fn quote_stream_instrument_ids(&self) -> BTreeSet<InstrumentId> {
+        self.quote_stream_interests.keys().copied().collect()
+    }
+
+    fn quote_stream_count(&self) -> usize {
+        self.quote_stream_interests.len()
+    }
+
+    fn quote_overflow_count(&self) -> usize {
+        self.quote_overflow_interests.len()
+    }
+
+    fn quote_desired_count(&self) -> usize {
+        self.quote_stream_interests
+            .keys()
+            .chain(self.quote_overflow_interests.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
     fn instrument_id_for_symbol(&self, symbol: &str) -> Option<InstrumentId> {
-        self.quote_instrument_ids
-            .iter()
+        self.quote_stream_interests
+            .keys()
             .chain(self.trade_instrument_ids.iter())
             .copied()
             .find(|instrument_id| {
                 alpaca_symbol_from_instrument_id(*instrument_id).eq_ignore_ascii_case(symbol)
             })
     }
+
+    fn counts(&self) -> OptionMarketDataCounts {
+        OptionMarketDataCounts {
+            quote_subscriptions: self.quote_stream_count(),
+            trade_subscriptions: self.trade_instrument_ids.len(),
+            desired_quote_subscriptions: self.quote_desired_count(),
+            stream_quote_subscriptions: self.quote_stream_count(),
+            snapshot_fallback_quote_subscriptions: self.quote_overflow_count(),
+            max_quote_subscriptions: self.max_quote_subscriptions,
+        }
+    }
+
+    fn subscribe_quote_interest(
+        &mut self,
+        instrument_id: InstrumentId,
+        interest: &str,
+        policy: OptionQuoteStreamPolicy,
+    ) -> OptionQuoteSubscriptionPlan {
+        let mut plan = OptionQuoteSubscriptionPlan::default();
+        if policy == OptionQuoteStreamPolicy::SnapshotOnly {
+            return plan;
+        }
+
+        if let Some(interests) = self.quote_stream_interests.get_mut(&instrument_id) {
+            interests.insert(interest.to_string());
+            return plan;
+        }
+
+        let mut interests = self
+            .quote_overflow_interests
+            .remove(&instrument_id)
+            .unwrap_or_default();
+        interests.insert(interest.to_string());
+
+        if self.max_quote_subscriptions == 0 {
+            self.quote_overflow_interests
+                .insert(instrument_id, interests);
+            plan.overflow_changed = true;
+            return plan;
+        }
+
+        if self.quote_stream_interests.len() < self.max_quote_subscriptions {
+            self.quote_stream_interests.insert(instrument_id, interests);
+            plan.subscribe.push(instrument_id);
+            return plan;
+        }
+
+        let incoming_priority = quote_interest_set_priority(&interests);
+        let lowest_streamed = self.lowest_streamed_quote();
+        if let Some((evicted_id, evicted_priority)) = lowest_streamed
+            && incoming_priority > evicted_priority
+        {
+            let evicted_interests = self
+                .quote_stream_interests
+                .remove(&evicted_id)
+                .expect("streamed quote exists");
+            self.quote_overflow_interests
+                .insert(evicted_id, evicted_interests);
+            self.quote_stream_interests.insert(instrument_id, interests);
+            plan.unsubscribe.push(evicted_id);
+            plan.subscribe.push(instrument_id);
+            plan.overflow_changed = true;
+            return plan;
+        }
+
+        self.quote_overflow_interests
+            .insert(instrument_id, interests);
+        plan.overflow_changed = true;
+        plan
+    }
+
+    fn unsubscribe_quote_interest(
+        &mut self,
+        instrument_id: InstrumentId,
+        interest: &str,
+    ) -> OptionQuoteSubscriptionPlan {
+        let mut plan = OptionQuoteSubscriptionPlan::default();
+        let removed_stream =
+            remove_quote_interest(&mut self.quote_stream_interests, instrument_id, interest);
+        if removed_stream {
+            plan.unsubscribe.push(instrument_id);
+        }
+
+        let removed_overflow =
+            remove_quote_interest(&mut self.quote_overflow_interests, instrument_id, interest);
+        if removed_overflow {
+            plan.overflow_changed = true;
+        }
+
+        if removed_stream {
+            self.promote_overflow(&mut plan);
+        }
+
+        plan
+    }
+
+    fn promote_overflow(&mut self, plan: &mut OptionQuoteSubscriptionPlan) {
+        if self.max_quote_subscriptions == 0 {
+            return;
+        }
+
+        while self.quote_stream_interests.len() < self.max_quote_subscriptions {
+            let Some((instrument_id, _priority)) = self.highest_overflow_quote() else {
+                break;
+            };
+            let interests = self
+                .quote_overflow_interests
+                .remove(&instrument_id)
+                .expect("overflow quote exists");
+            self.quote_stream_interests.insert(instrument_id, interests);
+            plan.subscribe.push(instrument_id);
+            plan.overflow_changed = true;
+        }
+    }
+
+    fn lowest_streamed_quote(&self) -> Option<(InstrumentId, u8)> {
+        self.quote_stream_interests
+            .iter()
+            .map(|(instrument_id, interests)| {
+                (*instrument_id, quote_interest_set_priority(interests))
+            })
+            .min_by_key(|(instrument_id, priority)| (*priority, *instrument_id))
+    }
+
+    fn highest_overflow_quote(&self) -> Option<(InstrumentId, u8)> {
+        self.quote_overflow_interests
+            .iter()
+            .map(|(instrument_id, interests)| {
+                (*instrument_id, quote_interest_set_priority(interests))
+            })
+            .max_by_key(|(instrument_id, priority)| (*priority, *instrument_id))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OptionMarketDataCounts {
+    quote_subscriptions: usize,
+    trade_subscriptions: usize,
+    desired_quote_subscriptions: usize,
+    stream_quote_subscriptions: usize,
+    snapshot_fallback_quote_subscriptions: usize,
+    max_quote_subscriptions: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OptionQuoteStreamPolicy {
+    Stream,
+    SnapshotOnly,
+}
+
+#[derive(Debug, Default)]
+struct OptionQuoteSubscriptionPlan {
+    subscribe: Vec<InstrumentId>,
+    unsubscribe: Vec<InstrumentId>,
+    overflow_changed: bool,
+}
+
+fn remove_quote_interest(
+    interests_by_instrument: &mut BTreeMap<InstrumentId, BTreeSet<String>>,
+    instrument_id: InstrumentId,
+    interest: &str,
+) -> bool {
+    let Some(interests) = interests_by_instrument.get_mut(&instrument_id) else {
+        return false;
+    };
+    interests.remove(interest);
+    if interests.is_empty() {
+        interests_by_instrument.remove(&instrument_id);
+        return true;
+    }
+    false
+}
+
+fn quote_interest_set_priority(interests: &BTreeSet<String>) -> u8 {
+    interests
+        .iter()
+        .map(|interest| quote_interest_priority(interest))
+        .max()
+        .unwrap_or(0)
+}
+
+fn quote_interest_priority(interest: &str) -> u8 {
+    match interest {
+        ALPACA_OPTION_QUOTE_INTEREST_ACTIVE_RISK => 100,
+        ALPACA_OPTION_QUOTE_INTEREST_SPREAD => 80,
+        ALPACA_OPTION_QUOTE_INTEREST_CANDIDATE => 60,
+        OPTION_QUOTE_INTEREST_DEFAULT => 40,
+        _ => 20,
+    }
+}
+
+fn option_quote_interest(params: Option<&Params>) -> String {
+    params
+        .and_then(|params| params.get_str(ALPACA_OPTION_QUOTE_INTEREST_PARAM))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(OPTION_QUOTE_INTEREST_DEFAULT)
+        .to_string()
+}
+
+fn option_quote_stream_policy(params: Option<&Params>) -> OptionQuoteStreamPolicy {
+    match params
+        .and_then(|params| params.get_str(ALPACA_OPTION_QUOTE_STREAM_POLICY_PARAM))
+        .map(str::trim)
+    {
+        Some(ALPACA_OPTION_QUOTE_STREAM_POLICY_SNAPSHOT_ONLY) => {
+            OptionQuoteStreamPolicy::SnapshotOnly
+        }
+        _ => OptionQuoteStreamPolicy::Stream,
+    }
+}
+
+fn emit_option_market_data_budget_event(feed: &str, reason: &str, counts: OptionMarketDataCounts) {
+    emit_operator_event(
+        "option_market_data_stream",
+        json!({
+            "source": "snapshot_fallback",
+            "feed": feed,
+            "reason": reason,
+            "quote_subscriptions": counts.quote_subscriptions,
+            "trade_subscriptions": counts.trade_subscriptions,
+            "desired_quote_subscriptions": counts.desired_quote_subscriptions,
+            "stream_quote_subscriptions": counts.stream_quote_subscriptions,
+            "snapshot_fallback_quote_subscriptions": counts.snapshot_fallback_quote_subscriptions,
+            "max_quote_subscriptions": counts.max_quote_subscriptions,
+        }),
+    );
+}
+
+fn option_market_data_event_signature(
+    source: OptionMarketDataSource,
+    counts: OptionMarketDataCounts,
+) -> u64 {
+    let mut signature = 0xcbf2_9ce4_8422_2325_u64;
+    for value in [
+        source.as_u8() as u64,
+        counts.quote_subscriptions as u64,
+        counts.trade_subscriptions as u64,
+        counts.desired_quote_subscriptions as u64,
+        counts.stream_quote_subscriptions as u64,
+        counts.snapshot_fallback_quote_subscriptions as u64,
+        counts.max_quote_subscriptions as u64,
+    ] {
+        signature ^= value;
+        signature = signature.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    signature
 }
 
 #[derive(Debug)]
@@ -193,59 +498,31 @@ impl OptionMarketDataSource {
 #[derive(Debug)]
 struct OptionMarketDataRuntimeState {
     source: AtomicU8,
-    last_stream_quote_init_ns: AtomicU64,
+    event_signature: AtomicU64,
 }
 
 impl Default for OptionMarketDataRuntimeState {
     fn default() -> Self {
         Self {
             source: AtomicU8::new(OptionMarketDataSource::Unknown.as_u8()),
-            last_stream_quote_init_ns: AtomicU64::new(0),
+            event_signature: AtomicU64::new(0),
         }
     }
 }
 
 impl OptionMarketDataRuntimeState {
-    fn is_quote_stream_fresh(
-        &self,
-        clock: &'static AtomicTime,
-        quote_snapshot_fallback_after: Duration,
-    ) -> bool {
-        if self.source.load(Ordering::Acquire) != OptionMarketDataSource::Stream.as_u8() {
-            return false;
-        }
-
-        let last_stream_quote_init_ns = self.last_stream_quote_init_ns.load(Ordering::Acquire);
-        last_stream_quote_init_ns > 0
-            && clock
-                .get_time_ns()
-                .as_u64()
-                .saturating_sub(last_stream_quote_init_ns)
-                <= quote_snapshot_fallback_after.as_nanos() as u64
+    fn is_stream_source(&self) -> bool {
+        self.source.load(Ordering::Acquire) == OptionMarketDataSource::Stream.as_u8()
     }
 
     fn reset(&self) {
         self.source
             .store(OptionMarketDataSource::Unknown.as_u8(), Ordering::Release);
-        self.last_stream_quote_init_ns.store(0, Ordering::Release);
+        self.event_signature.store(0, Ordering::Release);
     }
 
-    fn mark_stream_quote(
-        &self,
-        feed: &str,
-        quote_subscriptions: usize,
-        trade_subscriptions: usize,
-        clock: &'static AtomicTime,
-    ) {
-        self.last_stream_quote_init_ns
-            .store(clock.get_time_ns().as_u64(), Ordering::Release);
-        self.mark_source(
-            OptionMarketDataSource::Stream,
-            feed,
-            "quote",
-            quote_subscriptions,
-            trade_subscriptions,
-        );
+    fn mark_stream_quote(&self, feed: &str, counts: OptionMarketDataCounts) {
+        self.mark_source(OptionMarketDataSource::Stream, feed, "quote", counts);
     }
 
     fn mark_source(
@@ -253,11 +530,12 @@ impl OptionMarketDataRuntimeState {
         source: OptionMarketDataSource,
         feed: &str,
         reason: &str,
-        quote_subscriptions: usize,
-        trade_subscriptions: usize,
+        counts: OptionMarketDataCounts,
     ) {
+        let signature = option_market_data_event_signature(source, counts);
         let previous = self.source.swap(source.as_u8(), Ordering::AcqRel);
-        if previous == source.as_u8() {
+        let previous_signature = self.event_signature.swap(signature, Ordering::AcqRel);
+        if previous == source.as_u8() && previous_signature == signature {
             return;
         }
 
@@ -267,8 +545,12 @@ impl OptionMarketDataRuntimeState {
                 "source": source.as_str(),
                 "feed": feed,
                 "reason": reason,
-                "quote_subscriptions": quote_subscriptions,
-                "trade_subscriptions": trade_subscriptions,
+                "quote_subscriptions": counts.quote_subscriptions,
+                "trade_subscriptions": counts.trade_subscriptions,
+                "desired_quote_subscriptions": counts.desired_quote_subscriptions,
+                "stream_quote_subscriptions": counts.stream_quote_subscriptions,
+                "snapshot_fallback_quote_subscriptions": counts.snapshot_fallback_quote_subscriptions,
+                "max_quote_subscriptions": counts.max_quote_subscriptions,
             }),
         );
     }
@@ -307,6 +589,7 @@ impl AlpacaDataClient {
     pub fn new(client_id: ClientId, config: AlpacaDataClientConfig) -> anyhow::Result<Self> {
         let http_client = AlpacaHttpClient::from_data_config(&config)
             .context("failed to initialize Alpaca data HTTP client")?;
+        let option_market_data_max_quote_symbols = config.option_market_data_max_quote_symbols;
 
         Ok(Self {
             clock: get_atomic_clock_realtime(),
@@ -321,7 +604,9 @@ impl AlpacaDataClient {
                 OptionSnapshotSubscriptions::default(),
             )),
             option_market_data_subscriptions: Arc::new(Mutex::new(
-                OptionMarketDataSubscriptions::default(),
+                OptionMarketDataSubscriptions::with_max_quote_subscriptions(
+                    option_market_data_max_quote_symbols,
+                ),
             )),
             option_market_data_state: Arc::new(OptionMarketDataRuntimeState::default()),
         })
@@ -384,8 +669,8 @@ impl AlpacaDataClient {
         let subscriptions = self.option_snapshot_subscriptions.clone();
         let market_data_state = self.option_market_data_state.clone();
         let interval = self.option_snapshot_poll_interval();
-        let quote_snapshot_fallback_after = interval + interval;
         let feed = self.config.option_feed.as_str().to_string();
+        let max_quote_subscriptions = self.config.option_market_data_max_quote_symbols;
         let clock = self.clock;
 
         self.spawn_task("option_snapshot_poller", async move {
@@ -396,8 +681,8 @@ impl AlpacaDataClient {
                     &instruments,
                     &subscriptions,
                     &market_data_state,
-                    quote_snapshot_fallback_after,
                     &feed,
+                    max_quote_subscriptions,
                     clock,
                 )
                 .await
@@ -433,13 +718,12 @@ impl AlpacaDataClient {
         let Some(credential) =
             AlpacaCredential::resolve(self.config.api_key.clone(), self.config.api_secret.clone())
         else {
-            let (quote_count, trade_count) = self.option_market_data_subscription_counts();
+            let counts = self.option_market_data_subscription_counts();
             self.option_market_data_state.mark_source(
                 OptionMarketDataSource::SnapshotFallback,
                 self.config.option_feed.as_str(),
                 "missing_credentials",
-                quote_count,
-                trade_count,
+                counts,
             );
             self.ensure_option_snapshot_poller();
             return;
@@ -488,15 +772,14 @@ impl AlpacaDataClient {
             }
 
             if let Err(error) = &result {
-                let (quote_count, trade_count) = option_market_data_subscription_counts(
+                let counts = option_market_data_subscription_counts(
                     &subscriptions.lock().expect(MUTEX_POISONED),
                 );
                 market_data_state.mark_source(
                     OptionMarketDataSource::Error,
                     &feed,
                     &error.to_string(),
-                    quote_count,
-                    trade_count,
+                    counts,
                 );
             }
 
@@ -514,7 +797,7 @@ impl AlpacaDataClient {
         self.option_market_data_state.reset();
     }
 
-    fn option_market_data_subscription_counts(&self) -> (usize, usize) {
+    fn option_market_data_subscription_counts(&self) -> OptionMarketDataCounts {
         let subscriptions = self
             .option_market_data_subscriptions
             .lock()
@@ -568,50 +851,90 @@ impl AlpacaDataClient {
         }
     }
 
-    fn subscribe_option_snapshot_quotes(&self, instrument_id: InstrumentId) {
+    fn subscribe_option_snapshot_quotes(&self, instrument_id: InstrumentId, interest: &str) {
         let mut subscriptions = self
             .option_snapshot_subscriptions
             .lock()
             .expect(MUTEX_POISONED);
-        subscriptions.quote_instrument_ids.insert(instrument_id);
+        subscriptions.insert_quote(instrument_id, interest);
         drop(subscriptions);
         self.ensure_option_snapshot_poller();
     }
 
-    fn subscribe_option_market_data_quotes(&self, instrument_id: InstrumentId) {
-        let symbol = alpaca_symbol_from_instrument_id(instrument_id);
-        let inserted = {
+    fn unsubscribe_option_snapshot_quotes(&self, instrument_id: InstrumentId, interest: &str) {
+        self.option_snapshot_subscriptions
+            .lock()
+            .expect(MUTEX_POISONED)
+            .remove_quote(instrument_id, interest);
+    }
+
+    fn subscribe_option_market_data_quotes(
+        &self,
+        instrument_id: InstrumentId,
+        interest: &str,
+        policy: OptionQuoteStreamPolicy,
+    ) {
+        let (plan, counts) = {
             let mut subscriptions = self
                 .option_market_data_subscriptions
                 .lock()
                 .expect(MUTEX_POISONED);
-            subscriptions.quote_instrument_ids.insert(instrument_id)
+            let plan = subscriptions.subscribe_quote_interest(instrument_id, interest, policy);
+            let counts = subscriptions.counts();
+            (plan, counts)
         };
 
-        if inserted {
-            self.send_option_market_data_command(OptionMarketDataCommand::Subscribe {
-                quotes: vec![symbol],
+        for unsubscribe in plan.unsubscribe {
+            self.send_option_market_data_command(OptionMarketDataCommand::Unsubscribe {
+                quotes: vec![alpaca_symbol_from_instrument_id(unsubscribe)],
                 trades: Vec::new(),
             });
+        }
+        for subscribe in plan.subscribe {
+            self.send_option_market_data_command(OptionMarketDataCommand::Subscribe {
+                quotes: vec![alpaca_symbol_from_instrument_id(subscribe)],
+                trades: Vec::new(),
+            });
+        }
+        if plan.overflow_changed && counts.snapshot_fallback_quote_subscriptions > 0 {
+            emit_option_market_data_budget_event(
+                self.config.option_feed.as_str(),
+                "stream_budget_overflow",
+                counts,
+            );
         }
         self.ensure_option_market_data_stream();
     }
 
-    fn unsubscribe_option_market_data_quotes(&self, instrument_id: InstrumentId) {
-        let symbol = alpaca_symbol_from_instrument_id(instrument_id);
-        let removed = {
+    fn unsubscribe_option_market_data_quotes(&self, instrument_id: InstrumentId, interest: &str) {
+        let (plan, counts) = {
             let mut subscriptions = self
                 .option_market_data_subscriptions
                 .lock()
                 .expect(MUTEX_POISONED);
-            subscriptions.quote_instrument_ids.remove(&instrument_id)
+            let plan = subscriptions.unsubscribe_quote_interest(instrument_id, interest);
+            let counts = subscriptions.counts();
+            (plan, counts)
         };
 
-        if removed {
+        for unsubscribe in plan.unsubscribe {
             self.send_option_market_data_command(OptionMarketDataCommand::Unsubscribe {
-                quotes: vec![symbol],
+                quotes: vec![alpaca_symbol_from_instrument_id(unsubscribe)],
                 trades: Vec::new(),
             });
+        }
+        for subscribe in plan.subscribe {
+            self.send_option_market_data_command(OptionMarketDataCommand::Subscribe {
+                quotes: vec![alpaca_symbol_from_instrument_id(subscribe)],
+                trades: Vec::new(),
+            });
+        }
+        if plan.overflow_changed {
+            emit_option_market_data_budget_event(
+                self.config.option_feed.as_str(),
+                "stream_budget_rebalanced",
+                counts,
+            );
         }
     }
 
@@ -722,7 +1045,8 @@ impl DataClient for AlpacaDataClient {
             .option_market_data_subscriptions
             .lock()
             .expect(MUTEX_POISONED);
-        market_data_subscriptions.quote_instrument_ids.clear();
+        market_data_subscriptions.quote_stream_interests.clear();
+        market_data_subscriptions.quote_overflow_interests.clear();
         market_data_subscriptions.trade_instrument_ids.clear();
         market_data_subscriptions.is_streaming = false;
         market_data_subscriptions.cmd_tx = None;
@@ -779,6 +1103,9 @@ impl DataClient for AlpacaDataClient {
         );
 
         let instrument_id = cmd.instrument_id;
+        let params = cmd.params.clone();
+        let interest = option_quote_interest(params.as_ref());
+        let stream_policy = option_quote_stream_policy(params.as_ref());
         self.subscribe_instrument(SubscribeInstrument::new(
             instrument_id,
             cmd.client_id,
@@ -788,8 +1115,8 @@ impl DataClient for AlpacaDataClient {
             cmd.correlation_id,
             cmd.params,
         ))?;
-        self.subscribe_option_snapshot_quotes(instrument_id);
-        self.subscribe_option_market_data_quotes(instrument_id);
+        self.subscribe_option_snapshot_quotes(instrument_id, &interest);
+        self.subscribe_option_market_data_quotes(instrument_id, &interest, stream_policy);
 
         Ok(())
     }
@@ -799,12 +1126,9 @@ impl DataClient for AlpacaDataClient {
             "Unsubscribing from Alpaca option quotes: {}",
             cmd.instrument_id,
         );
-        self.option_snapshot_subscriptions
-            .lock()
-            .expect(MUTEX_POISONED)
-            .quote_instrument_ids
-            .remove(&cmd.instrument_id);
-        self.unsubscribe_option_market_data_quotes(cmd.instrument_id);
+        let interest = option_quote_interest(cmd.params.as_ref());
+        self.unsubscribe_option_snapshot_quotes(cmd.instrument_id, &interest);
+        self.unsubscribe_option_market_data_quotes(cmd.instrument_id, &interest);
         Ok(())
     }
 
@@ -1285,12 +1609,11 @@ async fn poll_option_snapshots(
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     subscriptions: &Arc<Mutex<OptionSnapshotSubscriptions>>,
     market_data_state: &Arc<OptionMarketDataRuntimeState>,
-    quote_snapshot_fallback_after: Duration,
     feed: &str,
+    max_quote_subscriptions: usize,
     clock: &'static AtomicTime,
 ) -> anyhow::Result<bool> {
-    let include_quote_snapshots =
-        !market_data_state.is_quote_stream_fresh(clock, quote_snapshot_fallback_after);
+    let include_quote_snapshots = true;
     let instrument_ids = {
         let subscriptions = subscriptions.lock().expect(MUTEX_POISONED);
         if subscriptions.is_empty() {
@@ -1340,18 +1663,23 @@ async fn poll_option_snapshots(
                 clock,
             )
         {
-            let quote_count = subscriptions
-                .lock()
-                .expect(MUTEX_POISONED)
-                .quote_instrument_ids
-                .len();
-            market_data_state.mark_source(
-                OptionMarketDataSource::SnapshotFallback,
-                feed,
-                "snapshot_quote",
-                quote_count,
-                0,
-            );
+            let quote_count = subscriptions.lock().expect(MUTEX_POISONED).quote_count();
+            let counts = OptionMarketDataCounts {
+                quote_subscriptions: 0,
+                trade_subscriptions: 0,
+                desired_quote_subscriptions: quote_count,
+                stream_quote_subscriptions: 0,
+                snapshot_fallback_quote_subscriptions: quote_count,
+                max_quote_subscriptions,
+            };
+            if !market_data_state.is_stream_source() {
+                market_data_state.mark_source(
+                    OptionMarketDataSource::SnapshotFallback,
+                    feed,
+                    "snapshot_quote",
+                    counts,
+                );
+            }
             send_data_event(sender, DataEvent::Data(Data::Quote(quote)), "option quote");
         }
         if emit_greeks
@@ -1471,10 +1799,10 @@ async fn handle_option_market_data_message(
                 && let Some(tick) =
                     option_stream_quote_tick(instrument_id, &instrument, &quote, clock)
             {
-                let (quote_count, trade_count) = option_market_data_subscription_counts(
+                let counts = option_market_data_subscription_counts(
                     &subscriptions.lock().expect(MUTEX_POISONED),
                 );
-                market_data_state.mark_stream_quote(feed, quote_count, trade_count, clock);
+                market_data_state.mark_stream_quote(feed, counts);
                 send_data_event(
                     sender,
                     DataEvent::Data(Data::Quote(tick)),
@@ -1488,15 +1816,14 @@ async fn handle_option_market_data_message(
                 && let Some(tick) =
                     option_stream_trade_tick(instrument_id, &instrument, &trade, clock)
             {
-                let (quote_count, trade_count) = option_market_data_subscription_counts(
+                let counts = option_market_data_subscription_counts(
                     &subscriptions.lock().expect(MUTEX_POISONED),
                 );
                 market_data_state.mark_source(
                     OptionMarketDataSource::Stream,
                     feed,
                     "trade",
-                    quote_count,
-                    trade_count,
+                    counts,
                 );
                 send_data_event(
                     sender,
@@ -1528,16 +1855,10 @@ async fn handle_option_market_data_message(
                     .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
                 error.msg.as_deref().unwrap_or("unknown")
             );
-            let (quote_count, trade_count) = option_market_data_subscription_counts(
+            let counts = option_market_data_subscription_counts(
                 &subscriptions.lock().expect(MUTEX_POISONED),
             );
-            market_data_state.mark_source(
-                OptionMarketDataSource::Error,
-                feed,
-                &reason,
-                quote_count,
-                trade_count,
-            );
+            market_data_state.mark_source(OptionMarketDataSource::Error, feed, &reason, counts);
             return Err(anyhow!("Alpaca option market-data stream error: {reason}"));
         }
         AlpacaOptionMarketDataMessage::Reconnected => {
@@ -2153,11 +2474,8 @@ fn instrument_symbols_for_stream(instrument_ids: &BTreeSet<InstrumentId>) -> Vec
 
 fn option_market_data_subscription_counts(
     subscriptions: &OptionMarketDataSubscriptions,
-) -> (usize, usize) {
-    (
-        subscriptions.quote_instrument_ids.len(),
-        subscriptions.trade_instrument_ids.len(),
-    )
+) -> OptionMarketDataCounts {
+    subscriptions.counts()
 }
 
 fn parse_rfc3339_timestamp(value: &str) -> Option<UnixNanos> {

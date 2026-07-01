@@ -56,3 +56,24 @@ pub const ALPACA_OPTION_CHAIN_MAX_EXPIRATION_PARAM: &str = "alpaca_option_chain_
 
 /// Data-client request param for limiting Alpaca option instruments to calls or puts.
 pub const ALPACA_OPTION_CHAIN_TYPE_PARAM: &str = "alpaca_option_chain_type";
+
+/// Quote subscription param naming the reason the option quote is needed.
+pub const ALPACA_OPTION_QUOTE_INTEREST_PARAM: &str = "option_quote_interest";
+
+/// Quote subscription param selecting how aggressively Alpaca should stream the quote.
+pub const ALPACA_OPTION_QUOTE_STREAM_POLICY_PARAM: &str = "option_quote_stream_policy";
+
+/// Stream policy for broad option-chain scan quotes that should use snapshot fallback only.
+pub const ALPACA_OPTION_QUOTE_STREAM_POLICY_SNAPSHOT_ONLY: &str = "snapshot_only";
+
+/// Quote interest for broad read-only option-chain scans.
+pub const ALPACA_OPTION_QUOTE_INTEREST_CHAIN_SCAN: &str = "chain_scan";
+
+/// Quote interest for selected or top-ranked entry candidates.
+pub const ALPACA_OPTION_QUOTE_INTEREST_CANDIDATE: &str = "candidate";
+
+/// Quote interest for active entry management and risk-reducing close decisions.
+pub const ALPACA_OPTION_QUOTE_INTEREST_ACTIVE_RISK: &str = "active_risk";
+
+/// Quote interest for synthetic spread quote builders.
+pub const ALPACA_OPTION_QUOTE_INTEREST_SPREAD: &str = "spread_quote";

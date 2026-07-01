@@ -23,5 +23,7 @@ fi
 
 cd "$REPO"
 
-echo "$(date -Is) starting alpaca-options runner repo=$REPO bin=$RUNNER_BIN" >> "$LOG_FILE"
-exec "$RUNNER_BIN" >> "$LOG_FILE" 2>&1
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "$(date -Is) starting alpaca-options runner repo=$REPO bin=$RUNNER_BIN"
+exec "$RUNNER_BIN"

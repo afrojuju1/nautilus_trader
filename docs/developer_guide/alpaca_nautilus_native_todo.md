@@ -256,8 +256,8 @@ loop.
     `subscribe_quotes`.
   - Cached `QuoteTick` timestamps drive stale-quote close blocks, selected-candidate freshness
     blocks when a stale cached quote exists, and `nautilus adapters alpaca status` quote-cache/stale alerts.
-  - The Alpaca data client fills those cache entries from the option stream when fresh stream quotes
-    are available and suppresses quote snapshot refresh only while stream quote freshness is current.
+  - The Alpaca data client keeps broad option-chain scan quotes on snapshot refresh, while active
+    management and top-candidate quote interests consume a bounded option-stream budget.
   - Missing active close-leg quotes remain a `close_quote_missing` management block; first-time
     candidate entries are not blocked solely because the subscription cache has not emitted yet.
 - [x] Remove direct management behavior from the account-engine loop once the new owner is proven.

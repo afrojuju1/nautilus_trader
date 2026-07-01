@@ -123,6 +123,8 @@ pub struct AlpacaDataClientConfig {
     pub request_timeout_secs: u64,
     /// Optional interval for polling option snapshot Greeks and IV.
     pub snapshot_greeks_poll_secs: Option<u64>,
+    /// Maximum option quote symbols to keep on the real-time stream.
+    pub option_market_data_max_quote_symbols: usize,
 }
 
 impl Default for AlpacaDataClientConfig {
@@ -138,6 +140,7 @@ impl Default for AlpacaDataClientConfig {
             option_feed: AlpacaOptionFeed::default(),
             request_timeout_secs: 30,
             snapshot_greeks_poll_secs: None,
+            option_market_data_max_quote_symbols: 180,
         }
     }
 }

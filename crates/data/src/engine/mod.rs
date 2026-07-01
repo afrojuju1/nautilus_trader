@@ -3424,8 +3424,14 @@ impl DataEngine {
             log::info!("Re-subscribing option chain for {series_id}, tearing down previous");
             let all_ids = old.borrow().all_instrument_ids();
             let old_venue = old.borrow().venue();
+            let old_subscription_params = old.borrow().subscription_params();
             old.borrow_mut().teardown(&self.clock);
-            self.forward_option_chain_unsubscribes(&all_ids, old_venue, cmd.client_id);
+            self.forward_option_chain_unsubscribes(
+                &all_ids,
+                old_venue,
+                cmd.client_id,
+                old_subscription_params,
+            );
         }
 
         // Drain any stale pending forward price requests for this series
@@ -3533,6 +3539,7 @@ impl DataEngine {
         // Extract info before teardown
         let all_ids = manager_rc.borrow().all_instrument_ids();
         let venue = manager_rc.borrow().venue();
+        let subscription_params = manager_rc.borrow().subscription_params();
 
         // Remove all instruments from reverse index
         for id in &all_ids {
@@ -3542,7 +3549,7 @@ impl DataEngine {
         manager_rc.borrow_mut().teardown(&self.clock);
 
         // Forward wire-level unsubscribes to the data client
-        self.forward_option_chain_unsubscribes(&all_ids, venue, cmd.client_id);
+        self.forward_option_chain_unsubscribes(&all_ids, venue, cmd.client_id, subscription_params);
 
         log::info!("Unsubscribed option chain for {series_id}");
     }
@@ -3553,6 +3560,7 @@ impl DataEngine {
         instrument_ids: &[InstrumentId],
         venue: Venue,
         client_id: Option<ClientId>,
+        params: Option<Params>,
     ) {
         let ts_init = self.clock.borrow().timestamp_ns();
 
@@ -3571,7 +3579,7 @@ impl DataEngine {
                 UUID4::new(),
                 ts_init,
                 None,
-                None,
+                params.clone(),
             )));
             client.execute_unsubscribe(&UnsubscribeCommand::OptionGreeks(
                 UnsubscribeOptionGreeks::new(
@@ -3581,7 +3589,7 @@ impl DataEngine {
                     UUID4::new(),
                     ts_init,
                     None,
-                    None,
+                    params.clone(),
                 ),
             ));
             client.execute_unsubscribe(&UnsubscribeCommand::InstrumentStatus(
@@ -3592,7 +3600,7 @@ impl DataEngine {
                     UUID4::new(),
                     ts_init,
                     None,
-                    None,
+                    params.clone(),
                 ),
             ));
         }

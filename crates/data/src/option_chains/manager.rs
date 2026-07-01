@@ -33,7 +33,7 @@ use nautilus_common::{
     msgbus::{self, MStr, Topic, TypedHandler, switchboard},
     timer::{TimeEvent, TimeEventCallback},
 };
-use nautilus_core::{UUID4, correctness::FAILED, datetime::millis_to_nanos_unchecked};
+use nautilus_core::{Params, UUID4, correctness::FAILED, datetime::millis_to_nanos_unchecked};
 use nautilus_model::{
     data::{QuoteTick, option_chain::OptionGreeks},
     enums::OptionKind,
@@ -71,6 +71,8 @@ pub struct OptionChainManager {
     deferred_cmd_queue: DeferredCommandQueue,
     /// Clock reference for constructing command timestamps.
     clock: Rc<RefCell<dyn Clock>>,
+    /// Params propagated to per-instrument quote and Greeks subscriptions.
+    subscription_params: Option<Params>,
     /// When `true`, every quote/greeks update for an active instrument immediately publishes a snapshot.
     raw_mode: bool,
 }
@@ -129,6 +131,7 @@ impl OptionChainManager {
             bootstrapped,
             deferred_cmd_queue,
             clock: clock.clone(),
+            subscription_params: cmd.params.clone(),
             raw_mode,
         };
         let manager_rc = Rc::new(RefCell::new(manager));
@@ -253,7 +256,7 @@ impl OptionChainManager {
                 command_id: UUID4::new(),
                 ts_init,
                 correlation_id: None,
-                params: None,
+                params: cmd.params.clone(),
             }));
             client.execute_subscribe(SubscribeCommand::OptionGreeks(SubscribeOptionGreeks {
                 instrument_id: *instrument_id,
@@ -262,7 +265,7 @@ impl OptionChainManager {
                 command_id: UUID4::new(),
                 ts_init,
                 correlation_id: None,
-                params: None,
+                params: cmd.params.clone(),
             }));
             client.execute_subscribe(SubscribeCommand::InstrumentStatus(
                 SubscribeInstrumentStatus {
@@ -365,6 +368,12 @@ impl OptionChainManager {
 
         self.quote_handlers.clear();
         self.greeks_handlers.clear();
+    }
+
+    /// Returns the params used for per-instrument wire subscriptions.
+    #[must_use]
+    pub fn subscription_params(&self) -> Option<Params> {
+        self.subscription_params.clone()
     }
 
     /// Routes incoming greeks to the aggregator.
@@ -531,7 +540,13 @@ impl OptionChainManager {
         }
 
         let venue = self.aggregator.series_id().venue;
-        Self::forward_instrument_subscriptions(client, instrument_id, venue, clock);
+        Self::forward_instrument_subscriptions(
+            client,
+            instrument_id,
+            venue,
+            clock,
+            self.subscription_params.clone(),
+        );
 
         log::info!(
             "Added instrument {instrument_id} to option chain {} (active={})",
@@ -567,7 +582,7 @@ impl OptionChainManager {
                 command_id: UUID4::new(),
                 ts_init,
                 correlation_id: None,
-                params: None,
+                params: self.subscription_params.clone(),
             },
         )));
         queue.push_back(DeferredCommand::Subscribe(SubscribeCommand::OptionGreeks(
@@ -578,7 +593,7 @@ impl OptionChainManager {
                 command_id: UUID4::new(),
                 ts_init,
                 correlation_id: None,
-                params: None,
+                params: self.subscription_params.clone(),
             },
         )));
         queue.push_back(DeferredCommand::Subscribe(
@@ -589,7 +604,7 @@ impl OptionChainManager {
                 command_id: UUID4::new(),
                 ts_init,
                 correlation_id: None,
-                params: None,
+                params: self.subscription_params.clone(),
             }),
         ));
     }
@@ -607,7 +622,7 @@ impl OptionChainManager {
                 command_id: UUID4::new(),
                 ts_init,
                 correlation_id: None,
-                params: None,
+                params: self.subscription_params.clone(),
             },
         )));
         queue.push_back(DeferredCommand::Unsubscribe(
@@ -618,7 +633,7 @@ impl OptionChainManager {
                 command_id: UUID4::new(),
                 ts_init,
                 correlation_id: None,
-                params: None,
+                params: self.subscription_params.clone(),
             }),
         ));
         queue.push_back(DeferredCommand::Unsubscribe(
@@ -640,6 +655,7 @@ impl OptionChainManager {
         instrument_id: InstrumentId,
         venue: Venue,
         clock: &Rc<RefCell<dyn Clock>>,
+        params: Option<Params>,
     ) {
         let Some(client) = client else {
             log::error!(
@@ -657,7 +673,7 @@ impl OptionChainManager {
             command_id: UUID4::new(),
             ts_init,
             correlation_id: None,
-            params: None,
+            params: params.clone(),
         }));
         client.execute_subscribe(SubscribeCommand::OptionGreeks(SubscribeOptionGreeks {
             instrument_id,
@@ -666,7 +682,7 @@ impl OptionChainManager {
             command_id: UUID4::new(),
             ts_init,
             correlation_id: None,
-            params: None,
+            params,
         }));
         client.execute_subscribe(SubscribeCommand::InstrumentStatus(
             SubscribeInstrumentStatus {

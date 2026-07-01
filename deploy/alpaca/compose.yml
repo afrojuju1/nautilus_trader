@@ -64,6 +64,7 @@ x-alpaca-runtime: &alpaca-runtime
     ALPACA_OPTION_CHAIN_SNAPSHOT_POLL_SECS: ${ALPACA_OPTION_CHAIN_SNAPSHOT_POLL_SECS:-}
     ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS: ${ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS:-}
     ALPACA_OPTION_CHAIN_OPTIONS_BUYING_POWER: ${ALPACA_OPTION_CHAIN_OPTIONS_BUYING_POWER:-}
+    ALPACA_OPTION_STREAM_MAX_QUOTE_SYMBOLS: ${ALPACA_OPTION_STREAM_MAX_QUOTE_SYMBOLS:-}
     NAUTILUS_MARKET_DATA_DUAL_WRITE: ${NAUTILUS_MARKET_DATA_DUAL_WRITE:-false}
     NAUTILUS_MARKET_DATA_CATALOG_URI: ${NAUTILUS_MARKET_DATA_CATALOG_URI:-/state/catalog}
     NAUTILUS_MARKET_DATA_WAREHOUSE_SOURCE: ${NAUTILUS_MARKET_DATA_WAREHOUSE_SOURCE:-alpaca-live}
@@ -132,13 +133,13 @@ services:
   alpaca-option-chain-live:
     <<: *alpaca-runtime
     profiles: ["cutover"]
-    command: ["alpaca-options-node"]
+    command: ["alpaca-options-runner"]
     restart: "no"
 
   alpaca-options:
     <<: *alpaca-runtime
     profiles: ["engine"]
-    command: ["alpaca-options-node"]
+    command: ["alpaca-options-runner"]
     restart: unless-stopped
 
 volumes:

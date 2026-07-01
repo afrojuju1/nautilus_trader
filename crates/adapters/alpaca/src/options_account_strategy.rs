@@ -15,7 +15,7 @@ use nautilus_common::{
     factories::OrderFactory,
     timer::TimeEvent,
 };
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_infrastructure::sql::operational::StrategyStateMutation;
 use nautilus_model::{
     data::{CustomData, CustomDataTrait, DataType, HasTsInit},
@@ -38,7 +38,10 @@ use crate::{
     candidate_payloads::{
         candidate_alert_key, insert_string_field, insert_value_field, selected_entry_alert_payload,
     },
-    common::consts::{ALPACA_CLIENT_ID, ALPACA_VENUE},
+    common::consts::{
+        ALPACA_CLIENT_ID, ALPACA_OPTION_QUOTE_INTEREST_ACTIVE_RISK,
+        ALPACA_OPTION_QUOTE_INTEREST_PARAM, ALPACA_VENUE,
+    },
     options_entry_admission::{
         EntryAdmissionConfig, EntryAdmissionSnapshot, EntryGateDecision, SubmissionBlock,
         UNCOVERED_OPTION_PERMISSION_REJECTION_REASON, entry_gate_decision,
@@ -1277,7 +1280,8 @@ impl AlpacaOptionsAccountStrategy {
         self.active_spread_instrument_ids = self.register_active_spread_instruments();
 
         let desired = active_quote_instrument_ids
-            .into_iter()
+            .iter()
+            .copied()
             .chain(self.candidate_quote_instrument_ids.iter().copied())
             .chain(self.candidate_spread_instrument_ids.iter().copied())
             .chain(self.active_spread_instrument_ids.iter().copied())
@@ -1300,7 +1304,11 @@ impl AlpacaOptionsAccountStrategy {
             .copied()
             .collect::<Vec<_>>()
         {
-            self.unsubscribe_quotes(instrument_id, self.config.client_id, None);
+            self.unsubscribe_quotes(
+                instrument_id,
+                self.config.client_id,
+                Some(Self::account_quote_subscription_params(false)),
+            );
         }
         if desired != self.active_risk_quote_subscriptions {
             emit_operator_event(
@@ -1322,15 +1330,25 @@ impl AlpacaOptionsAccountStrategy {
         self.active_risk_quote_subscriptions = desired;
     }
 
-    fn quote_subscription_params(
-        &self,
-        instrument_id: InstrumentId,
-    ) -> Option<nautilus_core::Params> {
-        (self
+    fn quote_subscription_params(&self, instrument_id: InstrumentId) -> Option<Params> {
+        let is_spread_quote = self
             .candidate_spread_instrument_ids
             .contains(&instrument_id)
-            || self.active_spread_instrument_ids.contains(&instrument_id))
-        .then(spread_quote_subscription_params)
+            || self.active_spread_instrument_ids.contains(&instrument_id);
+        Some(Self::account_quote_subscription_params(is_spread_quote))
+    }
+
+    fn account_quote_subscription_params(is_spread_quote: bool) -> Params {
+        let mut params = if is_spread_quote {
+            spread_quote_subscription_params()
+        } else {
+            Params::new()
+        };
+        params.insert(
+            ALPACA_OPTION_QUOTE_INTEREST_PARAM.to_string(),
+            json!(ALPACA_OPTION_QUOTE_INTEREST_ACTIVE_RISK),
+        );
+        params
     }
 
     fn register_active_spread_instruments(&mut self) -> BTreeSet<InstrumentId> {

@@ -44,6 +44,7 @@ use nautilus_common::{
     },
     msgbus::{self, switchboard::get_custom_topic},
 };
+use nautilus_core::Params;
 #[cfg(feature = "defi")]
 use nautilus_model::defi::Blockchain;
 use nautilus_model::{
@@ -420,7 +421,10 @@ impl DataClientAdapter {
     ///
     /// Returns an error if the underlying client subscribe operation fails.
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
-        if Self::track_subscribe(&mut self.subscriptions_quotes, cmd.instrument_id, "quotes") {
+        if is_option_quote_interest_update(cmd.params.as_ref()) {
+            self.client.subscribe_quotes(cmd)?;
+        } else if Self::track_subscribe(&mut self.subscriptions_quotes, cmd.instrument_id, "quotes")
+        {
             self.client.subscribe_quotes(cmd)?;
         }
         Ok(())
@@ -432,7 +436,13 @@ impl DataClientAdapter {
     ///
     /// Returns an error if the underlying client unsubscribe operation fails.
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
-        if Self::track_unsubscribe(&mut self.subscriptions_quotes, cmd.instrument_id, "quotes") {
+        if is_option_quote_interest_update(cmd.params.as_ref()) {
+            self.client.unsubscribe_quotes(cmd)?;
+        } else if Self::track_unsubscribe(
+            &mut self.subscriptions_quotes,
+            cmd.instrument_id,
+            "quotes",
+        ) {
             self.client.unsubscribe_quotes(cmd)?;
         }
         Ok(())
@@ -808,4 +818,11 @@ impl DataClientAdapter {
     pub fn request_book_depth(&self, req: RequestBookDepth) -> anyhow::Result<()> {
         self.client.request_book_depth(req)
     }
+}
+
+fn is_option_quote_interest_update(params: Option<&Params>) -> bool {
+    params.is_some_and(|params| {
+        params.get_str("option_quote_interest").is_some()
+            || params.get_str("option_quote_stream_policy").is_some()
+    })
 }
