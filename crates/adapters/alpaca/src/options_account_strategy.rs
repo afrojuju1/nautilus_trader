@@ -242,6 +242,10 @@ impl AlpacaOptionsAccountStrategyConfig {
 pub struct AlpacaOptionsSubmission {
     /// Submitted candidate.
     pub entry: SelectedOptionsEntry,
+    /// Originating scanner profile ID, when known.
+    pub profile_id: Option<String>,
+    /// Submitted order quantity.
+    pub quantity: u64,
     /// Parent order-list ID, or the single client-order ID for one-leg entries.
     pub order_list_id: String,
     /// Number of orders sent through the Nautilus strategy API.
@@ -253,6 +257,7 @@ pub struct AlpacaOptionsSubmission {
 #[derive(Clone, Debug)]
 struct PendingEntrySubmission {
     entry: SelectedOptionsEntry,
+    profile: Option<AlpacaOptionsCandidateProfile>,
     trade_date: String,
     order_list_id: String,
     submitted_at_utc: String,
@@ -352,16 +357,19 @@ impl AlpacaOptionsAccountStrategy {
                     entry_plan.underlying,
                     entry_plan.strategy
                 );
-                emit_operator_event(
-                    "entry_decision",
-                    json!({
-                        "action": "skipped",
-                        "reason": "outside_entry_window",
-                        "trade_date": data.candidates.trade_date,
-                        "underlying": entry_plan.underlying.as_str(),
-                        "strategy": entry_plan.strategy,
-                    }),
-                );
+                let mut payload = json!({
+                    "action": "skipped",
+                    "reason": "outside_entry_window",
+                    "trade_date": data.candidates.trade_date,
+                    "underlying": entry_plan.underlying.as_str(),
+                    "strategy": entry_plan.strategy,
+                    "strategy_family": entry_plan.family.as_str(),
+                    "symbols": entry_plan.symbols.clone(),
+                    "planned_order_legs": entry_plan_payload_legs(&entry_plan),
+                    "score": entry_plan.score,
+                });
+                insert_entry_plan_profile(&mut payload, &entry_plan);
+                emit_operator_event("entry_decision", payload);
                 self.record_selected_candidate_alert(
                     &data.candidates.trade_date,
                     entry,
@@ -399,6 +407,7 @@ impl AlpacaOptionsAccountStrategy {
                 "planned_order_legs": entry_plan_payload_legs(&entry_plan),
                 "score": entry_plan.score,
             });
+            insert_entry_plan_profile(&mut payload, &entry_plan);
             insert_regime_context(&mut payload, Some(context));
             emit_operator_event("entry_decision", payload);
             self.record_selected_candidate_alert(
@@ -421,7 +430,8 @@ impl AlpacaOptionsAccountStrategy {
             return Ok(None);
         }
 
-        if !selected_open_orders_enabled(&self.config.admission, entry) {
+        if !selected_open_orders_enabled(&self.config.admission, entry, entry_plan.profile.as_ref())
+        {
             log::info!(
                 "Dry-run Alpaca options entry: underlying={} strategy={} symbols={} score={:.1}",
                 entry_plan.underlying,
@@ -429,20 +439,19 @@ impl AlpacaOptionsAccountStrategy {
                 entry_plan.symbols.join(","),
                 entry_plan.score
             );
-            emit_operator_event(
-                "entry_decision",
-                json!({
-                    "action": "dry_run",
-                    "reason": "open_orders_disabled",
-                    "trade_date": data.candidates.trade_date,
-                    "underlying": entry_plan.underlying.as_str(),
-                    "strategy": entry_plan.strategy,
-                    "strategy_family": entry_plan.family.as_str(),
-                    "symbols": entry_plan.symbols.clone(),
-                    "planned_order_legs": entry_plan_payload_legs(&entry_plan),
-                    "score": entry_plan.score,
-                }),
-            );
+            let mut payload = json!({
+                "action": "dry_run",
+                "reason": "open_orders_disabled",
+                "trade_date": data.candidates.trade_date,
+                "underlying": entry_plan.underlying.as_str(),
+                "strategy": entry_plan.strategy,
+                "strategy_family": entry_plan.family.as_str(),
+                "symbols": entry_plan.symbols.clone(),
+                "planned_order_legs": entry_plan_payload_legs(&entry_plan),
+                "score": entry_plan.score,
+            });
+            insert_entry_plan_profile(&mut payload, &entry_plan);
+            emit_operator_event("entry_decision", payload);
             self.record_selected_candidate_alert(
                 &data.candidates.trade_date,
                 entry,
@@ -490,19 +499,18 @@ impl AlpacaOptionsAccountStrategy {
                 entry_plan.strategy,
                 entry_plan.symbols.join(",")
             );
-            emit_operator_event(
-                "entry_decision",
-                json!({
-                    "action": "skipped",
-                    "reason": "candidate_ledger_unhealthy",
-                    "trade_date": data.candidates.trade_date,
-                    "underlying": entry_plan.underlying.as_str(),
-                    "strategy": entry_plan.strategy,
-                    "strategy_family": entry_plan.family.as_str(),
-                    "symbols": entry_plan.symbols.clone(),
-                    "planned_order_legs": entry_plan_payload_legs(&entry_plan),
-                }),
-            );
+            let mut payload = json!({
+                "action": "skipped",
+                "reason": "candidate_ledger_unhealthy",
+                "trade_date": data.candidates.trade_date,
+                "underlying": entry_plan.underlying.as_str(),
+                "strategy": entry_plan.strategy,
+                "strategy_family": entry_plan.family.as_str(),
+                "symbols": entry_plan.symbols.clone(),
+                "planned_order_legs": entry_plan_payload_legs(&entry_plan),
+            });
+            insert_entry_plan_profile(&mut payload, &entry_plan);
+            emit_operator_event("entry_decision", payload);
             return Ok(None);
         }
 
@@ -514,19 +522,18 @@ impl AlpacaOptionsAccountStrategy {
                 entry_plan.strategy,
                 entry_plan.symbols.join(",")
             );
-            emit_operator_event(
-                "entry_decision",
-                json!({
-                    "action": "skipped",
-                    "reason": "state_persistence_unhealthy",
-                    "trade_date": data.candidates.trade_date,
-                    "underlying": entry_plan.underlying.as_str(),
-                    "strategy": entry_plan.strategy,
-                    "strategy_family": entry_plan.family.as_str(),
-                    "symbols": entry_plan.symbols.clone(),
-                    "planned_order_legs": entry_plan_payload_legs(&entry_plan),
-                }),
-            );
+            let mut payload = json!({
+                "action": "skipped",
+                "reason": "state_persistence_unhealthy",
+                "trade_date": data.candidates.trade_date,
+                "underlying": entry_plan.underlying.as_str(),
+                "strategy": entry_plan.strategy,
+                "strategy_family": entry_plan.family.as_str(),
+                "symbols": entry_plan.symbols.clone(),
+                "planned_order_legs": entry_plan_payload_legs(&entry_plan),
+            });
+            insert_entry_plan_profile(&mut payload, &entry_plan);
+            emit_operator_event("entry_decision", payload);
             self.record_selected_candidate_alert(
                 &data.candidates.trade_date,
                 entry,
@@ -547,6 +554,7 @@ impl AlpacaOptionsAccountStrategy {
             &self.config.admission,
             &self.state,
             entry,
+            entry_plan.profile.as_ref(),
             &data.candidates.trade_date,
             &snapshot,
         ) {
@@ -570,20 +578,19 @@ impl AlpacaOptionsAccountStrategy {
                 entry_plan.strategy,
                 entry_plan.symbols.join(",")
             );
-            emit_operator_event(
-                "entry_decision",
-                json!({
-                    "action": "skipped",
-                    "reason": "duplicate_pending_submission",
-                    "key": underlying_key,
-                    "trade_date": data.candidates.trade_date,
-                    "underlying": entry_plan.underlying.as_str(),
-                    "strategy": entry_plan.strategy,
-                    "strategy_family": entry_plan.family.as_str(),
-                    "symbols": entry_plan.symbols.clone(),
-                    "planned_order_legs": entry_plan_payload_legs(&entry_plan),
-                }),
-            );
+            let mut payload = json!({
+                "action": "skipped",
+                "reason": "duplicate_pending_submission",
+                "key": underlying_key,
+                "trade_date": data.candidates.trade_date,
+                "underlying": entry_plan.underlying.as_str(),
+                "strategy": entry_plan.strategy,
+                "strategy_family": entry_plan.family.as_str(),
+                "symbols": entry_plan.symbols.clone(),
+                "planned_order_legs": entry_plan_payload_legs(&entry_plan),
+            });
+            insert_entry_plan_profile(&mut payload, &entry_plan);
+            emit_operator_event("entry_decision", payload);
             self.record_selected_candidate_alert(
                 &data.candidates.trade_date,
                 entry,
@@ -661,13 +668,18 @@ impl AlpacaOptionsAccountStrategy {
         entry_plan: AlpacaOptionsEntryPlan,
         order_list_id: &str,
     ) -> anyhow::Result<AlpacaOptionsSubmission> {
-        let submission_orders = self.build_entry_orders(&entry_plan.entry, order_list_id)?;
+        let quantity = self.entry_plan_quantity(&entry_plan);
+        let profile = entry_plan.profile.clone();
+        let profile_id = profile.as_ref().map(|profile| profile.id.clone());
+        let submission_orders = self.build_entry_orders(&entry_plan, order_list_id)?;
         let order_count = submission_orders.orders.len();
         let broker_submit_path = submission_orders.broker_submit_path;
         self.submit_entry_orders(submission_orders.orders, order_list_id)?;
 
         Ok(AlpacaOptionsSubmission {
             entry: entry_plan.entry,
+            profile_id,
+            quantity,
             order_list_id: order_list_id.to_string(),
             order_count,
             broker_submit_path: broker_submit_path.to_string(),
@@ -681,7 +693,10 @@ impl AlpacaOptionsAccountStrategy {
         order_list_id: &str,
         regime_context: Option<&RegimeContext>,
     ) -> anyhow::Result<AlpacaOptionsSubmission> {
-        let submission_orders = self.build_entry_orders(&entry_plan.entry, order_list_id)?;
+        let quantity = self.entry_plan_quantity(&entry_plan);
+        let profile = entry_plan.profile.clone();
+        let profile_id = profile.as_ref().map(|profile| profile.id.clone());
+        let submission_orders = self.build_entry_orders(&entry_plan, order_list_id)?;
         let broker_submit_path = submission_orders.broker_submit_path;
         let client_order_ids = submission_orders
             .orders
@@ -691,9 +706,11 @@ impl AlpacaOptionsAccountStrategy {
         let order_count = submission_orders.orders.len();
         self.record_pending_submission(
             entry_plan.entry.clone(),
+            profile,
             trade_date.to_string(),
             order_list_id.to_string(),
             broker_submit_path.to_string(),
+            quantity,
             order_count,
             client_order_ids,
         );
@@ -717,6 +734,8 @@ impl AlpacaOptionsAccountStrategy {
 
         Ok(AlpacaOptionsSubmission {
             entry: entry_plan.entry,
+            profile_id,
+            quantity,
             order_list_id: order_list_id.to_string(),
             order_count,
             broker_submit_path: broker_submit_path.to_string(),
@@ -725,10 +744,11 @@ impl AlpacaOptionsAccountStrategy {
 
     fn build_entry_orders(
         &mut self,
-        entry: &SelectedOptionsEntry,
+        entry_plan: &AlpacaOptionsEntryPlan,
         order_list_id: &str,
     ) -> anyhow::Result<EntrySubmissionOrders> {
-        let quantity = self.config.quantity;
+        let quantity = self.entry_plan_quantity(entry_plan);
+        let entry = &entry_plan.entry;
         if let Some(order) = self.build_native_spread_entry_order(entry, order_list_id, quantity)? {
             return Ok(EntrySubmissionOrders {
                 orders: vec![order],
@@ -749,6 +769,14 @@ impl AlpacaOptionsAccountStrategy {
         anyhow::bail!(
             "spread entry {order_list_id} could not be planned as a native Nautilus OptionSpread"
         );
+    }
+
+    fn entry_plan_quantity(&self, entry_plan: &AlpacaOptionsEntryPlan) -> u64 {
+        entry_plan
+            .profile
+            .as_ref()
+            .map_or(self.config.quantity, |profile| profile.quantity)
+            .max(1)
     }
 
     fn build_native_spread_entry_order(
@@ -1528,7 +1556,8 @@ impl AlpacaOptionsAccountStrategy {
 
         let entry = &entry_plan.entry;
         let order_list_id = entry_order_list_id(trade_date, &entry_plan.underlying);
-        match self.vertical_spread_order_draft(entry, &order_list_id) {
+        let quantity = self.entry_plan_quantity(entry_plan);
+        match self.vertical_spread_order_draft(entry, &order_list_id, quantity) {
             Ok(Some(draft)) => emit_operator_event(
                 "entry_spread_order_draft",
                 vertical_spread_order_draft_payload(trade_date, entry_plan, dry_run_reason, &draft),
@@ -1556,6 +1585,7 @@ impl AlpacaOptionsAccountStrategy {
         &mut self,
         entry: &SelectedOptionsEntry,
         order_list_id: &str,
+        quantity: u64,
     ) -> anyhow::Result<Option<VerticalSpreadOrderDraft>> {
         let Some(plan) = selected_entry_spread_plan(entry, self.clock().timestamp_ns())? else {
             return Ok(None);
@@ -1571,7 +1601,7 @@ impl AlpacaOptionsAccountStrategy {
             &mut order_api,
             &plan,
             order_list_id,
-            self.config.quantity,
+            quantity,
             pricing.signed_limit_price,
         )?;
         Ok(Some(VerticalSpreadOrderDraft {
@@ -2024,9 +2054,11 @@ impl AlpacaOptionsAccountStrategy {
     fn record_pending_submission(
         &mut self,
         entry: SelectedOptionsEntry,
+        profile: Option<AlpacaOptionsCandidateProfile>,
         trade_date: String,
         order_list_id: String,
         broker_submit_path: String,
+        quantity: u64,
         order_count: usize,
         client_order_ids: Vec<String>,
     ) {
@@ -2039,11 +2071,12 @@ impl AlpacaOptionsAccountStrategy {
             order_list_id.clone(),
             PendingEntrySubmission {
                 entry,
+                profile,
                 trade_date,
                 order_list_id,
                 submitted_at_utc,
                 broker_submit_path,
-                quantity: self.config.quantity,
+                quantity,
                 order_count,
                 accepted: 0,
                 rejected: 0,
@@ -2071,6 +2104,7 @@ impl AlpacaOptionsAccountStrategy {
             if !pending.recorded {
                 let mut state_draft = selected_entry_state_entry_draft(
                     &pending.entry,
+                    pending.profile.as_ref().map(|profile| profile.id.clone()),
                     &pending.trade_date,
                     &pending.order_list_id,
                     pending.quantity,
@@ -2138,6 +2172,7 @@ impl AlpacaOptionsAccountStrategy {
                 };
                 let mut state_draft = selected_entry_state_entry_draft(
                     &pending.entry,
+                    pending.profile.as_ref().map(|profile| profile.id.clone()),
                     &pending.trade_date,
                     &pending.order_list_id,
                     pending.quantity,
@@ -2154,6 +2189,7 @@ impl AlpacaOptionsAccountStrategy {
                 submit_rejected_alert = Some((
                     pending.trade_date.clone(),
                     pending.entry.clone(),
+                    pending.profile.clone(),
                     pending.order_list_id.clone(),
                     pending.quantity,
                     pending.accepted,
@@ -2192,6 +2228,7 @@ impl AlpacaOptionsAccountStrategy {
         if let Some((
             trade_date,
             entry,
+            profile,
             order_list_id,
             quantity,
             accepted,
@@ -2203,6 +2240,7 @@ impl AlpacaOptionsAccountStrategy {
             self.record_submit_rejected_candidate_alert(
                 &trade_date,
                 &entry,
+                profile.as_ref(),
                 &order_list_id,
                 quantity,
                 accepted,
@@ -2382,9 +2420,7 @@ impl AlpacaOptionsAccountStrategy {
             "planned_order_legs": entry_plan_payload_legs(entry_plan),
             "score": entry.score(),
         });
-        if let Some(profile) = entry_plan.profile.as_ref() {
-            profile.insert_json_fields(&mut payload);
-        }
+        insert_entry_plan_profile(&mut payload, entry_plan);
         insert_regime_context(&mut payload, regime_context);
         emit_operator_event("entry_decision", payload);
         self.record_selected_candidate_alert(
@@ -2424,7 +2460,7 @@ impl AlpacaOptionsAccountStrategy {
             trade_date,
             action,
             order_list_id,
-            self.config.quantity,
+            profile.map_or(self.config.quantity, |profile| profile.quantity),
         );
         if let Some(profile) = profile {
             profile.insert_json_fields(&mut payload);
@@ -2461,6 +2497,7 @@ impl AlpacaOptionsAccountStrategy {
         &mut self,
         trade_date: &str,
         entry: &SelectedOptionsEntry,
+        profile: Option<&AlpacaOptionsCandidateProfile>,
         order_list_id: &str,
         quantity: u64,
         accepted: usize,
@@ -2479,6 +2516,9 @@ impl AlpacaOptionsAccountStrategy {
             Some(order_list_id),
             quantity,
         );
+        if let Some(profile) = profile {
+            profile.insert_json_fields(&mut payload);
+        }
         let alert_key = candidate_alert_key(CANDIDATE_SUBMIT_REJECTED_ALERT, &identity_key);
         if !self
             .recorded_candidate_alert_keys
@@ -2700,12 +2740,18 @@ fn entry_plan_payload_legs(entry_plan: &AlpacaOptionsEntryPlan) -> Vec<Value> {
         .collect()
 }
 
+fn insert_entry_plan_profile(payload: &mut Value, entry_plan: &AlpacaOptionsEntryPlan) {
+    if let Some(profile) = entry_plan.profile.as_ref() {
+        profile.insert_json_fields(payload);
+    }
+}
+
 fn spread_quote_snapshot_payload(
     trade_date: &str,
     entry_plan: &AlpacaOptionsEntryPlan,
     plan: &OptionSpreadPlan,
 ) -> Value {
-    json!({
+    let mut payload = json!({
         "trade_date": trade_date,
         "underlying": plan.underlying.as_str(),
         "strategy": plan.strategy.as_str(),
@@ -2728,7 +2774,9 @@ fn spread_quote_snapshot_payload(
         "scanner_premium_kind": plan.scanner_premium_kind.as_str(),
         "scanner_premium": plan.scanner_premium,
         "vega_pricing_enabled": false,
-    })
+    });
+    insert_entry_plan_profile(&mut payload, entry_plan);
+    payload
 }
 
 struct SpreadEntryOrderPricing {
@@ -2830,6 +2878,7 @@ fn vertical_spread_order_draft_payload(
     if let Some(value) = draft.pricing.quote_ts_init {
         insert_value_field(&mut payload, "quote_ts_init", json!(value.as_u64()));
     }
+    insert_entry_plan_profile(&mut payload, entry_plan);
     payload
 }
 
@@ -3544,6 +3593,7 @@ fn state_entry_draft_payload(draft: &StrategyStateEntryDraft) -> serde_json::Val
         "debit": draft.debit,
         "risk_capital_usd": draft.risk_capital_usd,
         "score": draft.score,
+        "profile_id": draft.profile_id,
         "parent_order_id": draft.parent_order_id,
         "submitted_at_utc": draft.submitted_at_utc,
         "spread_instrument_id": draft.spread_instrument_id,
@@ -3578,6 +3628,7 @@ fn state_entry_payload(entry: &StrategyStateEntry) -> serde_json::Value {
         "debit": entry.debit,
         "risk_capital_usd": entry.risk_capital_usd,
         "score": entry.score,
+        "profile_id": entry.profile_id,
         "parent_order_id": entry.parent_order_id,
         "submitted_at_utc": entry.submitted_at_utc,
         "spread_instrument_id": entry.spread_instrument_id,

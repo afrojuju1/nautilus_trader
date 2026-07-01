@@ -604,7 +604,9 @@ pub(super) fn build_options_runtime_config(
         &naked_scanner,
         &naked_1_3dte_scanner,
     )?;
-    let quantity = uniform_strategy_profile_quantity(&strategy_profiles)?;
+    let quantity = strategy_profiles
+        .first()
+        .map_or(default_quantity, |profile| profile.quantity);
     let strategy_config = strategy_family_config_from_profiles(&strategy_profiles);
     let dry_run_strategy_config = dry_run_strategy_family_config_from_profiles(&strategy_profiles);
     let profile_underlyings = underlyings_from_profiles(&strategy_profiles);
@@ -1154,25 +1156,6 @@ fn underlyings_from_profiles(profiles: &[AlpacaOptionsStrategyProfile]) -> Vec<S
             }
         })
         .collect()
-}
-
-fn uniform_strategy_profile_quantity(
-    profiles: &[AlpacaOptionsStrategyProfile],
-) -> anyhow::Result<u64> {
-    let Some(first) = profiles.first() else {
-        return Ok(1);
-    };
-    let quantity = first.quantity;
-    for profile in profiles.iter().skip(1) {
-        anyhow::ensure!(
-            profile.quantity == quantity,
-            "Alpaca strategy profiles must use one shared quantity until profile-scoped order sizing is wired; profile {} has quantity {}, expected {}",
-            profile.id,
-            profile.quantity,
-            quantity
-        );
-    }
-    Ok(quantity)
 }
 
 fn apply_fleet_policy(config: &mut AlpacaOptionsRuntimeConfig) {

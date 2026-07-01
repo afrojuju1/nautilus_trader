@@ -14,6 +14,7 @@ use crate::{
 #[must_use]
 pub fn selected_entry_state_entry_draft(
     entry: &SelectedOptionsEntry,
+    profile_id: Option<String>,
     trade_date: &str,
     order_list_id: &str,
     quantity: u64,
@@ -28,6 +29,7 @@ pub fn selected_entry_state_entry_draft(
     match entry {
         SelectedOptionsEntry::Credit(entry) => StrategyStateEntryDraft {
             trade_date: trade_date.to_string(),
+            profile_id: profile_id.clone(),
             underlying: entry.underlying.clone(),
             strategy: credit_spread_strategy_name(entry.kind).to_string(),
             order_list_id: order_list_id.to_string(),
@@ -55,6 +57,7 @@ pub fn selected_entry_state_entry_draft(
         },
         SelectedOptionsEntry::IronCondor(entry) => StrategyStateEntryDraft {
             trade_date: trade_date.to_string(),
+            profile_id: profile_id.clone(),
             underlying: entry.underlying.clone(),
             strategy: "iron_condor".to_string(),
             order_list_id: order_list_id.to_string(),
@@ -82,6 +85,7 @@ pub fn selected_entry_state_entry_draft(
         },
         SelectedOptionsEntry::Debit(entry) => StrategyStateEntryDraft {
             trade_date: trade_date.to_string(),
+            profile_id: profile_id.clone(),
             underlying: entry.underlying.clone(),
             strategy: debit_spread_strategy_name(entry.kind).to_string(),
             order_list_id: order_list_id.to_string(),
@@ -109,6 +113,7 @@ pub fn selected_entry_state_entry_draft(
         },
         SelectedOptionsEntry::NakedOption(entry) => StrategyStateEntryDraft {
             trade_date: trade_date.to_string(),
+            profile_id,
             underlying: entry.underlying.clone(),
             strategy: naked_option_strategy_name(entry.kind).to_string(),
             order_list_id: order_list_id.to_string(),

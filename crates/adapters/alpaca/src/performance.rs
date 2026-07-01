@@ -943,6 +943,7 @@ mod tests {
     fn state_entry() -> StrategyStateEntry {
         StrategyStateEntry {
             trade_date: "2026-05-07".to_string(),
+            profile_id: None,
             underlying: "SPY".to_string(),
             strategy: "call_credit".to_string(),
             order_list_id: "entry-list".to_string(),
@@ -978,6 +979,7 @@ mod tests {
     fn iron_condor_state_entry() -> StrategyStateEntry {
         StrategyStateEntry {
             trade_date: "2026-05-05".to_string(),
+            profile_id: None,
             underlying: "GLD".to_string(),
             strategy: "iron_condor".to_string(),
             order_list_id: "entry-list".to_string(),

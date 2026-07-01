@@ -55,6 +55,8 @@ pub struct StrategyState {
 pub struct StrategyStateEntryDraft {
     /// Market trade date for the entry.
     pub trade_date: String,
+    /// Originating strategy profile ID, when the entry came from scanner profile data.
+    pub profile_id: Option<String>,
     /// Underlying symbol.
     pub underlying: String,
     /// Strategy name.
@@ -142,6 +144,59 @@ impl StrategyState {
         submitted.saturating_sub(replacement_exemptions)
     }
 
+    /// Returns the same-day submit count for one profile, conservatively counting legacy entries.
+    #[must_use]
+    pub fn risk_counted_daily_submits_for_profile(
+        &self,
+        trade_date: &str,
+        profile_id: &str,
+    ) -> usize {
+        let submitted = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.submitted
+                    && entry.trade_date == trade_date
+                    && entry_matches_profile(entry, profile_id)
+            })
+            .count();
+        let replacement_exemptions = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.submitted
+                    && entry.trade_date == trade_date
+                    && entry_matches_profile(entry, profile_id)
+                    && entry.is_canceled_debit_replacement_candidate()
+            })
+            .count()
+            .min(CANCELED_DEBIT_REPLACEMENT_EXEMPTIONS_PER_DAY);
+
+        submitted.saturating_sub(replacement_exemptions)
+    }
+
+    /// Returns the active entry count for one profile, conservatively counting legacy entries.
+    #[must_use]
+    pub fn active_profile_count(&self, profile_id: &str) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.is_active() && entry_matches_profile(entry, profile_id))
+            .count()
+    }
+
+    /// Returns the active entry count for one profile and underlying.
+    #[must_use]
+    pub fn active_profile_underlying_count(&self, profile_id: &str, underlying: &str) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry.is_active()
+                    && entry.underlying.eq_ignore_ascii_case(underlying)
+                    && entry_matches_profile(entry, profile_id)
+            })
+            .count()
+    }
+
     /// Returns `true` when a same-day underlying entry should block another entry by risk policy.
     #[must_use]
     pub fn has_risk_counted_submitted_underlying_today(
@@ -210,6 +265,7 @@ impl StrategyState {
                 candidate.max_loss * OPTION_CONTRACT_MULTIPLIER * quantity as f64,
             ),
             score: candidate.score,
+            profile_id: None,
             parent_order_id,
             submitted_at_utc: None,
             spread_instrument_id: None,
@@ -245,6 +301,7 @@ impl StrategyState {
                 candidate.max_loss * OPTION_CONTRACT_MULTIPLIER * quantity as f64,
             ),
             score: candidate.score,
+            profile_id: None,
             parent_order_id,
             submitted_at_utc: None,
             spread_instrument_id: None,
@@ -281,6 +338,7 @@ impl StrategyState {
                 candidate.max_loss * OPTION_CONTRACT_MULTIPLIER * quantity as f64,
             ),
             score: candidate.score,
+            profile_id: None,
             parent_order_id,
             submitted_at_utc: None,
             spread_instrument_id: None,
@@ -315,6 +373,7 @@ impl StrategyState {
             debit: None,
             risk_capital_usd: Some(candidate.estimated_buying_power_requirement),
             score: candidate.score,
+            profile_id: None,
             parent_order_id,
             submitted_at_utc: None,
             spread_instrument_id: None,
@@ -331,6 +390,7 @@ impl StrategyState {
             .unwrap_or_else(|| Utc::now().to_rfc3339());
         self.entries.push(StrategyStateEntry {
             trade_date: draft.trade_date,
+            profile_id: draft.profile_id,
             underlying: draft.underlying,
             strategy: draft.strategy,
             order_list_id: draft.order_list_id,
@@ -364,6 +424,13 @@ impl StrategyState {
     }
 }
 
+fn entry_matches_profile(entry: &StrategyStateEntry, profile_id: &str) -> bool {
+    entry
+        .profile_id
+        .as_deref()
+        .is_none_or(|existing| existing == profile_id)
+}
+
 /// Persisted signed spread leg evidence for one strategy-state entry.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StrategyStateSpreadLeg {
@@ -380,6 +447,9 @@ pub struct StrategyStateSpreadLeg {
 pub struct StrategyStateEntry {
     /// Market trade date for the entry decision.
     pub trade_date: String,
+    /// Originating strategy profile ID.
+    #[serde(default)]
+    pub profile_id: Option<String>,
     /// Underlying symbol.
     pub underlying: String,
     /// Strategy name.
@@ -736,6 +806,7 @@ mod tests {
         let mut state = StrategyState::default();
         state.entries.push(StrategyStateEntry {
             trade_date: "2026-05-02".to_string(),
+            profile_id: None,
             underlying: "SPY".to_string(),
             strategy: credit_spread_strategy_name(CreditSpreadKind::Put).to_string(),
             order_list_id: "order-list-1".to_string(),
@@ -900,6 +971,7 @@ mod tests {
         let mut state = StrategyState::default();
         let mut credit = StrategyStateEntry {
             trade_date: "2026-05-04".to_string(),
+            profile_id: None,
             underlying: "SPY".to_string(),
             strategy: credit_spread_strategy_name(CreditSpreadKind::Put).to_string(),
             order_list_id: "open-list-1".to_string(),
@@ -941,6 +1013,7 @@ mod tests {
     fn risk_capital_derives_defined_risk_and_debit_entries() {
         let credit = StrategyStateEntry {
             trade_date: "2026-05-04".to_string(),
+            profile_id: None,
             underlying: "SPY".to_string(),
             strategy: credit_spread_strategy_name(CreditSpreadKind::Put).to_string(),
             order_list_id: "open-list-1".to_string(),
@@ -1026,6 +1099,7 @@ mod tests {
     fn debit_state_entry(order_list_id: &str) -> StrategyStateEntry {
         StrategyStateEntry {
             trade_date: "2026-05-04".to_string(),
+            profile_id: None,
             underlying: "SLV".to_string(),
             strategy: debit_spread_strategy_name(DebitSpreadKind::Call).to_string(),
             order_list_id: order_list_id.to_string(),

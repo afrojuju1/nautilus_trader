@@ -8,8 +8,8 @@ use chrono_tz::Tz;
 use crate::{
     earnings::{EarningsEvent, days_to_report, is_inside_event_shock_window},
     options_runtime::{
-        AlpacaOptionsRuntimeConfig, SelectedOptionsEntry, active_sector_count,
-        active_underlying_count,
+        AlpacaOptionsCandidateProfile, AlpacaOptionsRuntimeConfig, AlpacaOptionsStrategyMode,
+        SelectedOptionsEntry, active_sector_count, active_underlying_count,
     },
     runtime::StrategyState,
 };
@@ -236,11 +236,19 @@ impl Default for EntryAdmissionConfig {
 pub fn selected_open_orders_enabled(
     config: &EntryAdmissionConfig,
     selected: &SelectedOptionsEntry,
+    profile: Option<&AlpacaOptionsCandidateProfile>,
 ) -> bool {
-    config.open_orders_enabled
-        && !config
-            .dry_run_strategy_family_names
-            .contains_key(selected.strategy_name())
+    if !config.open_orders_enabled {
+        return false;
+    }
+
+    if let Some(profile) = profile {
+        return matches!(profile.mode, AlpacaOptionsStrategyMode::Live);
+    }
+
+    !config
+        .dry_run_strategy_family_names
+        .contains_key(selected.strategy_name())
 }
 
 /// Returns the entry action mode for a selected entry.
@@ -248,8 +256,9 @@ pub fn selected_open_orders_enabled(
 pub fn selected_entry_mode(
     config: &EntryAdmissionConfig,
     selected: &SelectedOptionsEntry,
+    profile: Option<&AlpacaOptionsCandidateProfile>,
 ) -> EntryMode {
-    if selected_open_orders_enabled(config, selected) {
+    if selected_open_orders_enabled(config, selected, profile) {
         EntryMode::Submit
     } else {
         EntryMode::DryRun
@@ -272,13 +281,17 @@ pub fn submission_block_for_selected(
     config: &EntryAdmissionConfig,
     state: &StrategyState,
     selected: &SelectedOptionsEntry,
+    profile: Option<&AlpacaOptionsCandidateProfile>,
     trade_date: &str,
     snapshot: &EntryAdmissionSnapshot,
 ) -> Option<SubmissionBlock> {
     broker_permission_block_for_selected(state, selected)
-        .or_else(|| risk_gate_decision(config, state, trade_date, snapshot).into_submission_block())
+        .or_else(|| {
+            risk_gate_decision(config, state, profile, trade_date, snapshot).into_submission_block()
+        })
         .or_else(|| event_shock_block(config, trade_date, selected.underlying()))
-        .or_else(|| portfolio_risk_capital_block(config, state, selected))
+        .or_else(|| portfolio_risk_capital_block(config, state, selected, profile))
+        .or_else(|| profile_underlying_block(state, profile, selected.underlying()))
         .or_else(|| per_underlying_block(config, state, selected.underlying()))
         .or_else(|| per_sector_block(config, state, selected.underlying()))
         .or_else(|| fleet_underlying_limit_block(config, selected.underlying()))
@@ -350,13 +363,35 @@ pub fn admission_block_reason(reasons: &[String]) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum RiskGateDecision {
     Continue,
-    MaxActiveEntries { current: usize, limit: usize },
-    MaxDailySubmits { current: usize, limit: usize },
-    MaxOpenOrders { current: usize, limit: usize },
-    FleetMaxActiveEntries { current: usize, limit: usize },
+    MaxActiveEntries {
+        current: usize,
+        limit: usize,
+    },
+    ProfileMaxActiveEntries {
+        profile_id: String,
+        current: usize,
+        limit: usize,
+    },
+    MaxDailySubmits {
+        current: usize,
+        limit: usize,
+    },
+    ProfileMaxDailySubmits {
+        profile_id: String,
+        current: usize,
+        limit: usize,
+    },
+    MaxOpenOrders {
+        current: usize,
+        limit: usize,
+    },
+    FleetMaxActiveEntries {
+        current: usize,
+        limit: usize,
+    },
 }
 
 impl RiskGateDecision {
@@ -369,11 +404,31 @@ impl RiskGateDecision {
                 limit: Some(limit),
                 details: Vec::new(),
             }),
+            Self::ProfileMaxActiveEntries {
+                profile_id,
+                current,
+                limit,
+            } => Some(SubmissionBlock {
+                reason: "risk_profile_max_active_entries".to_string(),
+                current: Some(current),
+                limit: Some(limit),
+                details: vec![format!("profile_id={profile_id}")],
+            }),
             Self::MaxDailySubmits { current, limit } => Some(SubmissionBlock {
                 reason: "risk_max_daily_submits".to_string(),
                 current: Some(current),
                 limit: Some(limit),
                 details: Vec::new(),
+            }),
+            Self::ProfileMaxDailySubmits {
+                profile_id,
+                current,
+                limit,
+            } => Some(SubmissionBlock {
+                reason: "risk_profile_max_daily_submits".to_string(),
+                current: Some(current),
+                limit: Some(limit),
+                details: vec![format!("profile_id={profile_id}")],
             }),
             Self::MaxOpenOrders { current, limit } => Some(SubmissionBlock {
                 reason: "risk_max_open_orders".to_string(),
@@ -394,6 +449,7 @@ impl RiskGateDecision {
 fn risk_gate_decision(
     config: &EntryAdmissionConfig,
     state: &StrategyState,
+    profile: Option<&AlpacaOptionsCandidateProfile>,
     trade_date: &str,
     snapshot: &EntryAdmissionSnapshot,
 ) -> RiskGateDecision {
@@ -408,10 +464,39 @@ fn risk_gate_decision(
         }
     }
 
+    if let Some((profile, limit)) = profile.and_then(|profile| {
+        profile
+            .risk
+            .max_active_entries
+            .map(|limit| (profile, limit))
+    }) {
+        let current = state.active_profile_count(&profile.id);
+        if current >= limit {
+            return RiskGateDecision::ProfileMaxActiveEntries {
+                profile_id: profile.id.clone(),
+                current,
+                limit,
+            };
+        }
+    }
+
     if let Some(limit) = config.max_daily_submits {
         let current = state.risk_counted_daily_submits(trade_date);
         if current >= limit {
             return RiskGateDecision::MaxDailySubmits { current, limit };
+        }
+    }
+
+    if let Some((profile, limit)) =
+        profile.and_then(|profile| profile.risk.max_daily_submits.map(|limit| (profile, limit)))
+    {
+        let current = state.risk_counted_daily_submits_for_profile(trade_date, &profile.id);
+        if current >= limit {
+            return RiskGateDecision::ProfileMaxDailySubmits {
+                profile_id: profile.id.clone(),
+                current,
+                limit,
+            };
         }
     }
 
@@ -467,18 +552,42 @@ fn per_underlying_block(
     })
 }
 
+fn profile_underlying_block(
+    state: &StrategyState,
+    profile: Option<&AlpacaOptionsCandidateProfile>,
+    underlying: &str,
+) -> Option<SubmissionBlock> {
+    let profile = profile?;
+    let limit = profile.risk.max_active_entries_per_underlying?;
+    let current = state.active_profile_underlying_count(&profile.id, underlying);
+    (current >= limit).then(|| SubmissionBlock {
+        reason: "risk_profile_max_active_entries_per_underlying".to_string(),
+        current: Some(current),
+        limit: Some(limit),
+        details: vec![
+            format!("profile_id={}", profile.id),
+            format!("underlying={underlying}"),
+        ],
+    })
+}
+
 fn portfolio_risk_capital_block(
     config: &EntryAdmissionConfig,
     state: &StrategyState,
     selected: &SelectedOptionsEntry,
+    profile: Option<&AlpacaOptionsCandidateProfile>,
 ) -> Option<SubmissionBlock> {
+    let profile_single_entry_limit =
+        profile.and_then(|profile| profile.risk.max_single_entry_risk_capital_usd);
     let has_limit = config.max_single_entry_risk_capital_usd.is_some()
-        || config.max_portfolio_risk_capital_usd.is_some();
+        || config.max_portfolio_risk_capital_usd.is_some()
+        || profile_single_entry_limit.is_some();
     if !has_limit {
         return None;
     }
 
-    let candidate_risk = selected.risk_capital_usd(config.quantity);
+    let quantity = profile.map_or(config.quantity, |profile| profile.quantity);
+    let candidate_risk = selected.risk_capital_usd(quantity);
     let Some(candidate_risk) = candidate_risk else {
         return config
             .block_unestimated_risk_capital
@@ -486,13 +595,33 @@ fn portfolio_risk_capital_block(
                 reason: "risk_capital_unestimated".to_string(),
                 current: None,
                 limit: None,
-                details: vec![
-                    "scope=selected_entry".to_string(),
-                    format!("strategy={}", selected.strategy_name()),
-                    format!("underlying={}", selected.underlying()),
-                ],
+                details: risk_capital_details(
+                    profile,
+                    vec![
+                        "scope=selected_entry".to_string(),
+                        format!("strategy={}", selected.strategy_name()),
+                        format!("underlying={}", selected.underlying()),
+                    ],
+                ),
             });
     };
+
+    if let Some(limit) = profile_single_entry_limit
+        && candidate_risk > limit
+    {
+        return Some(SubmissionBlock {
+            reason: "risk_profile_max_single_entry_risk_capital".to_string(),
+            current: None,
+            limit: None,
+            details: risk_capital_details(
+                profile,
+                vec![
+                    format!("candidate_risk_capital_usd={candidate_risk:.2}"),
+                    format!("limit_usd={limit:.2}"),
+                ],
+            ),
+        });
+    }
 
     if let Some(limit) = config.max_single_entry_risk_capital_usd
         && candidate_risk > limit
@@ -501,10 +630,13 @@ fn portfolio_risk_capital_block(
             reason: "risk_max_single_entry_risk_capital".to_string(),
             current: None,
             limit: None,
-            details: vec![
-                format!("candidate_risk_capital_usd={candidate_risk:.2}"),
-                format!("limit_usd={limit:.2}"),
-            ],
+            details: risk_capital_details(
+                profile,
+                vec![
+                    format!("candidate_risk_capital_usd={candidate_risk:.2}"),
+                    format!("limit_usd={limit:.2}"),
+                ],
+            ),
         });
     }
 
@@ -518,12 +650,15 @@ fn portfolio_risk_capital_block(
             reason: "risk_capital_unestimated".to_string(),
             current: None,
             limit: None,
-            details: vec![
-                "scope=active_entries".to_string(),
-                format!("unknown_active_entries={}", active.unknown_count),
-                format!("known_active_risk_capital_usd={:.2}", active.known_usd),
-                format!("limit_usd={limit:.2}"),
-            ],
+            details: risk_capital_details(
+                profile,
+                vec![
+                    "scope=active_entries".to_string(),
+                    format!("unknown_active_entries={}", active.unknown_count),
+                    format!("known_active_risk_capital_usd={:.2}", active.known_usd),
+                    format!("limit_usd={limit:.2}"),
+                ],
+            ),
         });
     }
 
@@ -532,13 +667,27 @@ fn portfolio_risk_capital_block(
         reason: "risk_max_portfolio_risk_capital".to_string(),
         current: None,
         limit: None,
-        details: vec![
-            format!("active_risk_capital_usd={:.2}", active.known_usd),
-            format!("candidate_risk_capital_usd={candidate_risk:.2}"),
-            format!("projected_risk_capital_usd={projected:.2}"),
-            format!("limit_usd={limit:.2}"),
-        ],
+        details: risk_capital_details(
+            profile,
+            vec![
+                format!("active_risk_capital_usd={:.2}", active.known_usd),
+                format!("candidate_risk_capital_usd={candidate_risk:.2}"),
+                format!("projected_risk_capital_usd={projected:.2}"),
+                format!("limit_usd={limit:.2}"),
+            ],
+        ),
     })
+}
+
+fn risk_capital_details(
+    profile: Option<&AlpacaOptionsCandidateProfile>,
+    mut details: Vec<String>,
+) -> Vec<String> {
+    if let Some(profile) = profile {
+        details.push(format!("profile_id={}", profile.id));
+        details.push(format!("profile_quantity={}", profile.quantity));
+    }
+    details
 }
 
 fn event_shock_block(
@@ -713,6 +862,7 @@ mod tests {
             &config,
             &state,
             &selected,
+            None,
             "2026-05-04",
             &EntryAdmissionSnapshot::default(),
         )
@@ -750,6 +900,7 @@ mod tests {
             &config,
             &state,
             &selected,
+            None,
             "2026-05-04",
             &EntryAdmissionSnapshot::default(),
         )
@@ -783,6 +934,7 @@ mod tests {
             &config,
             &state,
             &selected,
+            None,
             "2026-05-04",
             &EntryAdmissionSnapshot::default(),
         )
@@ -817,6 +969,7 @@ mod tests {
             &config,
             &state,
             &selected,
+            None,
             "2026-05-04",
             &EntryAdmissionSnapshot::default(),
         )
@@ -851,6 +1004,7 @@ mod tests {
     fn active_draft(underlying: &str, risk_capital_usd: Option<f64>) -> StrategyStateEntryDraft {
         StrategyStateEntryDraft {
             trade_date: "2026-05-03".to_string(),
+            profile_id: None,
             underlying: underlying.to_string(),
             strategy: credit_spread_strategy_name(CreditSpreadKind::Put).to_string(),
             order_list_id: format!("{underlying}-entry"),
