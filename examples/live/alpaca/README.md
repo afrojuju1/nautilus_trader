@@ -236,6 +236,10 @@ inspection filter, not a live-engine universe control.
 cargo run -p nautilus-alpaca --features live --bin alpaca-compare-option-chain-scan -- --pretty SPY YYYY-MM-DD
 ```
 
+The live options engine does not use this fixed expiry. It reads `[[strategies]]` profiles from
+`ALPACA_CONFIG_PATH`, resolves those profile intents into concrete `OptionSeriesId` subscriptions,
+and lets Nautilus `DataEngine`/`OptionChainManager` own the option-chain lifecycle.
+
 ## Check the options runtime config
 
 Keep broker order capabilities disabled while checking config:
@@ -246,6 +250,10 @@ export ALPACA_CLOSE_ORDERS=false
 
 cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- --check-config
 ```
+
+The config summary should include `strategy_profiles=...` and `universe_intents=...`. Strategy
+families, per-profile quantity, scanner overrides, and dry-run/live mode live in TOML profile
+blocks; env vars are for credentials, paths, emergency order gates, and narrow runtime overrides.
 
 To use an explicit diagnostic or account-boundary env file:
 

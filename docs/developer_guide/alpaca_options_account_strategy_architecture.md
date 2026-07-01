@@ -38,8 +38,8 @@ and are translated by execution clients.
 The fork is already aligned with this at the outer boundary:
 
 - `crates/adapters/alpaca/bin/options_node.rs` builds the live node and registers Alpaca clients.
-- `crates/adapters/alpaca/src/candidate_scan_actor.rs` subscribes to option chains and publishes
-  candidate data.
+- `crates/adapters/alpaca/src/candidate_scan_actor.rs` derives option-chain subscriptions from
+  strategy-profile universe intent and publishes candidate data.
 - `crates/adapters/alpaca/src/options_account_strategy.rs` consumes candidates and submits through Nautilus
   strategy APIs.
 - `crates/adapters/alpaca/src/execution.rs` maps Nautilus orders to Alpaca execution payloads.
@@ -105,9 +105,11 @@ readiness, runtime lease acquisition, node construction, and graceful shutdown.
 `AlpacaDataClient` owns Alpaca market-data access and converts venue data into Nautilus instruments,
 quotes, bars, Greeks, and option-chain inputs. It must not embed strategy family policy.
 
-`CandidateScanActor` owns Nautilus subscriptions and scan job orchestration. Its callback work must
-stay bounded: capture or normalize the current chain snapshot, enqueue a scan job, emit queue
-diagnostics, and return.
+`CandidateScanActor` owns profile-derived scan orchestration. It resolves strategy-profile universe
+intent into concrete option-series subscription requests, but `DataEngine` and
+`OptionChainManager` own the actual subscription lifecycle and option-chain assembly. Its callback
+work must stay bounded: capture or normalize the current chain snapshot, enqueue a scan job, emit
+queue diagnostics, and return.
 
 `Bounded scan workers` own CPU-heavy ranking. They receive immutable scan inputs, execute pure
 family planners, and return timestamped results. They do not access Alpaca credentials, submit
@@ -145,10 +147,10 @@ is not part of order submission, broker truth, or realized PnL.
 | Current area | Target |
 | --- | --- |
 | `options_node.rs` | Keep as process assembly; shrink business logic over time. |
-| `candidate_scan_actor.rs` | Keep as subscription actor; move scan/rank work to bounded workers. |
+| `candidate_scan_actor.rs` | Keep as Alpaca-housed scan/subscription orchestrator; profile-derived universe intent feeds Nautilus subscription APIs, while scan/rank work moves to bounded workers. |
 | `options_account_strategy.rs` | Split into account strategy, entry admission, close manager, state projector, and event handlers. |
 | `strategy.rs` and `option_chain_candidates.rs` | Move pure candidate ranking toward source-neutral planner modules. |
-| `options_runtime/config.rs` | Replace family string lists with explicit profile strategy blocks. |
+| `options_runtime/config.rs` | Explicit profile strategy blocks are the live scanner/admission control plane. Keep family-list and fixed-expiry controls out of the live runtime. |
 | `runtime.rs` strategy state | Replace the account JSONB snapshot table with normalized strategy_state rows plus account metadata and broker evidence. |
 | `spread_plan.rs` and `execution.rs` | Continue under `nt-ups`; this lane owns native `OptionSpread` cutover. |
 
@@ -168,8 +170,8 @@ is not part of order submission, broker truth, or realized PnL.
    thread and add stale-result dropping.
 3. Strategy module split. Extract account strategy shell, family planners, close manager, state
    projector, and event handlers without changing broker behavior.
-4. Profile strategy blocks. Replace `strategy_families` and `dry_run_families` with explicit
-   per-profile strategy blocks.
+4. Profile strategy blocks. Keep explicit per-profile strategy blocks as the live scanner and
+   admission control plane; `strategy_families` and `dry_run_families` are retired concepts.
 5. Strategy-state row replacement. Migrate operational state in place so `strategy_state` stores
    normalized order-state rows and `strategy_broker_leg_evidence` stores broker evidence, with
    backup and rollback instructions.

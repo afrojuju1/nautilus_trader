@@ -9,6 +9,9 @@ implemented surface focuses on US equity option workflows:
 - Alpaca option order payload builders and local validation for simple and multi-leg limit orders.
 - A Rust execution/runtime path for option-spread submission, trade-update handling, and REST
   reconciliation.
+- Profile-owned Alpaca options runtime orchestration: strategy profiles define live option
+  universe intent, the source-neutral resolver selects concrete option series, and Nautilus
+  `DataEngine`/`OptionChainManager` own option-chain subscriptions.
 - Diagnostic and operator binaries for paper-trading account checks, option-chain inspection,
   bounded scan comparison, multi-leg validation, candidate alerts, and performance reporting.
 

@@ -57,8 +57,8 @@ payloads.
 Paper order submission and cancel requests are now exposed through the REST client; the smoke
 binary submits one MLeg order and cancels it immediately if Alpaca accepts it.
 Order-by-ID polling, account-activity polling, admission gates for duplicate option exposure, a
-paper execution lifecycle harness, and a Nautilus timer strategy scaffold now share the same put
-credit scanner logic.
+paper execution lifecycle harness, and the Nautilus-native runtime path now share the same candidate
+engine logic.
 
 ## Alpaca API Mapping
 
@@ -112,9 +112,9 @@ Phase 1:
 - Implement paper multi-leg order submission. (Initial direct submit/cancel smoke path complete.)
 - Implement paper-only multi-leg payload validation. (Initial put credit spread payload builder
   complete; submit is exposed separately through the REST client.)
-- Add a dry-run strategy harness that emits candidate decisions without orders. (Initial standalone
-  scanner complete; scanner logic is shared by a timer-style Rust loop and a Nautilus
-  retired Python put-credit scanner scaffold.)
+- Add a dry-run strategy harness that emits candidate decisions without orders. (The standalone
+  scanner-only scaffolds are retired; the active path is the Nautilus-native actor/strategy runtime
+  plus bounded diagnostics.)
 
 Phase 2:
 

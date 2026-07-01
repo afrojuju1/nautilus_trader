@@ -54,10 +54,14 @@ when `NAUTILUS_ALPACA_REPO` points at the checkout or when commands run from the
 `NAUTILUS_ALPACA_ENV_FILE` only when intentionally pointing at a different env file for an account
 or diagnostic boundary.
 
-Edit `~/.config/nautilus-trader/alpaca/base-options.toml` for shared scanner, universe,
-sector, and management settings. Account configs can set top-level `extends` to inherit from that
-base, then override only strategy identity, state path, risk caps, or account-specific scanner
-limits. TOML `runtime.max_iterations = 0` is continuous service mode. Set
+Edit `~/.config/nautilus-trader/alpaca/base-options.toml` for shared scanner defaults, universe
+defaults, sector maps, and management settings. Account configs can set top-level `extends` to
+inherit from that base, then override only strategy identity, state path, risk caps, or
+account-specific scanner limits. Live scan composition belongs in explicit `[[strategies]]`
+profiles: each profile owns its family, mode, underlyings, quantity, per-profile scanner overrides,
+and risk overrides. The live engine resolves those profiles into concrete `OptionSeriesId`
+subscriptions; fixed expiries remain diagnostic/replay filters rather than live runtime controls.
+TOML `runtime.max_iterations = 0` is continuous service mode. Set
 `ALPACA_MAX_ITERATIONS=1` only for a manual one-shot smoke test override.
 
 Candidate-ledger evidence is enabled by default with `runtime.candidate_ledger_enabled = true`.
@@ -123,6 +127,11 @@ the fields they support:
 
 Not every TOML field has an env override. Scanner thresholds, sector maps, and most management
 parameters should stay in TOML so the checked config remains reviewable.
+
+Profile blocks are also the strategy-family switchboard. Use `mode = "dry_run"` for a profile that
+should scan and record decisions without opening broker risk while other profiles may remain live.
+Do not add or rely on environment variables for fixed expiries, automatic/fixed modes, or family
+enable lists in the live service.
 
 Env file loading differs by intent. If `NAUTILUS_ALPACA_ENV_FILE` is unset, the runtime auto-loads
 the repo `.env` from `NAUTILUS_ALPACA_REPO` or by walking up from the current directory, while
@@ -544,6 +553,11 @@ close trigger.
 Scanner diagnostics include a `rejections` map keyed by filter reason, so a no-candidate scan can be
 attributed to liquidity, quote quality, delta range, POP/touch gates, buying-power usage, score, or
 spread-construction filters instead of only reporting a generic no-candidate result.
+Profile-owned scans also report `profile_id`, `profile_family`, `profile_mode`, and
+`profile_quantity`. Universe status reports requested, selected, subscribed, skipped, and failed
+counts. A healthy live profile-owned scan should therefore show both the configured
+`strategy_profiles` summary and profile-tagged `last_scan.scans[]` rows in
+`nautilus adapters alpaca status --json`.
 
 Candidate alert commands read typed `candidate_alert` records from Postgres. They do not run
 scanners or submit orders:

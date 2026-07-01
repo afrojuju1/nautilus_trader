@@ -8,7 +8,10 @@ architecture note.
 
 This document describes the target architecture for moving Alpaca option candidate scanning toward
 standard Nautilus runtime patterns. It is intentionally high level. The goal is to name the system
-shape before we continue moving implementation details.
+shape before we continue moving implementation details. The current implementation is housed in the
+Alpaca adapter because Alpaca is the first live proof venue; the durable boundary is still
+source-neutral strategy intent, option-universe resolution, candidate ranking, and Nautilus
+data/subscription ownership.
 
 ## Naming
 
@@ -23,7 +26,9 @@ Nautilus does not have a first-class `Scanner` component. The closest native con
 
 For this project, use **candidate scanning** to mean the domain process that evaluates available
 market data and produces ranked trade candidates. Use **candidate selection** for the pure scoring
-and ranking logic. Use **entry strategy** for the Nautilus component that can submit orders.
+and ranking logic. Use **strategy profile** for the operator-owned intent block that chooses
+strategy family, underlyings, quantity, mode, risk overrides, and scanner thresholds. Use **entry
+strategy** for the Nautilus component that can submit orders.
 
 ## Target Shape
 
@@ -56,7 +61,8 @@ flowchart LR
     end
 
     subgraph Decision ["Candidate Decision Layer"]
-        UniversePolicy["Universe policy"]
+        StrategyProfiles["Strategy profiles"]
+        UniverseResolver["Option universe resolver"]
         RegimeRouter["Regime router"]
         CandidateEngine["Pure candidate engine"]
         SelectionPolicy["Selection policy"]
@@ -93,15 +99,17 @@ flowchart LR
     MsgBus --> ScanActor
     MsgBus --> RegimeActor
     MsgBus --> EntryStrategy
-    Cache --> UniversePolicy
-    ExternalSignals --> UniversePolicy
+    StrategyProfiles --> UniverseResolver
+    StrategyProfiles --> ScanActor
+    Cache --> UniverseResolver
+    ExternalSignals --> UniverseResolver
     Cache --> RegimeRouter
     ExternalSignals --> RegimeRouter
     FeatureStore --> RegimeRouter
     RegimeActor --> RegimeRouter
     RegimeRouter --> CandidateEngine
     RegimeRouter --> SelectionPolicy
-    UniversePolicy --> CandidateEngine
+    UniverseResolver --> DataEngine
     ScanActor --> CandidateEngine
     EntryStrategy --> CandidateEngine
     CandidateEngine --> SelectionPolicy
@@ -129,9 +137,11 @@ sequenceDiagram
     participant Node as TradingNode
     participant Provider as InstrumentProvider
     participant Cache as Cache
+    participant Resolver as OptionUniverseResolver
     participant Data as DataEngine
     participant Chain as OptionChainManager
     participant Regime as RegimeRouter
+    participant Scan as CandidateScanActor
     participant Strategy as AlpacaOptionsAccountStrategy
     participant Candidate as CandidateEngine
     participant Risk as RiskAdmission
@@ -140,16 +150,21 @@ sequenceDiagram
 
     Node->>Provider: load option instruments
     Provider->>Cache: store instruments
-    Strategy->>Data: subscribe_option_chain(series, strike_range)
+    Node->>Resolver: resolve strategy-profile universe intent
+    Cache-->>Resolver: available option instruments
+    Resolver-->>Node: OptionSeriesId selections and diagnostics
+    Node->>Data: subscribe_option_chain(profile-resolved series)
     Data->>Chain: create manager for series
     Chain->>Data: wire quote and greeks subscriptions
-    Data->>Strategy: on_option_chain(slice)
-    Strategy->>Regime: classify current market context
-    Regime-->>Strategy: regime context and routing policy
-    Strategy->>Candidate: rank candidates from slice, state, and regime
-    Candidate-->>Strategy: candidate set
-    Strategy->>Ledger: record scanner_result and ranked candidates
-    Strategy->>Risk: evaluate best candidate
+    Data->>Scan: on_option_chain(slice)
+    Scan->>Regime: classify current market context
+    Regime-->>Scan: regime context and routing policy
+    Scan->>Candidate: rank candidates from slice, profile, and regime
+    Candidate-->>Scan: candidate set
+    Scan->>Ledger: record scanner_result and ranked candidates
+    Scan-->>Data: publish OptionsCandidateData
+    Data->>Strategy: candidate data
+    Strategy->>Risk: evaluate best candidate and state
     Risk-->>Strategy: blocked, dry-run, or submit
     Strategy->>Ledger: record selected or blocked decision
     Strategy->>Exec: submit OrderList when admitted
@@ -168,6 +183,11 @@ other venue data without embedding strategy rules.
 `DataEngine` and `OptionChainManager` own option-chain assembly. They should produce
 `OptionChainSlice` events from cached instruments and live or replayed quote/greeks streams.
 
+`Option universe resolver` owns the source-neutral mapping from strategy-profile intent to concrete
+`OptionSeriesId` subscriptions. It accepts strategy profiles plus available option instruments and
+returns selected/skipped coverage diagnostics. It should not call Alpaca, submit orders, or encode
+live fixed-expiry policy.
+
 `RegimeFeatureActor` is the read-only runtime surface for regime features. It should consume
 Nautilus data, query approved historical feature sources, and publish or persist normalized regime
 features. It should not select strategies or submit orders.
@@ -181,8 +201,11 @@ variables, write ledgers directly from deep scoring code, or submit orders.
 `OptionChainSlice`, account-independent strategy config, regime context, and optional external
 signals. It should not read environment variables, call Alpaca, submit orders, or write ledgers.
 
-`CandidateScanActor` is the read-only runtime surface. It can run scheduled scans, publish alerts,
-and record evidence, but it does not submit orders.
+`CandidateScanActor` is the read-only runtime surface. In the current Alpaca implementation it is
+also the adapter-housed orchestrator that turns resolved profile universe intent into
+`subscribe_option_chain` requests. Nautilus `DataEngine` and `OptionChainManager` still own the
+actual subscription lifecycle and `OptionChainSlice` assembly. The actor can run scheduled scans,
+publish alerts, and record evidence, but it does not submit orders.
 
 `AlpacaOptionsAccountStrategy` is the order-capable runtime surface. It consumes the same pure candidate
 engine, applies strategy state and risk admission, then uses standard Nautilus order submission.
@@ -271,6 +294,10 @@ Target model:
 
 - `CandidateEngine` is pure. It ranks option candidates from normalized inputs and returns
   scanner diagnostics, rejection counts, and ranked candidates.
+- `[[strategies]]` profiles own live scan intent: family, mode, underlyings, quantity, per-profile
+  scanner overrides, and risk overrides.
+- The source-neutral option-universe resolver turns those profiles into concrete `OptionSeriesId`
+  selections. Fixed expiries remain diagnostic and replay filters, not live control-plane state.
 - Alpaca REST contract and snapshot loading is input acquisition, not strategy logic.
 - `OptionChainSlice` support feeds the same candidate engine without going through Alpaca REST
   scoring types.
@@ -291,16 +318,20 @@ Implemented refactor:
    functions.
 6. Kept ledger writes, operator events, account admission, and broker submission outside the
    candidate engine.
+7. Collapsed live family-flag control paths so profile blocks are the canonical scanner/admission
+   model. Diagnostics may synthesize temporary profiles, but they do not mutate live runtime flags.
 
 Current code ownership:
 
 - `crates/trading/src/options/candidates.rs`: pure scoring and ranking module.
 - `crates/trading/src/options/entries.rs`: selected option-entry metadata and strategy-family
   names.
+- `crates/trading/src/options/universe.rs`: source-neutral option universe intent and resolver.
 - `crates/trading/src/options/regime.rs`: regime feature snapshots, source-neutral event-load
   inputs, and pure routing.
 - `crates/adapters/alpaca/src/strategy.rs`: REST data-acquisition and input-adapter surface.
-- `crates/adapters/alpaca/src/candidate_scan_actor.rs`: read-only candidate evidence actor.
+- `crates/adapters/alpaca/src/candidate_scan_actor.rs`: Alpaca-housed read-only candidate evidence
+  actor and profile-derived option-chain subscription orchestrator.
 - `crates/adapters/alpaca/src/options_account_strategy.rs`: order-capable Nautilus strategy owner.
 - `crates/adapters/alpaca/src/options_runtime.rs`: legacy-compatible candidate-output assembly and
   supporting runtime contracts.
@@ -318,7 +349,8 @@ Acceptance criteria:
 - Public names describe owned concepts, such as `CandidateContract`, `CandidateMarketSnapshot`,
   `CandidateQuote`, candidate scan results, and `OptionsCandidateSet`, not temporary migration
   mechanics.
-- No compatibility selectors, old-name pass-through functions, or duplicate scoring paths remain.
+- No compatibility selectors, old-name pass-through functions, duplicate scoring paths, or
+  live family-flag control paths remain.
 - Targeted validation passes with `cargo fmt -p nautilus-alpaca`,
   `cargo check -p nautilus-alpaca --features live --bins`, and
   `cargo test -p nautilus-alpaca --features live --lib`.
@@ -352,10 +384,11 @@ Still deferred:
 7. Retire one-off scanner binaries once the actor/strategy path gives equal or better observability.
 
 Most of this migration path is implemented for the Alpaca runtime: the candidate engine,
-option-chain scan actor, and order-capable `AlpacaOptionsAccountStrategy` now exist, and the displaced
-account-engine entry loop has been retired. Regime routing remains intentionally blocked until real
-feature inputs exist. Do not reintroduce account-engine entry submission or standalone scanner loops
-while working on the remaining proof and analytics gaps.
+profile-owned universe resolution, option-chain scan actor, and order-capable
+`AlpacaOptionsAccountStrategy` now exist, and the displaced account-engine entry loop has been
+retired. Regime routing remains intentionally blocked until real feature inputs exist. Do not
+reintroduce account-engine entry submission, standalone scanner loops, live fixed-expiry flags, or
+family-list mode switches while working on the remaining proof and analytics gaps.
 
 ## Architecture Decisions
 
@@ -364,6 +397,12 @@ The read-only scan actor and order-capable strategy should be separate runtime c
 owns order-capable decisions. They should share the candidate engine, candidate-set types, and
 configuration model, but a read-only actor should not become order-capable through a submit-mode
 toggle.
+
+Strategy profiles are the live control plane for candidate scanning. They own universe intent,
+profile mode, profile quantity, and per-profile scanner/risk overrides. Global scanner sections are
+shared defaults; operator environment variables are for credentials, paths, emergency gates, and
+small runtime overrides. Do not add new live flags that choose strategy families or fixed expiries
+outside the profile model.
 
 Ranking should remain mostly account-independent. Candidate quality should be replayable from
 market data, strategy config, regime context, and explicit external signals. Account and portfolio

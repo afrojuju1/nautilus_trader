@@ -35,17 +35,21 @@ The Rust Alpaca runtime currently includes the following implemented components:
 - `AlpacaExecutionClient`: Rust execution client for simple option limit orders and multi-leg
   option limit orders, with trade-update and REST reconciliation paths.
 - `alpaca-options-node`: Account-level options runtime for paper trading with
-  Nautilus strategy hosting, risk gates, management, close handling, candidate ledgers, and
-  performance reporting.
+  profile-owned option universe intent, Nautilus option-chain subscriptions, candidate scan
+  evidence, Nautilus strategy hosting, risk gates, management, close handling, candidate ledgers,
+  and performance reporting.
 - `alpaca-options-node --check-config`: Config-check command for deployed options runtime
   configuration.
 - `nautilus adapters alpaca`: Unified operator CLI for read-only account status, fleet status, alerts,
   performance reports, and strategy-state sync.
 - Separate tooling remains for option-chain scan comparison.
 
-The Python package exposes config objects, a stock-bar and exact-option snapshot data client, an
-equity plus option multi-leg execution client, and the Alpaca-specific put-credit scanner scaffold.
-Regular daily-bar strategy examples live under the source-neutral examples strategy package.
+The Python package exposes config objects, a stock-bar and exact-option snapshot data client, and an
+equity plus option multi-leg execution client. Candidate scanning is not exposed as a standalone
+Python Alpaca scanner; the current live proof is the Rust Alpaca-housed runtime path using
+source-neutral profile intent, option-universe resolution, Nautilus `DataEngine`/
+`OptionChainManager` subscriptions, and shared candidate-engine logic. Regular daily-bar strategy
+examples live under the source-neutral examples strategy package.
 
 ## Alpaca documentation
 
