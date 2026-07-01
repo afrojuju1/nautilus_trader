@@ -4,13 +4,17 @@
 //! engine, `OptionChainManager` assembles `OptionChainSlice` events, and
 //! `OptionChainCandidateScanActor` ranks candidates without submitting orders.
 
-use std::{collections::BTreeSet, env, path::Path};
+use std::{collections::BTreeSet, env, path::Path, str::FromStr};
 
 use anyhow::{Context, anyhow, bail};
 use chrono::{NaiveDate, Utc};
 use nautilus_alpaca::candidate_scan_actor::{
     OptionChainCandidateScanActor, OptionChainCandidateScanActorConfig,
     OptionChainCandidateScanConfig,
+};
+use nautilus_alpaca::options_runtime::{
+    AlpacaOptionsStrategyFamily, AlpacaOptionsStrategyMode, AlpacaOptionsStrategyProfile,
+    AlpacaOptionsStrategyRiskOverrides, AlpacaOptionsStrategyScannerConfig,
 };
 use nautilus_backtest::{
     config::{BacktestDataConfig, BacktestRunConfig, BacktestVenueConfig, NautilusDataType},
@@ -25,12 +29,9 @@ use nautilus_model::{
     types::Price,
 };
 use nautilus_persistence::backend::catalog::ParquetDataCatalog;
-use nautilus_trading::options::{
-    candidates::{CreditSpreadKind, DebitSpreadKind, NakedOptionKind},
-    universe::{
-        OptionDteWindow, OptionUniverseContract, OptionUniverseIntent, OptionUniverseResolution,
-        OptionUniverseStrategyFamily, resolve_option_universe,
-    },
+use nautilus_trading::options::universe::{
+    OptionDteWindow, OptionUniverseContract, OptionUniverseIntent, OptionUniverseResolution,
+    OptionUniverseStrategyFamily, resolve_option_universe,
 };
 use ustr::Ustr;
 
@@ -61,7 +62,7 @@ fn main() -> anyhow::Result<()> {
     let args = Args::from_env()?;
     let catalog = ParquetDataCatalog::new(Path::new(&args.catalog_path), None, None, None, None);
     let instruments = catalog.query_instruments(None)?;
-    let scan_config = scan_config_from_values(&args.strategies)?;
+    let scan_config = scan_config_from_values(&args.strategies, &args.underlying)?;
     let selection = select_series(
         &instruments,
         args.venue,
@@ -295,69 +296,18 @@ fn diagnostic_universe_intents(
     underlying: &str,
     config: &OptionChainCandidateScanConfig,
 ) -> Vec<OptionUniverseIntent> {
-    let mut intents = Vec::new();
-    for kind in &config.spread_kinds {
-        let family = match kind {
-            CreditSpreadKind::Put => OptionUniverseStrategyFamily::PutCredit,
-            CreditSpreadKind::Call => OptionUniverseStrategyFamily::CallCredit,
-        };
-        intents.push(OptionUniverseIntent::from_family(
-            format!("diagnostic_{}", family.as_str()),
-            underlying.to_string(),
-            family,
-            OptionDteWindow::new(config.credit_scanner.min_dte, config.credit_scanner.max_dte),
-        ));
-    }
-    if config.iron_condor_enabled {
-        intents.push(OptionUniverseIntent::from_family(
-            "diagnostic_iron_condor",
-            underlying.to_string(),
-            OptionUniverseStrategyFamily::IronCondor,
-            OptionDteWindow::new(
-                config.iron_condor_scanner.credit.min_dte,
-                config.iron_condor_scanner.credit.max_dte,
-            ),
-        ));
-    }
-    for kind in &config.debit_kinds {
-        let family = match kind {
-            DebitSpreadKind::Put => OptionUniverseStrategyFamily::PutDebit,
-            DebitSpreadKind::Call => OptionUniverseStrategyFamily::CallDebit,
-        };
-        intents.push(OptionUniverseIntent::from_family(
-            format!("diagnostic_{}", family.as_str()),
-            underlying.to_string(),
-            family,
-            OptionDteWindow::new(config.debit_scanner.min_dte, config.debit_scanner.max_dte),
-        ));
-    }
-    for kind in &config.naked_kinds {
-        let (family, scanner) = match kind {
-            NakedOptionKind::Put => (
-                OptionUniverseStrategyFamily::NakedPut,
-                &config.naked_scanner,
-            ),
-            NakedOptionKind::Call => (
-                OptionUniverseStrategyFamily::NakedCall,
-                &config.naked_scanner,
-            ),
-            NakedOptionKind::PutOneToThreeDte => (
-                OptionUniverseStrategyFamily::NakedPutOneToThreeDte,
-                &config.naked_1_3dte_scanner,
-            ),
-            NakedOptionKind::CallOneToThreeDte => (
-                OptionUniverseStrategyFamily::NakedCallOneToThreeDte,
-                &config.naked_1_3dte_scanner,
-            ),
-        };
-        intents.push(OptionUniverseIntent::from_family(
-            format!("diagnostic_{}", family.as_str()),
-            underlying.to_string(),
-            family,
-            OptionDteWindow::new(scanner.min_dte, scanner.max_dte),
-        ));
-    }
-    intents
+    config
+        .strategy_profiles
+        .iter()
+        .map(|profile| {
+            OptionUniverseIntent::from_family(
+                profile.id.clone(),
+                underlying.to_string(),
+                universe_family_from_profile(profile.family),
+                dte_window_from_profile(profile),
+            )
+        })
+        .collect()
 }
 
 fn skipped_universe_summary(resolution: &OptionUniverseResolution) -> String {
@@ -432,73 +382,131 @@ fn strike_range_from_env(series_strikes: &[Price]) -> anyhow::Result<StrikeRange
     Ok(StrikeRange::Fixed(series_strikes.to_vec()))
 }
 
-fn scan_config_from_values(values: &[String]) -> anyhow::Result<OptionChainCandidateScanConfig> {
+fn scan_config_from_values(
+    values: &[String],
+    underlying: &str,
+) -> anyhow::Result<OptionChainCandidateScanConfig> {
     let mut config = OptionChainCandidateScanConfig::default();
+    let families = diagnostic_strategy_families(values)?;
+    apply_scan_env_overrides(&mut config)?;
+    config.strategy_profiles = diagnostic_profiles_from_families(&families, underlying, &config);
+    Ok(config)
+}
+
+fn diagnostic_strategy_families(
+    values: &[String],
+) -> anyhow::Result<Vec<AlpacaOptionsStrategyFamily>> {
+    let mut families = Vec::new();
     if values.is_empty() {
-        apply_scan_env_overrides(&mut config)?;
-        return Ok(config);
+        families.push(AlpacaOptionsStrategyFamily::PutCredit);
     }
-
-    config.spread_kinds.clear();
-    config.iron_condor_enabled = false;
-    config.debit_kinds.clear();
-    config.naked_kinds.clear();
-
     for raw in values.iter().map(|value| value.to_ascii_lowercase()) {
         match raw.as_str() {
-            "put" | "put_credit" => config.spread_kinds.push(CreditSpreadKind::Put),
-            "call" | "call_credit" => config.spread_kinds.push(CreditSpreadKind::Call),
             "credit" | "both" => {
-                config.spread_kinds.push(CreditSpreadKind::Put);
-                config.spread_kinds.push(CreditSpreadKind::Call);
+                families.push(AlpacaOptionsStrategyFamily::PutCredit);
+                families.push(AlpacaOptionsStrategyFamily::CallCredit);
             }
-            "iron_condor" | "condor" => config.iron_condor_enabled = true,
-            "call_debit" => config.debit_kinds.push(DebitSpreadKind::Call),
-            "put_debit" => config.debit_kinds.push(DebitSpreadKind::Put),
             "debit" | "directional" => {
-                config.debit_kinds.push(DebitSpreadKind::Call);
-                config.debit_kinds.push(DebitSpreadKind::Put);
-            }
-            "naked_call" | "short_call" => config.naked_kinds.push(NakedOptionKind::Call),
-            "naked_put" | "short_put" => config.naked_kinds.push(NakedOptionKind::Put),
-            "naked_call_1_3dte" | "short_call_1_3dte" => {
-                config.naked_kinds.push(NakedOptionKind::CallOneToThreeDte);
-            }
-            "naked_put_1_3dte" | "short_put_1_3dte" => {
-                config.naked_kinds.push(NakedOptionKind::PutOneToThreeDte);
+                families.push(AlpacaOptionsStrategyFamily::CallDebit);
+                families.push(AlpacaOptionsStrategyFamily::PutDebit);
             }
             "naked_1_3dte" => {
-                config.naked_kinds.push(NakedOptionKind::CallOneToThreeDte);
-                config.naked_kinds.push(NakedOptionKind::PutOneToThreeDte);
+                families.push(AlpacaOptionsStrategyFamily::NakedCallOneToThreeDte);
+                families.push(AlpacaOptionsStrategyFamily::NakedPutOneToThreeDte);
             }
             "naked" | "undefined_risk" => {
-                config.naked_kinds.push(NakedOptionKind::Call);
-                config.naked_kinds.push(NakedOptionKind::Put);
+                families.push(AlpacaOptionsStrategyFamily::NakedCall);
+                families.push(AlpacaOptionsStrategyFamily::NakedPut);
             }
-            other => bail!("unsupported ALPACA_OPTION_CHAIN_STRATEGY_FAMILIES value {other}"),
+            value => families.push(AlpacaOptionsStrategyFamily::from_str(value).map_err(|_| {
+                anyhow!("unsupported ALPACA_OPTION_CHAIN_STRATEGY_FAMILIES value {value}")
+            })?),
         }
     }
+    families.sort();
+    families.dedup();
+    Ok(families)
+}
 
-    config.spread_kinds.sort_by_key(|kind| match kind {
-        CreditSpreadKind::Put => 0,
-        CreditSpreadKind::Call => 1,
-    });
-    config.spread_kinds.dedup();
-    config.debit_kinds.sort_by_key(|kind| match kind {
-        DebitSpreadKind::Call => 0,
-        DebitSpreadKind::Put => 1,
-    });
-    config.debit_kinds.dedup();
-    config.naked_kinds.sort_by_key(|kind| match kind {
-        NakedOptionKind::Call => 0,
-        NakedOptionKind::Put => 1,
-        NakedOptionKind::CallOneToThreeDte => 2,
-        NakedOptionKind::PutOneToThreeDte => 3,
-    });
-    config.naked_kinds.dedup();
+fn diagnostic_profiles_from_families(
+    families: &[AlpacaOptionsStrategyFamily],
+    underlying: &str,
+    config: &OptionChainCandidateScanConfig,
+) -> Vec<AlpacaOptionsStrategyProfile> {
+    families
+        .iter()
+        .copied()
+        .map(|family| AlpacaOptionsStrategyProfile {
+            id: format!("diagnostic_{}", family.as_str()),
+            family,
+            mode: AlpacaOptionsStrategyMode::Live,
+            underlyings: vec![underlying.to_string()],
+            quantity: config.quantity.max(1),
+            scanner: scanner_config_for_family(family, config),
+            risk: AlpacaOptionsStrategyRiskOverrides::default(),
+        })
+        .collect()
+}
 
-    apply_scan_env_overrides(&mut config)?;
-    Ok(config)
+fn scanner_config_for_family(
+    family: AlpacaOptionsStrategyFamily,
+    config: &OptionChainCandidateScanConfig,
+) -> AlpacaOptionsStrategyScannerConfig {
+    match family {
+        AlpacaOptionsStrategyFamily::PutCredit | AlpacaOptionsStrategyFamily::CallCredit => {
+            AlpacaOptionsStrategyScannerConfig::Credit(config.credit_scanner.clone())
+        }
+        AlpacaOptionsStrategyFamily::IronCondor => {
+            AlpacaOptionsStrategyScannerConfig::IronCondor(config.iron_condor_scanner.clone())
+        }
+        AlpacaOptionsStrategyFamily::PutDebit | AlpacaOptionsStrategyFamily::CallDebit => {
+            AlpacaOptionsStrategyScannerConfig::Debit(config.debit_scanner.clone())
+        }
+        AlpacaOptionsStrategyFamily::NakedPut | AlpacaOptionsStrategyFamily::NakedCall => {
+            AlpacaOptionsStrategyScannerConfig::Naked(config.naked_scanner.clone())
+        }
+        AlpacaOptionsStrategyFamily::NakedPutOneToThreeDte
+        | AlpacaOptionsStrategyFamily::NakedCallOneToThreeDte => {
+            AlpacaOptionsStrategyScannerConfig::Naked(config.naked_1_3dte_scanner.clone())
+        }
+    }
+}
+
+fn universe_family_from_profile(
+    family: AlpacaOptionsStrategyFamily,
+) -> OptionUniverseStrategyFamily {
+    match family {
+        AlpacaOptionsStrategyFamily::PutCredit => OptionUniverseStrategyFamily::PutCredit,
+        AlpacaOptionsStrategyFamily::CallCredit => OptionUniverseStrategyFamily::CallCredit,
+        AlpacaOptionsStrategyFamily::IronCondor => OptionUniverseStrategyFamily::IronCondor,
+        AlpacaOptionsStrategyFamily::PutDebit => OptionUniverseStrategyFamily::PutDebit,
+        AlpacaOptionsStrategyFamily::CallDebit => OptionUniverseStrategyFamily::CallDebit,
+        AlpacaOptionsStrategyFamily::NakedPut => OptionUniverseStrategyFamily::NakedPut,
+        AlpacaOptionsStrategyFamily::NakedCall => OptionUniverseStrategyFamily::NakedCall,
+        AlpacaOptionsStrategyFamily::NakedPutOneToThreeDte => {
+            OptionUniverseStrategyFamily::NakedPutOneToThreeDte
+        }
+        AlpacaOptionsStrategyFamily::NakedCallOneToThreeDte => {
+            OptionUniverseStrategyFamily::NakedCallOneToThreeDte
+        }
+    }
+}
+
+fn dte_window_from_profile(profile: &AlpacaOptionsStrategyProfile) -> OptionDteWindow {
+    match &profile.scanner {
+        AlpacaOptionsStrategyScannerConfig::Credit(scanner) => {
+            OptionDteWindow::new(scanner.min_dte, scanner.max_dte)
+        }
+        AlpacaOptionsStrategyScannerConfig::IronCondor(scanner) => {
+            OptionDteWindow::new(scanner.credit.min_dte, scanner.credit.max_dte)
+        }
+        AlpacaOptionsStrategyScannerConfig::Debit(scanner) => {
+            OptionDteWindow::new(scanner.min_dte, scanner.max_dte)
+        }
+        AlpacaOptionsStrategyScannerConfig::Naked(scanner) => {
+            OptionDteWindow::new(scanner.min_dte, scanner.max_dte)
+        }
+    }
 }
 
 fn apply_scan_env_overrides(config: &mut OptionChainCandidateScanConfig) -> anyhow::Result<()> {

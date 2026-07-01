@@ -22,7 +22,7 @@ use nautilus_alpaca::{
         emit_lifecycle_poll_error, lifecycle_events_from_activities,
         option_lifecycle_activity_request,
     },
-    options_runtime::AlpacaOptionsRuntimeConfig,
+    options_runtime::{AlpacaOptionsRuntimeConfig, AlpacaOptionsStrategyFamily},
     runtime::{StrategyState, emit_operator_event, save_strategy_state_atomic},
     state_persistence::{StrategyStatePersistenceHandle, start_runtime_lease_heartbeat},
     state_reconciliation::{
@@ -736,13 +736,25 @@ async fn load_options_buying_power_if_needed(
     if let Some(value) = optional_f64_env("ALPACA_OPTION_CHAIN_OPTIONS_BUYING_POWER")? {
         return Ok(Some(value));
     }
-    if config.naked_kinds.is_empty() {
+    if !has_naked_profiles(config) {
         return Ok(None);
     }
 
     let client = AlpacaHttpClient::from_data_config(data_config)?;
     let account = client.account().await?;
     Ok(account_options_buying_power(&account))
+}
+
+fn has_naked_profiles(config: &AlpacaOptionsRuntimeConfig) -> bool {
+    config.strategy_profiles.iter().any(|profile| {
+        matches!(
+            profile.family,
+            AlpacaOptionsStrategyFamily::NakedPut
+                | AlpacaOptionsStrategyFamily::NakedCall
+                | AlpacaOptionsStrategyFamily::NakedPutOneToThreeDte
+                | AlpacaOptionsStrategyFamily::NakedCallOneToThreeDte
+        )
+    })
 }
 
 fn account_options_buying_power(account: &AlpacaAccount) -> Option<f64> {

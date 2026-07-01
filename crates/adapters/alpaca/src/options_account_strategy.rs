@@ -430,8 +430,7 @@ impl AlpacaOptionsAccountStrategy {
             return Ok(None);
         }
 
-        if !selected_open_orders_enabled(&self.config.admission, entry, entry_plan.profile.as_ref())
-        {
+        if !selected_open_orders_enabled(&self.config.admission, entry_plan.profile.as_ref()) {
             log::info!(
                 "Dry-run Alpaca options entry: underlying={} strategy={} symbols={} score={:.1}",
                 entry_plan.underlying,

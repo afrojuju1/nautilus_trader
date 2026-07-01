@@ -69,8 +69,9 @@ use crate::{
     options_account_strategy::OptionsCandidateData,
     options_runtime::{
         AlpacaOptionsCandidateProfile, AlpacaOptionsRuntimeConfig, AlpacaOptionsStrategyFamily,
-        AlpacaOptionsStrategyProfile, AlpacaOptionsStrategyScannerConfig, OptionsCandidateSet,
-        OptionsScanOutcome, OptionsScanReport, ProfiledOptionsEntry,
+        AlpacaOptionsStrategyMode, AlpacaOptionsStrategyProfile,
+        AlpacaOptionsStrategyRiskOverrides, AlpacaOptionsStrategyScannerConfig,
+        OptionsCandidateSet, OptionsScanOutcome, OptionsScanReport, ProfiledOptionsEntry,
     },
     runtime::emit_operator_event,
 };
@@ -86,16 +87,8 @@ const DEFAULT_UNIVERSE_REFRESH_INTERVAL_SECS: u64 = 300;
 /// Read-only scan settings for candidate discovery from option-chain slices.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OptionChainCandidateScanConfig {
-    /// Resolved strategy profiles. Runtime configs populate this; defaults mirror family flags.
+    /// Resolved strategy profiles. Empty diagnostics fall back to one synthetic put-credit profile.
     pub strategy_profiles: Vec<AlpacaOptionsStrategyProfile>,
-    /// Enabled credit-spread kinds.
-    pub spread_kinds: Vec<CreditSpreadKind>,
-    /// Whether to scan iron-condor candidates.
-    pub iron_condor_enabled: bool,
-    /// Enabled debit-spread kinds.
-    pub debit_kinds: Vec<DebitSpreadKind>,
-    /// Enabled naked-option kinds.
-    pub naked_kinds: Vec<NakedOptionKind>,
     /// Credit-spread scanner configuration.
     pub credit_scanner: PutCreditScannerConfig,
     /// Iron-condor scanner configuration.
@@ -132,10 +125,6 @@ impl Default for OptionChainCandidateScanConfig {
     fn default() -> Self {
         Self {
             strategy_profiles: Vec::new(),
-            spread_kinds: vec![CreditSpreadKind::Put],
-            iron_condor_enabled: false,
-            debit_kinds: Vec::new(),
-            naked_kinds: Vec::new(),
             credit_scanner: PutCreditScannerConfig::default(),
             iron_condor_scanner: IronCondorScannerConfig::default(),
             debit_scanner: DebitSpreadScannerConfig::default(),
@@ -1246,10 +1235,6 @@ pub fn candidate_scan_config_from_runtime(
 ) -> OptionChainCandidateScanConfig {
     OptionChainCandidateScanConfig {
         strategy_profiles: config.strategy_profiles.clone(),
-        spread_kinds: config.spread_kinds.clone(),
-        iron_condor_enabled: config.iron_condor_enabled,
-        debit_kinds: config.debit_kinds.clone(),
-        naked_kinds: config.naked_kinds.clone(),
         credit_scanner: config.scanner.clone(),
         iron_condor_scanner: config.iron_condor_scanner.clone(),
         debit_scanner: config.debit_scanner.clone(),
@@ -1381,318 +1366,152 @@ fn scan_option_chain_candidate_input(
 ) -> OptionsCandidateSet {
     let mut candidates = OptionsCandidateSet::new(trade_date);
 
-    if !config.strategy_profiles.is_empty() {
-        for profile in config
-            .strategy_profiles
-            .iter()
-            .filter(|profile| profile.scans_underlying(&input.underlying))
+    let diagnostic_profiles;
+    let strategy_profiles = if config.strategy_profiles.is_empty() {
+        diagnostic_profiles = diagnostic_strategy_profiles(config, &input.underlying);
+        diagnostic_profiles.as_slice()
+    } else {
+        config.strategy_profiles.as_slice()
+    };
+
+    for profile in strategy_profiles
+        .iter()
+        .filter(|profile| profile.scans_underlying(&input.underlying))
+    {
+        let profile_context = AlpacaOptionsCandidateProfile::from_strategy_profile(profile);
+        if let (Some(kind), AlpacaOptionsStrategyScannerConfig::Credit(scanner)) =
+            (credit_kind_from_family(profile.family), &profile.scanner)
         {
-            let profile_context = AlpacaOptionsCandidateProfile::from_strategy_profile(profile);
-            if let (Some(kind), AlpacaOptionsStrategyScannerConfig::Credit(scanner)) =
-                (credit_kind_from_family(profile.family), &profile.scanner)
-            {
-                let result = scan_credit_spread_option_chain(&input, scanner, kind, scan_date);
-                let strategy_name = credit_spread_strategy_name(kind);
-                candidates.push_scan(OptionsScanReport::new(
+            let result = scan_credit_spread_option_chain(&input, scanner, kind, scan_date);
+            let strategy_name = credit_spread_strategy_name(kind);
+            candidates.push_scan(OptionsScanReport::new(
+                profile_context.clone(),
+                &input.underlying,
+                strategy_name,
+                result.candidates.len(),
+                result.contract_count,
+                result.snapshot_count,
+                result.scoreable_count,
+                result.rejection_counts.clone(),
+            ));
+            if let Some(best) = result.candidates.first() {
+                candidates.consider_candidate(ProfiledOptionsEntry::new(
                     profile_context.clone(),
-                    &input.underlying,
-                    strategy_name,
-                    result.candidates.len(),
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                    result.rejection_counts.clone(),
-                ));
-                if let Some(best) = result.candidates.first() {
-                    candidates.consider_candidate(ProfiledOptionsEntry::new(
-                        profile_context.clone(),
-                        SelectedOptionsEntry::Credit(SelectedEntry {
-                            underlying: input.underlying.clone(),
-                            kind,
-                            candidate: best.clone(),
-                        }),
-                    ));
-                }
-            }
-
-            if matches!(profile.family, AlpacaOptionsStrategyFamily::IronCondor) {
-                let AlpacaOptionsStrategyScannerConfig::IronCondor(scanner) = &profile.scanner
-                else {
-                    continue;
-                };
-                let result = scan_iron_condor_option_chain(&input, scanner, scan_date);
-                candidates.push_scan(OptionsScanReport::new(
-                    profile_context.clone(),
-                    &input.underlying,
-                    "iron_condor",
-                    result.candidates.len(),
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                    result.rejection_counts.clone(),
-                ));
-                if let Some(best) = result.candidates.first() {
-                    candidates.consider_candidate(ProfiledOptionsEntry::new(
-                        profile_context.clone(),
-                        SelectedOptionsEntry::IronCondor(SelectedIronCondorEntry {
-                            underlying: input.underlying.clone(),
-                            candidate: best.clone(),
-                        }),
-                    ));
-                }
-            }
-
-            if let (Some(kind), AlpacaOptionsStrategyScannerConfig::Debit(scanner)) =
-                (debit_kind_from_family(profile.family), &profile.scanner)
-            {
-                let result = scan_debit_spread_option_chain(&input, scanner, kind, scan_date);
-                let strategy_name = debit_spread_strategy_name(kind);
-                candidates.push_scan(OptionsScanReport::new(
-                    profile_context.clone(),
-                    &input.underlying,
-                    strategy_name,
-                    result.candidates.len(),
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                    result.rejection_counts.clone(),
-                ));
-                if let Some(best) = result.candidates.first() {
-                    candidates.consider_candidate(ProfiledOptionsEntry::new(
-                        profile_context.clone(),
-                        SelectedOptionsEntry::Debit(SelectedDebitEntry {
-                            underlying: input.underlying.clone(),
-                            kind,
-                            candidate: best.clone(),
-                        }),
-                    ));
-                }
-            }
-
-            if let (Some(kind), AlpacaOptionsStrategyScannerConfig::Naked(scanner)) =
-                (naked_kind_from_family(profile.family), &profile.scanner)
-            {
-                let result = scan_naked_option_chain(
-                    &input,
-                    scanner,
-                    kind,
-                    Some(NakedOptionCapitalContext {
-                        options_buying_power: config.options_buying_power,
-                        quantity: profile.quantity,
+                    SelectedOptionsEntry::Credit(SelectedEntry {
+                        underlying: input.underlying.clone(),
+                        kind,
+                        candidate: best.clone(),
                     }),
-                    scan_date,
-                );
-                let strategy_name = naked_option_strategy_name(kind);
-                candidates.push_scan(OptionsScanReport::new(
-                    profile_context.clone(),
-                    &input.underlying,
-                    strategy_name,
-                    result.candidates.len(),
-                    result.contract_count,
-                    result.snapshot_count,
-                    result.scoreable_count,
-                    result.rejection_counts.clone(),
                 ));
-                if let Some(best) = result.candidates.first() {
-                    candidates.consider_candidate(ProfiledOptionsEntry::new(
-                        profile_context.clone(),
-                        SelectedOptionsEntry::NakedOption(SelectedNakedOptionEntry {
-                            underlying: input.underlying.clone(),
-                            kind,
-                            candidate: best.clone(),
-                        }),
-                    ));
-                }
             }
         }
 
-        return candidates;
-    }
-
-    for kind in &config.spread_kinds {
-        let profile_context = diagnostic_credit_profile_context(*kind, config.quantity);
-        let result =
-            scan_credit_spread_option_chain(&input, &config.credit_scanner, *kind, scan_date);
-        let strategy_name = credit_spread_strategy_name(*kind);
-        candidates.push_scan(OptionsScanReport::new(
-            profile_context.clone(),
-            &input.underlying,
-            strategy_name,
-            result.candidates.len(),
-            result.contract_count,
-            result.snapshot_count,
-            result.scoreable_count,
-            result.rejection_counts.clone(),
-        ));
-        if let Some(best) = result.candidates.first() {
-            candidates.consider_candidate(ProfiledOptionsEntry::new(
-                profile_context,
-                SelectedOptionsEntry::Credit(SelectedEntry {
-                    underlying: input.underlying.clone(),
-                    kind: *kind,
-                    candidate: best.clone(),
-                }),
+        if matches!(profile.family, AlpacaOptionsStrategyFamily::IronCondor) {
+            let AlpacaOptionsStrategyScannerConfig::IronCondor(scanner) = &profile.scanner else {
+                continue;
+            };
+            let result = scan_iron_condor_option_chain(&input, scanner, scan_date);
+            candidates.push_scan(OptionsScanReport::new(
+                profile_context.clone(),
+                &input.underlying,
+                "iron_condor",
+                result.candidates.len(),
+                result.contract_count,
+                result.snapshot_count,
+                result.scoreable_count,
+                result.rejection_counts.clone(),
             ));
+            if let Some(best) = result.candidates.first() {
+                candidates.consider_candidate(ProfiledOptionsEntry::new(
+                    profile_context.clone(),
+                    SelectedOptionsEntry::IronCondor(SelectedIronCondorEntry {
+                        underlying: input.underlying.clone(),
+                        candidate: best.clone(),
+                    }),
+                ));
+            }
         }
-    }
 
-    if config.iron_condor_enabled {
-        let profile_context = diagnostic_profile_context(
-            "diagnostic_iron_condor",
-            AlpacaOptionsStrategyFamily::IronCondor,
-            config.quantity,
-        );
-        let result = scan_iron_condor_option_chain(&input, &config.iron_condor_scanner, scan_date);
-        candidates.push_scan(OptionsScanReport::new(
-            profile_context.clone(),
-            &input.underlying,
-            "iron_condor",
-            result.candidates.len(),
-            result.contract_count,
-            result.snapshot_count,
-            result.scoreable_count,
-            result.rejection_counts.clone(),
-        ));
-        if let Some(best) = result.candidates.first() {
-            candidates.consider_candidate(ProfiledOptionsEntry::new(
-                profile_context,
-                SelectedOptionsEntry::IronCondor(SelectedIronCondorEntry {
-                    underlying: input.underlying.clone(),
-                    candidate: best.clone(),
-                }),
+        if let (Some(kind), AlpacaOptionsStrategyScannerConfig::Debit(scanner)) =
+            (debit_kind_from_family(profile.family), &profile.scanner)
+        {
+            let result = scan_debit_spread_option_chain(&input, scanner, kind, scan_date);
+            let strategy_name = debit_spread_strategy_name(kind);
+            candidates.push_scan(OptionsScanReport::new(
+                profile_context.clone(),
+                &input.underlying,
+                strategy_name,
+                result.candidates.len(),
+                result.contract_count,
+                result.snapshot_count,
+                result.scoreable_count,
+                result.rejection_counts.clone(),
             ));
+            if let Some(best) = result.candidates.first() {
+                candidates.consider_candidate(ProfiledOptionsEntry::new(
+                    profile_context.clone(),
+                    SelectedOptionsEntry::Debit(SelectedDebitEntry {
+                        underlying: input.underlying.clone(),
+                        kind,
+                        candidate: best.clone(),
+                    }),
+                ));
+            }
         }
-    }
 
-    for kind in &config.debit_kinds {
-        let profile_context = diagnostic_debit_profile_context(*kind, config.quantity);
-        let result =
-            scan_debit_spread_option_chain(&input, &config.debit_scanner, *kind, scan_date);
-        let strategy_name = debit_spread_strategy_name(*kind);
-        candidates.push_scan(OptionsScanReport::new(
-            profile_context.clone(),
-            &input.underlying,
-            strategy_name,
-            result.candidates.len(),
-            result.contract_count,
-            result.snapshot_count,
-            result.scoreable_count,
-            result.rejection_counts.clone(),
-        ));
-        if let Some(best) = result.candidates.first() {
-            candidates.consider_candidate(ProfiledOptionsEntry::new(
-                profile_context,
-                SelectedOptionsEntry::Debit(SelectedDebitEntry {
-                    underlying: input.underlying.clone(),
-                    kind: *kind,
-                    candidate: best.clone(),
+        if let (Some(kind), AlpacaOptionsStrategyScannerConfig::Naked(scanner)) =
+            (naked_kind_from_family(profile.family), &profile.scanner)
+        {
+            let result = scan_naked_option_chain(
+                &input,
+                scanner,
+                kind,
+                Some(NakedOptionCapitalContext {
+                    options_buying_power: config.options_buying_power,
+                    quantity: profile.quantity,
                 }),
+                scan_date,
+            );
+            let strategy_name = naked_option_strategy_name(kind);
+            candidates.push_scan(OptionsScanReport::new(
+                profile_context.clone(),
+                &input.underlying,
+                strategy_name,
+                result.candidates.len(),
+                result.contract_count,
+                result.snapshot_count,
+                result.scoreable_count,
+                result.rejection_counts.clone(),
             ));
-        }
-    }
-
-    for kind in &config.naked_kinds {
-        let profile_context = diagnostic_naked_profile_context(*kind, config.quantity);
-        let result = scan_naked_option_chain(
-            &input,
-            naked_scanner_for(config, *kind),
-            *kind,
-            Some(NakedOptionCapitalContext {
-                options_buying_power: config.options_buying_power,
-                quantity: config.quantity,
-            }),
-            scan_date,
-        );
-        let strategy_name = naked_option_strategy_name(*kind);
-        candidates.push_scan(OptionsScanReport::new(
-            profile_context.clone(),
-            &input.underlying,
-            strategy_name,
-            result.candidates.len(),
-            result.contract_count,
-            result.snapshot_count,
-            result.scoreable_count,
-            result.rejection_counts.clone(),
-        ));
-        if let Some(best) = result.candidates.first() {
-            candidates.consider_candidate(ProfiledOptionsEntry::new(
-                profile_context,
-                SelectedOptionsEntry::NakedOption(SelectedNakedOptionEntry {
-                    underlying: input.underlying.clone(),
-                    kind: *kind,
-                    candidate: best.clone(),
-                }),
-            ));
+            if let Some(best) = result.candidates.first() {
+                candidates.consider_candidate(ProfiledOptionsEntry::new(
+                    profile_context.clone(),
+                    SelectedOptionsEntry::NakedOption(SelectedNakedOptionEntry {
+                        underlying: input.underlying.clone(),
+                        kind,
+                        candidate: best.clone(),
+                    }),
+                ));
+            }
         }
     }
 
     candidates
 }
 
-fn diagnostic_credit_profile_context(
-    kind: CreditSpreadKind,
-    quantity: u64,
-) -> AlpacaOptionsCandidateProfile {
-    let family = match kind {
-        CreditSpreadKind::Put => AlpacaOptionsStrategyFamily::PutCredit,
-        CreditSpreadKind::Call => AlpacaOptionsStrategyFamily::CallCredit,
-    };
-    diagnostic_profile_context(
-        format!("diagnostic_{}", credit_spread_strategy_name(kind)),
-        family,
-        quantity,
-    )
-}
-
-fn diagnostic_debit_profile_context(
-    kind: DebitSpreadKind,
-    quantity: u64,
-) -> AlpacaOptionsCandidateProfile {
-    let family = match kind {
-        DebitSpreadKind::Put => AlpacaOptionsStrategyFamily::PutDebit,
-        DebitSpreadKind::Call => AlpacaOptionsStrategyFamily::CallDebit,
-    };
-    diagnostic_profile_context(
-        format!("diagnostic_{}", debit_spread_strategy_name(kind)),
-        family,
-        quantity,
-    )
-}
-
-fn diagnostic_naked_profile_context(
-    kind: NakedOptionKind,
-    quantity: u64,
-) -> AlpacaOptionsCandidateProfile {
-    let family = match kind {
-        NakedOptionKind::Put => AlpacaOptionsStrategyFamily::NakedPut,
-        NakedOptionKind::Call => AlpacaOptionsStrategyFamily::NakedCall,
-        NakedOptionKind::PutOneToThreeDte => AlpacaOptionsStrategyFamily::NakedPutOneToThreeDte,
-        NakedOptionKind::CallOneToThreeDte => AlpacaOptionsStrategyFamily::NakedCallOneToThreeDte,
-    };
-    diagnostic_profile_context(
-        format!("diagnostic_{}", naked_option_strategy_name(kind)),
-        family,
-        quantity,
-    )
-}
-
-fn diagnostic_profile_context(
-    id: impl Into<String>,
-    family: AlpacaOptionsStrategyFamily,
-    quantity: u64,
-) -> AlpacaOptionsCandidateProfile {
-    AlpacaOptionsCandidateProfile::synthetic(id, family, quantity)
-}
-
-fn naked_scanner_for(
+fn diagnostic_strategy_profiles(
     config: &OptionChainCandidateScanConfig,
-    kind: NakedOptionKind,
-) -> &NakedOptionScannerConfig {
-    if kind.is_one_to_three_dte() {
-        &config.naked_1_3dte_scanner
-    } else {
-        &config.naked_scanner
-    }
+    underlying: &str,
+) -> Vec<AlpacaOptionsStrategyProfile> {
+    vec![AlpacaOptionsStrategyProfile {
+        id: "diagnostic_put_credit".to_string(),
+        family: AlpacaOptionsStrategyFamily::PutCredit,
+        mode: AlpacaOptionsStrategyMode::Live,
+        underlyings: vec![underlying.to_string()],
+        quantity: config.quantity.max(1),
+        scanner: AlpacaOptionsStrategyScannerConfig::Credit(config.credit_scanner.clone()),
+        risk: AlpacaOptionsStrategyRiskOverrides::default(),
+    }]
 }
 
 fn credit_kind_from_family(family: AlpacaOptionsStrategyFamily) -> Option<CreditSpreadKind> {

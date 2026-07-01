@@ -97,22 +97,6 @@ pub struct AlpacaOptionsRuntimeConfig {
     pub underlyings: Vec<String>,
     /// Resolved strategy profiles that define scan composition.
     pub strategy_profiles: Vec<AlpacaOptionsStrategyProfile>,
-    /// Enabled spread kinds.
-    pub spread_kinds: Vec<CreditSpreadKind>,
-    /// Whether the iron-condor strategy is enabled.
-    pub iron_condor_enabled: bool,
-    /// Enabled long-premium debit spread kinds.
-    pub debit_kinds: Vec<DebitSpreadKind>,
-    /// Enabled naked short option kinds.
-    pub naked_kinds: Vec<NakedOptionKind>,
-    /// Credit spread kinds which scan but never submit.
-    pub dry_run_spread_kinds: Vec<CreditSpreadKind>,
-    /// Whether iron-condor candidates scan but never submit.
-    pub iron_condor_dry_run: bool,
-    /// Debit spread kinds which scan but never submit.
-    pub dry_run_debit_kinds: Vec<DebitSpreadKind>,
-    /// Naked option kinds which scan but never submit.
-    pub dry_run_naked_kinds: Vec<NakedOptionKind>,
     /// Maximum active strategy entries. `None` means unlimited.
     pub max_active_entries: Option<usize>,
     /// Maximum accepted strategy submissions for one trade date. `None` means unlimited.
@@ -879,17 +863,6 @@ impl AlpacaOptionsRuntimeConfig {
         )
     }
 
-    /// Returns strategy names which are configured for dry-run selection only.
-    #[must_use]
-    pub fn dry_run_strategy_family_names(&self) -> Vec<&'static str> {
-        unique_strategy_names(
-            self.strategy_profiles
-                .iter()
-                .filter(|profile| profile.is_dry_run())
-                .map(AlpacaOptionsStrategyProfile::strategy_name),
-        )
-    }
-
     /// Returns compact resolved strategy profile summaries.
     #[must_use]
     pub fn strategy_profile_summaries(&self) -> Vec<String> {
@@ -897,30 +870,6 @@ impl AlpacaOptionsRuntimeConfig {
             .iter()
             .map(AlpacaOptionsStrategyProfile::summary)
             .collect()
-    }
-
-    /// Returns whether a selected credit-spread kind may open broker orders.
-    #[must_use]
-    pub fn credit_open_orders_enabled(&self, kind: CreditSpreadKind) -> bool {
-        self.open_orders_enabled && !self.dry_run_spread_kinds.contains(&kind)
-    }
-
-    /// Returns whether a selected iron condor may open broker orders.
-    #[must_use]
-    pub fn iron_condor_open_orders_enabled(&self) -> bool {
-        self.open_orders_enabled && !self.iron_condor_dry_run
-    }
-
-    /// Returns whether a selected debit-spread kind may open broker orders.
-    #[must_use]
-    pub fn debit_open_orders_enabled(&self, kind: DebitSpreadKind) -> bool {
-        self.open_orders_enabled && !self.dry_run_debit_kinds.contains(&kind)
-    }
-
-    /// Returns whether a selected naked-option kind may open broker orders.
-    #[must_use]
-    pub fn naked_open_orders_enabled(&self, kind: NakedOptionKind) -> bool {
-        self.open_orders_enabled && !self.dry_run_naked_kinds.contains(&kind)
     }
 
     /// Returns the scanner config for a naked-option strategy profile.

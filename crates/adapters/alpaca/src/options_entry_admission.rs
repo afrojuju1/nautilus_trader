@@ -80,8 +80,6 @@ pub struct EntryAdmissionSnapshot {
 pub struct EntryAdmissionConfig {
     /// Whether broker orders which open new risk are globally enabled.
     pub open_orders_enabled: bool,
-    /// Strategy names that are intentionally scanned but not submitted.
-    pub dry_run_strategy_family_names: BTreeMap<String, ()>,
     /// Whether the entry window should be ignored.
     pub ignore_entry_window: bool,
     /// Entry window start.
@@ -142,11 +140,6 @@ impl EntryAdmissionConfig {
         let fleet_section = engine.fleet.as_ref().map(|fleet| &fleet.config.fleet);
         Self {
             open_orders_enabled: engine.open_orders_enabled,
-            dry_run_strategy_family_names: engine
-                .dry_run_strategy_family_names()
-                .into_iter()
-                .map(|name| (name.to_string(), ()))
-                .collect(),
             ignore_entry_window: engine.ignore_entry_window,
             entry_start: engine.entry_start,
             entry_end: engine.entry_end,
@@ -201,7 +194,6 @@ impl Default for EntryAdmissionConfig {
     fn default() -> Self {
         Self {
             open_orders_enabled: true,
-            dry_run_strategy_family_names: BTreeMap::new(),
             ignore_entry_window: true,
             entry_start: NaiveTime::MIN,
             entry_end: NaiveTime::from_hms_opt(23, 59, 59).expect("valid terminal day time"),
@@ -235,7 +227,6 @@ impl Default for EntryAdmissionConfig {
 #[must_use]
 pub fn selected_open_orders_enabled(
     config: &EntryAdmissionConfig,
-    selected: &SelectedOptionsEntry,
     profile: Option<&AlpacaOptionsCandidateProfile>,
 ) -> bool {
     if !config.open_orders_enabled {
@@ -246,19 +237,17 @@ pub fn selected_open_orders_enabled(
         return matches!(profile.mode, AlpacaOptionsStrategyMode::Live);
     }
 
-    !config
-        .dry_run_strategy_family_names
-        .contains_key(selected.strategy_name())
+    true
 }
 
 /// Returns the entry action mode for a selected entry.
 #[must_use]
 pub fn selected_entry_mode(
     config: &EntryAdmissionConfig,
-    selected: &SelectedOptionsEntry,
+    _selected: &SelectedOptionsEntry,
     profile: Option<&AlpacaOptionsCandidateProfile>,
 ) -> EntryMode {
-    if selected_open_orders_enabled(config, selected, profile) {
+    if selected_open_orders_enabled(config, profile) {
         EntryMode::Submit
     } else {
         EntryMode::DryRun
