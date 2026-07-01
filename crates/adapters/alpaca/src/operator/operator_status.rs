@@ -92,6 +92,7 @@ struct OperatorStatus {
     risk: RiskStatus,
     last_scan: Option<Value>,
     regime_coverage: Option<RegimeCoverageStatus>,
+    universe: Option<UniverseStatus>,
     last_scanner_diagnostic: Option<Value>,
     last_decision: Option<Value>,
     last_management_snapshot: Option<Value>,
@@ -219,6 +220,25 @@ struct RegimeCoverageStatus {
     has_underlying_trend_vol: bool,
     has_option_liquidity: bool,
     has_event_load: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct UniverseStatus {
+    source: String,
+    requested: usize,
+    selected: usize,
+    subscribed: usize,
+    scanned: usize,
+    skipped: usize,
+    failed: usize,
+    last_reason: Option<String>,
+    selected_series: Vec<String>,
+    subscribed_series: Vec<String>,
+    scanned_series: Vec<String>,
+    skipped_reasons: BTreeMap<String, usize>,
+    failed_reasons: BTreeMap<String, usize>,
+    last_refresh: Option<Value>,
+    last_resolution: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -634,6 +654,7 @@ fn build_status(
         .or_else(|| latest_event(events, "management_iteration"));
     let regime_coverage =
         regime_coverage_status(events, &config.candidate_ledger_records, last_scan.as_ref());
+    let universe = universe_status(events);
     let last_scanner_diagnostic = latest_event(events, "scanner_diagnostic");
     let last_decision = latest_event(events, "entry_decision")
         .or_else(|| {
@@ -688,6 +709,7 @@ fn build_status(
         risk,
         last_scan,
         regime_coverage,
+        universe,
         last_scanner_diagnostic,
         last_decision,
         last_management_snapshot,
@@ -1212,6 +1234,13 @@ fn print_human_status(status: &OperatorStatus) {
             .map_or_else(|| "none".to_string(), regime_coverage_line)
     );
     println!(
+        "option_universe: {}",
+        status
+            .universe
+            .as_ref()
+            .map_or_else(|| "none".to_string(), universe_status_line)
+    );
+    println!(
         "last_scanner_diagnostic: {}",
         status
             .last_scanner_diagnostic
@@ -1392,6 +1421,114 @@ fn regime_coverage_status(
     })
 }
 
+fn universe_status(events: &[Value]) -> Option<UniverseStatus> {
+    let refresh_index = events.iter().rposition(|event| {
+        event.get("type").and_then(Value::as_str) == Some("option_universe_refresh")
+            && event.get("event").and_then(Value::as_str) == Some("requested")
+    });
+    let cycle_events = refresh_index.map_or(events, |index| &events[index..]);
+    let last_refresh = latest_event(cycle_events, "option_universe_refresh");
+    let last_resolution = latest_event(cycle_events, "option_universe_resolution");
+    if last_refresh.is_none() && last_resolution.is_none() {
+        return None;
+    }
+
+    let requested_from_refresh = cycle_events
+        .first()
+        .filter(|event| {
+            event.get("type").and_then(Value::as_str) == Some("option_universe_refresh")
+                && event.get("event").and_then(Value::as_str) == Some("requested")
+        })
+        .and_then(|event| value_usize(event, "intent_count"));
+    let mut resolved_requested = 0;
+    let mut selected = 0;
+    let mut skipped = 0;
+    let mut failed = 0;
+    let mut selected_series = BTreeSet::<String>::new();
+    let mut subscribed_series = BTreeSet::<String>::new();
+    let mut scanned_series = BTreeSet::<String>::new();
+    let mut skipped_reasons = BTreeMap::<String, usize>::new();
+    let mut failed_reasons = BTreeMap::<String, usize>::new();
+
+    for event in cycle_events {
+        match event.get("type").and_then(Value::as_str) {
+            Some("option_universe_resolution") => {
+                resolved_requested += value_usize(event, "requested_count").unwrap_or_default();
+                selected += value_usize(event, "selected_count").unwrap_or_default();
+                skipped += value_usize(event, "skipped_count").unwrap_or_default();
+                extend_string_set(event.get("selected_series"), &mut selected_series);
+                merge_reason_counts(event.get("skipped_reasons"), &mut skipped_reasons);
+            }
+            Some("option_universe_subscription") => {
+                let Some(series_id) = event.get("series_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                match event.get("event").and_then(Value::as_str) {
+                    Some("subscribed") => {
+                        subscribed_series.insert(series_id.to_string());
+                    }
+                    Some("unsubscribed_stale") => {
+                        subscribed_series.remove(series_id);
+                    }
+                    _ => {}
+                }
+            }
+            Some("option_chain_scan_queue") => {
+                if event.get("event").and_then(Value::as_str) == Some("enqueued")
+                    && let Some(series_id) = event.get("series_id").and_then(Value::as_str)
+                {
+                    scanned_series.insert(series_id.to_string());
+                }
+            }
+            Some("option_universe_refresh") => {
+                if event.get("event").and_then(Value::as_str) == Some("skipped") {
+                    failed += 1;
+                    let reason = event
+                        .get("skip_reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    *failed_reasons.entry(reason.to_string()).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let requested = requested_from_refresh.unwrap_or_else(|| {
+        if resolved_requested == 0 {
+            selected + skipped
+        } else {
+            resolved_requested
+        }
+    });
+    if subscribed_series.is_empty() {
+        subscribed_series = selected_series.clone();
+    }
+
+    Some(UniverseStatus {
+        source: "operator_event".to_string(),
+        requested,
+        selected,
+        subscribed: subscribed_series.len(),
+        scanned: scanned_series.len(),
+        skipped,
+        failed,
+        last_reason: last_resolution
+            .as_ref()
+            .or(last_refresh.as_ref())
+            .and_then(|event| event.get("reason"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        selected_series: selected_series.into_iter().collect(),
+        subscribed_series: subscribed_series.into_iter().collect(),
+        scanned_series: scanned_series.into_iter().collect(),
+        skipped_reasons,
+        failed_reasons,
+        last_refresh,
+        last_resolution,
+    })
+}
+
 fn feature_freshness_map(values: &[Value]) -> BTreeMap<String, String> {
     values
         .iter()
@@ -1416,6 +1553,37 @@ fn string_array(values: &[Value]) -> Vec<String> {
         .filter_map(Value::as_str)
         .map(ToString::to_string)
         .collect()
+}
+
+fn value_usize(value: &Value, key: &str) -> Option<usize> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|raw| usize::try_from(raw).ok())
+}
+
+fn extend_string_set(value: Option<&Value>, output: &mut BTreeSet<String>) {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return;
+    };
+    output.extend(
+        values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string),
+    );
+}
+
+fn merge_reason_counts(value: Option<&Value>, output: &mut BTreeMap<String, usize>) {
+    let Some(fields) = value.and_then(Value::as_object) else {
+        return;
+    };
+    for (reason, count) in fields {
+        let Some(count) = count.as_u64().and_then(|raw| usize::try_from(raw).ok()) else {
+            continue;
+        };
+        *output.entry(reason.clone()).or_default() += count;
+    }
 }
 
 fn latest_event(events: &[Value], event_type: &str) -> Option<Value> {
@@ -1700,6 +1868,36 @@ fn regime_coverage_line(status: &RegimeCoverageStatus) -> String {
         status.unavailable_features.join(","),
         status.explanation_codes.join(","),
     )
+}
+
+fn universe_status_line(status: &UniverseStatus) -> String {
+    format!(
+        "source={} reason={} requested={} selected={} subscribed={} scanned={} skipped={} failed={} skipped_reasons={} failed_reasons={} selected_series={} subscribed_series={} scanned_series={}",
+        status.source,
+        status.last_reason.as_deref().unwrap_or("unknown"),
+        status.requested,
+        status.selected,
+        status.subscribed,
+        status.scanned,
+        status.skipped,
+        status.failed,
+        format_count_map(&status.skipped_reasons),
+        format_count_map(&status.failed_reasons),
+        status.selected_series.join(","),
+        status.subscribed_series.join(","),
+        status.scanned_series.join(","),
+    )
+}
+
+fn format_count_map(values: &BTreeMap<String, usize>) -> String {
+    if values.is_empty() {
+        return "none".to_string();
+    }
+    values
+        .iter()
+        .map(|(key, value)| format!("{key}:{value}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn compact_json(value: &Value) -> String {

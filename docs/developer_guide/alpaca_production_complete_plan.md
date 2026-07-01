@@ -176,13 +176,16 @@ cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- --chec
 
 # Dry-run scan, no order submission.
 ALPACA_IGNORE_ENTRY_WINDOW=true \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- SPY,QQQ,IWM
+  cargo run -p nautilus-alpaca --features live --bin alpaca-options-node
 
 # Paper submission path; use cancel-after-accept only for smoke testing.
 ALPACA_OPEN_ORDERS=true \
 ALPACA_CANCEL_AFTER_ACCEPT=true \
-  cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- SPY,QQQ,IWM
+  cargo run -p nautilus-alpaca --features live --bin alpaca-options-node
 ```
+
+The live option universe is derived from strategy profiles in `ALPACA_CONFIG_PATH`. Explicit
+expiry filters belong to compare, replay, and backtest diagnostics, not the live runner.
 
 Phase 7A call-credit mode:
 

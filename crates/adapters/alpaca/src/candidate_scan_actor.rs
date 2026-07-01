@@ -1,7 +1,7 @@
 //! Read-only Nautilus actor for option-chain candidate evidence.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Condvar, Mutex, MutexGuard, mpsc},
@@ -13,17 +13,18 @@ use chrono::{Datelike, Duration, NaiveDate, Utc};
 use chrono_tz::Tz;
 use nautilus_common::{
     actor::{DataActor, DataActorConfig, DataActorCore},
+    messages::data::InstrumentsResponse,
     nautilus_actor,
     timer::TimeEvent,
 };
-use nautilus_core::{Params, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     data::{
         Bar, BarSpecification, BarType,
         option_chain::{OptionChainSlice, StrikeRange},
     },
     enums::{AggregationSource, BarAggregation, PriceType},
-    identifiers::{ActorId, ClientId, InstrumentId, OptionSeriesId},
+    identifiers::{ActorId, ClientId, InstrumentId, OptionSeriesId, Venue},
     instruments::{Instrument, InstrumentAny},
 };
 use nautilus_trading::options::{
@@ -42,6 +43,11 @@ use nautilus_trading::options::{
         RegimeFeatureSnapshot, RegimeRoutingSummary, apply_regime_routing, insert_regime_context,
         regime_context_from_features, regime_feature_snapshot_from_option_chain,
     },
+    universe::{
+        OptionDteWindow, OptionUniverseContract, OptionUniverseIntent, OptionUniverseRequiredSides,
+        OptionUniverseResolution, OptionUniverseStrategyFamily, ResolvedOptionUniverseSeries,
+        SkippedOptionUniverseIntent, option_series_matches_intent_dte, resolve_option_universe,
+    },
 };
 use serde_json::{Value, json};
 
@@ -49,10 +55,11 @@ use crate::{
     candidate_ledger_persistence::CandidateLedgerPersistenceHandle,
     candidate_payloads::selected_entry_candidate_ledger_payload,
     common::consts::{
-        ALPACA_OPTION_CHAIN_EXPIRATION_PARAM, ALPACA_OPTION_CHAIN_UNDERLYING_PARAM,
-        ALPACA_OPTION_QUOTE_INTEREST_CHAIN_SCAN, ALPACA_OPTION_QUOTE_INTEREST_PARAM,
-        ALPACA_OPTION_QUOTE_STREAM_POLICY_PARAM, ALPACA_OPTION_QUOTE_STREAM_POLICY_SNAPSHOT_ONLY,
-        ALPACA_VENUE,
+        ALPACA_OPTION_CHAIN_EXPIRATION_PARAM, ALPACA_OPTION_CHAIN_MAX_EXPIRATION_PARAM,
+        ALPACA_OPTION_CHAIN_MIN_EXPIRATION_PARAM, ALPACA_OPTION_CHAIN_TYPE_PARAM,
+        ALPACA_OPTION_CHAIN_UNDERLYING_PARAM, ALPACA_OPTION_QUOTE_INTEREST_CHAIN_SCAN,
+        ALPACA_OPTION_QUOTE_INTEREST_PARAM, ALPACA_OPTION_QUOTE_STREAM_POLICY_PARAM,
+        ALPACA_OPTION_QUOTE_STREAM_POLICY_SNAPSHOT_ONLY, ALPACA_VENUE,
     },
     earnings::EarningsEvent,
     option_chain_candidates::{
@@ -69,10 +76,12 @@ use crate::{
 };
 
 const SCAN_RESULT_TIMER: &str = "alpaca_option_chain_scan_results";
+const UNIVERSE_REFRESH_TIMER: &str = "alpaca_option_universe_refresh";
 const DEFAULT_SCAN_QUEUE_CAPACITY: usize = 4;
 const DEFAULT_SCAN_WORKER_THREADS: usize = 2;
 const DEFAULT_SCAN_RESULT_DRAIN_INTERVAL_MS: u64 = 250;
 const DEFAULT_SCAN_MAX_RESULT_AGE_MS: u64 = 15_000;
+const DEFAULT_UNIVERSE_REFRESH_INTERVAL_SECS: u64 = 300;
 
 /// Read-only scan settings for candidate discovery from option-chain slices.
 #[derive(Clone, Debug, PartialEq)]
@@ -167,8 +176,10 @@ impl Default for OptionChainCandidateScanConfig {
 pub struct OptionChainCandidateScanActorConfig {
     /// Actor ID.
     pub actor_id: Option<ActorId>,
-    /// Option series subscriptions.
+    /// Explicit option series subscriptions for catalog, backtest, and diagnostics.
     pub series: Vec<OptionSeriesId>,
+    /// Strategy-derived universe intents for live dynamic resolution.
+    pub universe_intents: Vec<OptionUniverseIntent>,
     /// Strike range for every subscribed series.
     pub strike_range: StrikeRange,
     /// Optional snapshot interval in milliseconds.
@@ -187,6 +198,8 @@ pub struct OptionChainCandidateScanActorConfig {
     pub scan_result_drain_interval_ms: u64,
     /// Maximum wall-clock age in milliseconds for a completed scan result. `0` disables age drops.
     pub scan_max_result_age_ms: u64,
+    /// Interval in seconds for dynamic universe rollover/stale-series checks.
+    pub universe_refresh_interval_secs: u64,
 }
 
 impl Default for OptionChainCandidateScanActorConfig {
@@ -194,6 +207,7 @@ impl Default for OptionChainCandidateScanActorConfig {
         Self {
             actor_id: Some(ActorId::from("ALPACA-OPPORTUNITY-SCAN")),
             series: Vec::new(),
+            universe_intents: Vec::new(),
             strike_range: StrikeRange::AtmRelative {
                 strikes_above: 10,
                 strikes_below: 10,
@@ -206,6 +220,7 @@ impl Default for OptionChainCandidateScanActorConfig {
             scan_worker_threads: DEFAULT_SCAN_WORKER_THREADS,
             scan_result_drain_interval_ms: DEFAULT_SCAN_RESULT_DRAIN_INTERVAL_MS,
             scan_max_result_age_ms: DEFAULT_SCAN_MAX_RESULT_AGE_MS,
+            universe_refresh_interval_secs: DEFAULT_UNIVERSE_REFRESH_INTERVAL_SECS,
         }
     }
 }
@@ -217,12 +232,37 @@ pub struct OptionChainCandidateScanActor {
     config: OptionChainCandidateScanActorConfig,
     candidate_ledger_persistence: Option<CandidateLedgerPersistenceHandle>,
     subscribed_series: BTreeSet<OptionSeriesId>,
+    pending_universe_intents: HashMap<UUID4, PendingUniverseRequest>,
+    selected_series_by_profile_underlying: BTreeMap<UniverseIntentKey, OptionSeriesId>,
+    selected_profiles_by_series: BTreeMap<OptionSeriesId, Vec<AlpacaOptionsStrategyProfile>>,
+    last_universe_trade_date: Option<NaiveDate>,
     underlying_bar_types: BTreeMap<String, BarType>,
     latest_underlying_bars: BTreeMap<String, Vec<Bar>>,
     latest_candidates: Option<OptionsCandidateSet>,
     scan_workers: Option<ScanWorkerPool>,
     latest_enqueued_scan_sequence: u64,
     latest_published_scan_sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct UniverseIntentKey {
+    profile_id: String,
+    underlying: String,
+}
+
+impl UniverseIntentKey {
+    fn new(profile_id: impl Into<String>, underlying: impl Into<String>) -> Self {
+        Self {
+            profile_id: profile_id.into(),
+            underlying: underlying.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingUniverseRequest {
+    reason: String,
+    intents: Vec<OptionUniverseIntent>,
 }
 
 nautilus_actor!(OptionChainCandidateScanActor);
@@ -240,6 +280,10 @@ impl OptionChainCandidateScanActor {
             config,
             candidate_ledger_persistence: None,
             subscribed_series: BTreeSet::new(),
+            pending_universe_intents: HashMap::new(),
+            selected_series_by_profile_underlying: BTreeMap::new(),
+            selected_profiles_by_series: BTreeMap::new(),
+            last_universe_trade_date: None,
             underlying_bar_types: BTreeMap::new(),
             latest_underlying_bars: BTreeMap::new(),
             latest_candidates: None,
@@ -265,9 +309,9 @@ impl OptionChainCandidateScanActor {
         self.latest_candidates.as_ref()
     }
 
-    fn subscribe_series(&mut self, series_id: OptionSeriesId) {
+    fn subscribe_series(&mut self, series_id: OptionSeriesId) -> bool {
         if !self.subscribed_series.insert(series_id) {
-            return;
+            return false;
         }
 
         let cached = self
@@ -287,6 +331,7 @@ impl OptionChainCandidateScanActor {
             self.config.client_id,
             Some(option_chain_quote_params()),
         );
+        true
     }
 
     fn request_series_instruments(&mut self, series_id: OptionSeriesId) -> anyhow::Result<()> {
@@ -316,6 +361,365 @@ impl OptionChainCandidateScanActor {
             Some(params),
         )?;
         Ok(())
+    }
+
+    fn request_universe_intent_instruments(
+        &mut self,
+        intent: OptionUniverseIntent,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let trade_date = market_trade_naive_date(self.config.scan.trade_date_timezone);
+        let min_expiration = trade_date + Duration::days(intent.dte_window.min_dte);
+        let max_expiration = trade_date + Duration::days(intent.dte_window.max_dte);
+
+        let mut params = Params::new();
+        params.insert(
+            ALPACA_OPTION_CHAIN_UNDERLYING_PARAM.to_string(),
+            json!(intent.underlying.as_str()),
+        );
+        params.insert(
+            ALPACA_OPTION_CHAIN_MIN_EXPIRATION_PARAM.to_string(),
+            json!(min_expiration.format("%Y-%m-%d").to_string()),
+        );
+        params.insert(
+            ALPACA_OPTION_CHAIN_MAX_EXPIRATION_PARAM.to_string(),
+            json!(max_expiration.format("%Y-%m-%d").to_string()),
+        );
+        if let Some(option_type) = option_type_param_for_required_sides(intent.required_sides) {
+            params.insert(
+                ALPACA_OPTION_CHAIN_TYPE_PARAM.to_string(),
+                json!(option_type),
+            );
+        }
+
+        log::info!(
+            "Requesting Alpaca option instruments for universe intent profile={} underlying={} family={} dte={}..{} sides={} reason={}",
+            intent.profile_id,
+            intent.underlying,
+            intent.strategy_family.as_str(),
+            intent.dte_window.min_dte,
+            intent.dte_window.max_dte,
+            intent.required_sides.as_str(),
+            reason,
+        );
+        let request_id = self.request_instruments(
+            Some(Venue::from(ALPACA_VENUE)),
+            None,
+            None,
+            self.config.client_id,
+            Some(params),
+        )?;
+        self.pending_universe_intents.insert(
+            request_id,
+            PendingUniverseRequest {
+                reason: reason.to_string(),
+                intents: vec![intent],
+            },
+        );
+        Ok(())
+    }
+
+    fn handle_universe_instruments_response(
+        &mut self,
+        response: &nautilus_common::messages::data::InstrumentsResponse,
+    ) -> anyhow::Result<bool> {
+        let Some(pending) = self
+            .pending_universe_intents
+            .remove(&response.correlation_id)
+        else {
+            return Ok(false);
+        };
+        let contracts = response
+            .data
+            .iter()
+            .filter_map(option_universe_contract_from_instrument)
+            .collect::<Vec<_>>();
+        let resolution =
+            resolve_option_universe(&pending.intents, &contracts, &[], self.core.timestamp_ns());
+        self.apply_universe_resolution(&pending.reason, &resolution)?;
+        self.emit_universe_resolution(&pending.reason, &resolution);
+        Ok(true)
+    }
+
+    fn apply_universe_resolution(
+        &mut self,
+        reason: &str,
+        resolution: &OptionUniverseResolution,
+    ) -> anyhow::Result<()> {
+        for selected in &resolution.selected {
+            let series_id = selected.coverage.series_id;
+            let key = UniverseIntentKey::new(&selected.profile_id, &selected.underlying);
+            let previous = self.selected_series_by_profile_underlying.remove(&key);
+            match previous {
+                Some(previous_series_id) if previous_series_id != series_id => {
+                    self.remove_profile_from_selected_series(previous_series_id, &key, reason);
+                    self.emit_universe_rollover_selected(
+                        reason,
+                        selected,
+                        Some(previous_series_id),
+                    );
+                }
+                None if reason != "startup" => {
+                    self.emit_universe_rollover_selected(reason, selected, None);
+                }
+                _ => {}
+            }
+            self.selected_series_by_profile_underlying
+                .insert(key.clone(), series_id);
+            self.add_profile_to_selected_series(series_id, &key);
+            if self.subscribe_series(series_id) {
+                emit_operator_event(
+                    "option_universe_subscription",
+                    json!({
+                        "event": "subscribed",
+                        "reason": reason,
+                        "profile_id": selected.profile_id,
+                        "underlying": selected.underlying,
+                        "series_id": series_id.to_string(),
+                        "dte": selected.coverage.dte,
+                    }),
+                );
+            }
+            if let Err(error) = self.request_underlying_bars(series_id) {
+                log::warn!("Failed to request Alpaca underlying bars for {series_id}: {error:#}");
+            }
+        }
+        for skipped in &resolution.skipped {
+            let key = UniverseIntentKey::new(&skipped.profile_id, &skipped.underlying);
+            if let Some(previous_series_id) =
+                self.selected_series_by_profile_underlying.remove(&key)
+            {
+                self.remove_profile_from_selected_series(previous_series_id, &key, reason);
+                self.emit_universe_rollover_skipped(reason, skipped, previous_series_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn add_profile_to_selected_series(
+        &mut self,
+        series_id: OptionSeriesId,
+        key: &UniverseIntentKey,
+    ) {
+        let Some(profile) = self.profile_for_intent(key) else {
+            return;
+        };
+        let profiles = self
+            .selected_profiles_by_series
+            .entry(series_id)
+            .or_default();
+        if !profiles
+            .iter()
+            .any(|existing| existing.id == profile.id && existing.scans_underlying(&key.underlying))
+        {
+            profiles.push(profile);
+        }
+    }
+
+    fn remove_profile_from_selected_series(
+        &mut self,
+        series_id: OptionSeriesId,
+        key: &UniverseIntentKey,
+        reason: &str,
+    ) {
+        let remove_series =
+            if let Some(profiles) = self.selected_profiles_by_series.get_mut(&series_id) {
+                profiles.retain(|profile| {
+                    !(profile.id == key.profile_id && profile.scans_underlying(&key.underlying))
+                });
+                profiles.is_empty()
+            } else {
+                true
+            };
+        if remove_series {
+            self.selected_profiles_by_series.remove(&series_id);
+            self.unsubscribe_dynamic_series_if_unused(series_id, reason);
+        }
+    }
+
+    fn unsubscribe_dynamic_series_if_unused(&mut self, series_id: OptionSeriesId, reason: &str) {
+        if self
+            .selected_series_by_profile_underlying
+            .values()
+            .any(|selected_series_id| *selected_series_id == series_id)
+        {
+            return;
+        }
+        if self.subscribed_series.remove(&series_id) {
+            self.unsubscribe_option_chain(series_id, self.config.client_id);
+            emit_operator_event(
+                "option_universe_subscription",
+                json!({
+                    "event": "unsubscribed_stale",
+                    "reason": reason,
+                    "series_id": series_id.to_string(),
+                }),
+            );
+        }
+    }
+
+    fn emit_universe_resolution(&self, reason: &str, resolution: &OptionUniverseResolution) {
+        let selected_series = resolution
+            .selected
+            .iter()
+            .map(|selected| selected.coverage.series_id.to_string())
+            .collect::<Vec<_>>();
+        let mut skipped_reasons = BTreeMap::<String, usize>::new();
+        for skipped in &resolution.skipped {
+            *skipped_reasons
+                .entry(skipped.reason.as_str().to_string())
+                .or_default() += 1;
+        }
+        let resolution_payload = serde_json::to_value(resolution).unwrap_or_else(|error| {
+            json!({
+                "serialization_error": error.to_string(),
+                "selected_count": resolution.selected.len(),
+                "skipped_count": resolution.skipped.len(),
+            })
+        });
+        emit_operator_event(
+            "option_universe_resolution",
+            json!({
+                "reason": reason,
+                "requested_count": resolution.selected.len() + resolution.skipped.len(),
+                "selected_count": resolution.selected.len(),
+                "skipped_count": resolution.skipped.len(),
+                "selected_series": selected_series,
+                "skipped_reasons": skipped_reasons,
+                "resolution": resolution_payload,
+            }),
+        );
+    }
+
+    fn emit_universe_rollover_selected(
+        &self,
+        reason: &str,
+        selected: &ResolvedOptionUniverseSeries,
+        previous_series_id: Option<OptionSeriesId>,
+    ) {
+        emit_operator_event(
+            "option_universe_rollover",
+            json!({
+                "event": "selected",
+                "reason": reason,
+                "profile_id": selected.profile_id,
+                "underlying": selected.underlying,
+                "previous_series_id": previous_series_id.map(|series_id| series_id.to_string()),
+                "selected_series_id": selected.coverage.series_id.to_string(),
+                "selected_dte": selected.coverage.dte,
+                "selection_reason": selected.reason.as_str(),
+            }),
+        );
+    }
+
+    fn emit_universe_rollover_skipped(
+        &self,
+        reason: &str,
+        skipped: &SkippedOptionUniverseIntent,
+        previous_series_id: OptionSeriesId,
+    ) {
+        emit_operator_event(
+            "option_universe_rollover",
+            json!({
+                "event": "skipped",
+                "reason": reason,
+                "profile_id": skipped.profile_id,
+                "underlying": skipped.underlying,
+                "previous_series_id": previous_series_id.to_string(),
+                "skip_reason": skipped.reason.as_str(),
+            }),
+        );
+    }
+
+    fn profile_for_intent(&self, key: &UniverseIntentKey) -> Option<AlpacaOptionsStrategyProfile> {
+        self.config
+            .scan
+            .strategy_profiles
+            .iter()
+            .find(|profile| {
+                profile.id == key.profile_id && profile.scans_underlying(&key.underlying)
+            })
+            .cloned()
+    }
+
+    fn has_dynamic_universe(&self) -> bool {
+        !self.config.universe_intents.is_empty()
+    }
+
+    fn request_dynamic_universe_resolution(&mut self, reason: &str) -> anyhow::Result<()> {
+        if !self.pending_universe_intents.is_empty() {
+            emit_operator_event(
+                "option_universe_refresh",
+                json!({
+                    "event": "skipped",
+                    "reason": reason,
+                    "skip_reason": "pending_requests",
+                    "pending_requests": self.pending_universe_intents.len(),
+                }),
+            );
+            return Ok(());
+        }
+
+        self.last_universe_trade_date = Some(market_trade_naive_date(
+            self.config.scan.trade_date_timezone,
+        ));
+        emit_operator_event(
+            "option_universe_refresh",
+            json!({
+                "event": "requested",
+                "reason": reason,
+                "intent_count": self.config.universe_intents.len(),
+                "trade_date": self
+                    .last_universe_trade_date
+                    .map(|date| date.format("%Y-%m-%d").to_string()),
+            }),
+        );
+        for intent in self.config.universe_intents.clone() {
+            self.request_universe_intent_instruments(intent, reason)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_dynamic_universe_if_needed(&mut self) -> anyhow::Result<()> {
+        let Some(reason) = self.dynamic_universe_refresh_reason() else {
+            return Ok(());
+        };
+        self.request_dynamic_universe_resolution(reason)
+    }
+
+    fn dynamic_universe_refresh_reason(&mut self) -> Option<&'static str> {
+        if !self.has_dynamic_universe() {
+            return None;
+        }
+        let trade_date = market_trade_naive_date(self.config.scan.trade_date_timezone);
+        if self
+            .last_universe_trade_date
+            .is_some_and(|last_trade_date| last_trade_date != trade_date)
+        {
+            return Some("trade_date_rollover");
+        }
+        if self.has_stale_selected_universe_series() {
+            return Some("stale_dte");
+        }
+        None
+    }
+
+    fn has_stale_selected_universe_series(&self) -> bool {
+        let evaluation_time = self.core.timestamp_ns();
+        self.selected_series_by_profile_underlying
+            .iter()
+            .any(|(key, series_id)| {
+                let Some(intent) = self.intent_for_key(key) else {
+                    return true;
+                };
+                !option_series_matches_intent_dte(intent, *series_id, evaluation_time)
+            })
+    }
+
+    fn intent_for_key(&self, key: &UniverseIntentKey) -> Option<&OptionUniverseIntent> {
+        self.config.universe_intents.iter().find(|intent| {
+            intent.profile_id == key.profile_id && intent.underlying == key.underlying
+        })
     }
 
     fn request_underlying_bars(&mut self, series_id: OptionSeriesId) -> anyhow::Result<()> {
@@ -487,6 +891,36 @@ impl OptionChainCandidateScanActor {
             return;
         };
 
+        let strategy_profiles = if self.has_dynamic_universe() {
+            let Some(profiles) = self.selected_profiles_by_series.get(&slice.series_id) else {
+                emit_operator_event(
+                    "option_chain_scan_skipped",
+                    json!({
+                        "reason": "unresolved_universe_series",
+                        "series_id": slice.series_id.to_string(),
+                        "source_ts_event": slice.ts_event.as_u64(),
+                        "source_ts_init": slice.ts_init.as_u64(),
+                    }),
+                );
+                return;
+            };
+            if profiles.is_empty() {
+                emit_operator_event(
+                    "option_chain_scan_skipped",
+                    json!({
+                        "reason": "empty_universe_profile_set",
+                        "series_id": slice.series_id.to_string(),
+                        "source_ts_event": slice.ts_event.as_u64(),
+                        "source_ts_init": slice.ts_init.as_u64(),
+                    }),
+                );
+                return;
+            }
+            Some(profiles.clone())
+        } else {
+            None
+        };
+
         self.latest_enqueued_scan_sequence = self.latest_enqueued_scan_sequence.saturating_add(1);
         let underlying = slice.series_id.underlying.to_string();
         let job = ScanJob {
@@ -494,6 +928,7 @@ impl OptionChainCandidateScanActor {
             slice: slice.clone(),
             trade_date,
             ts_init,
+            strategy_profiles,
             underlying_bars: self
                 .latest_underlying_bars
                 .get(&underlying)
@@ -683,8 +1118,10 @@ impl OptionChainCandidateScanActor {
 
 impl DataActor for OptionChainCandidateScanActor {
     fn on_start(&mut self) -> anyhow::Result<()> {
-        if self.config.series.is_empty() {
-            log::warn!("Option-chain candidate scan actor has no series subscriptions");
+        if self.config.series.is_empty() && self.config.universe_intents.is_empty() {
+            log::warn!(
+                "Option-chain candidate scan actor has no series subscriptions or universe intents"
+            );
             return Ok(());
         }
 
@@ -699,21 +1136,49 @@ impl DataActor for OptionChainCandidateScanActor {
             None,
         )?;
 
-        for series_id in self.config.series.clone() {
-            if self.config.bootstrap_instruments {
-                self.request_series_instruments(series_id)?;
-            } else {
-                self.subscribe_series(series_id);
+        if self.has_dynamic_universe() {
+            self.clock().set_timer(
+                UNIVERSE_REFRESH_TIMER,
+                StdDuration::from_secs(self.config.universe_refresh_interval_secs.max(1)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            self.request_dynamic_universe_resolution("startup")?;
+        } else {
+            for series_id in self.config.series.clone() {
+                if self.config.bootstrap_instruments {
+                    self.request_series_instruments(series_id)?;
+                } else {
+                    self.subscribe_series(series_id);
+                }
+                if let Err(error) = self.request_underlying_bars(series_id) {
+                    log::warn!(
+                        "Failed to request Alpaca underlying bars for {series_id}: {error:#}"
+                    );
+                }
             }
-            if let Err(error) = self.request_underlying_bars(series_id) {
-                log::warn!("Failed to request Alpaca underlying bars for {series_id}: {error:#}");
+        }
+        Ok(())
+    }
+
+    fn on_instruments_response(&mut self, response: &InstrumentsResponse) -> anyhow::Result<()> {
+        if self.handle_universe_instruments_response(response)? {
+            return Ok(());
+        }
+
+        for instrument in &response.data {
+            if let Err(error) = self.on_instrument(instrument) {
+                log::error!("Error handling Alpaca instruments response instrument: {error:#}");
             }
         }
         Ok(())
     }
 
     fn on_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
-        if !self.config.bootstrap_instruments {
+        if !self.config.bootstrap_instruments || self.has_dynamic_universe() {
             return Ok(());
         }
 
@@ -746,19 +1211,26 @@ impl DataActor for OptionChainCandidateScanActor {
     }
 
     fn on_time_event(&mut self, event: &TimeEvent) -> anyhow::Result<()> {
-        if event.name.as_str() == SCAN_RESULT_TIMER {
-            self.drain_scan_results();
+        match event.name.as_str() {
+            SCAN_RESULT_TIMER => self.drain_scan_results(),
+            UNIVERSE_REFRESH_TIMER => self.refresh_dynamic_universe_if_needed()?,
+            _ => {}
         }
         Ok(())
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
         self.clock().cancel_timer(SCAN_RESULT_TIMER);
+        self.clock().cancel_timer(UNIVERSE_REFRESH_TIMER);
         self.stop_scan_workers();
         for series_id in self.subscribed_series.iter().copied().collect::<Vec<_>>() {
             self.unsubscribe_option_chain(series_id, self.config.client_id);
         }
         self.subscribed_series.clear();
+        self.pending_universe_intents.clear();
+        self.selected_series_by_profile_underlying.clear();
+        self.selected_profiles_by_series.clear();
+        self.last_universe_trade_date = None;
         self.underlying_bar_types.clear();
         self.latest_underlying_bars.clear();
         Ok(())
@@ -795,6 +1267,63 @@ pub fn candidate_scan_config_from_runtime(
         event_shock_earnings_events: config.event_shock_earnings_events.clone(),
         event_shock_block_days_before_earnings: config.event_shock_block_days_before_earnings,
         event_shock_block_days_after_earnings: config.event_shock_block_days_after_earnings,
+    }
+}
+
+/// Builds source-neutral universe intents from resolved Alpaca strategy profiles.
+#[must_use]
+pub fn option_universe_intents_from_strategy_profiles(
+    profiles: &[AlpacaOptionsStrategyProfile],
+) -> Vec<OptionUniverseIntent> {
+    profiles
+        .iter()
+        .flat_map(|profile| {
+            profile.underlyings.iter().map(|underlying| {
+                OptionUniverseIntent::from_family(
+                    profile.id.clone(),
+                    underlying.clone(),
+                    option_universe_strategy_family(profile.family),
+                    profile_universe_dte_window(profile),
+                )
+            })
+        })
+        .collect()
+}
+
+fn option_universe_strategy_family(
+    family: AlpacaOptionsStrategyFamily,
+) -> OptionUniverseStrategyFamily {
+    match family {
+        AlpacaOptionsStrategyFamily::PutCredit => OptionUniverseStrategyFamily::PutCredit,
+        AlpacaOptionsStrategyFamily::CallCredit => OptionUniverseStrategyFamily::CallCredit,
+        AlpacaOptionsStrategyFamily::IronCondor => OptionUniverseStrategyFamily::IronCondor,
+        AlpacaOptionsStrategyFamily::PutDebit => OptionUniverseStrategyFamily::PutDebit,
+        AlpacaOptionsStrategyFamily::CallDebit => OptionUniverseStrategyFamily::CallDebit,
+        AlpacaOptionsStrategyFamily::NakedPut => OptionUniverseStrategyFamily::NakedPut,
+        AlpacaOptionsStrategyFamily::NakedCall => OptionUniverseStrategyFamily::NakedCall,
+        AlpacaOptionsStrategyFamily::NakedPutOneToThreeDte => {
+            OptionUniverseStrategyFamily::NakedPutOneToThreeDte
+        }
+        AlpacaOptionsStrategyFamily::NakedCallOneToThreeDte => {
+            OptionUniverseStrategyFamily::NakedCallOneToThreeDte
+        }
+    }
+}
+
+fn profile_universe_dte_window(profile: &AlpacaOptionsStrategyProfile) -> OptionDteWindow {
+    match &profile.scanner {
+        AlpacaOptionsStrategyScannerConfig::Credit(scanner) => {
+            OptionDteWindow::new(scanner.min_dte, scanner.max_dte)
+        }
+        AlpacaOptionsStrategyScannerConfig::IronCondor(scanner) => {
+            OptionDteWindow::new(scanner.credit.min_dte, scanner.credit.max_dte)
+        }
+        AlpacaOptionsStrategyScannerConfig::Debit(scanner) => {
+            OptionDteWindow::new(scanner.min_dte, scanner.max_dte)
+        }
+        AlpacaOptionsStrategyScannerConfig::Naked(scanner) => {
+            OptionDteWindow::new(scanner.min_dte, scanner.max_dte)
+        }
     }
 }
 
@@ -1171,10 +1700,22 @@ fn selected_entry_payload(entry: &SelectedOptionsEntry) -> Value {
     })
 }
 
+fn option_type_param_for_required_sides(
+    required_sides: OptionUniverseRequiredSides,
+) -> Option<&'static str> {
+    match required_sides {
+        OptionUniverseRequiredSides::Calls => Some("call"),
+        OptionUniverseRequiredSides::Puts => Some("put"),
+        OptionUniverseRequiredSides::CallsAndPuts => None,
+    }
+}
+
+fn market_trade_naive_date(timezone: Tz) -> NaiveDate {
+    Utc::now().with_timezone(&timezone).date_naive()
+}
+
 fn market_trade_date(timezone: Tz) -> String {
-    Utc::now()
-        .with_timezone(&timezone)
-        .date_naive()
+    market_trade_naive_date(timezone)
         .format("%Y-%m-%d")
         .to_string()
 }
@@ -1197,6 +1738,29 @@ fn instrument_belongs_to_series(instrument: &InstrumentAny, series_id: &OptionSe
         && instrument.settlement_currency().code == series_id.settlement_currency
         && instrument.strike_price().is_some()
         && instrument.option_kind().is_some()
+}
+
+fn option_universe_contract_from_instrument(
+    instrument: &InstrumentAny,
+) -> Option<OptionUniverseContract> {
+    let underlying = instrument.underlying()?;
+    let option_kind = instrument.option_kind()?;
+    let expiration_ns = instrument.expiration_ns()?;
+    if instrument.strike_price().is_none() {
+        return None;
+    }
+
+    let series_id = OptionSeriesId::new(
+        instrument.venue(),
+        underlying,
+        instrument.settlement_currency().code,
+        expiration_ns,
+    );
+    Some(OptionUniverseContract::new(
+        instrument.id(),
+        series_id,
+        option_kind,
+    ))
 }
 
 #[derive(Debug)]
@@ -1371,6 +1935,7 @@ struct ScanJob {
     slice: OptionChainSlice,
     trade_date: String,
     ts_init: UnixNanos,
+    strategy_profiles: Option<Vec<AlpacaOptionsStrategyProfile>>,
     underlying_bars: Vec<Bar>,
     enqueued_at: Instant,
 }
@@ -1474,7 +2039,12 @@ fn scan_worker_job(
     config: &OptionChainCandidateScanConfig,
     started_at: Instant,
 ) -> ScanWorkerResult {
-    let event_load_events = config
+    let mut scan_config = config.clone();
+    if let Some(strategy_profiles) = &job.strategy_profiles {
+        scan_config.strategy_profiles = strategy_profiles.clone();
+    }
+
+    let event_load_events = scan_config
         .event_shock_earnings_events
         .iter()
         .map(|event| {
@@ -1488,12 +2058,12 @@ fn scan_worker_job(
     let feature_inputs = RegimeFeatureInputs {
         underlying_bars: &job.underlying_bars,
         event_load_events: &event_load_events,
-        event_load_block_days_before: config.event_shock_block_days_before_earnings,
-        event_load_block_days_after: config.event_shock_block_days_after_earnings,
+        event_load_block_days_before: scan_config.event_shock_block_days_before_earnings,
+        event_load_block_days_after: scan_config.event_shock_block_days_after_earnings,
     };
     let feature_snapshot = regime_feature_snapshot_from_option_chain(
         &job.slice,
-        &config.regime_features,
+        &scan_config.regime_features,
         feature_inputs,
         &job.trade_date,
         job.ts_init,
@@ -1502,7 +2072,7 @@ fn scan_worker_job(
     let input = option_chain_candidate_input(&job.slice);
     let candidates = scan_option_chain_candidate_input(
         &input,
-        config,
+        &scan_config,
         &job.trade_date,
         scan_date_from_timestamp(job.slice.ts_event),
     );

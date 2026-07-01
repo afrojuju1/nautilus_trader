@@ -241,6 +241,12 @@ manager wraps `OptionChainAggregator` and `AtmTracker`, registers message bus ha
 publishes snapshots, and queues wire subscription changes for the engine to drain. A
 separate PyO3 `OptionChainManager` exposes the same aggregation core to Python.
 
+Universe selection happens before this layer. Strategy profiles and source-neutral
+resolution should decide which concrete `OptionSeriesId` values exist, while the
+`DataEngine` and `OptionChainManager` own the mechanics after a series is selected.
+See [Option Universe Ownership](../developer_guide/option_universe_ownership.md) for
+the live architecture boundary.
+
 ```mermaid
 flowchart TD
     subgraph DataEngine

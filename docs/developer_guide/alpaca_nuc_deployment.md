@@ -500,7 +500,8 @@ tiny live canary.
 
 `alpaca-control operator` runs the `nautilus adapters alpaca status` binary and summarizes service state,
 account status, open orders, positions, strategy state, the last structured scan/decision event, the
-latest broker event, and operator alerts. Use `--json` for machine-readable output.
+latest option-universe coverage counts, the latest broker event, and operator alerts. Use `--json`
+for machine-readable output.
 
 Common operator-status commands:
 

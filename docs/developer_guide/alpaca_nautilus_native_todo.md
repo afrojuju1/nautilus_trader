@@ -37,6 +37,9 @@ and strategies.
     actor lifecycle without submitting orders.
   - Run with:
     `cargo run -p nautilus-alpaca --features live,backtest-node --bin alpaca-option-chain-scan-node -- <CATALOG_PATH> <UNDERLYING> [VENUE]`.
+  - Without `ALPACA_OPTION_CHAIN_EXPIRY`, the scan node chooses a catalog series through the
+    source-neutral DTE universe resolver. Set `ALPACA_OPTION_CHAIN_EXPIRY=YYYY-MM-DD` only for an
+    explicit catalog-inspection filter.
 - [x] Add Alpaca live data-client support for option `QuoteTick` and `OptionGreeks` subscriptions
   before wiring the actor into a live `TradingNode`.
   - Implemented through `AlpacaDataClient` using Nautilus-native subscriptions.
@@ -55,8 +58,10 @@ and strategies.
   - Standard external-LAST `RequestBars` for Alpaca option instruments now map to Alpaca historical
     option bars through `AlpacaDataClient`; unsupported bar aggregations return an empty
     `BarsResponse` after logging the request error.
-  - `nautilus adapters alpaca status` surfaces the latest `option_market_data_stream` event so operators can see
-    stream vs snapshot-fallback source and feed.
+  - `nautilus adapters alpaca status` surfaces the latest `option_market_data_stream` event so
+    operators can see stream vs snapshot-fallback source and feed.
+  - Operator status also reports option-universe requested, selected, subscribed, scanned, skipped,
+    and failed counts from `option_universe_*` events.
 - [x] Add a REST-vs-option-chain comparison command for the same symbol, expiry, and scan time.
   - Implemented as `alpaca-compare-option-chain-scan`.
   - It loads one Alpaca REST option snapshot for the requested underlying/expiry, scans the same
@@ -101,9 +106,11 @@ validation and operational cleanup, not keeping a second account-engine owner al
   - Docker: `ALPACA_COMPARE_UNDERLYING=SPY ALPACA_COMPARE_EXPIRY=2026-07-02 docker compose -f deploy/alpaca/compose.yml --profile cutover run --rm alpaca-compare-option-chain-scan`
 - [x] Live Nautilus node exists with scanner-to-strategy wiring.
   - Local bounded run:
-    `ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS=90 cargo run -p nautilus-alpaca --features live --bin alpaca-options-node -- SPY 2026-07-02`
+    `ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS=90 cargo run -p nautilus-alpaca --features live --bin alpaca-options-node`
   - Docker bounded run:
-    `ALPACA_OPTION_CHAIN_UNDERLYING=SPY ALPACA_OPTION_CHAIN_EXPIRY=2026-07-02 ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS=90 docker compose -f deploy/alpaca/compose.yml --profile cutover run --rm alpaca-option-chain-live`
+    `ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS=90 docker compose -f deploy/alpaca/compose.yml --profile cutover run --rm alpaca-option-chain-live`
+  - Live universe intent comes from strategy profiles; explicit expiries remain scoped to compare
+    and replay diagnostics.
 - [x] One-command cutover proof retired from `alpaca-control`.
   - Keep proof steps explicit so the deploy wrapper does not own migration diagnostics.
 - [ ] Run the cutover proof during market hours across the paper-profile symbols and expiries.

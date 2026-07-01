@@ -173,6 +173,7 @@ impl Args {
 fn print_usage() {
     println!(
         "usage: alpaca-compare-option-chain-scan [--pretty] UNDERLYING EXPIRY\n\
+         diagnostic fixed-expiry inspection; live runtime uses strategy-profile universe intent\n\
          example: alpaca-compare-option-chain-scan --pretty SPY 2026-07-02"
     );
 }

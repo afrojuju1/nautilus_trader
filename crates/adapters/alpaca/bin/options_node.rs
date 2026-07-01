@@ -1,6 +1,6 @@
 //! Live Nautilus option-chain scan and entry node for Alpaca.
 
-use std::{collections::BTreeSet, env, sync::Arc, time::Duration};
+use std::{env, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use chrono::{Duration as ChronoDuration, NaiveDate, Utc};
@@ -9,7 +9,7 @@ use nautilus_alpaca::{
     candidate_ledger_persistence::CandidateLedgerPersistenceHandle,
     candidate_scan_actor::{
         OptionChainCandidateScanActor, OptionChainCandidateScanActorConfig,
-        candidate_scan_config_from_runtime,
+        candidate_scan_config_from_runtime, option_universe_intents_from_strategy_profiles,
     },
     common::consts::ALPACA_CLIENT_ID,
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
@@ -23,7 +23,6 @@ use nautilus_alpaca::{
         option_lifecycle_activity_request,
     },
     options_runtime::AlpacaOptionsRuntimeConfig,
-    parse::parse_option_series_id,
     runtime::{StrategyState, emit_operator_event, save_strategy_state_atomic},
     state_persistence::{StrategyStatePersistenceHandle, start_runtime_lease_heartbeat},
     state_reconciliation::{
@@ -123,9 +122,6 @@ struct Args {
     trader_id: TraderId,
     node_name: String,
     actor_id: ActorId,
-    underlyings: Vec<String>,
-    expiry: String,
-    settlement: String,
     strike_range: StrikeRange,
     snapshot_interval_ms: Option<u64>,
     snapshot_greeks_poll_secs: Option<u64>,
@@ -141,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
         print_config_check(&runtime_config)?;
         return Ok(());
     }
-    let args = Args::from_env(&runtime_config)?;
+    let args = Args::from_env()?;
     let broker_orders_requested =
         runtime_config.open_orders_enabled || runtime_config.close_orders_enabled;
     let runtime_config = if broker_orders_requested {
@@ -151,14 +147,6 @@ async fn main() -> anyhow::Result<()> {
     } else {
         runtime_config
     };
-    let series_ids = args
-        .underlyings
-        .iter()
-        .map(|underlying| {
-            parse_option_series_id(underlying, &args.settlement, &args.expiry)
-                .map_err(|e| anyhow::anyhow!("invalid Alpaca option series for {underlying}: {e}"))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
     let client_id = ClientId::from(ALPACA_CLIENT_ID);
     let data_config = AlpacaDataClientConfig {
         snapshot_greeks_poll_secs: args.snapshot_greeks_poll_secs,
@@ -171,6 +159,8 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to load options buying-power context")?;
     let scan_config = candidate_scan_config_from_runtime(&runtime_config, options_buying_power);
+    let universe_intents =
+        option_universe_intents_from_strategy_profiles(&runtime_config.strategy_profiles);
     let mut strategy_state = runtime_config
         .load_strategy_state()
         .await
@@ -218,12 +208,8 @@ async fn main() -> anyhow::Result<()> {
     let strategy_state_entry_count = strategy_state.entries.len();
 
     log::info!(
-        "Starting Alpaca options live node: series={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategy_profiles={:?} open_orders_enabled={} close_orders_enabled={} operational_store_required={} strategy_state_entries={}",
-        series_ids
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(","),
+        "Starting Alpaca options live node: universe_intents={} snapshot_interval_ms={:?} max_runtime_secs={:?} strategy_profiles={:?} open_orders_enabled={} close_orders_enabled={} operational_store_required={} strategy_state_entries={}",
+        universe_intents.len(),
         args.snapshot_interval_ms,
         args.max_runtime_secs,
         runtime_config.strategy_profile_summaries(),
@@ -259,7 +245,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mut actor = OptionChainCandidateScanActor::new(OptionChainCandidateScanActorConfig {
         actor_id: Some(args.actor_id),
-        series: series_ids,
+        series: Vec::new(),
+        universe_intents,
         strike_range: args.strike_range,
         snapshot_interval_ms: args.snapshot_interval_ms,
         client_id: Some(client_id),
@@ -627,8 +614,7 @@ fn emit_unmanaged_broker_state_block(report: &StrategyStateReconciliationReport)
 }
 
 impl Args {
-    fn from_env(config: &AlpacaOptionsRuntimeConfig) -> anyhow::Result<Self> {
-        let mut values = Vec::new();
+    fn from_env() -> anyhow::Result<Self> {
         for arg in env::args().skip(1) {
             match arg.as_str() {
                 "--help" | "-h" => {
@@ -636,35 +622,11 @@ impl Args {
                     std::process::exit(0);
                 }
                 value if value.starts_with('-') => bail!("unknown argument `{value}`"),
-                value => values.push(value.to_string()),
+                value => bail!(
+                    "unexpected positional argument `{value}`: alpaca-options-node derives its live option universe from strategy profiles"
+                ),
             }
         }
-
-        if values.len() > 2 {
-            bail!("too many positional arguments: expected [UNDERLYING[,UNDERLYING...]] EXPIRY");
-        }
-
-        let raw_underlyings = values
-            .first()
-            .cloned()
-            .or_else(|| env::var("ALPACA_OPTION_CHAIN_UNDERLYING").ok())
-            .map(split_values)
-            .filter(|values| !values.is_empty());
-        let underlyings =
-            normalize_underlyings(raw_underlyings.unwrap_or_else(|| config.underlyings.clone()));
-        anyhow::ensure!(
-            !underlyings.is_empty(),
-            "underlying required: pass UNDERLYING, set ALPACA_OPTION_CHAIN_UNDERLYING, or configure a runtime universe",
-        );
-        let expiry = values
-            .get(1)
-            .cloned()
-            .or_else(|| env::var("ALPACA_OPTION_CHAIN_EXPIRY").ok())
-            .context("expiry required: pass EXPIRY or set ALPACA_OPTION_CHAIN_EXPIRY")?;
-        let settlement = env::var("ALPACA_OPTION_CHAIN_SETTLEMENT")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "USD".to_string());
 
         Ok(Self {
             trader_id: TraderId::from(
@@ -683,9 +645,6 @@ impl Args {
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| "ALPACA-OPTION-CHAIN-SCAN".to_string()),
             ),
-            underlyings,
-            expiry,
-            settlement: settlement.to_ascii_uppercase(),
             strike_range: strike_range_from_env()?,
             snapshot_interval_ms: optional_u64_env(
                 "ALPACA_OPTION_CHAIN_SNAPSHOT_INTERVAL_MS",
@@ -803,30 +762,41 @@ fn split_values(raw: String) -> Vec<String> {
         .collect()
 }
 
-fn normalize_underlyings(values: Vec<String>) -> Vec<String> {
-    values
-        .into_iter()
-        .map(|value| value.trim().to_ascii_uppercase())
-        .filter(|value| !value.is_empty())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
 fn print_usage() {
     println!(
-        "usage: alpaca-options-node [--check-config] [UNDERLYING[,UNDERLYING...] EXPIRY]\n\
+        "usage: alpaca-options-node [--check-config]\n\
          example: ALPACA_OPTION_CHAIN_MAX_RUNTIME_SECS=60 \
-         alpaca-options-node SPY,QQQ 2026-07-02"
+         alpaca-options-node"
     );
 }
 
 fn print_config_check(config: &AlpacaOptionsRuntimeConfig) -> anyhow::Result<()> {
     let option_stream_max_quote_symbols = option_stream_max_quote_symbols_from_env()?;
+    let universe_intents =
+        option_universe_intents_from_strategy_profiles(&config.strategy_profiles);
+    let universe_intent_summaries = universe_intents
+        .iter()
+        .map(|intent| {
+            format!(
+                "{}:{}:{}:{}..{}:{}",
+                intent.profile_id,
+                intent.underlying,
+                intent.strategy_family.as_str(),
+                intent.dte_window.min_dte,
+                intent.dte_window.max_dte,
+                intent.required_sides.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
     println!(
-        "alpaca_options_runtime_config: underlyings={} strategy_profiles={} open_orders_enabled={} close_orders_enabled={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} active_risk_candidate_quote_limit={} active_risk_quote_stale_secs={} option_stream_max_quote_symbols={} expiration_exit_days={} lifecycle_poll_secs={} lifecycle_activity_lookback_hours={} lifecycle_activity_block_hours={} expiration_entry_block_days={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_max_candidates={}",
+        "alpaca_options_runtime_config: underlyings={} strategy_profiles={} universe_intents={} open_orders_enabled={} close_orders_enabled={} quantity={} max_active_entries={} max_daily_submits={} max_open_orders={} max_active_entries_per_underlying={} max_active_entries_per_sector={} fleet_account={} fleet_policy_blocks={} stale_close_secs={} close_regular_hours_only={} close_window={}-{} close_price_cushion={:.2} max_close_attempts={} close_reprice_cooldown_secs={} active_risk_candidate_quote_limit={} active_risk_quote_stale_secs={} option_stream_max_quote_symbols={} expiration_exit_days={} lifecycle_poll_secs={} lifecycle_activity_lookback_hours={} lifecycle_activity_block_hours={} expiration_entry_block_days={} max_iterations={} interval_secs={} state_path={} candidate_ledger_enabled={} candidate_ledger_max_candidates={}",
         config.underlyings.join(","),
         config.strategy_profile_summaries().join(","),
+        if universe_intent_summaries.is_empty() {
+            "none".to_string()
+        } else {
+            universe_intent_summaries.join(",")
+        },
         config.open_orders_enabled,
         config.close_orders_enabled,
         config.quantity,

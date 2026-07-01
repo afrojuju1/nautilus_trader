@@ -7,7 +7,7 @@
 use std::{collections::BTreeSet, env, path::Path};
 
 use anyhow::{Context, anyhow, bail};
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Utc};
 use nautilus_alpaca::candidate_scan_actor::{
     OptionChainCandidateScanActor, OptionChainCandidateScanActorConfig,
     OptionChainCandidateScanConfig,
@@ -16,6 +16,7 @@ use nautilus_backtest::{
     config::{BacktestDataConfig, BacktestRunConfig, BacktestVenueConfig, NautilusDataType},
     node::BacktestNode,
 };
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::option_chain::StrikeRange,
     enums::{AccountType, BookType, OmsType},
@@ -24,7 +25,13 @@ use nautilus_model::{
     types::Price,
 };
 use nautilus_persistence::backend::catalog::ParquetDataCatalog;
-use nautilus_trading::options::candidates::{CreditSpreadKind, DebitSpreadKind, NakedOptionKind};
+use nautilus_trading::options::{
+    candidates::{CreditSpreadKind, DebitSpreadKind, NakedOptionKind},
+    universe::{
+        OptionDteWindow, OptionUniverseContract, OptionUniverseIntent, OptionUniverseResolution,
+        OptionUniverseStrategyFamily, resolve_option_universe,
+    },
+};
 use ustr::Ustr;
 
 const DEFAULT_SNAPSHOT_INTERVAL_MS: u64 = 5_000;
@@ -45,6 +52,7 @@ struct SeriesSelection {
     series_id: OptionSeriesId,
     instrument_ids: Vec<InstrumentId>,
     strikes: Vec<Price>,
+    reason: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -53,21 +61,23 @@ fn main() -> anyhow::Result<()> {
     let args = Args::from_env()?;
     let catalog = ParquetDataCatalog::new(Path::new(&args.catalog_path), None, None, None, None);
     let instruments = catalog.query_instruments(None)?;
+    let scan_config = scan_config_from_values(&args.strategies)?;
     let selection = select_series(
         &instruments,
         args.venue,
         &args.underlying,
         args.expiry.as_deref(),
+        &scan_config,
     )?;
     let strike_range = strike_range_from_env(&selection.strikes)?;
-    let scan_config = scan_config_from_values(&args.strategies)?;
 
     println!(
-        "option_chain_scan_node: catalog={} series={} instruments={} strikes={} snapshot_interval_ms={:?}",
+        "option_chain_scan_node: catalog={} series={} instruments={} strikes={} selection_reason={} snapshot_interval_ms={:?}",
         args.catalog_path,
         selection.series_id,
         selection.instrument_ids.len(),
         selection.strikes.len(),
+        selection.reason,
         args.snapshot_interval_ms,
     );
 
@@ -168,6 +178,7 @@ fn select_series(
     venue: Venue,
     underlying: &str,
     expiry: Option<&str>,
+    scan_config: &OptionChainCandidateScanConfig,
 ) -> anyhow::Result<SeriesSelection> {
     let requested_expiry = expiry.map(parse_expiry_date).transpose()?;
     let mut eligible = instruments
@@ -205,13 +216,28 @@ fn select_series(
         )
     });
 
-    let selected_expiration = eligible[0].expiration_ns().expect("filtered");
-    let selected_settlement = eligible[0].settlement_currency().code;
-    let selected_underlying = eligible[0].underlying().expect("filtered");
+    let (selected_series_id, reason) = if requested_expiry.is_some() {
+        let selected_expiration = eligible[0].expiration_ns().expect("filtered");
+        let selected_settlement = eligible[0].settlement_currency().code;
+        let selected_underlying = eligible[0].underlying().expect("filtered");
+        (
+            OptionSeriesId::new(
+                venue,
+                selected_underlying,
+                selected_settlement,
+                selected_expiration,
+            ),
+            "explicit_expiry_filter".to_string(),
+        )
+    } else {
+        select_series_with_neutral_universe(underlying, scan_config, &eligible)?
+    };
     let selected = eligible
         .into_iter()
-        .filter(|instrument| instrument.expiration_ns() == Some(selected_expiration))
-        .filter(|instrument| instrument.settlement_currency().code == selected_settlement)
+        .filter(|instrument| instrument.expiration_ns() == Some(selected_series_id.expiration_ns))
+        .filter(|instrument| {
+            instrument.settlement_currency().code == selected_series_id.settlement_currency
+        })
         .collect::<Vec<_>>();
 
     let strikes = selected
@@ -226,15 +252,154 @@ fn select_series(
         .collect::<Vec<_>>();
 
     Ok(SeriesSelection {
-        series_id: OptionSeriesId::new(
-            venue,
-            selected_underlying,
-            selected_settlement,
-            selected_expiration,
-        ),
+        series_id: selected_series_id,
         instrument_ids,
         strikes,
+        reason,
     })
+}
+
+fn select_series_with_neutral_universe(
+    underlying: &str,
+    scan_config: &OptionChainCandidateScanConfig,
+    instruments: &[&InstrumentAny],
+) -> anyhow::Result<(OptionSeriesId, String)> {
+    let intents = diagnostic_universe_intents(underlying, scan_config);
+    if intents.is_empty() {
+        bail!("no diagnostic universe intents were enabled for underlying={underlying}");
+    }
+    let contracts = instruments
+        .iter()
+        .filter_map(|instrument| option_universe_contract_from_instrument(instrument))
+        .collect::<Vec<_>>();
+    let evaluation_time = unix_nanos(Utc::now())?;
+    let resolution = resolve_option_universe(&intents, &contracts, &[], evaluation_time);
+    let Some(selected) = resolution.selected.first() else {
+        bail!(
+            "no option series matched neutral diagnostic universe intent for underlying={} skipped={}",
+            underlying,
+            skipped_universe_summary(&resolution),
+        );
+    };
+    Ok((
+        selected.coverage.series_id,
+        format!(
+            "neutral_universe:{}:{}dte",
+            selected.reason.as_str(),
+            selected.coverage.dte,
+        ),
+    ))
+}
+
+fn diagnostic_universe_intents(
+    underlying: &str,
+    config: &OptionChainCandidateScanConfig,
+) -> Vec<OptionUniverseIntent> {
+    let mut intents = Vec::new();
+    for kind in &config.spread_kinds {
+        let family = match kind {
+            CreditSpreadKind::Put => OptionUniverseStrategyFamily::PutCredit,
+            CreditSpreadKind::Call => OptionUniverseStrategyFamily::CallCredit,
+        };
+        intents.push(OptionUniverseIntent::from_family(
+            format!("diagnostic_{}", family.as_str()),
+            underlying.to_string(),
+            family,
+            OptionDteWindow::new(config.credit_scanner.min_dte, config.credit_scanner.max_dte),
+        ));
+    }
+    if config.iron_condor_enabled {
+        intents.push(OptionUniverseIntent::from_family(
+            "diagnostic_iron_condor",
+            underlying.to_string(),
+            OptionUniverseStrategyFamily::IronCondor,
+            OptionDteWindow::new(
+                config.iron_condor_scanner.credit.min_dte,
+                config.iron_condor_scanner.credit.max_dte,
+            ),
+        ));
+    }
+    for kind in &config.debit_kinds {
+        let family = match kind {
+            DebitSpreadKind::Put => OptionUniverseStrategyFamily::PutDebit,
+            DebitSpreadKind::Call => OptionUniverseStrategyFamily::CallDebit,
+        };
+        intents.push(OptionUniverseIntent::from_family(
+            format!("diagnostic_{}", family.as_str()),
+            underlying.to_string(),
+            family,
+            OptionDteWindow::new(config.debit_scanner.min_dte, config.debit_scanner.max_dte),
+        ));
+    }
+    for kind in &config.naked_kinds {
+        let (family, scanner) = match kind {
+            NakedOptionKind::Put => (
+                OptionUniverseStrategyFamily::NakedPut,
+                &config.naked_scanner,
+            ),
+            NakedOptionKind::Call => (
+                OptionUniverseStrategyFamily::NakedCall,
+                &config.naked_scanner,
+            ),
+            NakedOptionKind::PutOneToThreeDte => (
+                OptionUniverseStrategyFamily::NakedPutOneToThreeDte,
+                &config.naked_1_3dte_scanner,
+            ),
+            NakedOptionKind::CallOneToThreeDte => (
+                OptionUniverseStrategyFamily::NakedCallOneToThreeDte,
+                &config.naked_1_3dte_scanner,
+            ),
+        };
+        intents.push(OptionUniverseIntent::from_family(
+            format!("diagnostic_{}", family.as_str()),
+            underlying.to_string(),
+            family,
+            OptionDteWindow::new(scanner.min_dte, scanner.max_dte),
+        ));
+    }
+    intents
+}
+
+fn skipped_universe_summary(resolution: &OptionUniverseResolution) -> String {
+    if resolution.skipped.is_empty() {
+        return "none".to_string();
+    }
+    resolution
+        .skipped
+        .iter()
+        .map(|skipped| {
+            format!(
+                "{}:{}:{}",
+                skipped.profile_id,
+                skipped.underlying,
+                skipped.reason.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn option_universe_contract_from_instrument(
+    instrument: &InstrumentAny,
+) -> Option<OptionUniverseContract> {
+    let underlying = instrument.underlying()?;
+    let option_kind = instrument.option_kind()?;
+    let expiration_ns = instrument.expiration_ns()?;
+    if instrument.strike_price().is_none() {
+        return None;
+    }
+
+    let series_id = OptionSeriesId::new(
+        instrument.venue(),
+        underlying,
+        instrument.settlement_currency().code,
+        expiration_ns,
+    );
+    Some(OptionUniverseContract::new(
+        instrument.id(),
+        series_id,
+        option_kind,
+    ))
 }
 
 fn venue_config(venue: Venue, settlement_currency: Ustr) -> BacktestVenueConfig {
@@ -397,4 +562,12 @@ fn optional_raw_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn unix_nanos(value: chrono::DateTime<Utc>) -> anyhow::Result<UnixNanos> {
+    value
+        .timestamp_nanos_opt()
+        .and_then(|timestamp| u64::try_from(timestamp).ok())
+        .map(UnixNanos::from)
+        .context("current time was outside supported UnixNanos range")
 }

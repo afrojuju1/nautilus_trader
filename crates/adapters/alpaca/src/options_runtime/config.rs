@@ -1536,6 +1536,7 @@ fn load_event_shock_earnings_events(
     config: &EventShockSection,
 ) -> anyhow::Result<Vec<crate::earnings::EarningsEvent>> {
     let path = env::var_os("ALPACA_EVENT_SHOCK_EARNINGS_EVENTS_PATH")
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .or_else(|| config.earnings_events_path.clone());
     let required = env_bool("ALPACA_EVENT_SHOCK_REQUIRE_EARNINGS_EVENTS")

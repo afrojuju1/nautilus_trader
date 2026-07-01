@@ -411,6 +411,25 @@ pub trait DataActor: Component {
         Ok(())
     }
 
+    /// Actions to be performed when receiving an instruments response.
+    ///
+    /// The default implementation preserves per-instrument behavior by dispatching every
+    /// instrument through [`Self::on_instrument`]. Override this when response metadata such as
+    /// `correlation_id`, `client_id`, params, or an empty response is meaningful to the actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if handling the instruments response fails.
+    fn on_instruments_response(&mut self, response: &InstrumentsResponse) -> anyhow::Result<()> {
+        for instrument in &response.data {
+            if let Err(e) = self.on_instrument(instrument) {
+                log_error(&e);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Actions to be performed when receiving order book deltas.
     ///
     /// # Errors
@@ -1154,10 +1173,8 @@ pub trait DataActor: Component {
         log_received_bulk("InstrumentsResponse", &resp.correlation_id, resp.data.len());
         log::trace!("{RECV} {resp:?}");
 
-        for inst in &resp.data {
-            if let Err(e) = self.on_instrument(inst) {
-                log_error(&e);
-            }
+        if let Err(e) = self.on_instruments_response(resp) {
+            log_error(&e);
         }
     }
 

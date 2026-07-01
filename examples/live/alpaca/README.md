@@ -228,8 +228,9 @@ cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca op
 
 ## Option-chain scan comparison
 
-This command compares the REST-normalized scanner output with the Nautilus option-chain scanner for
-one underlying and expiry. It does not submit orders.
+This diagnostic command compares the REST-normalized scanner output with the Nautilus option-chain
+scanner for one explicit underlying and expiry. It does not submit orders, and the expiry is an
+inspection filter, not a live-engine universe control.
 
 ```bash
 cargo run -p nautilus-alpaca --features live --bin alpaca-compare-option-chain-scan -- --pretty SPY YYYY-MM-DD

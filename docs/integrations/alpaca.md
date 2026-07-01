@@ -212,6 +212,7 @@ export ALPACA_TRADING_BASE_URL="https://paper-api.alpaca.markets"
 cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca account
 cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca option-contracts SPY QQQ
 cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca option-snapshots SPY
+# Diagnostic fixed-expiry comparison only; live options runtime uses strategy-profile universe intent.
 cargo run -p nautilus-alpaca --features live --bin alpaca-compare-option-chain-scan -- --pretty SPY YYYY-MM-DD
 ```
 
