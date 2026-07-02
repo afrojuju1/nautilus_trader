@@ -56,6 +56,14 @@ id = "RUSTSEC-2026-0173"
 reason = "proc-macro-error2 unmaintained via alloy and tabled_derive; no patch available"
 
 [[IgnoredVulns]]
+id = "RUSTSEC-2026-0194"
+reason = "quick-xml DoS via object_store 0.13.2; no fixed object_store release"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0195"
+reason = "quick-xml NsReader DoS via object_store 0.13.2; no fixed object_store release"
+
+[[IgnoredVulns]]
 id = "GHSA-6w46-j5rx-g56g"
 reason = "pytest tmpdir local tampering (fixed in 9.0.3); dev/test-only dependency intentionally pinned to 7.x, not a runtime risk"
 

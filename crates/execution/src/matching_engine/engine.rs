@@ -3001,19 +3001,7 @@ impl OrderMatchingEngine {
                 );
             }
 
-            // Get position if exists
-            let position = cache_borrow
-                .position_for_order(&order.client_order_id())
-                .or_else(|| {
-                    if self.oms_type == OmsType::Netting {
-                        let position_id = PositionId::new(
-                            format!("{}-{}", order.instrument_id(), order.strategy_id()).as_str(),
-                        );
-                        cache_borrow.position(&position_id)
-                    } else {
-                        None
-                    }
-                });
+            let position = self.position_for_order_in_cache(&cache_borrow, order);
 
             // Check not shorting an equity without a MARGIN account
             if order.order_side() == OrderSide::Sell
@@ -4408,13 +4396,7 @@ impl OrderMatchingEngine {
             return;
         }
 
-        let venue_position_id = self.ids_generator.get_position_id(&order, Some(true));
-        let position: Option<Position> = if let Some(venue_position_id) = venue_position_id {
-            let cache = self.cache.as_ref().borrow();
-            cache.position_owned(&venue_position_id)
-        } else {
-            None
-        };
+        let (venue_position_id, position) = self.fill_position_for_order(&order, Some(true));
 
         if self.config.use_reduce_only && order.is_reduce_only() && position.is_none() {
             log::warn!(
@@ -4474,7 +4456,11 @@ impl OrderMatchingEngine {
             &order,
             &fills,
             LiquiditySide::Taker,
-            None,
+            if self.config.use_reduce_only && order.is_reduce_only() {
+                venue_position_id
+            } else {
+                None
+            },
             position.as_ref(),
             protection_price,
         );
@@ -4589,13 +4575,7 @@ impl OrderMatchingEngine {
                     None
                 };
 
-                let venue_position_id = self.ids_generator.get_position_id(&order, None);
-                let position = if let Some(venue_position_id) = venue_position_id {
-                    let cache = self.cache.as_ref().borrow();
-                    cache.position_owned(&venue_position_id)
-                } else {
-                    None
-                };
+                let (venue_position_id, position) = self.fill_position_for_order(&order, None);
 
                 if self.config.use_reduce_only && order.is_reduce_only() && position.is_none() {
                     log::warn!(
@@ -4661,6 +4641,77 @@ impl OrderMatchingEngine {
             }
             None => panic!("Limit order must have a price"),
         }
+    }
+
+    fn fill_position_for_order(
+        &mut self,
+        order: &OrderAny,
+        generate: Option<bool>,
+    ) -> (Option<PositionId>, Option<Position>) {
+        if self.oms_type == OmsType::Hedging
+            && self.config.use_reduce_only
+            && order.is_reduce_only()
+        {
+            let cache = self.cache.as_ref().borrow();
+
+            if let Some(position) = cache.position_for_order(&order.client_order_id()) {
+                let position = position.cloned();
+                return (Some(position.id), Some(position));
+            }
+
+            if let Some(position) = Self::open_position_reduced_by_order(&cache, order) {
+                return (Some(position.id), Some(position));
+            }
+        }
+
+        let venue_position_id = self.ids_generator.get_position_id(order, generate);
+
+        let position = {
+            let cache = self.cache.as_ref().borrow();
+            venue_position_id
+                .as_ref()
+                .and_then(|position_id| cache.position_owned(position_id))
+        };
+
+        (venue_position_id, position)
+    }
+
+    fn position_for_order_in_cache(&self, cache: &Cache, order: &OrderAny) -> Option<Position> {
+        if let Some(position) = cache.position_for_order(&order.client_order_id()) {
+            return Some(position.cloned());
+        }
+
+        if self.oms_type == OmsType::Netting {
+            let position_id = PositionId::new(
+                format!("{}-{}", order.instrument_id(), order.strategy_id()).as_str(),
+            );
+            return cache
+                .position(&position_id)
+                .map(|position| position.cloned());
+        }
+
+        if self.oms_type == OmsType::Hedging
+            && self.config.use_reduce_only
+            && order.is_reduce_only()
+        {
+            return Self::open_position_reduced_by_order(cache, order);
+        }
+
+        None
+    }
+
+    fn open_position_reduced_by_order(cache: &Cache, order: &OrderAny) -> Option<Position> {
+        cache
+            .positions_open(
+                None,
+                Some(&order.instrument_id()),
+                Some(&order.strategy_id()),
+                None,
+                None,
+            )
+            .into_iter()
+            .find(|position| order.would_reduce_only(position.side, position.quantity))
+            .map(|position| position.cloned())
     }
 
     fn apply_fills(

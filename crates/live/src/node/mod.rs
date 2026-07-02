@@ -124,13 +124,17 @@ use crate::{
 
 pub mod builder;
 pub mod config;
+mod metrics;
+mod state;
+
 #[cfg(feature = "plugin")]
 pub mod plugin;
-mod state;
 
 use builder::ExternalMessageBusIngress;
 pub use builder::LiveNodeBuilder;
 use config::{LiveNodeConfig, PluginConfig};
+pub use metrics::{RunnerChannelMetricsSnapshot, RunnerMetricsSnapshot};
+use metrics::{RunnerChannelQueueDepths, RunnerMetricChannel, RunnerMetrics};
 use state::EngineConnectionStatus;
 pub use state::{LiveNodeHandle, NodeState};
 
@@ -158,9 +162,6 @@ pub struct LiveNode {
     shutdown_deadline: Option<dst::time::Instant>,
     #[cfg(feature = "plugin")]
     plugins: plugin::NodePlugins,
-    #[cfg(feature = "python")]
-    #[allow(dead_code)] // TODO: Under development
-    python_actors: Vec<pyo3::Py<pyo3::PyAny>>,
 }
 
 impl LiveNode {
@@ -187,8 +188,6 @@ impl LiveNode {
             shutdown_deadline: None,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
-            #[cfg(feature = "python")]
-            python_actors: Vec::new(),
         }
     }
 
@@ -257,8 +256,6 @@ impl LiveNode {
             shutdown_deadline: None,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
-            #[cfg(feature = "python")]
-            python_actors: Vec::new(),
         };
         node.load_configured_plugins()?;
 
@@ -982,8 +979,13 @@ impl LiveNode {
         let mut position_report_task: Option<PositionReportTask> = None;
         let ctrl_c = dst::signal::ctrl_c();
         let terminate = dst::signal::terminate();
+
         tokio::pin!(ctrl_c);
         tokio::pin!(terminate);
+
+        let metrics = self.handle.metrics.clone();
+        let metrics_start = dst::time::Instant::now();
+        metrics.reset();
 
         loop {
             let shutdown_deadline = self.shutdown_deadline;
@@ -1031,11 +1033,14 @@ impl LiveNode {
                         None => std::future::pending::<OpenOrderReportResult>().await,
                     }
                 }, if open_order_report_task.is_some() => {
+                    let maintenance_start = dst::time::Instant::now();
+
                     open_order_report_task = None;
                     let events = self
                         .exec_manager
                         .reconcile_open_order_reports(&result.check, result.reports);
                     self.process_reconciliation_events(&events);
+                    record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
                 result = async {
                     match position_report_task.as_mut() {
@@ -1043,6 +1048,8 @@ impl LiveNode {
                         None => std::future::pending::<PositionReportResult>().await,
                     }
                 }, if position_report_task.is_some() => {
+                    let maintenance_start = dst::time::Instant::now();
+
                     position_report_task = None;
                     let events = self.exec_manager.reconcile_position_reports(
                         &result.check,
@@ -1050,11 +1057,24 @@ impl LiveNode {
                         &result.failed_venues,
                     );
                     self.process_reconciliation_events(&events);
+                    record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
 
                 // Maintenance dispatcher (before event processing to avoid
                 // starvation). See module docs for design rationale.
                 _ = maintenance_timer.tick(), if is_running => {
+                    let maintenance_start = dst::time::Instant::now();
+                    metrics.publish_queue_depths(
+                        RunnerChannelQueueDepths::from_receivers(
+                            &time_evt_rx,
+                            &exec_evt_rx,
+                            &exec_cmd_rx,
+                            &data_evt_rx,
+                            &data_cmd_rx,
+                        ),
+                        metrics_start.elapsed(),
+                    );
+
                     let mut now = dst::time::Instant::now();
 
                     if recon_enabled && now >= recon_next {
@@ -1104,6 +1124,8 @@ impl LiveNode {
                         self.exec_manager.prune_recent_fills_cache(60.0);
                         prune_fills_next = now + prune_fills_interval;
                     }
+
+                    record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
 
                 // Event processing branches. Exec commands and events are
@@ -1111,14 +1133,24 @@ impl LiveNode {
                 // submit, etc.) is not delayed behind a market data backlog
                 // when the biased select polls receivers each iteration.
                 Some(handler) = time_evt_rx.recv() => {
+                    let dispatch_start = dst::time::Instant::now();
                     AsyncRunner::handle_time_event(handler);
 
                     if is_shutting_down {
                         log::debug!("Residual time event");
                         residual_events += 1;
                     }
+
+                    record_runner_dispatch(
+                        &metrics,
+                        RunnerMetricChannel::TimeEvents,
+                        dispatch_start,
+                        metrics_start,
+                    );
                 }
                 Some(evt) = exec_evt_rx.recv() => {
+                    let dispatch_start = dst::time::Instant::now();
+
                     if is_shutting_down {
                         log::debug!("Residual exec event: {evt:?}");
                         residual_events += 1;
@@ -1183,8 +1215,14 @@ impl LiveNode {
                                         "Skipping recently processed fill report: {}",
                                         fill_report.trade_id,
                                     );
+                                    record_runner_dispatch(
+                                        &metrics,
+                                        RunnerMetricChannel::ExecEvents,
+                                        dispatch_start,
+                                        metrics_start,
+                                    );
                                     continue;
-                            }
+                                }
                             self.exec_manager.observe_execution_report(report);
                         }
                         ExecutionEvent::Account(_) => {}
@@ -1200,8 +1238,16 @@ impl LiveNode {
                             self.exec_manager.clear_recon_tracking(coid, true);
                         }
                     }
+                    record_runner_dispatch(
+                        &metrics,
+                        RunnerMetricChannel::ExecEvents,
+                        dispatch_start,
+                        metrics_start,
+                    );
                 }
                 Some(cmd) = exec_cmd_rx.recv() => {
+                    let dispatch_start = dst::time::Instant::now();
+
                     if is_shutting_down {
                         log::debug!("Residual exec command: {cmd:?}");
                         residual_events += 1;
@@ -1230,8 +1276,16 @@ impl LiveNode {
                         _ => {}
                     }
                     AsyncRunner::handle_exec_command(cmd);
+                    record_runner_dispatch(
+                        &metrics,
+                        RunnerMetricChannel::ExecCommands,
+                        dispatch_start,
+                        metrics_start,
+                    );
                 }
                 message = recv_external_msgbus_message(&mut external_msgbus_rx) => {
+                    let external_msgbus_start = dst::time::Instant::now();
+
                     match message {
                         Some(message) => {
                             if is_shutting_down {
@@ -1246,20 +1300,42 @@ impl LiveNode {
                             self.close_external_ingress();
                         }
                     }
+
+                    record_runner_external_msgbus(
+                        &metrics,
+                        external_msgbus_start,
+                        metrics_start,
+                    );
                 }
                 Some(evt) = data_evt_rx.recv() => {
+                    let dispatch_start = dst::time::Instant::now();
+
                     if is_shutting_down {
                         log::debug!("Residual data event: {evt:?}");
                         residual_events += 1;
                     }
                     AsyncRunner::handle_data_event(evt);
+                    record_runner_dispatch(
+                        &metrics,
+                        RunnerMetricChannel::DataEvents,
+                        dispatch_start,
+                        metrics_start,
+                    );
                 }
                 Some(cmd) = data_cmd_rx.recv() => {
+                    let dispatch_start = dst::time::Instant::now();
+
                     if is_shutting_down {
                         log::debug!("Residual data command: {cmd:?}");
                         residual_events += 1;
                     }
                     AsyncRunner::handle_data_command(cmd);
+                    record_runner_dispatch(
+                        &metrics,
+                        RunnerMetricChannel::DataCommands,
+                        dispatch_start,
+                        metrics_start,
+                    );
                 }
             }
         }
@@ -1809,6 +1885,44 @@ impl LiveNode {
             }),
         })
     }
+}
+
+fn record_runner_dispatch(
+    metrics: &RunnerMetrics,
+    channel: RunnerMetricChannel,
+    dispatch_start: dst::time::Instant,
+    metrics_start: dst::time::Instant,
+) {
+    let dispatch_end = dst::time::Instant::now();
+    metrics.record_dispatch(
+        channel,
+        dispatch_end.duration_since(dispatch_start),
+        dispatch_end.duration_since(metrics_start),
+    );
+}
+
+fn record_runner_maintenance(
+    metrics: &RunnerMetrics,
+    work_start: dst::time::Instant,
+    metrics_start: dst::time::Instant,
+) {
+    let work_end = dst::time::Instant::now();
+    metrics.record_maintenance(
+        work_end.duration_since(work_start),
+        work_end.duration_since(metrics_start),
+    );
+}
+
+fn record_runner_external_msgbus(
+    metrics: &RunnerMetrics,
+    work_start: dst::time::Instant,
+    metrics_start: dst::time::Instant,
+) {
+    let work_end = dst::time::Instant::now();
+    metrics.record_external_msgbus(
+        work_end.duration_since(work_start),
+        work_end.duration_since(metrics_start),
+    );
 }
 
 async fn recv_external_msgbus_message(
@@ -2862,6 +2976,39 @@ mod tests {
         assert_eq!(handle.state(), NodeState::Idle);
         assert!(!handle.should_stop());
         assert!(!handle.is_running());
+    }
+
+    #[rstest]
+    fn test_handle_initial_metrics_snapshot_is_zero() {
+        let handle = LiveNodeHandle::new();
+
+        assert_eq!(handle.metrics_snapshot(), RunnerMetricsSnapshot::default());
+    }
+
+    #[rstest]
+    fn test_record_runner_dispatch_updates_selected_channel() {
+        let metrics = RunnerMetrics::default();
+        let dispatch_start = dst::time::Instant::now();
+        let metrics_start = dispatch_start - Duration::from_micros(1);
+
+        record_runner_dispatch(
+            &metrics,
+            RunnerMetricChannel::DataCommands,
+            dispatch_start,
+            metrics_start,
+        );
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(snapshot.time_events.dispatched, 0);
+        assert_eq!(snapshot.exec_events.dispatched, 0);
+        assert_eq!(snapshot.exec_commands.dispatched, 0);
+        assert_eq!(snapshot.data_events.dispatched, 0);
+        assert_eq!(snapshot.data_commands.dispatched, 1);
+        assert_eq!(
+            snapshot.data_commands.last_dispatch_at_ns,
+            snapshot.elapsed_ns
+        );
+        assert!(snapshot.dispatch_busy_ns < snapshot.elapsed_ns);
     }
 
     #[rstest]

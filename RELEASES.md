@@ -24,6 +24,7 @@ installation. Follow-up `2.0.0rcN` wheels are likely to ship at a higher cadence
 releases as feedback arrives, before the final `2.0.0` release.
 
 ### Enhancements
+- Added `LiveNode` metrics for Rust live runner metrics
 - Added returns skewness and kurtosis portfolio statistics (#4334), thanks @Martingale42
 - Added WebSocket transport backend selection for Python and PyO3 configs (#4342), thanks @graceyangfan
 - Added Hyperliquid market data stream health warnings for stalled Deltas, Depth10, and Quote subscriptions (#4298)
@@ -34,10 +35,12 @@ releases as feedback arrives, before the final `2.0.0` release.
 
 ### Fixes
 - Fixed `LiveNode` external order claims bypassing the execution engine (#4347), thanks for reporting @linimin
+- Fixed `PerContractFeeModel` generic spread fees to charge per leg ratio (#4360), thanks for reporting @pjlegato
+- Fixed `HEDGING` reduce-only orders without cached position IDs (#4312), thanks for reporting @luckykefu
+- Fixed Redis message bus startup with Python v2 configs (#4356), thanks for reporting @davidgreyme
 - Fixed Binance Futures order reports omitting external limit order prices (#4346), thanks for reporting @linimin
 - Fixed Binance Futures external algo order materialization (#4348), thanks for reporting @linimin
-- Fixed `PerContractFeeModel` generic spread fees to charge per leg ratio (#4360), thanks for reporting @pjlegato
-- Fixed Redis message bus startup with Python v2 configs (#4356), thanks for reporting @davidgreyme
+- Fixed Polymarket RTDS retained-subscription recovery after reconnects (#4353), thanks @graceyangfan
 
 ### Internal Improvements
 - Upgraded `redis` crate to v1.3.0

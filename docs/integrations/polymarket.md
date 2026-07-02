@@ -91,7 +91,7 @@ The table below shows the main differences that affect behavior today.
 | Batch cancel        | Uses `DELETE /orders`                                                         | Uses `DELETE /orders`                                         | Both align with official Polymarket docs. |
 | Market unsubscribe  | Sends dynamic WebSocket `unsubscribe` messages                                | Sends dynamic WebSocket `unsubscribe` messages                | Both support subscribe and unsubscribe. |
 | Auto‑load retry     | `auto_load_max_retries` (12), `auto_load_retry_delay_*` (5.0/15.0 secs)       | Same knobs, same defaults                                     | Both retry CLOB‑hydration / indexing‑lag misses with bounded exponential backoff plus jitter. |
-| Data client config  | Credentials, subscription buffering, quote handling, provider config          | Base URLs, timeouts, filters, new‑market discovery            | Config surfaces differ materially outside of the auto‑load family. |
+| Data client config  | Credentials, buffering, effective delta compression, provider config          | Base URLs, timeouts, filters, discovery, provider config      | Shared auto‑load and `drop_quotes_missing_side`; other surfaces still differ. |
 | Exec client config  | Credentials, retries, raw WS logging, experimental trade‑based order recovery | Credentials, retries, account IDs, native timeouts            | Rust does not expose every Python‑only option. |
 
 ## pUSD
@@ -465,11 +465,13 @@ adapter treats the change as a book epoch transition:
 4. Drop incremental `price_change` book deltas until the snapshot arrives.
 5. Reseed the book from the snapshot and resume normal processing.
 
-Trade ticks and the instrument update flow through unchanged. The Rust adapter
-keeps emitting `QuoteTick` events through the gap by reading `best_bid` and
-`best_ask` from each `price_change`. The Python adapter derives quotes from
-the local book, so quote subscribers see the same brief gap as the deltas
-(typically sub-second, until the venue snapshot arrives).
+Trade ticks and the instrument update flow through unchanged. Quote handling
+follows `drop_quotes_missing_side`: when enabled, quote ticks require both bid
+and ask prices; when disabled, missing sides use Polymarket boundary prices with
+zero size. The Rust adapter can keep quotes flowing during the gap by reading
+`best_bid` and `best_ask` from each `price_change`. The Python adapter derives
+quotes from the local book, so quote subscribers can see the same brief gap as
+the deltas until the venue snapshot arrives.
 
 ## Trades
 
@@ -940,6 +942,7 @@ Struct: `PolymarketDataClientConfig` in `crates/adapters/polymarket/src/config.r
 | `ws_max_subscriptions`               | `200`                                      | Maximum instrument subscriptions per WebSocket connection. |
 | `update_instruments_interval_mins`   | `60`                                       | Interval (minutes) between instrument catalogue refreshes. |
 | `subscribe_new_markets`              | `false`                                    | Subscribe to new‑market discovery events via WebSocket when `true`. |
+| `drop_quotes_missing_side`           | `true`                                     | Drop quotes with missing bid/ask prices instead of substituting boundary values. |
 | `new_market_fetch_max_concurrency`   | `8`                                        | Maximum concurrent instrument fetches spawned from new‑market discovery events. |
 | `auto_load_missing_instruments`      | `true`                                     | Load instruments on demand when subscribe or request commands reference uncached instruments. |
 | `auto_load_debounce_ms`              | `100`                                      | Debounce window (milliseconds) for coalescing concurrent runtime instrument loads. |
@@ -956,8 +959,8 @@ Struct: `PolymarketDataClientConfig` in `crates/adapters/polymarket/src/config.r
 | `transport_backend`                  | `Sockudo`                                  | WebSocket transport backend. |
 
 The Rust data client config does not accept account credentials; authentication is handled by
-the execution client. Subscription buffering (`ws_connection_initial_delay_secs`) and quote
-handling (`compute_effective_deltas`, `drop_quotes_missing_side`) are Python-only today.
+the execution client. Subscription buffering (`ws_connection_initial_delay_secs`) and effective
+delta compression (`compute_effective_deltas`) are Python-only today.
 
 ### Execution client options (Rust v2)
 

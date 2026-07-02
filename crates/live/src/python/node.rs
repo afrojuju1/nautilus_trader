@@ -76,6 +76,15 @@ unsafe impl<T> Send for SendPtr<T> {}
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pymethods]
 impl LiveNode {
+    /// Creates a new `LiveNode` directly from a kernel name and optional configuration.
+    ///
+    /// This is a convenience method for creating a live node with a pre-configured
+    /// kernel configuration, bypassing the builder pattern. If no config is provided,
+    /// a default configuration will be used.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if kernel construction fails.
     #[staticmethod]
     #[pyo3(name = "build")]
     #[pyo3(signature = (name, config=None))]
@@ -83,6 +92,7 @@ impl LiveNode {
         Self::build(name, config).map_err(to_pyruntime_err)
     }
 
+    /// Creates a new `LiveNodeBuilder` for fluent configuration.
     #[staticmethod]
     #[pyo3(name = "builder")]
     fn py_builder(
@@ -122,6 +132,17 @@ impl LiveNode {
         self.is_running()
     }
 
+    /// Starts the live node without entering a select loop.
+    ///
+    /// Connects clients, runs reconciliation, and starts the trader, but does
+    /// not consume the runner or drive channel receivers. Channel traffic that
+    /// arrives after startup is not serviced until the caller provides a loop.
+    ///
+    /// For a self-contained entry point that owns the event loop, use `run`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if startup fails.
     #[pyo3(name = "start")]
     fn py_start(&mut self) -> PyResult<()> {
         if self.is_running() {
@@ -171,6 +192,14 @@ impl LiveNode {
         result
     }
 
+    /// Stop the live node.
+    ///
+    /// This method stops the trader, waits for the configured grace period to allow
+    /// residual events to be processed, then finalizes the shutdown sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if shutdown fails.
     #[pyo3(name = "stop")]
     fn py_stop(&self) -> PyResult<()> {
         if !self.is_running() {
@@ -675,7 +704,7 @@ impl LiveNode {
         Ok(())
     }
 
-    /// Adds a Rust-native plug-in component from a cdylib.
+    /// Rejects plug-in registration when host support is not linked.
     #[pyo3(name = "add_plugin", signature = (path, type_name, config=None, sha256=None))]
     fn py_add_plugin(
         &mut self,

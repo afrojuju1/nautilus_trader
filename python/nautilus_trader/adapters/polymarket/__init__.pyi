@@ -44,6 +44,7 @@ class PolymarketDataClientConfig:
         resolve_poll_max_wait_secs: int | None = None,
         base_url_rtds: str | None = None,
         transport_backend: network.TransportBackend | None = None,
+        drop_quotes_missing_side: bool | None = None,
     ) -> None: ...
 
 @typing.final

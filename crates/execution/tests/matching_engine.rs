@@ -4272,6 +4272,482 @@ fn test_reduce_only_order_exceeding_position_quantity(
 }
 
 #[rstest]
+#[case::market(OrderType::Market, None, "HEDGE-RO-MARKET")]
+#[case::limit(OrderType::Limit, Some(Price::from("1000.00")), "HEDGE-RO-LIMIT")]
+fn test_hedging_reduce_only_order_without_cached_position_id_uses_open_position(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+    #[case] order_type: OrderType,
+    #[case] price: Option<Price>,
+    #[case] client_order_id: &str,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+    cache
+        .borrow_mut()
+        .add_instrument(instrument_eth_usdt.clone())
+        .unwrap();
+
+    let mut engine = OrderMatchingEngine::new(
+        instrument_eth_usdt.clone(),
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::default().into(),
+        BookType::L2_MBP,
+        OmsType::Hedging,
+        AccountType::Margin,
+        Rc::new(RefCell::new(TestClock::new())),
+        cache.clone(),
+        OrderMatchingEngineConfig::default(),
+    );
+
+    let position_id = PositionId::from("P-HEDGE-OPEN");
+    let opening_order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(ClientOrderId::from("HEDGE-OPEN"))
+        .build();
+    let opening_fill = build_order_filled(
+        opening_order.trader_id(),
+        opening_order.strategy_id(),
+        opening_order.instrument_id(),
+        opening_order.client_order_id(),
+        VenueOrderId::from("V-HEDGE-OPEN"),
+        account_id,
+        TradeId::new("T-HEDGE-OPEN"),
+        opening_order.order_side(),
+        opening_order.order_type(),
+        opening_order.quantity(),
+        Price::from("1000.00"),
+        instrument_eth_usdt.quote_currency(),
+        LiquiditySide::Taker,
+        Some(position_id),
+        None,
+    );
+    let position = Position::new(&instrument_eth_usdt, opening_fill);
+    cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Hedging)
+        .unwrap();
+
+    let bid = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+        .book_action(BookAction::Add)
+        .book_order(BookOrder::new(
+            OrderSide::Buy,
+            Price::from("1000.00"),
+            Quantity::from("2.000"),
+            1,
+        ))
+        .build();
+    engine.process_order_book_delta(&bid).unwrap();
+
+    let client_order_id = ClientOrderId::from(client_order_id);
+    let mut order_builder = OrderTestBuilder::new(order_type);
+    order_builder
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(client_order_id)
+        .reduce_only(true)
+        .submit(true);
+
+    if let Some(price) = price {
+        order_builder.price(price);
+    }
+
+    let mut close_order = order_builder.build();
+    engine.process_order(&mut close_order, account_id);
+
+    let messages = get_order_event_handler_messages(&order_event_handler);
+    let fill = messages
+        .iter()
+        .find_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == client_order_id => Some(fill),
+            _ => None,
+        })
+        .expect("Expected reduce-only order to fill");
+
+    assert_eq!(fill.position_id, Some(position_id));
+    assert_eq!(fill.last_qty, Quantity::from("1.000"));
+    assert!(!messages.iter().any(|event| {
+        matches!(
+            event,
+            OrderEventAny::Rejected(rejected) if rejected.client_order_id == client_order_id
+        )
+    }));
+    assert!(!messages.iter().any(|event| {
+        matches!(
+            event,
+            OrderEventAny::Canceled(canceled) if canceled.client_order_id == client_order_id
+        )
+    }));
+}
+
+#[rstest]
+fn test_hedging_reduce_only_fallback_scopes_open_position_to_order_strategy(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+    cache
+        .borrow_mut()
+        .add_instrument(instrument_eth_usdt.clone())
+        .unwrap();
+
+    let mut engine = OrderMatchingEngine::new(
+        instrument_eth_usdt.clone(),
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::default().into(),
+        BookType::L2_MBP,
+        OmsType::Hedging,
+        AccountType::Margin,
+        Rc::new(RefCell::new(TestClock::new())),
+        cache.clone(),
+        OrderMatchingEngineConfig::default(),
+    );
+
+    let strategy_a = StrategyId::from("S-HEDGE-A");
+    let strategy_b = StrategyId::from("S-HEDGE-B");
+    let position_a_id = PositionId::from("P-000-A");
+    let position_b_id = PositionId::from("P-999-B");
+
+    for (strategy_id, position_id, client_order_id, trade_id) in [
+        (
+            strategy_a,
+            position_a_id,
+            ClientOrderId::from("HEDGE-OPEN-A"),
+            TradeId::new("T-HEDGE-OPEN-A"),
+        ),
+        (
+            strategy_b,
+            position_b_id,
+            ClientOrderId::from("HEDGE-OPEN-B"),
+            TradeId::new("T-HEDGE-OPEN-B"),
+        ),
+    ] {
+        let opening_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument_eth_usdt.id())
+            .strategy_id(strategy_id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .client_order_id(client_order_id)
+            .build();
+        let opening_fill = build_order_filled(
+            opening_order.trader_id(),
+            opening_order.strategy_id(),
+            opening_order.instrument_id(),
+            opening_order.client_order_id(),
+            VenueOrderId::from(format!("V-{client_order_id}").as_str()),
+            account_id,
+            trade_id,
+            opening_order.order_side(),
+            opening_order.order_type(),
+            opening_order.quantity(),
+            Price::from("1000.00"),
+            instrument_eth_usdt.quote_currency(),
+            LiquiditySide::Taker,
+            Some(position_id),
+            None,
+        );
+        let position = Position::new(&instrument_eth_usdt, opening_fill);
+        cache
+            .borrow_mut()
+            .add_position(&position, OmsType::Hedging)
+            .unwrap();
+    }
+
+    let bid = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+        .book_action(BookAction::Add)
+        .book_order(BookOrder::new(
+            OrderSide::Buy,
+            Price::from("1000.00"),
+            Quantity::from("2.000"),
+            1,
+        ))
+        .build();
+    engine.process_order_book_delta(&bid).unwrap();
+
+    let client_order_id = ClientOrderId::from("HEDGE-RO-STRATEGY-B");
+    let mut close_order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_eth_usdt.id())
+        .strategy_id(strategy_b)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(client_order_id)
+        .reduce_only(true)
+        .submit(true)
+        .build();
+    engine.process_order(&mut close_order, account_id);
+
+    let fill = get_order_event_handler_messages(&order_event_handler)
+        .iter()
+        .find_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == client_order_id => Some(*fill),
+            _ => None,
+        })
+        .expect("Expected strategy B reduce-only order to fill");
+
+    assert_eq!(fill.position_id, Some(position_b_id));
+}
+
+#[rstest]
+fn test_hedging_non_reduce_only_market_order_keeps_empty_position_id(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+    cache
+        .borrow_mut()
+        .add_instrument(instrument_eth_usdt.clone())
+        .unwrap();
+
+    let mut engine = OrderMatchingEngine::new(
+        instrument_eth_usdt.clone(),
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::default().into(),
+        BookType::L2_MBP,
+        OmsType::Hedging,
+        AccountType::Margin,
+        Rc::new(RefCell::new(TestClock::new())),
+        cache,
+        OrderMatchingEngineConfig::default(),
+    );
+
+    let ask = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+        .book_action(BookAction::Add)
+        .book_order(BookOrder::new(
+            OrderSide::Sell,
+            Price::from("1000.00"),
+            Quantity::from("2.000"),
+            1,
+        ))
+        .build();
+    engine.process_order_book_delta(&ask).unwrap();
+
+    let client_order_id = ClientOrderId::from("HEDGE-MARKET-OPEN");
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(client_order_id)
+        .submit(true)
+        .build();
+    engine.process_order(&mut order, account_id);
+
+    let fill = get_order_event_handler_messages(&order_event_handler)
+        .iter()
+        .find_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == client_order_id => Some(*fill),
+            _ => None,
+        })
+        .expect("Expected hedging market order to fill");
+
+    assert_eq!(fill.position_id, None);
+}
+
+#[rstest]
+fn test_hedging_reduce_only_fallback_covers_short_position(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+    cache
+        .borrow_mut()
+        .add_instrument(instrument_eth_usdt.clone())
+        .unwrap();
+
+    let mut engine = OrderMatchingEngine::new(
+        instrument_eth_usdt.clone(),
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::default().into(),
+        BookType::L2_MBP,
+        OmsType::Hedging,
+        AccountType::Margin,
+        Rc::new(RefCell::new(TestClock::new())),
+        cache.clone(),
+        OrderMatchingEngineConfig::default(),
+    );
+
+    let position_id = PositionId::from("P-HEDGE-SHORT");
+    let opening_order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(ClientOrderId::from("HEDGE-SHORT-OPEN"))
+        .build();
+    let opening_fill = build_order_filled(
+        opening_order.trader_id(),
+        opening_order.strategy_id(),
+        opening_order.instrument_id(),
+        opening_order.client_order_id(),
+        VenueOrderId::from("V-HEDGE-SHORT-OPEN"),
+        account_id,
+        TradeId::new("T-HEDGE-SHORT-OPEN"),
+        opening_order.order_side(),
+        opening_order.order_type(),
+        opening_order.quantity(),
+        Price::from("1000.00"),
+        instrument_eth_usdt.quote_currency(),
+        LiquiditySide::Taker,
+        Some(position_id),
+        None,
+    );
+    let position = Position::new(&instrument_eth_usdt, opening_fill);
+    cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Hedging)
+        .unwrap();
+
+    let ask = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+        .book_action(BookAction::Add)
+        .book_order(BookOrder::new(
+            OrderSide::Sell,
+            Price::from("1000.00"),
+            Quantity::from("2.000"),
+            1,
+        ))
+        .build();
+    engine.process_order_book_delta(&ask).unwrap();
+
+    let client_order_id = ClientOrderId::from("HEDGE-RO-SHORT-COVER");
+    let mut close_order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(client_order_id)
+        .reduce_only(true)
+        .submit(true)
+        .build();
+    engine.process_order(&mut close_order, account_id);
+
+    let fill = get_order_event_handler_messages(&order_event_handler)
+        .iter()
+        .find_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == client_order_id => Some(*fill),
+            _ => None,
+        })
+        .expect("Expected reduce-only short cover to fill");
+
+    assert_eq!(fill.position_id, Some(position_id));
+    assert_eq!(fill.last_qty, Quantity::from("1.000"));
+}
+
+#[rstest]
+fn test_hedging_reduce_only_uses_cached_position_id_before_open_position_scan(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+    cache
+        .borrow_mut()
+        .add_instrument(instrument_eth_usdt.clone())
+        .unwrap();
+
+    let mut engine = OrderMatchingEngine::new(
+        instrument_eth_usdt.clone(),
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::default().into(),
+        BookType::L2_MBP,
+        OmsType::Hedging,
+        AccountType::Margin,
+        Rc::new(RefCell::new(TestClock::new())),
+        cache.clone(),
+        OrderMatchingEngineConfig::default(),
+    );
+
+    let position_a_id = PositionId::from("P-000-CACHED-A");
+    let position_b_id = PositionId::from("P-999-CACHED-B");
+
+    for (position_id, client_order_id, trade_id) in [
+        (
+            position_a_id,
+            ClientOrderId::from("HEDGE-CACHED-OPEN-A"),
+            TradeId::new("T-HEDGE-CACHED-A"),
+        ),
+        (
+            position_b_id,
+            ClientOrderId::from("HEDGE-CACHED-OPEN-B"),
+            TradeId::new("T-HEDGE-CACHED-B"),
+        ),
+    ] {
+        let opening_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument_eth_usdt.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .client_order_id(client_order_id)
+            .build();
+        let opening_fill = build_order_filled(
+            opening_order.trader_id(),
+            opening_order.strategy_id(),
+            opening_order.instrument_id(),
+            opening_order.client_order_id(),
+            VenueOrderId::from(format!("V-{client_order_id}").as_str()),
+            account_id,
+            trade_id,
+            opening_order.order_side(),
+            opening_order.order_type(),
+            opening_order.quantity(),
+            Price::from("1000.00"),
+            instrument_eth_usdt.quote_currency(),
+            LiquiditySide::Taker,
+            Some(position_id),
+            None,
+        );
+        let position = Position::new(&instrument_eth_usdt, opening_fill);
+        cache
+            .borrow_mut()
+            .add_position(&position, OmsType::Hedging)
+            .unwrap();
+    }
+
+    let bid = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+        .book_action(BookAction::Add)
+        .book_order(BookOrder::new(
+            OrderSide::Buy,
+            Price::from("1000.00"),
+            Quantity::from("2.000"),
+            1,
+        ))
+        .build();
+    engine.process_order_book_delta(&bid).unwrap();
+
+    let client_order_id = ClientOrderId::from("HEDGE-RO-CACHED");
+    let mut close_order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(client_order_id)
+        .reduce_only(true)
+        .submit(true)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(close_order.clone(), Some(position_b_id), None, false)
+        .unwrap();
+
+    engine.process_order(&mut close_order, account_id);
+
+    let fill = get_order_event_handler_messages(&order_event_handler)
+        .iter()
+        .find_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == client_order_id => Some(*fill),
+            _ => None,
+        })
+        .expect("Expected reduce-only order with cached position id to fill");
+
+    assert_eq!(fill.position_id, Some(position_b_id));
+}
+
+#[rstest]
 fn test_reduce_only_stop_market_caps_cumulative_multi_level_fill(
     account_id: AccountId,
     instrument_eth_usdt: InstrumentAny,
