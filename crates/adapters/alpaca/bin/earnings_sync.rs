@@ -30,7 +30,9 @@ use nautilus_alpaca::earnings::{
 };
 use nautilus_persistence::backend::catalog::ParquetDataCatalog;
 use nautilus_trading::scheduled_events::{
-    ScheduledEventObservation, ensure_scheduled_event_custom_data_registered,
+    ApprovedScheduledEvent, ScheduledEventApprovalPolicy, ScheduledEventDecision,
+    ScheduledEventObservation, ScheduledEventResolverConfig, approve_scheduled_event_decisions,
+    ensure_scheduled_event_custom_data_registered, resolve_scheduled_event_observations,
     scheduled_event_catalog_path, scheduled_event_raw_path,
 };
 use sha2::{Digest, Sha256};
@@ -92,8 +94,8 @@ async fn main() -> anyhow::Result<()> {
         .into_iter()
         .chain(manual_observations.iter().cloned())
         .collect();
-    let observation_count = tokio::task::spawn_blocking(move || {
-        write_observations_to_catalog(&catalog_path, observations)
+    let write_counts = tokio::task::spawn_blocking(move || {
+        write_scheduled_events_to_catalog(&catalog_path, observations, sync_time_utc)
     })
     .await??;
 
@@ -112,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
     let raw_counts = quality_counts(&events);
     let approved_counts = quality_counts(&approved_events);
     println!(
-        "earnings_sync: source={} events={} before_open={} after_close={} unknown={} approved_events={} approved_before_open={} approved_after_close={} observations={} manual_observations={} catalog_path={} raw_evidence_path={} raw_sha256={} csv_bridge_output_path={} csv_bridge_approved_path={}",
+        "earnings_sync: source={} events={} before_open={} after_close={} unknown={} csv_bridge_approved_events={} csv_bridge_approved_before_open={} csv_bridge_approved_after_close={} observations={} manual_observations={} decisions={} approved_custom_data={} approved_tradeable={} block_only={} rejected={} catalog_path={} raw_evidence_path={} raw_sha256={} csv_bridge_output_path={} csv_bridge_approved_path={}",
         raw_source.as_str(),
         events.len(),
         raw_counts.before_open,
@@ -121,8 +123,13 @@ async fn main() -> anyhow::Result<()> {
         approved_events.len(),
         approved_counts.before_open,
         approved_counts.after_close,
-        observation_count,
+        write_counts.observations,
         manual_observation_count,
+        write_counts.decisions,
+        write_counts.approved_custom_data,
+        write_counts.approved_tradeable,
+        write_counts.block_only,
+        write_counts.rejected,
         args.catalog_path.display(),
         alpha_vantage_raw_evidence_path.display(),
         raw_sha256,
@@ -255,6 +262,16 @@ struct QualityCounts {
     unknown: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct CatalogWriteCounts {
+    observations: usize,
+    decisions: usize,
+    approved_custom_data: usize,
+    approved_tradeable: usize,
+    block_only: usize,
+    rejected: usize,
+}
+
 fn quality_counts(events: &[EarningsEvent]) -> QualityCounts {
     let mut counts = QualityCounts::default();
     for event in events {
@@ -289,8 +306,55 @@ fn load_manual_override_observations(
     ))
 }
 
-fn write_observations_to_catalog(
+fn write_scheduled_events_to_catalog(
     catalog_path: &Path,
+    observations: Vec<ScheduledEventObservation>,
+    resolved_at_utc: DateTime<Utc>,
+) -> anyhow::Result<CatalogWriteCounts> {
+    if observations.is_empty() {
+        return Ok(CatalogWriteCounts::default());
+    }
+
+    let decisions = resolve_scheduled_event_observations(
+        &observations,
+        &ScheduledEventResolverConfig::default(),
+        resolved_at_utc,
+    );
+    let approved = approve_scheduled_event_decisions(
+        &decisions,
+        &ScheduledEventApprovalPolicy::default(),
+        resolved_at_utc,
+    );
+    let counts = CatalogWriteCounts {
+        observations: observations.len(),
+        decisions: decisions.len(),
+        approved_custom_data: approved.len(),
+        approved_tradeable: approved
+            .iter()
+            .filter(|event| event.approval_status == "approved")
+            .count(),
+        block_only: approved
+            .iter()
+            .filter(|event| event.approval_status == "block_only")
+            .count(),
+        rejected: approved
+            .iter()
+            .filter(|event| event.approval_status == "rejected")
+            .count(),
+    };
+
+    ensure_scheduled_event_custom_data_registered();
+    fs::create_dir_all(catalog_path)?;
+    let catalog = ParquetDataCatalog::new(catalog_path, None, None, None, None);
+    write_observation_batch(&catalog, observations)?;
+    write_decision_batch(&catalog, decisions)?;
+    write_approved_batch(&catalog, approved)?;
+
+    Ok(counts)
+}
+
+fn write_observation_batch(
+    catalog: &ParquetDataCatalog,
     observations: Vec<ScheduledEventObservation>,
 ) -> anyhow::Result<usize> {
     let count = observations.len();
@@ -298,9 +362,6 @@ fn write_observations_to_catalog(
         return Ok(0);
     }
 
-    ensure_scheduled_event_custom_data_registered();
-    fs::create_dir_all(catalog_path)?;
-    let catalog = ParquetDataCatalog::new(catalog_path, None, None, None, None);
     let mut by_identifier = BTreeMap::new();
 
     for observation in observations {
@@ -312,6 +373,50 @@ fn write_observations_to_catalog(
             .entry(identifier.clone())
             .or_insert_with(Vec::new)
             .push(observation.into_custom_data(Some(identifier)));
+    }
+
+    for data in by_identifier.into_values() {
+        catalog.write_custom_data_batch(data, None, None, Some(true))?;
+    }
+
+    Ok(count)
+}
+
+fn write_decision_batch(
+    catalog: &ParquetDataCatalog,
+    decisions: Vec<ScheduledEventDecision>,
+) -> anyhow::Result<usize> {
+    let count = decisions.len();
+    let mut by_identifier = BTreeMap::new();
+
+    for decision in decisions {
+        let identifier = ScheduledEventDecision::catalog_identifier(&decision.event_type);
+        by_identifier
+            .entry(identifier.clone())
+            .or_insert_with(Vec::new)
+            .push(decision.into_custom_data(Some(identifier)));
+    }
+
+    for data in by_identifier.into_values() {
+        catalog.write_custom_data_batch(data, None, None, Some(true))?;
+    }
+
+    Ok(count)
+}
+
+fn write_approved_batch(
+    catalog: &ParquetDataCatalog,
+    approved: Vec<ApprovedScheduledEvent>,
+) -> anyhow::Result<usize> {
+    let count = approved.len();
+    let mut by_identifier = BTreeMap::new();
+
+    for event in approved {
+        let identifier = ApprovedScheduledEvent::catalog_identifier(&event.event_type);
+        by_identifier
+            .entry(identifier.clone())
+            .or_insert_with(Vec::new)
+            .push(event.into_custom_data(Some(identifier)));
     }
 
     for data in by_identifier.into_values() {

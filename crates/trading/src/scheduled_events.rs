@@ -5,12 +5,14 @@
 //! approved view. The trading runtime should consume approved records instead of provider payloads.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, Once},
 };
 
+use chrono::{DateTime, Datelike, Duration, NaiveDate, SecondsFormat, Utc};
 use nautilus_core::UnixNanos;
 use nautilus_model::data::{CustomData, DataType};
 use nautilus_persistence_macros::custom_data;
@@ -23,6 +25,25 @@ const STATE_DIR: &str = "nautilus_trader";
 const SCHEDULED_EVENTS_DIR: &str = "scheduled_events";
 const CATALOG_DIR: &str = "catalog";
 const RAW_DIR: &str = "raw";
+
+/// Initial deterministic resolver version for scheduled-event observations.
+pub const SCHEDULED_EVENT_RESOLVER_VERSION: &str = "scheduled-event-resolver:v1";
+/// Initial approval policy version for runtime-safe scheduled events.
+pub const SCHEDULED_EVENT_APPROVAL_POLICY_VERSION: &str = "scheduled-event-approval:v1";
+
+const STATUS_CONFIRMED: &str = "confirmed";
+const STATUS_CONFLICTED: &str = "conflicted";
+const STATUS_UNCERTAIN: &str = "uncertain";
+const STATUS_REJECTED: &str = "rejected";
+
+const APPROVAL_APPROVED: &str = "approved";
+const APPROVAL_BLOCK_ONLY: &str = "block_only";
+const APPROVAL_REJECTED: &str = "rejected";
+
+const TIMING_BEFORE_OPEN: &str = "before_open";
+const TIMING_AFTER_CLOSE: &str = "after_close";
+const TIMING_DURING_SESSION: &str = "during_session";
+const TIMING_UNKNOWN: &str = "unknown";
 
 /// A normalized provider or manual observation for one scheduled event.
 ///
@@ -213,6 +234,362 @@ impl ApprovedScheduledEvent {
     }
 }
 
+/// Deterministic configuration for resolving scheduled-event observations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduledEventResolverConfig {
+    /// Resolver version stamped onto decision records.
+    pub resolver_version: String,
+    /// Higher-priority source labels come first.
+    pub source_precedence: Vec<String>,
+    /// Number of days the decision remains valid from `decided_at_utc`.
+    pub valid_for_days: i64,
+}
+
+impl Default for ScheduledEventResolverConfig {
+    fn default() -> Self {
+        Self {
+            resolver_version: SCHEDULED_EVENT_RESOLVER_VERSION.to_string(),
+            source_precedence: vec!["manual_override".to_string(), "alpha_vantage".to_string()],
+            valid_for_days: 7,
+        }
+    }
+}
+
+/// Conservative approval policy for runtime-safe scheduled events.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduledEventApprovalPolicy {
+    /// Approval policy version stamped onto approved-event records.
+    pub policy_version: String,
+    /// Number of calendar days to block before the event.
+    pub block_days_before: i64,
+    /// Number of calendar days to block after the event.
+    pub block_days_after: i64,
+    /// Whether unknown timing can become an approved tradeable event.
+    pub allow_unknown_timing: bool,
+    /// Whether weekend event dates can be consumed by runtime.
+    pub allow_weekend_events: bool,
+    /// Whether symbols outside common listed-equity shape can be consumed by runtime.
+    pub allow_non_common_symbols: bool,
+}
+
+impl Default for ScheduledEventApprovalPolicy {
+    fn default() -> Self {
+        Self {
+            policy_version: SCHEDULED_EVENT_APPROVAL_POLICY_VERSION.to_string(),
+            block_days_before: 1,
+            block_days_after: 1,
+            allow_unknown_timing: false,
+            allow_weekend_events: false,
+            allow_non_common_symbols: false,
+        }
+    }
+}
+
+/// Resolves observations into canonical scheduled-event decisions.
+#[must_use]
+pub fn resolve_scheduled_event_observations(
+    observations: &[ScheduledEventObservation],
+    config: &ScheduledEventResolverConfig,
+    decided_at_utc: DateTime<Utc>,
+) -> Vec<ScheduledEventDecision> {
+    let mut groups: BTreeMap<ObservationGroupKey, Vec<ScheduledEventObservation>> = BTreeMap::new();
+
+    for observation in dedupe_observations(observations, config) {
+        let key = ObservationGroupKey {
+            event_type: observation.event_type.trim().to_string(),
+            underlying: normalize_underlying(&observation.underlying),
+            event_date: observation.event_date.trim().to_string(),
+        };
+        groups.entry(key).or_default().push(observation);
+    }
+
+    groups
+        .into_iter()
+        .map(|(key, group)| resolve_observation_group(key, &group, config, decided_at_utc))
+        .collect()
+}
+
+/// Applies runtime approval policy to resolver decisions.
+#[must_use]
+pub fn approve_scheduled_event_decisions(
+    decisions: &[ScheduledEventDecision],
+    policy: &ScheduledEventApprovalPolicy,
+    approved_at_utc: DateTime<Utc>,
+) -> Vec<ApprovedScheduledEvent> {
+    decisions
+        .iter()
+        .map(|decision| approve_decision(decision, policy, approved_at_utc))
+        .collect()
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ObservationGroupKey {
+    event_type: String,
+    underlying: String,
+    event_date: String,
+}
+
+fn dedupe_observations(
+    observations: &[ScheduledEventObservation],
+    config: &ScheduledEventResolverConfig,
+) -> Vec<ScheduledEventObservation> {
+    let mut by_source_event: BTreeMap<(String, String), ScheduledEventObservation> =
+        BTreeMap::new();
+
+    for observation in observations {
+        let key = (
+            observation.source.trim().to_string(),
+            observation.source_event_id.trim().to_string(),
+        );
+        match by_source_event.get(&key) {
+            Some(existing)
+                if compare_observation_freshness(observation, existing, config).is_lt() => {}
+            _ => {
+                by_source_event.insert(key, observation.clone());
+            }
+        }
+    }
+
+    by_source_event.into_values().collect()
+}
+
+fn resolve_observation_group(
+    key: ObservationGroupKey,
+    group: &[ScheduledEventObservation],
+    config: &ScheduledEventResolverConfig,
+    decided_at_utc: DateTime<Utc>,
+) -> ScheduledEventDecision {
+    let mut sorted = group.to_vec();
+    sorted.sort_by(|left, right| compare_observation_freshness(left, right, config));
+
+    let sources_used = sorted_sources(group, config).join("|");
+    let known_timings = sorted
+        .iter()
+        .filter_map(|observation| known_timing(&observation.timing))
+        .collect::<BTreeSet<_>>();
+    let chosen_timing = sorted
+        .iter()
+        .find_map(|observation| known_timing(&observation.timing))
+        .unwrap_or_else(|| TIMING_UNKNOWN.to_string());
+    let (status, confidence, conflict_reason) = resolver_status(&key, &known_timings);
+    let valid_from_utc = format_utc(decided_at_utc);
+    let valid_until_utc = format_utc(decided_at_utc + Duration::days(config.valid_for_days));
+
+    ScheduledEventDecision {
+        canonical_event_id: canonical_event_id(&key.event_type, &key.underlying, &key.event_date),
+        event_type: key.event_type,
+        underlying: key.underlying,
+        event_date: key.event_date.clone(),
+        timing: chosen_timing,
+        status,
+        confidence,
+        sources_used,
+        conflict_reason,
+        resolver_version: config.resolver_version.clone(),
+        decided_at_utc: format_utc(decided_at_utc),
+        valid_from_utc,
+        valid_until_utc,
+        ts_event: unix_nanos_from_date_string(&key.event_date),
+        ts_init: unix_nanos_from_utc(decided_at_utc),
+    }
+}
+
+fn resolver_status(
+    key: &ObservationGroupKey,
+    known_timings: &BTreeSet<String>,
+) -> (String, f64, String) {
+    if key.event_type.is_empty() || key.underlying.is_empty() {
+        return (
+            STATUS_REJECTED.to_string(),
+            0.0,
+            "missing_event_type_or_underlying".to_string(),
+        );
+    }
+    if NaiveDate::parse_from_str(&key.event_date, "%Y-%m-%d").is_err() {
+        return (
+            STATUS_REJECTED.to_string(),
+            0.0,
+            "invalid_event_date".to_string(),
+        );
+    }
+    if known_timings.len() > 1 {
+        return (
+            STATUS_CONFLICTED.to_string(),
+            0.25,
+            format!(
+                "timing_disagreement:{}",
+                known_timings.iter().cloned().collect::<Vec<_>>().join("|")
+            ),
+        );
+    }
+    if known_timings.is_empty() {
+        return (
+            STATUS_UNCERTAIN.to_string(),
+            0.4,
+            "timing_unknown".to_string(),
+        );
+    }
+
+    (STATUS_CONFIRMED.to_string(), 0.9, String::new())
+}
+
+fn approve_decision(
+    decision: &ScheduledEventDecision,
+    policy: &ScheduledEventApprovalPolicy,
+    approved_at_utc: DateTime<Utc>,
+) -> ApprovedScheduledEvent {
+    let (approval_status, diagnostic_reason) = approval_status_and_reason(decision, policy);
+
+    ApprovedScheduledEvent {
+        canonical_event_id: decision.canonical_event_id.clone(),
+        event_type: decision.event_type.clone(),
+        underlying: decision.underlying.clone(),
+        event_date: decision.event_date.clone(),
+        timing: decision.timing.clone(),
+        approval_status,
+        source_set: decision.sources_used.clone(),
+        policy_version: policy.policy_version.clone(),
+        block_days_before: policy.block_days_before,
+        block_days_after: policy.block_days_after,
+        approved_at_utc: format_utc(approved_at_utc),
+        valid_from_utc: decision.valid_from_utc.clone(),
+        valid_until_utc: decision.valid_until_utc.clone(),
+        diagnostic_reason,
+        ts_event: decision.ts_event,
+        ts_init: unix_nanos_from_utc(approved_at_utc),
+    }
+}
+
+fn approval_status_and_reason(
+    decision: &ScheduledEventDecision,
+    policy: &ScheduledEventApprovalPolicy,
+) -> (String, String) {
+    let Ok(event_date) = NaiveDate::parse_from_str(&decision.event_date, "%Y-%m-%d") else {
+        return (
+            APPROVAL_REJECTED.to_string(),
+            "invalid_event_date".to_string(),
+        );
+    };
+    if !policy.allow_non_common_symbols && !is_common_listed_equity_symbol(&decision.underlying) {
+        return (
+            APPROVAL_REJECTED.to_string(),
+            "non_common_symbol".to_string(),
+        );
+    }
+    if !policy.allow_weekend_events && !is_weekday(event_date) {
+        return (
+            APPROVAL_REJECTED.to_string(),
+            "weekend_event_date".to_string(),
+        );
+    }
+    if decision.status == STATUS_CONFIRMED
+        && (policy.allow_unknown_timing || known_timing(&decision.timing).is_some())
+    {
+        return (APPROVAL_APPROVED.to_string(), "confirmed".to_string());
+    }
+    if matches!(
+        decision.status.as_str(),
+        STATUS_CONFLICTED | STATUS_UNCERTAIN
+    ) || decision.timing == TIMING_UNKNOWN
+    {
+        return (
+            APPROVAL_BLOCK_ONLY.to_string(),
+            format!("{}:{}", decision.status, decision.conflict_reason),
+        );
+    }
+
+    (
+        APPROVAL_REJECTED.to_string(),
+        format!("decision_status:{}", decision.status),
+    )
+}
+
+fn compare_observation_freshness(
+    left: &ScheduledEventObservation,
+    right: &ScheduledEventObservation,
+    config: &ScheduledEventResolverConfig,
+) -> std::cmp::Ordering {
+    source_rank(&left.source, config)
+        .cmp(&source_rank(&right.source, config))
+        .then_with(|| right.ts_init.as_u64().cmp(&left.ts_init.as_u64()))
+        .then_with(|| left.observation_id.cmp(&right.observation_id))
+}
+
+fn sorted_sources(
+    observations: &[ScheduledEventObservation],
+    config: &ScheduledEventResolverConfig,
+) -> Vec<String> {
+    let mut sources = observations
+        .iter()
+        .map(|observation| observation.source.trim().to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    sources.sort_by(|left, right| {
+        source_rank(left, config)
+            .cmp(&source_rank(right, config))
+            .then_with(|| left.cmp(right))
+    });
+    sources
+}
+
+fn source_rank(source: &str, config: &ScheduledEventResolverConfig) -> usize {
+    config
+        .source_precedence
+        .iter()
+        .position(|candidate| candidate == source)
+        .unwrap_or(config.source_precedence.len())
+}
+
+fn known_timing(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "before_open" | "before" | "bmo" | "pre-market" => Some(TIMING_BEFORE_OPEN.to_string()),
+        "after_close" | "after" | "amc" | "post-market" => Some(TIMING_AFTER_CLOSE.to_string()),
+        "during_session" | "during" => Some(TIMING_DURING_SESSION.to_string()),
+        "unknown" | "unk" | "" => None,
+        _ => None,
+    }
+}
+
+fn normalize_underlying(value: &str) -> String {
+    value.trim().to_ascii_uppercase()
+}
+
+fn canonical_event_id(event_type: &str, underlying: &str, event_date: &str) -> String {
+    format!("{event_type}:{underlying}:{event_date}")
+}
+
+fn is_weekday(date: NaiveDate) -> bool {
+    date.weekday().number_from_monday() <= 5
+}
+
+fn is_common_listed_equity_symbol(symbol: &str) -> bool {
+    let len = symbol.len();
+    (1..=4).contains(&len) && symbol.chars().all(|ch| ch.is_ascii_uppercase())
+}
+
+fn unix_nanos_from_date_string(value: &str) -> UnixNanos {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .ok()
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .and_then(|datetime| datetime.and_utc().timestamp_nanos_opt())
+        .and_then(|nanos| u64::try_from(nanos).ok())
+        .map(UnixNanos::from)
+        .unwrap_or_default()
+}
+
+fn unix_nanos_from_utc(value: DateTime<Utc>) -> UnixNanos {
+    value
+        .timestamp_nanos_opt()
+        .and_then(|nanos| u64::try_from(nanos).ok())
+        .map(UnixNanos::from)
+        .unwrap_or_default()
+}
+
+fn format_utc(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
 /// Registers all scheduled-event custom data types for JSON and Arrow catalog use.
 pub fn ensure_scheduled_event_custom_data_registered() {
     static ONCE: Once = Once::new();
@@ -320,6 +697,7 @@ fn catalog_identifier_component(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
     use nautilus_model::data::{CustomDataTrait, Data};
     use nautilus_persistence::backend::catalog::ParquetDataCatalog;
     use tempfile::TempDir;
@@ -368,6 +746,95 @@ mod tests {
         assert_eq!(
             path,
             PathBuf::from("nautilus_trader/scheduled_events/catalog")
+        );
+    }
+
+    #[test]
+    fn resolver_marks_known_timing_conflict_and_approval_blocks_only() {
+        let observations = vec![
+            observation("AAPL", "2026-05-05", "before_open", "alpha_vantage", 1),
+            observation("AAPL", "2026-05-05", "after_close", "manual_override", 2),
+        ];
+
+        let decisions = resolve_scheduled_event_observations(
+            &observations,
+            &ScheduledEventResolverConfig::default(),
+            fixed_utc(),
+        );
+        let approved = approve_scheduled_event_decisions(
+            &decisions,
+            &ScheduledEventApprovalPolicy::default(),
+            fixed_utc(),
+        );
+
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].timing, "after_close");
+        assert_eq!(decisions[0].status, "conflicted");
+        assert_eq!(decisions[0].sources_used, "manual_override|alpha_vantage");
+        assert!(decisions[0].conflict_reason.contains("timing_disagreement"));
+        assert_eq!(approved[0].approval_status, "block_only");
+        assert!(
+            approved[0]
+                .diagnostic_reason
+                .contains("timing_disagreement")
+        );
+    }
+
+    #[test]
+    fn approval_blocks_unknown_common_weekday_events() {
+        let observations = vec![observation(
+            "IWM",
+            "2026-05-05",
+            "unknown",
+            "alpha_vantage",
+            1,
+        )];
+
+        let decisions = resolve_scheduled_event_observations(
+            &observations,
+            &ScheduledEventResolverConfig::default(),
+            fixed_utc(),
+        );
+        let approved = approve_scheduled_event_decisions(
+            &decisions,
+            &ScheduledEventApprovalPolicy::default(),
+            fixed_utc(),
+        );
+
+        assert_eq!(decisions[0].status, "uncertain");
+        assert_eq!(decisions[0].conflict_reason, "timing_unknown");
+        assert_eq!(approved[0].approval_status, "block_only");
+        assert!(approved[0].diagnostic_reason.contains("timing_unknown"));
+    }
+
+    #[test]
+    fn approval_rejects_weekend_and_non_common_symbols() {
+        let observations = vec![
+            observation("QQQ", "2026-05-09", "after_close", "alpha_vantage", 1),
+            observation("NABZY", "2026-05-05", "after_close", "alpha_vantage", 2),
+        ];
+
+        let decisions = resolve_scheduled_event_observations(
+            &observations,
+            &ScheduledEventResolverConfig::default(),
+            fixed_utc(),
+        );
+        let approved = approve_scheduled_event_decisions(
+            &decisions,
+            &ScheduledEventApprovalPolicy::default(),
+            fixed_utc(),
+        );
+
+        let by_underlying = approved
+            .iter()
+            .map(|event| (event.underlying.as_str(), event))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(by_underlying["QQQ"].approval_status, "rejected");
+        assert_eq!(by_underlying["QQQ"].diagnostic_reason, "weekend_event_date");
+        assert_eq!(by_underlying["NABZY"].approval_status, "rejected");
+        assert_eq!(
+            by_underlying["NABZY"].diagnostic_reason,
+            "non_common_symbol"
         );
     }
 
@@ -461,6 +928,36 @@ mod tests {
             ts_event: UnixNanos::from(ts),
             ts_init: UnixNanos::from(ts),
         }
+    }
+
+    fn observation(
+        underlying: &str,
+        event_date: &str,
+        timing: &str,
+        source: &str,
+        ts: u64,
+    ) -> ScheduledEventObservation {
+        ScheduledEventObservation {
+            observation_id: format!("{source}:{underlying}:{event_date}:{timing}"),
+            event_type: "earnings_report".to_string(),
+            source: source.to_string(),
+            source_event_id: format!("{underlying}:{event_date}:{timing}"),
+            underlying: underlying.to_string(),
+            event_date: event_date.to_string(),
+            timing: timing.to_string(),
+            timezone: "America/New_York".to_string(),
+            source_published_at_utc: String::new(),
+            source_fetched_at_utc: "2026-05-01T12:00:00Z".to_string(),
+            raw_uri: "file:///tmp/raw.csv".to_string(),
+            raw_sha256: "abc123".to_string(),
+            quality_flags: String::new(),
+            ts_event: unix_nanos_from_date_string(event_date),
+            ts_init: UnixNanos::from(ts),
+        }
+    }
+
+    fn fixed_utc() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()
     }
 
     fn sample_decision(ts: u64) -> ScheduledEventDecision {
