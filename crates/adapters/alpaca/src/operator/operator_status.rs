@@ -74,7 +74,6 @@ struct OperatorConfig {
     strategy_state_metadata: Option<StrategyStateMetadata>,
     strategy_state_storage_summary: Option<StrategyStateStorageSummary>,
     candidate_ledger_records: Vec<Value>,
-    json_output: bool,
 }
 
 #[derive(Debug)]
@@ -87,6 +86,9 @@ struct AccountRuntimeDefaults {
 #[derive(Debug, Serialize)]
 struct OperatorStatus {
     checked_at_utc: String,
+    health: String,
+    health_reasons: Vec<String>,
+    next_action: String,
     engine_state: EngineState,
     service: ServiceStatus,
     operational_store: OperationalStoreStatus,
@@ -329,6 +331,27 @@ enum AlertSeverity {
 }
 
 pub(crate) async fn run() -> anyhow::Result<()> {
+    let status = collect_status().await?;
+    let json_output = crate::operator::args().iter().any(|arg| arg == "--json");
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        print_human_status(&status);
+    }
+
+    if matches!(status.engine_state, EngineState::Broken) {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn collect_status_value() -> anyhow::Result<Value> {
+    Ok(serde_json::to_value(collect_status().await?)?)
+}
+
+async fn collect_status() -> anyhow::Result<OperatorStatus> {
     let config = OperatorConfig::from_env().await?;
     let mut data_config = AlpacaDataClientConfig::default();
     data_config.trading_base_url = env::var("ALPACA_TRADING_BASE_URL").ok();
@@ -353,18 +376,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         &state,
         &events,
     );
-
-    if config.json_output {
-        println!("{}", serde_json::to_string_pretty(&status)?);
-    } else {
-        print_human_status(&status);
-    }
-
-    if matches!(status.engine_state, EngineState::Broken) {
-        std::process::exit(1);
-    }
-
-    Ok(())
+    Ok(status)
 }
 
 impl OperatorConfig {
@@ -516,7 +528,6 @@ impl OperatorConfig {
             strategy_state_metadata,
             strategy_state_storage_summary,
             candidate_ledger_records,
-            json_output: crate::operator::args().iter().any(|arg| arg == "--json"),
         })
     }
 
@@ -810,9 +821,13 @@ fn build_status(
         &positions_status,
         &account_status,
     );
+    let health = status_health(engine_state, &alerts, universe.as_ref());
 
     OperatorStatus {
         checked_at_utc: now.to_rfc3339(),
+        health: health.status,
+        health_reasons: health.reasons,
+        next_action: health.next_action,
         engine_state,
         service,
         operational_store: config.operational_store.clone(),
@@ -836,6 +851,100 @@ fn build_status(
         last_lifecycle_event,
         last_broker_event,
         alerts,
+    }
+}
+
+#[derive(Debug)]
+struct HealthSummary {
+    status: String,
+    reasons: Vec<String>,
+    next_action: String,
+}
+
+fn status_health(
+    engine_state: EngineState,
+    alerts: &[OperatorAlert],
+    universe: Option<&UniverseStatus>,
+) -> HealthSummary {
+    let mut reasons = Vec::new();
+    let critical_alerts = alerts
+        .iter()
+        .filter(|alert| alert.severity == AlertSeverity::Critical)
+        .collect::<Vec<_>>();
+    let warning_alerts = alerts
+        .iter()
+        .filter(|alert| alert.severity == AlertSeverity::Warning)
+        .collect::<Vec<_>>();
+
+    let status = if !critical_alerts.is_empty() || matches!(engine_state, EngineState::Broken) {
+        reasons.extend(
+            critical_alerts
+                .iter()
+                .map(|alert| format!("{}: {}", alert.code, alert.message)),
+        );
+        "broken"
+    } else if matches!(engine_state, EngineState::Blocked) {
+        reasons.push("engine_state_blocked".to_string());
+        "blocked"
+    } else if !warning_alerts.is_empty()
+        || universe.is_some_and(|status| status.failed > 0 || !status.failed_reasons.is_empty())
+    {
+        reasons.extend(
+            warning_alerts
+                .iter()
+                .map(|alert| format!("{}: {}", alert.code, alert.message)),
+        );
+        if let Some(universe) = universe {
+            for (reason, count) in &universe.failed_reasons {
+                reasons.push(format!("universe_failed_{reason}: {count}"));
+            }
+        }
+        "degraded"
+    } else {
+        reasons.push("no_operator_alerts".to_string());
+        "healthy"
+    };
+
+    let next_action = next_status_action(status, alerts, universe);
+
+    HealthSummary {
+        status: status.to_string(),
+        reasons,
+        next_action,
+    }
+}
+
+fn next_status_action(
+    status: &str,
+    alerts: &[OperatorAlert],
+    universe: Option<&UniverseStatus>,
+) -> String {
+    if status == "healthy" {
+        return "none".to_string();
+    }
+
+    if let Some(alert) = alerts
+        .iter()
+        .find(|alert| alert.severity == AlertSeverity::Critical)
+        .or_else(|| {
+            alerts
+                .iter()
+                .find(|alert| alert.severity == AlertSeverity::Warning)
+        })
+    {
+        return format!("inspect_{}: {}", alert.code, alert.message);
+    }
+
+    if let Some(universe) = universe
+        && let Some((reason, _)) = universe.failed_reasons.iter().next()
+    {
+        return format!("inspect_option_universe_resolution: {reason}");
+    }
+
+    if status == "blocked" {
+        "inspect_order_gates_and_account_blocks".to_string()
+    } else {
+        "inspect_operator_status".to_string()
     }
 }
 
@@ -1181,6 +1290,12 @@ fn print_human_status(status: &OperatorStatus) {
     println!(
         "engine: state={:?} checked_at_utc={}",
         status.engine_state, status.checked_at_utc
+    );
+    println!(
+        "health: status={} reasons={} next_action={}",
+        status.health,
+        format_strings(&status.health_reasons),
+        status.next_action,
     );
     println!(
         "service: name={} active={} open_orders={} close_orders={} strategy_profiles={} submitting_profiles={} lock={} log={}",

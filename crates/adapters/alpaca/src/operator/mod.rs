@@ -4,6 +4,8 @@ use std::{env, sync::OnceLock};
 
 mod candidate_alerts;
 mod check_account_orders;
+mod config_lint;
+mod doctor;
 mod fleet_status;
 mod historical_replay;
 mod load_option_contracts;
@@ -11,6 +13,7 @@ mod load_option_snapshots;
 mod operator_status;
 mod performance_report;
 mod reconciliation_probe;
+mod scanner_report;
 mod spread_reconciliation_preview;
 mod sync_strategy_state;
 mod universe_plan;
@@ -21,8 +24,14 @@ static OPERATOR_ARGS: OnceLock<Vec<String>> = OnceLock::new();
 /// Alpaca adapter operator commands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AlpacaOperatorCommand {
+    /// Runs one-shot Alpaca options operator validation.
+    Doctor,
     /// Prints supervised runtime status.
     Status,
+    /// Lints Alpaca options runtime configuration.
+    ConfigLint,
+    /// Reports recent option-chain scanner quality.
+    ScannerReport,
     /// Checks the broker account, positions, and open orders.
     Account,
     /// Summarizes the configured Alpaca account fleet.
@@ -55,7 +64,10 @@ pub enum AlpacaOperatorCommand {
 pub async fn run_command(command: AlpacaOperatorCommand, args: Vec<String>) -> anyhow::Result<()> {
     set_args(args)?;
     match command {
+        AlpacaOperatorCommand::Doctor => doctor::run().await,
         AlpacaOperatorCommand::Status => operator_status::run().await,
+        AlpacaOperatorCommand::ConfigLint => config_lint::run().await,
+        AlpacaOperatorCommand::ScannerReport => scanner_report::run().await,
         AlpacaOperatorCommand::Account => check_account_orders::run().await,
         AlpacaOperatorCommand::Fleet => fleet_status::run().await,
         AlpacaOperatorCommand::UniversePlan => universe_plan::run().await,

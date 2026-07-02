@@ -186,8 +186,14 @@ pub struct AlpacaAdapterOpt {
 #[derive(Parser, Debug, Clone)]
 #[command(about = "Alpaca adapter operations", long_about = None)]
 pub enum AlpacaAdapterCommand {
+    /// Runs one-shot Alpaca options operator validation.
+    Doctor(ForwardedArgs),
     /// Prints supervised Alpaca runtime status.
     Status(ForwardedArgs),
+    /// Alpaca runtime configuration checks.
+    Config(AlpacaConfigOpt),
+    /// Alpaca option-chain scanner reports.
+    Scanner(AlpacaScannerOpt),
     /// Checks Alpaca account, positions, and open orders.
     Account(ForwardedArgs),
     /// Summarizes configured Alpaca accounts.
@@ -210,6 +216,40 @@ pub enum AlpacaAdapterCommand {
     Reconciliation(ForwardedArgs),
     /// Probes Alpaca trade-update WebSocket authorization and listening.
     TradeUpdates(ForwardedArgs),
+}
+
+#[cfg(feature = "alpaca")]
+/// Alpaca config commands.
+#[derive(Parser, Debug, Clone)]
+#[command(about = "Alpaca config operations", long_about = None)]
+pub struct AlpacaConfigOpt {
+    #[clap(subcommand)]
+    pub command: AlpacaConfigCommand,
+}
+
+#[cfg(feature = "alpaca")]
+/// Available Alpaca config commands.
+#[derive(Parser, Debug, Clone)]
+pub enum AlpacaConfigCommand {
+    /// Lints Alpaca options runtime configuration.
+    Lint(ForwardedArgs),
+}
+
+#[cfg(feature = "alpaca")]
+/// Alpaca scanner report commands.
+#[derive(Parser, Debug, Clone)]
+#[command(about = "Alpaca scanner report operations", long_about = None)]
+pub struct AlpacaScannerOpt {
+    #[clap(subcommand)]
+    pub command: AlpacaScannerCommand,
+}
+
+#[cfg(feature = "alpaca")]
+/// Available Alpaca scanner report commands.
+#[derive(Parser, Debug, Clone)]
+pub enum AlpacaScannerCommand {
+    /// Reports recent option-chain scanner quality.
+    Report(ForwardedArgs),
 }
 
 #[cfg(feature = "alpaca")]

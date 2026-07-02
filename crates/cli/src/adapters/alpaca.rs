@@ -1,8 +1,8 @@
 use nautilus_alpaca::operator::{self, AlpacaOperatorCommand};
 
 use crate::opt::{
-    AlpacaAdapterCommand, AlpacaAdapterOpt, AlpacaAlertsCommand, AlpacaUniverseCommand,
-    ForwardedArgs,
+    AlpacaAdapterCommand, AlpacaAdapterOpt, AlpacaAlertsCommand, AlpacaConfigCommand,
+    AlpacaScannerCommand, AlpacaUniverseCommand, ForwardedArgs,
 };
 
 /// Executes Alpaca adapter operational commands.
@@ -12,9 +12,22 @@ use crate::opt::{
 /// Returns an error if the requested Alpaca command fails.
 pub(crate) async fn run_alpaca_command(opt: AlpacaAdapterOpt) -> anyhow::Result<()> {
     match opt.command {
+        AlpacaAdapterCommand::Doctor(args) => {
+            run_operator_command(AlpacaOperatorCommand::Doctor, args).await?
+        }
         AlpacaAdapterCommand::Status(args) => {
             run_operator_command(AlpacaOperatorCommand::Status, args).await?
         }
+        AlpacaAdapterCommand::Config(config) => match config.command {
+            AlpacaConfigCommand::Lint(args) => {
+                run_operator_command(AlpacaOperatorCommand::ConfigLint, args).await?
+            }
+        },
+        AlpacaAdapterCommand::Scanner(scanner) => match scanner.command {
+            AlpacaScannerCommand::Report(args) => {
+                run_operator_command(AlpacaOperatorCommand::ScannerReport, args).await?
+            }
+        },
         AlpacaAdapterCommand::Account(args) => {
             run_operator_command(AlpacaOperatorCommand::Account, args).await?
         }
