@@ -54,10 +54,13 @@ nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
 nautilus-execution = { workspace = true }
 nautilus-model = { workspace = true, features = ["stubs"] }
+nautilus-persistence-macros = { workspace = true }
 nautilus-portfolio = { workspace = true }
+nautilus-serialization = { workspace = true, features = ["arrow"] }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
+arrow = { workspace = true }
 bon = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
@@ -74,6 +77,9 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-persistence = { workspace = true, features = ["catalog-query"] }
+
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }

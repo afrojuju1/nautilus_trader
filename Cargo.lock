@@ -7015,6 +7015,7 @@ version = "0.61.0"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
+ "arrow 58.3.0",
  "bon",
  "chrono",
  "chrono-tz",
@@ -7026,7 +7027,10 @@ dependencies = [
  "nautilus-execution",
  "nautilus-indicators",
  "nautilus-model",
+ "nautilus-persistence",
+ "nautilus-persistence-macros",
  "nautilus-portfolio",
+ "nautilus-serialization",
  "pyo3",
  "pyo3-stub-gen",
  "rstest",
@@ -7035,6 +7039,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum 0.28.0",
+ "tempfile",
  "ustr",
 ]
 
