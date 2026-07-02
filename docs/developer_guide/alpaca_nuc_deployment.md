@@ -82,8 +82,9 @@ records from the Postgres candidate ledger, not by the trading loop. Put the web
 `600`.
 
 The installer also creates `~/.config/nautilus-trader/alpaca/fleet.toml` if missing. The fleet
-registry is read-only operator metadata; credentials remain in the shared untracked repo `.env`
-unless an account intentionally opts into its own env file.
+registry is read-only, non-secret operator metadata and is installed mode `0644` so the Docker
+runtime can bind-mount it into the non-root container. Credentials remain in the shared untracked
+repo `.env` or an account-specific env file; keep those env files mode `0600`.
 
 ## Configuration Layering and Overrides
 

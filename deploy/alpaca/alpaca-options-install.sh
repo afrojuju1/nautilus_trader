@@ -14,13 +14,15 @@ ALERTS_ENV_FILE="${NAUTILUS_ALPACA_ALERTS_ENV_FILE:-$ALPACA_CONFIG_HOME/alerts.e
 PROFILE_MANIFEST_FILE="${NAUTILUS_ALPACA_PROFILE_MANIFEST:-$ALPACA_CONFIG_HOME/paper-profiles.tsv}"
 
 install_runtime_file() {
-  local source target
+  local source target mode
   source="$1"
   target="$2"
+  mode="$3"
   if [[ -f "$target" ]]; then
+    chmod "$mode" "$target"
     return
   fi
-  install -Dm600 "$source" "$target"
+  install -Dm"$mode" "$source" "$target"
 }
 
 cd "$REPO"
@@ -53,21 +55,23 @@ install -Dm644 deploy/alpaca/alpaca-performance-digest.service \
 install -Dm644 deploy/alpaca/alpaca-performance-digest.timer \
   "$HOME/.config/systemd/user/alpaca-performance-digest.timer"
 
-install_runtime_file deploy/alpaca/alpaca-options.env.example "$ENV_FILE"
-install_runtime_file deploy/alpaca/alpaca-options.base.toml.example "$BASE_CONFIG_FILE"
-install_runtime_file deploy/alpaca/alpaca-options.toml.example "$CONFIG_FILE"
+install_runtime_file deploy/alpaca/alpaca-options.env.example "$ENV_FILE" 600
+install_runtime_file deploy/alpaca/alpaca-options.base.toml.example "$BASE_CONFIG_FILE" 644
+install_runtime_file deploy/alpaca/alpaca-options.toml.example "$CONFIG_FILE" 644
 if [[ ! -f "$FLEET_CONFIG_FILE" ]]; then
-  install -Dm600 deploy/alpaca/alpaca-fleet.toml.example "$FLEET_CONFIG_FILE"
+  install -Dm644 deploy/alpaca/alpaca-fleet.toml.example "$FLEET_CONFIG_FILE"
+else
+  chmod 644 "$FLEET_CONFIG_FILE"
 fi
 install -d -m 700 "$ACCOUNT_ENV_DIR" "$ACCOUNT_CONFIG_DIR"
 if [[ ! -f "$ALERTS_ENV_FILE" ]]; then
   install -Dm600 deploy/alpaca/alpaca-alerts.env.example "$ALERTS_ENV_FILE"
 fi
-install_runtime_file deploy/alpaca/alpaca-paper-profiles.tsv "$PROFILE_MANIFEST_FILE"
-install_runtime_file deploy/alpaca/alpaca-options.paper-directional.toml.example "$ACCOUNT_CONFIG_DIR/paper-directional-options.toml"
-install_runtime_file deploy/alpaca/alpaca-options.paper-put-credit-spy.toml.example "$ACCOUNT_CONFIG_DIR/paper-put-credit-spy-options.toml"
-install_runtime_file deploy/alpaca/alpaca-options.paper-call-credit-qqq.toml.example "$ACCOUNT_CONFIG_DIR/paper-call-credit-qqq-options.toml"
-install_runtime_file deploy/alpaca/alpaca-options.paper-undefined-risk.toml.example "$ACCOUNT_CONFIG_DIR/paper-undefined-risk-options.toml"
+install_runtime_file deploy/alpaca/alpaca-paper-profiles.tsv "$PROFILE_MANIFEST_FILE" 644
+install_runtime_file deploy/alpaca/alpaca-options.paper-directional.toml.example "$ACCOUNT_CONFIG_DIR/paper-directional-options.toml" 644
+install_runtime_file deploy/alpaca/alpaca-options.paper-put-credit-spy.toml.example "$ACCOUNT_CONFIG_DIR/paper-put-credit-spy-options.toml" 644
+install_runtime_file deploy/alpaca/alpaca-options.paper-call-credit-qqq.toml.example "$ACCOUNT_CONFIG_DIR/paper-call-credit-qqq-options.toml" 644
+install_runtime_file deploy/alpaca/alpaca-options.paper-undefined-risk.toml.example "$ACCOUNT_CONFIG_DIR/paper-undefined-risk-options.toml" 644
 
 systemctl --user daemon-reload
 

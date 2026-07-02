@@ -1,7 +1,8 @@
 # Copy to ~/.config/nautilus-trader/alpaca/fleet.toml.
 #
-# This registry is operator/control-plane metadata only. Accounts use the shared repo `.env`
-# unless an account intentionally sets `env_file` to a different boundary.
+# This registry is non-secret operator/control-plane metadata. Install it mode 0644 so Docker can
+# bind-mount it into non-root containers. Keep credentials in the shared repo `.env` or an
+# account-specific env file, never in this registry.
 
 [fleet]
 operator_bin = "/home/ade/.local/bin/nautilus"

@@ -231,6 +231,11 @@ run_logged() {
   "$@"
 }
 
+ensure_fleet_config_readable() {
+  [[ -f "$FLEET_CONFIG_FILE" ]] || return 0
+  chmod 644 "$FLEET_CONFIG_FILE"
+}
+
 require_env_file() {
   local env_file
   env_file="$(account_env_file "$1")"
@@ -453,6 +458,7 @@ run_validate() {
 run_deploy() {
   cd "$REPO"
   run_logged deploy/alpaca/alpaca-options-install.sh
+  ensure_fleet_config_readable
 }
 
 restart_all_services() {
