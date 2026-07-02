@@ -12,7 +12,6 @@ candidate_ledger_enabled = true
 candidate_ledger_max_candidates = 10
 
 [universe]
-underlyings = ["SPY", "QQQ", "IWM", "DIA", "GLD", "GDX", "SLV", "TLT", "XLE", "XLF", "XLK", "XLV", "XLY", "XLI", "XLP", "XLU", "XLB", "XLC", "SMH", "USO", "XOP", "XOM"]
 quantity = 1
 entry_start = "09:45"
 entry_end = "14:30"

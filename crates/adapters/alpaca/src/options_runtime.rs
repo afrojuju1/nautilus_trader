@@ -689,7 +689,7 @@ impl AlpacaOptionsRuntimeConfig {
     /// Builds the default runtime config for unit tests.
     #[cfg(test)]
     pub(crate) fn from_runtime_config_for_tests() -> Self {
-        build_options_runtime_config(config::RuntimeConfigFile::default(), Vec::new())
+        build_options_runtime_config(config::runtime_config_file_for_tests(), Vec::new())
             .expect("default Alpaca options runtime config should parse")
     }
 

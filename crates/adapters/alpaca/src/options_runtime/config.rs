@@ -179,9 +179,8 @@ struct StrategyRiskOverrideSection {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct UniverseSection {
-    underlyings: Vec<String>,
     quantity: Option<u64>,
     entry_start: Option<String>,
     entry_end: Option<String>,
@@ -191,7 +190,6 @@ struct UniverseSection {
 impl UniverseSection {
     fn merge_parent(self, parent: Self) -> Self {
         Self {
-            underlyings: merge_vec(self.underlyings, parent.underlyings),
             quantity: self.quantity.or(parent.quantity),
             entry_start: self.entry_start.or(parent.entry_start),
             entry_end: self.entry_end.or(parent.entry_end),
@@ -601,6 +599,10 @@ pub(super) fn build_options_runtime_config(
 ) -> anyhow::Result<AlpacaOptionsRuntimeConfig> {
     reject_retired_order_capability_env_vars()?;
     reject_retired_strategy_composition_env_vars()?;
+    anyhow::ensure!(
+        split_strings(cli_underlyings).is_empty(),
+        "positional Alpaca underlyings are retired; configure profile-level underlyings or universe_groups"
+    );
     let scanner = scanner_config_from_file(&file.scanner);
     let iron_condor_scanner = iron_condor_scanner_config_from_file(&scanner, &file.iron_condor);
     let debit_scanner = debit_scanner_config_from_file(&file.debit_scanner);
@@ -610,7 +612,6 @@ pub(super) fn build_options_runtime_config(
     let interval_secs = env_parse("ALPACA_INTERVAL_SECS")
         .or(file.runtime.interval_secs)
         .unwrap_or(300);
-    let underlyings = underlyings_from_sources(cli_underlyings, &file.universe);
     let universe_groups = universe_groups_from_file(file.universe_groups)?;
     let default_quantity = file.universe.quantity.unwrap_or(1);
     anyhow::ensure!(
@@ -619,7 +620,6 @@ pub(super) fn build_options_runtime_config(
     );
     let strategy_profiles = strategy_profiles_from_file(
         file.strategies,
-        &underlyings,
         &universe_groups,
         default_quantity,
         &scanner,
@@ -780,7 +780,6 @@ pub(super) fn build_options_runtime_config(
 
 fn strategy_profiles_from_file(
     strategies: Vec<StrategyBlockSection>,
-    default_underlyings: &[String],
     universe_groups: &BTreeMap<String, Vec<String>>,
     default_quantity: u64,
     credit_scanner: &PutCreditScannerConfig,
@@ -789,22 +788,10 @@ fn strategy_profiles_from_file(
     naked_scanner: &NakedOptionScannerConfig,
     naked_1_3dte_scanner: &NakedOptionScannerConfig,
 ) -> anyhow::Result<Vec<AlpacaOptionsStrategyProfile>> {
-    let strategies = if strategies.is_empty() {
-        vec![StrategyBlockSection {
-            id: Some("put_credit_default".to_string()),
-            family: Some("put_credit".to_string()),
-            mode: Some("live".to_string()),
-            universe_groups: Vec::new(),
-            underlyings: default_underlyings.to_vec(),
-            include_underlyings: Vec::new(),
-            exclude_underlyings: Vec::new(),
-            quantity: Some(default_quantity),
-            scanner: StrategyScannerSection::default(),
-            risk: StrategyRiskOverrideSection::default(),
-        }]
-    } else {
-        strategies
-    };
+    anyhow::ensure!(
+        !strategies.is_empty(),
+        "Alpaca options runtime requires at least one explicit [[strategies]] profile"
+    );
 
     let mut profiles = Vec::new();
     let mut ids = std::collections::BTreeSet::new();
@@ -1337,18 +1324,6 @@ fn min_limit(current: Option<usize>, fleet_limit: usize) -> usize {
     current.map_or(fleet_limit, |current| current.min(fleet_limit))
 }
 
-fn underlyings_from_sources(cli_underlyings: Vec<String>, config: &UniverseSection) -> Vec<String> {
-    let args = split_strings(cli_underlyings);
-    if !args.is_empty() {
-        return args;
-    }
-    let configured = split_strings(config.underlyings.clone());
-    if !configured.is_empty() {
-        return configured;
-    }
-    default_underlyings()
-}
-
 fn split_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
     values
         .into_iter()
@@ -1461,16 +1436,6 @@ pub(crate) fn active_sector_count(
                     .is_some_and(|entry_sector| entry_sector == sector)
         })
         .count()
-}
-
-fn default_underlyings() -> Vec<String> {
-    [
-        "SPY", "QQQ", "IWM", "DIA", "GLD", "GDX", "SLV", "TLT", "XLE", "XLF", "XLK", "XLV", "XLY",
-        "XLI", "XLP", "XLU", "XLB", "XLC", "SMH", "USO", "XOP", "XOM",
-    ]
-    .into_iter()
-    .map(ToString::to_string)
-    .collect()
 }
 
 fn sector_map_from_file(config: BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -1830,8 +1795,43 @@ where
 }
 
 #[cfg(test)]
+pub(super) fn runtime_config_file_for_tests() -> RuntimeConfigFile {
+    let mut file = RuntimeConfigFile::default();
+    file.universe.quantity = Some(1);
+    file.strategies.push(runtime_test_strategy_block(
+        "put_credit_test",
+        "put_credit",
+        AlpacaOptionsStrategyMode::Live,
+        ["SPY"],
+    ));
+    file
+}
+
+#[cfg(test)]
+fn runtime_test_strategy_block(
+    id: impl Into<String>,
+    family: impl Into<String>,
+    mode: AlpacaOptionsStrategyMode,
+    underlyings: impl IntoIterator<Item = impl Into<String>>,
+) -> StrategyBlockSection {
+    StrategyBlockSection {
+        id: Some(id.into()),
+        family: Some(family.into()),
+        mode: Some(mode.as_str().to_string()),
+        universe_groups: Vec::new(),
+        underlyings: underlyings.into_iter().map(Into::into).collect(),
+        include_underlyings: Vec::new(),
+        exclude_underlyings: Vec::new(),
+        quantity: Some(1),
+        scanner: StrategyScannerSection::default(),
+        risk: StrategyRiskOverrideSection::default(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::options_runtime::{AlpacaOptionsStrategyScannerConfig, EventShockRuntimeStatus};
 
     #[test]
     fn split_strings_splits_args_and_csv() {
@@ -1839,6 +1839,136 @@ mod tests {
             split_strings(["SPY, QQQ".to_string(), "IWM".to_string()]),
             vec!["SPY", "QQQ", "IWM"],
         );
+    }
+
+    #[test]
+    fn strategy_profiles_require_explicit_profile() {
+        let error = build_strategy_profiles(Vec::new(), BTreeMap::new())
+            .expect_err("empty strategy profile list should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires at least one explicit [[strategies]] profile")
+        );
+    }
+
+    #[test]
+    fn strategy_profiles_expand_groups_includes_and_excludes() {
+        let groups = BTreeMap::from([(
+            "core_liquid_options".to_string(),
+            vec!["SPY".to_string(), "QQQ".to_string(), "IWM".to_string()],
+        )]);
+        let mut strategy = strategy_block(
+            "put_credit_core",
+            "put_credit",
+            AlpacaOptionsStrategyMode::Live,
+            Vec::<String>::new(),
+        );
+        strategy.universe_groups = vec!["core_liquid_options".to_string()];
+        strategy.include_underlyings = vec!["GLD".to_string(), "spy".to_string()];
+        strategy.exclude_underlyings = vec!["QQQ".to_string()];
+
+        let profiles = build_strategy_profiles(vec![strategy], groups).unwrap();
+
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            profiles[0].underlyings,
+            vec!["SPY".to_string(), "IWM".to_string(), "GLD".to_string()],
+        );
+        assert_eq!(
+            profiles[0].universe_groups,
+            vec!["core_liquid_options".to_string()]
+        );
+        assert_eq!(
+            profiles[0].include_underlyings,
+            vec!["GLD".to_string(), "SPY".to_string()]
+        );
+        assert_eq!(profiles[0].exclude_underlyings, vec!["QQQ".to_string()]);
+    }
+
+    #[test]
+    fn strategy_profiles_reject_unknown_universe_group() {
+        let mut strategy = strategy_block(
+            "put_credit_missing",
+            "put_credit",
+            AlpacaOptionsStrategyMode::Live,
+            Vec::<String>::new(),
+        );
+        strategy.universe_groups = vec!["missing_group".to_string()];
+
+        let error = build_strategy_profiles(vec![strategy], BTreeMap::new())
+            .expect_err("unknown group should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("references unknown universe group missing_group")
+        );
+    }
+
+    #[test]
+    fn strategy_profiles_reject_empty_expansion_after_excludes() {
+        let groups = BTreeMap::from([("core_liquid_options".to_string(), vec!["SPY".to_string()])]);
+        let mut strategy = strategy_block(
+            "put_credit_empty",
+            "put_credit",
+            AlpacaOptionsStrategyMode::Live,
+            Vec::<String>::new(),
+        );
+        strategy.universe_groups = vec!["core_liquid_options".to_string()];
+        strategy.exclude_underlyings = vec!["SPY".to_string()];
+
+        let error = build_strategy_profiles(vec![strategy], groups)
+            .expect_err("exclude-empty universe should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("resolved no underlyings after excludes")
+        );
+    }
+
+    #[test]
+    fn runtime_config_rejects_positional_underlyings() {
+        let error =
+            build_options_runtime_config(runtime_config_file_for_tests(), vec!["SPY".to_string()])
+                .expect_err("positional underlyings should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("positional Alpaca underlyings are retired")
+        );
+    }
+
+    #[test]
+    fn dry_run_undefined_risk_profiles_do_not_require_live_permission() {
+        let config = minimal_policy_config(vec![
+            test_strategy_profile(
+                "iron_condor_live",
+                AlpacaOptionsStrategyFamily::IronCondor,
+                AlpacaOptionsStrategyMode::Live,
+                ["SPY"],
+            ),
+            test_strategy_profile(
+                "naked_put_watch",
+                AlpacaOptionsStrategyFamily::NakedPut,
+                AlpacaOptionsStrategyMode::DryRun,
+                ["SPY"],
+            ),
+            test_strategy_profile(
+                "naked_call_watch",
+                AlpacaOptionsStrategyFamily::NakedCall,
+                AlpacaOptionsStrategyMode::DryRun,
+                ["SPY"],
+            ),
+        ]);
+
+        assert!(has_defined_risk_strategies(&config));
+        assert!(!has_undefined_risk_strategies(&config));
+        assert!(!has_naked_put_profiles(&config));
+        assert!(!has_naked_call_profiles(&config));
     }
 
     #[test]
@@ -1850,9 +1980,11 @@ max_iterations = 0
 candidate_ledger_enabled = true
 candidate_ledger_max_candidates = 5
 
-[universe]
-underlyings = ["SPY", "GLD"]
-quantity = 1
+	[universe]
+	quantity = 1
+
+	[universe_groups.core]
+	members = ["SPY", "GLD"]
 
 [naked_scanner]
 max_buying_power_usage_pct = 0.10
@@ -1913,7 +2045,13 @@ GDX = "metals"
         assert_eq!(merged.runtime.max_iterations, Some(0));
         assert_eq!(merged.runtime.candidate_ledger_enabled, Some(true));
         assert_eq!(merged.runtime.candidate_ledger_max_candidates, Some(20));
-        assert_eq!(merged.universe.underlyings, vec!["SPY", "GLD"]);
+        assert_eq!(
+            merged
+                .universe_groups
+                .get("core")
+                .map(|group| group.members.clone()),
+            Some(vec!["SPY".to_string(), "GLD".to_string()]),
+        );
         assert_eq!(merged.universe.quantity, Some(1));
         assert_eq!(merged.naked_scanner.max_buying_power_usage_pct, Some(0.03),);
         assert_eq!(merged.naked_scanner.min_score, Some(70.0));
@@ -1977,10 +2115,9 @@ min_return_on_risk = 0.21
 max_active_entries = 1
 max_daily_submits = 1
 
-[universe]
-underlyings = ["SPY", "QQQ"]
-quantity = 2
-entry_start = "09:45"
+	[universe]
+	quantity = 2
+	entry_start = "09:45"
 entry_end = "14:30"
 entry_timezone = "America/New_York"
 
@@ -2117,7 +2254,7 @@ block_days_after_earnings = 2
         assert_eq!(config.runtime.close_orders, Some(true));
         assert_eq!(config.runtime.candidate_ledger_enabled, Some(true));
         assert_eq!(config.runtime.candidate_ledger_max_candidates, Some(7));
-        assert_eq!(config.universe.underlyings, vec!["SPY", "QQQ"]);
+        assert_eq!(config.universe.quantity, Some(2));
         assert_eq!(config.scanner.widths, Some(vec![2.0, 5.0]));
         assert_eq!(config.scanner.min_credit_to_width, Some(0.09));
         assert_eq!(config.iron_condor.min_return_on_risk, Some(0.20));
@@ -2201,5 +2338,168 @@ block_days_after_earnings = 2
         assert_eq!(config.event_shock.horizon_days, Some(60));
         assert_eq!(config.event_shock.block_days_before_earnings, Some(3));
         assert_eq!(config.event_shock.block_days_after_earnings, Some(2));
+    }
+
+    fn build_strategy_profiles(
+        strategies: Vec<StrategyBlockSection>,
+        universe_groups: BTreeMap<String, Vec<String>>,
+    ) -> anyhow::Result<Vec<AlpacaOptionsStrategyProfile>> {
+        strategy_profiles_from_file(
+            strategies,
+            &universe_groups,
+            1,
+            &PutCreditScannerConfig::default(),
+            &IronCondorScannerConfig::default(),
+            &DebitSpreadScannerConfig::default(),
+            &NakedOptionScannerConfig::default(),
+            &NakedOptionScannerConfig::default(),
+        )
+    }
+
+    fn strategy_block(
+        id: impl Into<String>,
+        family: impl Into<String>,
+        mode: AlpacaOptionsStrategyMode,
+        underlyings: impl IntoIterator<Item = impl Into<String>>,
+    ) -> StrategyBlockSection {
+        StrategyBlockSection {
+            id: Some(id.into()),
+            family: Some(family.into()),
+            mode: Some(mode.as_str().to_string()),
+            universe_groups: Vec::new(),
+            underlyings: underlyings.into_iter().map(Into::into).collect(),
+            include_underlyings: Vec::new(),
+            exclude_underlyings: Vec::new(),
+            quantity: Some(1),
+            scanner: StrategyScannerSection::default(),
+            risk: StrategyRiskOverrideSection::default(),
+        }
+    }
+
+    fn test_strategy_profile(
+        id: impl Into<String>,
+        family: AlpacaOptionsStrategyFamily,
+        mode: AlpacaOptionsStrategyMode,
+        underlyings: impl IntoIterator<Item = impl Into<String>>,
+    ) -> AlpacaOptionsStrategyProfile {
+        AlpacaOptionsStrategyProfile {
+            id: id.into(),
+            family,
+            mode,
+            universe_groups: Vec::new(),
+            include_underlyings: Vec::new(),
+            exclude_underlyings: Vec::new(),
+            underlyings: underlyings.into_iter().map(Into::into).collect(),
+            quantity: 1,
+            scanner: scanner_for_family(family),
+            risk: AlpacaOptionsStrategyRiskOverrides::default(),
+        }
+    }
+
+    fn scanner_for_family(
+        family: AlpacaOptionsStrategyFamily,
+    ) -> AlpacaOptionsStrategyScannerConfig {
+        match family {
+            AlpacaOptionsStrategyFamily::PutCredit | AlpacaOptionsStrategyFamily::CallCredit => {
+                AlpacaOptionsStrategyScannerConfig::Credit(PutCreditScannerConfig::default())
+            }
+            AlpacaOptionsStrategyFamily::IronCondor => {
+                AlpacaOptionsStrategyScannerConfig::IronCondor(IronCondorScannerConfig::default())
+            }
+            AlpacaOptionsStrategyFamily::PutDebit | AlpacaOptionsStrategyFamily::CallDebit => {
+                AlpacaOptionsStrategyScannerConfig::Debit(DebitSpreadScannerConfig::default())
+            }
+            AlpacaOptionsStrategyFamily::NakedPut
+            | AlpacaOptionsStrategyFamily::NakedCall
+            | AlpacaOptionsStrategyFamily::NakedPutOneToThreeDte
+            | AlpacaOptionsStrategyFamily::NakedCallOneToThreeDte => {
+                AlpacaOptionsStrategyScannerConfig::Naked(NakedOptionScannerConfig::default())
+            }
+        }
+    }
+
+    fn minimal_policy_config(
+        strategy_profiles: Vec<AlpacaOptionsStrategyProfile>,
+    ) -> AlpacaOptionsRuntimeConfig {
+        AlpacaOptionsRuntimeConfig {
+            underlyings: Vec::new(),
+            universe_groups: BTreeMap::new(),
+            strategy_profiles,
+            max_active_entries: None,
+            max_daily_submits: None,
+            max_open_orders: None,
+            max_active_entries_per_underlying: None,
+            max_active_entries_per_sector: None,
+            max_single_entry_risk_capital_usd: None,
+            max_portfolio_risk_capital_usd: None,
+            block_unestimated_risk_capital: true,
+            event_shock_earnings_events: Vec::new(),
+            event_shock: EventShockRuntimeStatus {
+                source: "test".to_string(),
+                scheduled_event_catalog_path: PathBuf::new(),
+                event_count: 0,
+                catalog_event_count: 0,
+                source_set: Vec::new(),
+                policy_versions: Vec::new(),
+                coverage_start: None,
+                coverage_end: None,
+                freshness: "unavailable".to_string(),
+                unavailable_reason: None,
+                rejected_count: 0,
+                csv_bridge_enabled: false,
+                csv_bridge_path: None,
+                dry_run_only: false,
+                required: false,
+            },
+            event_shock_block_days_before_earnings: 1,
+            event_shock_block_days_after_earnings: 1,
+            sectors: BTreeMap::new(),
+            max_iterations: 1,
+            interval_secs: 300,
+            quantity: 1,
+            open_orders_enabled: true,
+            force_flatten: false,
+            cancel_after_accept: false,
+            stale_entry_secs: 900,
+            stale_close_secs: 900,
+            close_orders_enabled: false,
+            close_regular_hours_only: true,
+            close_start: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            close_end: NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+            close_price_cushion: 0.0,
+            close_reprice_step: 0.0,
+            max_close_price_cushion: 0.0,
+            max_close_attempts: 3,
+            close_reprice_cooldown_secs: 30,
+            active_risk_candidate_quote_limit: 5,
+            active_risk_quote_stale_secs: 30,
+            profit_target_close_fraction: 0.5,
+            stop_loss_close_multiple: 2.0,
+            max_hold_secs: 0,
+            expiration_exit_days: 1,
+            lifecycle_poll_secs: 300,
+            lifecycle_activity_lookback_hours: 72,
+            lifecycle_activity_block_hours: 24,
+            expiration_entry_block_days: 0,
+            ignore_entry_window: false,
+            entry_start: NaiveTime::from_hms_opt(9, 45, 0).unwrap(),
+            entry_end: NaiveTime::from_hms_opt(14, 30, 0).unwrap(),
+            entry_timezone: "America/New_York".parse().unwrap(),
+            state_path: PathBuf::new(),
+            candidate_ledger_enabled: true,
+            candidate_ledger_max_candidates: 10,
+            scanner: PutCreditScannerConfig::default(),
+            iron_condor_scanner: IronCondorScannerConfig::default(),
+            debit_scanner: DebitSpreadScannerConfig::default(),
+            naked_scanner: NakedOptionScannerConfig::default(),
+            naked_1_3dte_scanner: NakedOptionScannerConfig::default(),
+            fleet: None,
+            fleet_account_id: None,
+            fleet_policy_blocks: Vec::new(),
+            operational_repository: None,
+            operational_database_url: None,
+            operational_schema: OPERATIONAL_SCHEMA_DEFAULT.to_string(),
+            operational_account_id: None,
+        }
     }
 }
