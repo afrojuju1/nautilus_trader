@@ -492,21 +492,18 @@ operator visibility before live enablement.
 
 Phase 7 earnings input policy:
 
-- Earnings events must come from an operator-approved local CSV with
-  `underlying,report_date,timing,source` columns.
-- `report_date` is exchange-local `YYYY-MM-DD`.
-- `timing` must be `before_open`, `after_close`, or `unknown`; unknown timing is blocked by the
-  default entry policy.
-- The `earnings` module parses and filters events by entry window without Alpaca credentials.
+- Earnings is the first use of the source-neutral
+  [Scheduled Event Engine](scheduled_event_engine.md). Alpha Vantage is one source adapter, not the
+  event model.
+- Provider adapters fetch raw evidence and write normalized `ScheduledEventObservation` custom data
+  through `ParquetDataCatalog`. A resolver writes canonical event decisions. Approval policy writes
+  the strategy-safe approved scheduled-event custom data consumed by event-load and admission.
+- `report_date` is exchange-local `YYYY-MM-DD`. `timing` must normalize to `before_open`,
+  `after_close`, `during_session`, or `unknown`; unknown timing remains conservative by default.
 - Do not infer earnings dates from broker option chains or snapshots.
-- Alpha Vantage is the first approved low-cost upstream source. `earnings-sync` downloads
-  `EARNINGS_CALENDAR`, caches the raw CSV for 23 hours by default, and writes normalized events to
-  `$XDG_STATE_HOME/nautilus_trader/earnings/earnings_events.csv` or
-  `$HOME/.local/state/nautilus_trader/earnings/earnings_events.csv`.
-- `earnings-sync` also writes `earnings_events_approved.csv`, which applies the default
-  strategy-safe filter: known timing only, future/default-window reports only, weekday reports only,
-  and common listed-equity symbol shape only. Full raw normalized output remains available for
-  diagnostics and manual review.
+- Current `earnings_events.csv` / `earnings_events_approved.csv` support is migration wiring for the
+  Alpaca runtime only. The durable runtime contract is the approved scheduled-event catalog plus a
+  read-only loader that maps approved events into `RegimeEvent` and entry-admission blocks.
 - `DebitSpreadScannerConfig`, `scan_call_debit_underlying`, `scan_put_debit_underlying`, and
   pure candidate builders now cover initial earnings-debit scanner mechanics.
 
@@ -607,9 +604,9 @@ High-value after the required platform work:
      router types and a real read-only feature actor. Do not add fake `neutral` regime metadata to
      ledgers just to create a router-shaped surface.
    - Build this as a Nautilus-native routing layer, not a standalone scanner. A read-only regime
-     feature actor derives features from bars, option-chain state, external signals, and approved
-     historical feature sources; a pure regime router returns labels, confidence, explanation codes,
-     and strategy-family weights.
+     feature actor derives features from bars, option-chain state, approved scheduled-event inputs,
+     and approved historical feature sources; a pure regime router returns labels, confidence,
+     explanation codes, and strategy-family weights.
    - Route strategy families, not individual orders. Risk admission remains the final gate, and the
      router must not submit orders, mutate strategy state, or call Alpaca directly.
    - Record regime label, confidence, feature freshness, feature version, routing action, and
@@ -702,11 +699,11 @@ Reference sources:
 
 Parked next steps for earnings debit:
 
-- Add earnings strategy config for approved CSV path, call/put debit enablement, entry window, max
-  candidates, sizing, and submit gate. Submission remains disabled by default.
-- Add dry-run earnings selection: read `earnings_events_approved.csv`, scan eligible call/put debit
-  candidates, require Alpaca option-chain and snapshot liquidity, and emit explicit strategy
-  decisions without broker submission.
+- Add earnings strategy config for scheduled-event catalog path, call/put debit enablement, entry
+  window, max candidates, sizing, and submit gate. Submission remains disabled by default.
+- Add dry-run earnings selection: read approved earnings events through the scheduled-event catalog
+  loader, scan eligible call/put debit candidates, require Alpaca option-chain and snapshot
+  liquidity, and emit explicit strategy decisions without broker submission.
 - Host earnings debit in the single Alpaca account engine as another `StrategyRuntime`; do not add
   another account-owning service.
 - Define long-premium management rules before any non-smoke paper open: max debit at entry,

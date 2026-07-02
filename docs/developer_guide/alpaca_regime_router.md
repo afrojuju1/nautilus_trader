@@ -1,8 +1,9 @@
 # Alpaca Regime Router
 
 Status: v1 feature input contract defined; option-chain liquidity, cached underlying bar, derived
-trend/vol, and approved earnings event-load snapshots implemented; fail-conservative router slice
-implemented.
+trend/vol, and earnings event-load snapshots implemented; fail-conservative router slice
+implemented. The durable event-load source is the Parquet-backed scheduled event engine; current
+Alpaca CSV feed wiring is a migration bridge.
 
 This document defines the target architecture for Alpaca option strategy regime routing. It refines
 the regime-router slice described in the Nautilus-native candidate scanning architecture and the
@@ -165,7 +166,7 @@ V1 is intentionally deterministic and source-limited. The approved inputs are:
 | Underlying bars | Yes | Nautilus bar cache/stream, `ParquetDataCatalog`, or ClickHouse market-data warehouse. Current scanner requests daily underlying bars through standard Alpaca `request_bars`. | Live: last complete bar must satisfy the configured stale-after window. Replay: bar timestamp must be at or before decision time. |
 | Underlying trend/vol features | Yes | Derived from approved bars. Current scanner derives close-to-close window return, mean return, and realized volatility from cached underlying bars. | Computed from the same fresh bar snapshot as the underlying bars. |
 | Option liquidity snapshot | Yes for families under consideration | `OptionChainSlice`, Nautilus quote cache, Alpaca option snapshot adapter, or future option quote stream. | Quote age must be no older than `management.active_risk_quote_stale_secs` for selected legs when available; chain-level summaries must name their source timestamp. |
-| Event load | Yes | Normalized earnings feed and event cache used by Alpaca admission. Current scanner reuses the configured approved earnings events and event-shock window. | Earnings data must cover the trade date and next configured event-block window. Unknown timing remains blocking unless explicitly allowed by the event policy. |
+| Event load | Yes | Approved scheduled-event custom data from the [Scheduled Event Engine](scheduled_event_engine.md), persisted through `ParquetDataCatalog`. Current Alpaca scanner may bridge from the configured approved earnings feed until the runtime reader loads the catalog directly. | Approved events must cover the trade date and next configured event-block window. Unknown or conflicted timing remains blocking unless explicitly allowed by the event policy. |
 | Portfolio stress summary | Optional in v1 | Existing risk-capital state, strategy state, broker positions, and future Greek/stress governor output. | Must be produced in the same decision pass as risk admission if used for routing. |
 | Breadth/proxy instruments | Optional in v1 | Configured ETF/index proxies from approved bar sources. | Use only when every configured proxy passes the bar freshness rule; otherwise mark the feature group unavailable. |
 | Historical feature snapshot | Optional in v1 | ClickHouse or catalog-derived feature snapshots. | Replay: as-of timestamp must be no later than decision time. Live: snapshot must be current for the configured session. |
@@ -174,7 +175,8 @@ Disallowed v1 inputs:
 
 - Ad hoc environment reads inside the router.
 - Direct Alpaca HTTP calls from the router.
-- Raw CSV parsing by the router.
+- Raw CSV, provider payload, or Parquet catalog parsing by the router. A runtime reader must supply
+  complete normalized event-load inputs.
 - Placeholder, default, or hand-filled `neutral` labels.
 - Model outputs without deterministic feature values and explanation codes.
 
@@ -435,8 +437,9 @@ Minimum validation reports:
 - Current feature values: `option_liquidity` includes contract and quote counts, two-sided quote
   coverage, median spread percentage, wide-quote ratio, open-interest coverage, implied-volatility
   coverage, chain source timestamp, and freshness. `underlying_bars` and `underlying_trend_vol`
-  come from cached/requested Nautilus bars. `event_load` uses source-neutral scheduled-event inputs;
-  the Alpaca runtime currently converts approved earnings event-shock data into that contract.
+  come from cached/requested Nautilus bars. `event_load` uses source-neutral scheduled-event custom
+  data from the scheduled event engine; the Alpaca runtime currently converts approved earnings
+  event-shock data into that contract only as migration wiring.
 - Current routing behavior: the scanner computes a pure `RegimeContext` from the feature snapshot,
   filters blocked strategy families before candidate selection, writes the context into scanner and
   candidate ledgers, and passes the same context through `OptionsCandidateData`.
@@ -452,8 +455,12 @@ Minimum validation reports:
 - `unknown` policy: when the router is enabled and required features fail, produce `unknown`,
   `dry_run_only = true`, and block undefined-risk families. Omit regime metadata entirely when the
   router is disabled.
-- Storage boundary: candidate ledgers receive compact `RegimeContext` and freshness evidence;
-  ClickHouse/catalog own high-volume feature snapshots and series.
+- Event-load storage boundary: source adapters, the resolver, and approval policy belong to the
+  scheduled event engine. Observation, decision, and approved event facts are registered Nautilus
+  custom data stored through `ParquetDataCatalog`. Candidate ledgers receive compact
+  `RegimeContext` and freshness evidence; they do not store raw provider payloads or own event
+  resolution.
+- Feature storage boundary: ClickHouse/catalog own high-volume feature snapshots and series.
 
 ## Truly Open Questions
 

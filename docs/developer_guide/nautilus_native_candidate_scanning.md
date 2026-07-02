@@ -40,7 +40,7 @@ flowchart LR
     subgraph Venue ["Venue and External Data"]
         AlpacaRest["Alpaca REST"]
         AlpacaWs["Alpaca WebSocket"]
-        ExternalSignals["External signals<br/>earnings, calendars, allowlists"]
+        EventSources["Scheduled event sources<br/>earnings, calendars, allowlists"]
     end
 
     subgraph Adapter ["Alpaca Adapter"]
@@ -64,6 +64,7 @@ flowchart LR
         StrategyProfiles["Strategy profiles"]
         UniverseResolver["Option universe resolver"]
         RegimeRouter["Regime router"]
+        EventReader["Scheduled event reader"]
         CandidateEngine["Pure candidate engine"]
         SelectionPolicy["Selection policy"]
         RiskAdmission["Risk and admission gates"]
@@ -81,6 +82,7 @@ flowchart LR
         StrategyState["Strategy state"]
         PerformanceLedger["Performance ledger"]
         FeatureStore["Feature store<br/>catalog or ClickHouse"]
+        EventCatalog["Scheduled event catalog<br/>CustomData Parquet"]
     end
 
     AlpacaRest --> HttpClient
@@ -102,9 +104,11 @@ flowchart LR
     StrategyProfiles --> UniverseResolver
     StrategyProfiles --> ScanActor
     Cache --> UniverseResolver
-    ExternalSignals --> UniverseResolver
+    EventSources --> EventCatalog
+    EventCatalog --> EventReader
+    EventReader --> UniverseResolver
     Cache --> RegimeRouter
-    ExternalSignals --> RegimeRouter
+    EventReader --> RegimeRouter
     FeatureStore --> RegimeRouter
     RegimeActor --> RegimeRouter
     RegimeRouter --> CandidateEngine
@@ -192,14 +196,22 @@ live fixed-expiry policy.
 Nautilus data, query approved historical feature sources, and publish or persist normalized regime
 features. It should not select strategies or submit orders.
 
+`ScheduledEventEngine` owns earnings and other non-price event ingestion. It uses provider adapters
+to write normalized observations, resolver decisions, and approved scheduled events into a
+source-neutral `ParquetDataCatalog` as registered custom data. Runtime actors and strategies use a
+read-only scheduled-event reader to obtain approved event-load inputs; they do not read raw provider
+payloads or generated CSV files. The focused architecture lives in
+[Scheduled Event Engine](scheduled_event_engine.md).
+
 `RegimeRouter` owns strategy-family routing from market context. It should be a pure classifier that
-accepts normalized features, optional external signals, and optional portfolio context, then returns
-a regime label plus strategy-family weights or blocks. It should not call Alpaca, query environment
-variables, write ledgers directly from deep scoring code, or submit orders.
+accepts normalized features, approved scheduled-event inputs, and optional portfolio context, then
+returns a regime label plus strategy-family weights or blocks. It should not call Alpaca, query
+environment variables, write ledgers directly from deep scoring code, or submit orders.
 
 `CandidateEngine` owns pure candidate ranking. It should accept normalized inputs such as
-`OptionChainSlice`, account-independent strategy config, regime context, and optional external
-signals. It should not read environment variables, call Alpaca, submit orders, or write ledgers.
+`OptionChainSlice`, account-independent strategy config, regime context, and approved
+scheduled-event inputs. It should not read environment variables, call Alpaca, submit orders, or
+write ledgers.
 
 `CandidateScanActor` is the read-only runtime surface. In the current Alpaca implementation it is
 also the adapter-housed orchestrator that turns resolved profile universe intent into
@@ -239,7 +251,7 @@ CandidateContract / CandidateMarketSnapshot
   option chain slice or normalized chain snapshot
   regime context
   underlying state
-  optional external signals
+  approved scheduled-event inputs
   optional account/risk context for ranking only
 
 OptionsCandidateSet / candidate scan result
@@ -271,7 +283,7 @@ ownership.
 | 3. REST input adapter | Current operations use the target input model. | Convert Alpaca contract and snapshot responses into normalized candidate inputs; update existing binaries and the options engine to consume candidate-engine types directly. | Implemented for the current Alpaca REST scanner adapter in `strategy.rs`; dry-run scans and the current options engine keep producing the same candidate and ledger evidence through the target input model. |
 | 4. Option-chain input adapter | Nautilus-native market-state input. | Convert `OptionChainSlice` and cached instruments into the same candidate input model. | The same candidate engine can rank candidates from REST snapshots or `OptionChainSlice` events. |
 | 5. Regime router boundary | Reusable strategy-family routing. | Add pure `RegimeInput`, `RegimeContext`, and routing-policy types with threshold-based labels and explanation codes. | Candidate ranking can accept regime context without calling venue APIs or reading operator config. |
-| 6. Regime feature actor | Native feature surface. | Add a read-only actor or service that computes feature snapshots from Nautilus data, catalog/ClickHouse history, and external signals. | A scan records regime label, feature freshness, and routing decision in the candidate ledger. |
+| 6. Regime feature actor | Native feature surface. | Add a read-only actor or service that computes feature snapshots from Nautilus data, catalog/ClickHouse history, and approved scheduled-event inputs. | A scan records regime label, feature freshness, and routing decision in the candidate ledger. |
 | 7. Read-only scan actor | Native scan and alert surface. | Add an `CandidateScanActor` that runs scheduled or event-driven scans, records ledgers, and publishes alerts without order submission. | One-shot and interval scans can run inside a `TradingNode` without the standalone scanner loop. |
 | 8. Entry strategy | Standard order-capable path. | Add an `AlpacaOptionsAccountStrategy` that consumes candidate sets, applies regime routing, selection, and risk admission, then submits through Nautilus order flow. | Paper dry-run and paper submit paths use the strategy path instead of bespoke scanner submission glue. |
 | 9. Management and cleanup | Slim runtime with fewer parallel paths. | Move close/flatten lifecycle into an `OptionsManagementStrategy`; retire one-off scanner binaries once operator commands use actor/strategy surfaces. | Active docs and operator commands point at the Nautilus-native path, with REST-only scanners kept only where they remain useful diagnostics. |
@@ -405,16 +417,18 @@ small runtime overrides. Do not add new live flags that choose strategy families
 outside the profile model.
 
 Ranking should remain mostly account-independent. Candidate quality should be replayable from
-market data, strategy config, regime context, and explicit external signals. Account and portfolio
-context can influence ranking only where it changes the economic quality of the candidate, such as
-naked-option buying-power usage or portfolio-level Greek and correlation exposure. Hard controls
-such as kill switches, broker permissions, duplicate underlyings, max active entries, open orders,
-and account tradability belong in risk admission.
+market data, strategy config, regime context, and approved scheduled-event inputs. Account and
+portfolio context can influence ranking only where it changes the economic quality of the
+candidate, such as naked-option buying-power usage or portfolio-level Greek and correlation
+exposure. Hard controls such as kill switches, broker permissions, duplicate underlyings, max active
+entries, open orders, and account tradability belong in risk admission.
 
 External signals should be provider-owned normalized data. Earnings calendars, allowlists, market
-calendars, and similar inputs may use cached files as ingest cache and evidence, but actors and
-strategies should consume normalized signal snapshots rather than read CSVs or environment-specific
-files directly.
+calendars, and similar inputs belong in the scheduled event engine. Provider adapters may retain raw
+payloads as audit evidence, but normalized observations, resolver decisions, and approved runtime
+events should be registered custom data persisted through `ParquetDataCatalog`. Actors and
+strategies consume approved signal snapshots through a typed reader rather than reading CSVs or
+environment-specific files directly.
 
 Ledger migration should preserve evidence semantics, not the old physical shape. Keep stable
 candidate identity keys, scan diagnostics, ranked-candidate evidence, selected/blocked/submitted
