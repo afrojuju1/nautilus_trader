@@ -20,8 +20,19 @@
 
 use std::{fs, path::Path, str::FromStr};
 
+#[cfg(feature = "live")]
+use chrono::{DateTime, SecondsFormat, Utc};
 use chrono::{Datelike, NaiveDate};
+#[cfg(feature = "live")]
+use nautilus_core::UnixNanos;
+#[cfg(feature = "live")]
+use nautilus_trading::scheduled_events::ScheduledEventObservation;
 use thiserror::Error;
+
+#[cfg(feature = "live")]
+const EARNINGS_EVENT_TYPE: &str = "earnings_report";
+#[cfg(feature = "live")]
+const US_EQUITY_EVENT_TIMEZONE: &str = "America/New_York";
 
 /// Earnings-calendar parsing and policy error.
 #[derive(Debug, Error)]
@@ -124,6 +135,22 @@ pub struct EarningsEvent {
     pub timing: EarningsTiming,
     /// Operator-approved event source label.
     pub source: String,
+}
+
+/// Provenance attached to scheduled-event observations produced from earnings input rows.
+#[cfg(feature = "live")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EarningsObservationProvenance {
+    /// Source adapter label written to scheduled-event observations.
+    pub source: String,
+    /// URI or local path for the raw evidence payload.
+    pub raw_uri: String,
+    /// SHA-256 digest for the raw evidence payload.
+    pub raw_sha256: String,
+    /// When the source payload was fetched or observed.
+    pub source_fetched_at_utc: DateTime<Utc>,
+    /// When the source published the payload, if known.
+    pub source_published_at_utc: Option<DateTime<Utc>>,
 }
 
 /// Entry policy for earnings debit-spread candidates.
@@ -338,6 +365,41 @@ pub fn parse_alpha_vantage_earnings_calendar_csv(
     Ok(events)
 }
 
+/// Converts normalized earnings events into source-neutral scheduled-event observations.
+#[cfg(feature = "live")]
+#[must_use]
+pub fn earnings_events_to_observations(
+    events: &[EarningsEvent],
+    provenance: &EarningsObservationProvenance,
+) -> Vec<ScheduledEventObservation> {
+    events
+        .iter()
+        .map(|event| {
+            let source_event_id = earnings_source_event_id(event);
+            ScheduledEventObservation {
+                observation_id: format!("{}:{source_event_id}", provenance.source),
+                event_type: EARNINGS_EVENT_TYPE.to_string(),
+                source: provenance.source.clone(),
+                source_event_id,
+                underlying: event.underlying.clone(),
+                event_date: event.report_date.to_string(),
+                timing: event.timing.as_str().to_string(),
+                timezone: US_EQUITY_EVENT_TIMEZONE.to_string(),
+                source_published_at_utc: provenance
+                    .source_published_at_utc
+                    .map(format_utc_timestamp)
+                    .unwrap_or_default(),
+                source_fetched_at_utc: format_utc_timestamp(provenance.source_fetched_at_utc),
+                raw_uri: provenance.raw_uri.clone(),
+                raw_sha256: provenance.raw_sha256.clone(),
+                quality_flags: earnings_quality_flags(event),
+                ts_event: unix_nanos_from_report_date(event.report_date),
+                ts_init: unix_nanos_from_utc(provenance.source_fetched_at_utc),
+            }
+        })
+        .collect()
+}
+
 /// Formats earnings events as normalized CSV.
 #[must_use]
 pub fn format_earnings_events_csv(events: &[EarningsEvent]) -> String {
@@ -432,6 +494,58 @@ fn alpha_vantage_timing(value: Option<&str>) -> Option<EarningsTiming> {
         "post-market" => Some(EarningsTiming::AfterClose),
         _ => parse_timing(value),
     }
+}
+
+#[cfg(feature = "live")]
+fn earnings_source_event_id(event: &EarningsEvent) -> String {
+    format!(
+        "{}:{}:{}",
+        event.underlying,
+        event.report_date,
+        event.timing.as_str()
+    )
+}
+
+#[cfg(feature = "live")]
+fn earnings_quality_flags(event: &EarningsEvent) -> String {
+    let mut flags = Vec::new();
+
+    if event.timing == EarningsTiming::Unknown {
+        flags.push("unknown_timing");
+    } else {
+        flags.push("timing_present");
+    }
+    if !is_weekday(event.report_date) {
+        flags.push("weekend_report_date");
+    }
+    if !is_common_listed_equity_symbol(&event.underlying) {
+        flags.push("non_common_symbol");
+    }
+
+    flags.join("|")
+}
+
+#[cfg(feature = "live")]
+fn format_utc_timestamp(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+#[cfg(feature = "live")]
+fn unix_nanos_from_report_date(date: NaiveDate) -> UnixNanos {
+    date.and_hms_opt(0, 0, 0)
+        .and_then(|datetime| datetime.and_utc().timestamp_nanos_opt())
+        .and_then(|nanos| u64::try_from(nanos).ok())
+        .map(UnixNanos::from)
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "live")]
+fn unix_nanos_from_utc(value: DateTime<Utc>) -> UnixNanos {
+    value
+        .timestamp_nanos_opt()
+        .and_then(|nanos| u64::try_from(nanos).ok())
+        .map(UnixNanos::from)
+        .unwrap_or_default()
 }
 
 fn is_weekday(date: NaiveDate) -> bool {
@@ -551,5 +665,44 @@ mod tests {
         let normalized = format_earnings_events_csv(&events);
 
         assert_eq!(parse_earnings_events_csv(&normalized).unwrap(), events);
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn earnings_events_to_observations_preserve_source_provenance() {
+        use chrono::TimeZone;
+
+        let events = parse_alpha_vantage_earnings_calendar_csv(
+            "symbol,name,reportDate,fiscalDateEnding,estimate,currency,timeOfTheDay\nADCT,ADC THERAPEUTICS SA,2026-05-04,2026-03-31,-0.19,USD,pre-market\nNABZY,NABZY,2026-05-03,2026-03-31,,USD,\n",
+        )
+        .unwrap();
+        let fetched_at = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+        let provenance = EarningsObservationProvenance {
+            source: "alpha_vantage".to_string(),
+            raw_uri: "file:///tmp/alpha_vantage.csv".to_string(),
+            raw_sha256: "abc123".to_string(),
+            source_fetched_at_utc: fetched_at,
+            source_published_at_utc: None,
+        };
+
+        let observations = earnings_events_to_observations(&events, &provenance);
+
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].event_type, "earnings_report");
+        assert_eq!(observations[0].source, "alpha_vantage");
+        assert_eq!(observations[0].underlying, "ADCT");
+        assert_eq!(observations[0].timing, "before_open");
+        assert_eq!(
+            observations[0].source_fetched_at_utc,
+            "2026-05-01T12:00:00Z"
+        );
+        assert_eq!(observations[0].raw_sha256, "abc123");
+        assert_eq!(observations[0].quality_flags, "timing_present");
+        assert!(observations[1].quality_flags.contains("unknown_timing"));
+        assert!(
+            observations[1]
+                .quality_flags
+                .contains("weekend_report_date")
+        );
     }
 }
