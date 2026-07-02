@@ -14,7 +14,8 @@ use std::{
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, SecondsFormat, Utc};
 use nautilus_core::UnixNanos;
-use nautilus_model::data::{CustomData, DataType};
+use nautilus_model::data::{CustomData, Data, DataType};
+use nautilus_persistence::backend::catalog::ParquetDataCatalog;
 use nautilus_persistence_macros::custom_data;
 use nautilus_serialization::ensure_custom_data_registered;
 
@@ -285,6 +286,157 @@ impl Default for ScheduledEventApprovalPolicy {
     }
 }
 
+/// Query parameters for loading approved scheduled events at runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovedScheduledEventLoadRequest {
+    /// Event type to load, such as `earnings_report`.
+    pub event_type: String,
+    /// Runtime decision date.
+    pub as_of_date: NaiveDate,
+    /// Runtime decision timestamp.
+    pub as_of_utc: DateTime<Utc>,
+    /// Number of calendar days before `as_of_date` to include.
+    pub lookback_days: i64,
+    /// Number of calendar days after `as_of_date` to include.
+    pub horizon_days: i64,
+    /// Optional uppercase underlyings to filter. Empty means all underlyings.
+    pub underlyings: Vec<String>,
+    /// Maximum age of approved data before it is considered stale.
+    pub stale_after_days: i64,
+}
+
+impl ApprovedScheduledEventLoadRequest {
+    /// Creates a request for a scheduled-event type and date window.
+    #[must_use]
+    pub fn new(
+        event_type: impl Into<String>,
+        as_of_date: NaiveDate,
+        as_of_utc: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            event_type: event_type.into(),
+            as_of_date,
+            as_of_utc,
+            lookback_days: 0,
+            horizon_days: 0,
+            underlyings: Vec::new(),
+            stale_after_days: 1,
+        }
+    }
+
+    fn window_start(&self) -> NaiveDate {
+        self.as_of_date - Duration::days(self.lookback_days.max(0))
+    }
+
+    fn window_end(&self) -> NaiveDate {
+        self.as_of_date + Duration::days(self.horizon_days.max(0))
+    }
+}
+
+/// Freshness status for an approved scheduled-event loader response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScheduledEventLoadFreshness {
+    /// Runtime-relevant approved data exists and is fresh.
+    Fresh,
+    /// No matching approved-event data exists.
+    Missing,
+    /// Matching approved-event data exists but is stale.
+    Stale,
+    /// Approved data exists but does not cover the requested event-date window.
+    OutOfWindow,
+}
+
+impl ScheduledEventLoadFreshness {
+    /// Returns the stable lowercase label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Missing => "missing",
+            Self::Stale => "stale",
+            Self::OutOfWindow => "out_of_window",
+        }
+    }
+}
+
+/// Runtime loader output for approved scheduled events.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApprovedScheduledEventLoadReport {
+    /// Runtime-relevant events in the requested window.
+    pub events: Vec<ApprovedScheduledEvent>,
+    /// Count of runtime-relevant events in `events`.
+    pub event_count: usize,
+    /// Source labels represented by the matching dataset.
+    pub source_set: Vec<String>,
+    /// Approval policy versions represented by the matching dataset.
+    pub policy_versions: Vec<String>,
+    /// Minimum event date present for matching underlyings.
+    pub coverage_start: Option<NaiveDate>,
+    /// Maximum event date present for matching underlyings.
+    pub coverage_end: Option<NaiveDate>,
+    /// Freshness status for the response.
+    pub freshness: ScheduledEventLoadFreshness,
+    /// Machine-readable reason when data is not fresh.
+    pub unavailable_reason: Option<String>,
+    /// Count of rejected records seen in the matching dataset.
+    pub rejected_count: usize,
+}
+
+/// Loads approved scheduled events from a [`ParquetDataCatalog`].
+///
+/// The loader is read-only. It returns `approved` and `block_only` records in the requested window;
+/// `rejected` records are counted for diagnostics and excluded from runtime consumption.
+///
+/// # Errors
+///
+/// Returns an error if the catalog query or custom-data decode fails.
+pub fn load_approved_scheduled_events(
+    catalog_path: &Path,
+    request: &ApprovedScheduledEventLoadRequest,
+) -> anyhow::Result<ApprovedScheduledEventLoadReport> {
+    if !catalog_path.exists() {
+        return Ok(ApprovedScheduledEventLoadReport::unavailable(
+            ScheduledEventLoadFreshness::Missing,
+            "catalog_missing",
+        ));
+    }
+
+    ensure_scheduled_event_custom_data_registered();
+    let mut catalog =
+        ParquetDataCatalog::from_uri(&catalog_path.to_string_lossy(), None, None, None, None)?;
+    let identifiers = vec![ApprovedScheduledEvent::catalog_identifier(
+        &request.event_type,
+    )];
+    let data = catalog.query_custom_data_dynamic(
+        ApprovedScheduledEvent::TYPE_NAME,
+        Some(&identifiers),
+        None,
+        None,
+        None,
+        None,
+        true,
+    )?;
+    let events = approved_events_from_data(data)?;
+
+    Ok(build_approved_event_report(events, request))
+}
+
+impl ApprovedScheduledEventLoadReport {
+    fn unavailable(freshness: ScheduledEventLoadFreshness, reason: &str) -> Self {
+        Self {
+            events: Vec::new(),
+            event_count: 0,
+            source_set: Vec::new(),
+            policy_versions: Vec::new(),
+            coverage_start: None,
+            coverage_end: None,
+            freshness,
+            unavailable_reason: Some(reason.to_string()),
+            rejected_count: 0,
+        }
+    }
+}
+
 /// Resolves observations into canonical scheduled-event decisions.
 #[must_use]
 pub fn resolve_scheduled_event_observations(
@@ -502,6 +654,190 @@ fn approval_status_and_reason(
         APPROVAL_REJECTED.to_string(),
         format!("decision_status:{}", decision.status),
     )
+}
+
+fn approved_events_from_data(data: Vec<Data>) -> anyhow::Result<Vec<ApprovedScheduledEvent>> {
+    let mut events = Vec::with_capacity(data.len());
+
+    for item in data {
+        let Data::Custom(custom) = item else {
+            anyhow::bail!("expected ApprovedScheduledEvent custom data");
+        };
+        let Some(event) = custom
+            .data
+            .as_any()
+            .downcast_ref::<ApprovedScheduledEvent>()
+        else {
+            anyhow::bail!(
+                "expected {}, got {}",
+                ApprovedScheduledEvent::TYPE_NAME,
+                custom.data.type_name()
+            );
+        };
+        events.push(event.clone());
+    }
+
+    Ok(events)
+}
+
+fn build_approved_event_report(
+    events: Vec<ApprovedScheduledEvent>,
+    request: &ApprovedScheduledEventLoadRequest,
+) -> ApprovedScheduledEventLoadReport {
+    let matching_underlyings = matching_underlying_events(events, request);
+    if matching_underlyings.is_empty() {
+        return ApprovedScheduledEventLoadReport::unavailable(
+            ScheduledEventLoadFreshness::Missing,
+            "events_missing",
+        );
+    }
+
+    let coverage_start = matching_underlyings
+        .iter()
+        .filter_map(|event| parse_event_date(&event.event_date))
+        .min();
+    let coverage_end = matching_underlyings
+        .iter()
+        .filter_map(|event| parse_event_date(&event.event_date))
+        .max();
+    let source_set = sorted_token_set(
+        matching_underlyings
+            .iter()
+            .map(|event| event.source_set.as_str()),
+    );
+    let policy_versions = sorted_token_set(
+        matching_underlyings
+            .iter()
+            .map(|event| event.policy_version.as_str()),
+    );
+    let rejected_count = matching_underlyings
+        .iter()
+        .filter(|event| event.approval_status == APPROVAL_REJECTED)
+        .count();
+    let window_events = matching_underlyings
+        .into_iter()
+        .filter(|event| {
+            parse_event_date(&event.event_date).is_some_and(|event_date| {
+                request.window_start() <= event_date && event_date <= request.window_end()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let runtime_events = window_events
+        .into_iter()
+        .filter(|event| is_runtime_relevant_approval(&event.approval_status))
+        .collect::<Vec<_>>();
+    let freshness = report_freshness(&runtime_events, request, coverage_start, coverage_end);
+    let unavailable_reason = unavailable_reason(freshness, &runtime_events);
+
+    ApprovedScheduledEventLoadReport {
+        event_count: runtime_events.len(),
+        events: runtime_events,
+        source_set,
+        policy_versions,
+        coverage_start,
+        coverage_end,
+        freshness,
+        unavailable_reason,
+        rejected_count,
+    }
+}
+
+fn matching_underlying_events(
+    events: Vec<ApprovedScheduledEvent>,
+    request: &ApprovedScheduledEventLoadRequest,
+) -> Vec<ApprovedScheduledEvent> {
+    let underlyings = request
+        .underlyings
+        .iter()
+        .map(|underlying| normalize_underlying(underlying))
+        .collect::<BTreeSet<_>>();
+
+    events
+        .into_iter()
+        .filter(|event| event.event_type == request.event_type)
+        .filter(|event| {
+            underlyings.is_empty() || underlyings.contains(&normalize_underlying(&event.underlying))
+        })
+        .collect()
+}
+
+fn report_freshness(
+    runtime_events: &[ApprovedScheduledEvent],
+    request: &ApprovedScheduledEventLoadRequest,
+    coverage_start: Option<NaiveDate>,
+    coverage_end: Option<NaiveDate>,
+) -> ScheduledEventLoadFreshness {
+    if runtime_events.is_empty() {
+        if coverage_start.is_some_and(|start| start > request.window_end())
+            || coverage_end.is_some_and(|end| end < request.window_start())
+        {
+            return ScheduledEventLoadFreshness::OutOfWindow;
+        }
+        return ScheduledEventLoadFreshness::Missing;
+    }
+
+    if runtime_events
+        .iter()
+        .all(|event| event_is_stale(event, request))
+    {
+        return ScheduledEventLoadFreshness::Stale;
+    }
+
+    ScheduledEventLoadFreshness::Fresh
+}
+
+fn event_is_stale(
+    event: &ApprovedScheduledEvent,
+    request: &ApprovedScheduledEventLoadRequest,
+) -> bool {
+    let valid_until_stale = parse_utc(&event.valid_until_utc)
+        .map_or(true, |valid_until| valid_until < request.as_of_utc);
+    let approved_at_stale = parse_utc(&event.approved_at_utc).map_or(true, |approved_at| {
+        approved_at + Duration::days(request.stale_after_days.max(0)) < request.as_of_utc
+    });
+
+    valid_until_stale || approved_at_stale
+}
+
+fn unavailable_reason(
+    freshness: ScheduledEventLoadFreshness,
+    runtime_events: &[ApprovedScheduledEvent],
+) -> Option<String> {
+    match freshness {
+        ScheduledEventLoadFreshness::Fresh => None,
+        ScheduledEventLoadFreshness::Missing if runtime_events.is_empty() => {
+            Some("events_missing".to_string())
+        }
+        ScheduledEventLoadFreshness::Missing => Some("events_missing".to_string()),
+        ScheduledEventLoadFreshness::Stale => Some("events_stale".to_string()),
+        ScheduledEventLoadFreshness::OutOfWindow => Some("events_out_of_window".to_string()),
+    }
+}
+
+fn is_runtime_relevant_approval(status: &str) -> bool {
+    matches!(status, APPROVAL_APPROVED | APPROVAL_BLOCK_ONLY)
+}
+
+fn sorted_token_set<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+    values
+        .flat_map(|value| value.split('|'))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn parse_event_date(value: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()
+}
+
+fn parse_utc(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
 }
 
 fn compare_observation_freshness(
@@ -882,6 +1218,140 @@ mod tests {
         );
     }
 
+    #[test]
+    fn approved_event_loader_returns_fresh_runtime_events_and_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        write_approved_events(
+            temp_dir.path(),
+            vec![
+                approved_event(
+                    "AAPL",
+                    "2026-05-05",
+                    "approved",
+                    "alpha_vantage",
+                    fixed_utc(),
+                    "2026-05-08T12:00:00Z",
+                    1,
+                ),
+                approved_event(
+                    "IWM",
+                    "2026-05-05",
+                    "block_only",
+                    "manual_override|alpha_vantage",
+                    fixed_utc(),
+                    "2026-05-08T12:00:00Z",
+                    2,
+                ),
+                approved_event(
+                    "NABZY",
+                    "2026-05-05",
+                    "rejected",
+                    "alpha_vantage",
+                    fixed_utc(),
+                    "2026-05-08T12:00:00Z",
+                    3,
+                ),
+            ],
+        );
+        let request = loader_request(&["AAPL", "IWM", "NABZY"]);
+
+        let report = load_approved_scheduled_events(temp_dir.path(), &request).unwrap();
+
+        assert_eq!(report.freshness, ScheduledEventLoadFreshness::Fresh);
+        assert_eq!(report.event_count, 2);
+        assert_eq!(report.rejected_count, 1);
+        assert_eq!(
+            report
+                .events
+                .iter()
+                .map(|event| event.underlying.as_str())
+                .collect::<Vec<_>>(),
+            vec!["AAPL", "IWM"]
+        );
+        assert_eq!(report.source_set, vec!["alpha_vantage", "manual_override"]);
+        assert_eq!(report.policy_versions, vec!["scheduled-event-approval:v1"]);
+        assert_eq!(
+            report.coverage_start,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 5).unwrap())
+        );
+        assert_eq!(
+            report.coverage_end,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 5).unwrap())
+        );
+        assert_eq!(report.unavailable_reason, None);
+    }
+
+    #[test]
+    fn approved_event_loader_reports_missing_catalog() {
+        let temp_dir = TempDir::new().unwrap();
+        let request = loader_request(&["AAPL"]);
+
+        let report =
+            load_approved_scheduled_events(&temp_dir.path().join("missing"), &request).unwrap();
+
+        assert_eq!(report.freshness, ScheduledEventLoadFreshness::Missing);
+        assert_eq!(
+            report.unavailable_reason.as_deref(),
+            Some("catalog_missing")
+        );
+        assert_eq!(report.event_count, 0);
+    }
+
+    #[test]
+    fn approved_event_loader_reports_out_of_window_data() {
+        let temp_dir = TempDir::new().unwrap();
+        write_approved_events(
+            temp_dir.path(),
+            vec![approved_event(
+                "AAPL",
+                "2026-06-01",
+                "approved",
+                "alpha_vantage",
+                fixed_utc(),
+                "2026-06-08T12:00:00Z",
+                1,
+            )],
+        );
+        let request = loader_request(&["AAPL"]);
+
+        let report = load_approved_scheduled_events(temp_dir.path(), &request).unwrap();
+
+        assert_eq!(report.freshness, ScheduledEventLoadFreshness::OutOfWindow);
+        assert_eq!(
+            report.unavailable_reason.as_deref(),
+            Some("events_out_of_window")
+        );
+        assert_eq!(report.event_count, 0);
+        assert_eq!(
+            report.coverage_start,
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).unwrap())
+        );
+    }
+
+    #[test]
+    fn approved_event_loader_reports_stale_data() {
+        let temp_dir = TempDir::new().unwrap();
+        write_approved_events(
+            temp_dir.path(),
+            vec![approved_event(
+                "AAPL",
+                "2026-05-05",
+                "approved",
+                "alpha_vantage",
+                Utc.with_ymd_and_hms(2026, 4, 30, 12, 0, 0).unwrap(),
+                "2026-05-03T12:00:00Z",
+                1,
+            )],
+        );
+        let request = loader_request(&["AAPL"]);
+
+        let report = load_approved_scheduled_events(temp_dir.path(), &request).unwrap();
+
+        assert_eq!(report.freshness, ScheduledEventLoadFreshness::Stale);
+        assert_eq!(report.unavailable_reason.as_deref(), Some("events_stale"));
+        assert_eq!(report.event_count, 1);
+    }
+
     fn assert_custom_roundtrip<T>(
         catalog: &mut ParquetDataCatalog,
         type_name: &str,
@@ -976,6 +1446,64 @@ mod tests {
 
     fn fixed_utc() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()
+    }
+
+    fn loader_request(underlyings: &[&str]) -> ApprovedScheduledEventLoadRequest {
+        ApprovedScheduledEventLoadRequest {
+            event_type: "earnings_report".to_string(),
+            as_of_date: NaiveDate::from_ymd_opt(2026, 5, 4).unwrap(),
+            as_of_utc: Utc.with_ymd_and_hms(2026, 5, 4, 12, 0, 0).unwrap(),
+            lookback_days: 0,
+            horizon_days: 3,
+            underlyings: underlyings
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            stale_after_days: 7,
+        }
+    }
+
+    fn write_approved_events(catalog_path: &Path, events: Vec<ApprovedScheduledEvent>) {
+        ensure_scheduled_event_custom_data_registered();
+        let catalog = ParquetDataCatalog::new(catalog_path, None, None, None, None);
+        let identifier = ApprovedScheduledEvent::catalog_identifier("earnings_report");
+        let data = events
+            .into_iter()
+            .map(|event| event.into_custom_data(Some(identifier.clone())))
+            .collect();
+
+        catalog
+            .write_custom_data_batch(data, None, None, Some(true))
+            .unwrap();
+    }
+
+    fn approved_event(
+        underlying: &str,
+        event_date: &str,
+        approval_status: &str,
+        source_set: &str,
+        approved_at_utc: DateTime<Utc>,
+        valid_until_utc: &str,
+        ts: u64,
+    ) -> ApprovedScheduledEvent {
+        ApprovedScheduledEvent {
+            canonical_event_id: format!("earnings_report:{underlying}:{event_date}"),
+            event_type: "earnings_report".to_string(),
+            underlying: underlying.to_string(),
+            event_date: event_date.to_string(),
+            timing: "after_close".to_string(),
+            approval_status: approval_status.to_string(),
+            source_set: source_set.to_string(),
+            policy_version: "scheduled-event-approval:v1".to_string(),
+            block_days_before: 1,
+            block_days_after: 1,
+            approved_at_utc: format_utc(approved_at_utc),
+            valid_from_utc: "2026-05-01T12:00:00Z".to_string(),
+            valid_until_utc: valid_until_utc.to_string(),
+            diagnostic_reason: "test".to_string(),
+            ts_event: unix_nanos_from_date_string(event_date),
+            ts_init: UnixNanos::from(ts),
+        }
     }
 
     fn sample_decision(ts: u64) -> ScheduledEventDecision {
