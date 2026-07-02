@@ -25,6 +25,7 @@ struct UniversePlan {
 struct UniversePlanSummary {
     universe_groups: usize,
     strategy_profiles: usize,
+    unique_underlyings: usize,
     resolved_underlyings: usize,
     universe_intents: usize,
 }
@@ -139,6 +140,7 @@ fn build_plan(config: &AlpacaOptionsRuntimeConfig) -> UniversePlan {
         summary: UniversePlanSummary {
             universe_groups: universe_groups.len(),
             strategy_profiles: strategy_profiles.len(),
+            unique_underlyings: config.underlyings.len(),
             resolved_underlyings: config.underlyings.len(),
             universe_intents: universe_intents.len(),
         },
@@ -182,11 +184,11 @@ fn is_naked_family(family: AlpacaOptionsStrategyFamily) -> bool {
 
 fn print_human_plan(plan: &UniversePlan) {
     println!(
-        "universe_plan checked_at={} groups={} profiles={} resolved_underlyings={} intents={} warnings={}",
+        "universe_plan checked_at={} groups={} profiles={} unique_underlyings={} intents={} warnings={}",
         plan.checked_at_utc,
         plan.summary.universe_groups,
         plan.summary.strategy_profiles,
-        plan.summary.resolved_underlyings,
+        plan.summary.unique_underlyings,
         plan.summary.universe_intents,
         plan.warnings.len()
     );

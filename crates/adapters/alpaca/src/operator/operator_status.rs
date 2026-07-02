@@ -31,7 +31,9 @@ use crate::{
         client::AlpacaHttpClient,
         models::{AlpacaAccount, AlpacaActivity, AlpacaOrder, AlpacaPosition, ListOrdersRequest},
     },
-    options_runtime::{AlpacaOptionsRuntimeConfig, EventShockRuntimeStatus},
+    options_runtime::{
+        AlpacaOptionsRuntimeConfig, AlpacaOptionsStrategyMode, EventShockRuntimeStatus,
+    },
     runtime::{StrategyState, read_operator_events},
 };
 use chrono::{DateTime, Duration, Utc};
@@ -54,7 +56,11 @@ struct OperatorConfig {
     trade_date: String,
     open_orders_enabled: bool,
     close_orders_enabled: bool,
-    strategy_profiles: Vec<String>,
+    universe_groups: Vec<UniverseGroupStatus>,
+    strategy_profiles: Vec<StrategyProfileStatus>,
+    strategy_profile_summaries: Vec<String>,
+    submitting_profiles: Vec<String>,
+    submitting_strategy_families: Vec<String>,
     max_active_entries: Option<usize>,
     max_daily_submits: Option<usize>,
     max_open_orders: Option<usize>,
@@ -127,7 +133,11 @@ struct ServiceStatus {
     log_file_exists: bool,
     open_orders_enabled: bool,
     close_orders_enabled: bool,
-    strategy_profiles: Vec<String>,
+    universe_groups: Vec<UniverseGroupStatus>,
+    strategy_profiles: Vec<StrategyProfileStatus>,
+    strategy_profile_summaries: Vec<String>,
+    submitting_profiles: Vec<String>,
+    submitting_strategy_families: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -137,6 +147,28 @@ struct OperationalStoreStatus {
     applied_migrations: Option<i64>,
     latest_migration_version: Option<i64>,
     dirty_migration_version: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct UniverseGroupStatus {
+    name: String,
+    member_count: usize,
+    members: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StrategyProfileStatus {
+    id: String,
+    family: String,
+    mode: String,
+    submits_open_orders: bool,
+    quantity: u64,
+    universe_groups: Vec<String>,
+    include_underlyings: Vec<String>,
+    exclude_underlyings: Vec<String>,
+    resolved_underlying_count: usize,
+    resolved_underlyings: Vec<String>,
+    risk: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -370,7 +402,15 @@ impl OperatorConfig {
                     .and_then(|defaults| defaults.lock_dir.clone())
             })
             .unwrap_or_else(|| default_state_dir.join("locks"));
-        let strategy_profiles = strategy_config.strategy_profile_summaries();
+        let universe_groups = universe_group_statuses(&strategy_config);
+        let strategy_profiles = strategy_profile_statuses(&strategy_config);
+        let strategy_profile_summaries = strategy_config.strategy_profile_summaries();
+        let submitting_profiles = submitting_profile_ids(&strategy_config);
+        let submitting_strategy_families = strategy_config
+            .submitting_strategy_family_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
         let trade_date = Utc::now()
             .with_timezone(&strategy_config.entry_timezone)
             .date_naive();
@@ -458,7 +498,11 @@ impl OperatorConfig {
             trade_date: trade_date.to_string(),
             open_orders_enabled: strategy_config.open_orders_enabled,
             close_orders_enabled: strategy_config.close_orders_enabled,
+            universe_groups,
             strategy_profiles,
+            strategy_profile_summaries,
+            submitting_profiles,
+            submitting_strategy_families,
             max_active_entries: strategy_config.max_active_entries,
             max_daily_submits: strategy_config.max_daily_submits,
             max_open_orders: strategy_config.max_open_orders,
@@ -481,6 +525,51 @@ impl OperatorConfig {
             AlpacaOptionsRuntimeConfig::from_runtime_env_with_read_only_operational_store().await?;
         strategy_config.load_strategy_state().await
     }
+}
+
+fn universe_group_statuses(config: &AlpacaOptionsRuntimeConfig) -> Vec<UniverseGroupStatus> {
+    config
+        .universe_groups
+        .iter()
+        .map(|(name, members)| UniverseGroupStatus {
+            name: name.clone(),
+            member_count: members.len(),
+            members: members.clone(),
+        })
+        .collect()
+}
+
+fn strategy_profile_statuses(config: &AlpacaOptionsRuntimeConfig) -> Vec<StrategyProfileStatus> {
+    config
+        .strategy_profiles
+        .iter()
+        .map(|profile| StrategyProfileStatus {
+            id: profile.id.clone(),
+            family: profile.family.as_str().to_string(),
+            mode: profile.mode.as_str().to_string(),
+            submits_open_orders: config.open_orders_enabled
+                && matches!(profile.mode, AlpacaOptionsStrategyMode::Live),
+            quantity: profile.quantity,
+            universe_groups: profile.universe_groups.clone(),
+            include_underlyings: profile.include_underlyings.clone(),
+            exclude_underlyings: profile.exclude_underlyings.clone(),
+            resolved_underlying_count: profile.underlyings.len(),
+            resolved_underlyings: profile.underlyings.clone(),
+            risk: profile.risk.to_json_value(),
+        })
+        .collect()
+}
+
+fn submitting_profile_ids(config: &AlpacaOptionsRuntimeConfig) -> Vec<String> {
+    if !config.open_orders_enabled {
+        return Vec::new();
+    }
+    config
+        .strategy_profiles
+        .iter()
+        .filter(|profile| matches!(profile.mode, AlpacaOptionsStrategyMode::Live))
+        .map(|profile| profile.id.clone())
+        .collect()
 }
 
 fn build_status(
@@ -667,7 +756,11 @@ fn build_status(
         log_file_exists: config.log_path.exists(),
         open_orders_enabled: config.open_orders_enabled,
         close_orders_enabled: config.close_orders_enabled,
+        universe_groups: config.universe_groups.clone(),
         strategy_profiles: config.strategy_profiles.clone(),
+        strategy_profile_summaries: config.strategy_profile_summaries.clone(),
+        submitting_profiles: config.submitting_profiles.clone(),
+        submitting_strategy_families: config.submitting_strategy_families.clone(),
     };
 
     let last_scan = latest_event(events, "option_chain_candidate_scan")
@@ -1090,12 +1183,13 @@ fn print_human_status(status: &OperatorStatus) {
         status.engine_state, status.checked_at_utc
     );
     println!(
-        "service: name={} active={} open_orders={} close_orders={} strategy_profiles={} lock={} log={}",
+        "service: name={} active={} open_orders={} close_orders={} strategy_profiles={} submitting_profiles={} lock={} log={}",
         status.service.name,
         status.service.active_state.as_deref().unwrap_or("unknown"),
         status.service.open_orders_enabled,
         status.service.close_orders_enabled,
-        status.service.strategy_profiles.join(","),
+        status.service.strategy_profile_summaries.join(","),
+        status.service.submitting_profiles.join(","),
         status.service.lock_file,
         status.service.log_file,
     );
