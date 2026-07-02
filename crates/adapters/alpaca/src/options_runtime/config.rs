@@ -469,6 +469,7 @@ struct EventShockSection {
     require_earnings_events: Option<bool>,
     allow_csv_bridge: Option<bool>,
     stale_after_days: Option<i64>,
+    horizon_days: Option<i64>,
     block_days_before_earnings: Option<i64>,
     block_days_after_earnings: Option<i64>,
 }
@@ -485,6 +486,7 @@ impl EventShockSection {
                 .or(parent.require_earnings_events),
             allow_csv_bridge: self.allow_csv_bridge.or(parent.allow_csv_bridge),
             stale_after_days: self.stale_after_days.or(parent.stale_after_days),
+            horizon_days: self.horizon_days.or(parent.horizon_days),
             block_days_before_earnings: self
                 .block_days_before_earnings
                 .or(parent.block_days_before_earnings),
@@ -1523,7 +1525,10 @@ fn load_event_shock_earnings_events(
     let mut request =
         ApprovedScheduledEventLoadRequest::new(EARNINGS_EVENT_TYPE, as_of_date, as_of_utc);
     request.lookback_days = block_days_after_earnings;
-    request.horizon_days = block_days_before_earnings;
+    request.horizon_days = env_parse("ALPACA_EVENT_SHOCK_HORIZON_DAYS")
+        .or(config.horizon_days)
+        .unwrap_or(90)
+        .max(block_days_before_earnings);
     request.underlyings = underlyings.to_vec();
     request.stale_after_days = env_parse("ALPACA_EVENT_SHOCK_STALE_AFTER_DAYS")
         .or(config.stale_after_days)
@@ -1758,6 +1763,7 @@ scheduled_event_catalog_path = "/tmp/scheduled_events/catalog"
 earnings_events_path = "/tmp/earnings_events_approved.csv"
 allow_csv_bridge = true
 stale_after_days = 2
+horizon_days = 60
 block_days_before_earnings = 2
 
 [risk.sectors]
@@ -1821,6 +1827,7 @@ GDX = "metals"
         );
         assert_eq!(merged.event_shock.allow_csv_bridge, Some(true));
         assert_eq!(merged.event_shock.stale_after_days, Some(2));
+        assert_eq!(merged.event_shock.horizon_days, Some(60));
         assert_eq!(merged.event_shock.block_days_before_earnings, Some(2));
         assert_eq!(
             merged.risk.sectors.get("SPY").map(String::as_str),
@@ -1980,6 +1987,7 @@ earnings_events_path = "/tmp/earnings_events_approved.csv"
 require_earnings_events = true
 allow_csv_bridge = true
 stale_after_days = 2
+horizon_days = 60
 block_days_before_earnings = 3
 block_days_after_earnings = 2
 "#,
@@ -2085,6 +2093,7 @@ block_days_after_earnings = 2
         assert_eq!(config.event_shock.require_earnings_events, Some(true));
         assert_eq!(config.event_shock.allow_csv_bridge, Some(true));
         assert_eq!(config.event_shock.stale_after_days, Some(2));
+        assert_eq!(config.event_shock.horizon_days, Some(60));
         assert_eq!(config.event_shock.block_days_before_earnings, Some(3));
         assert_eq!(config.event_shock.block_days_after_earnings, Some(2));
     }

@@ -10,6 +10,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, Once},
+    thread,
 };
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, SecondsFormat, Utc};
@@ -401,22 +402,8 @@ pub fn load_approved_scheduled_events(
         ));
     }
 
-    ensure_scheduled_event_custom_data_registered();
-    let mut catalog =
-        ParquetDataCatalog::from_uri(&catalog_path.to_string_lossy(), None, None, None, None)?;
-    let identifiers = vec![ApprovedScheduledEvent::catalog_identifier(
-        &request.event_type,
-    )];
-    let data = catalog.query_custom_data_dynamic(
-        ApprovedScheduledEvent::TYPE_NAME,
-        Some(&identifiers),
-        None,
-        None,
-        None,
-        None,
-        true,
-    )?;
-    let events = approved_events_from_data(data)?;
+    let events =
+        query_approved_scheduled_events(catalog_path.to_path_buf(), request.event_type.clone())?;
 
     Ok(build_approved_event_report(events, request))
 }
@@ -435,6 +422,30 @@ impl ApprovedScheduledEventLoadReport {
             rejected_count: 0,
         }
     }
+}
+
+fn query_approved_scheduled_events(
+    catalog_path: PathBuf,
+    event_type: String,
+) -> anyhow::Result<Vec<ApprovedScheduledEvent>> {
+    thread::spawn(move || {
+        ensure_scheduled_event_custom_data_registered();
+        let mut catalog =
+            ParquetDataCatalog::from_uri(&catalog_path.to_string_lossy(), None, None, None, None)?;
+        let identifiers = vec![ApprovedScheduledEvent::catalog_identifier(&event_type)];
+        let data = catalog.query_custom_data_dynamic(
+            ApprovedScheduledEvent::TYPE_NAME,
+            Some(&identifiers),
+            None,
+            None,
+            None,
+            None,
+            true,
+        )?;
+        approved_events_from_data(data)
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("approved scheduled-event catalog query panicked"))?
 }
 
 /// Resolves observations into canonical scheduled-event decisions.

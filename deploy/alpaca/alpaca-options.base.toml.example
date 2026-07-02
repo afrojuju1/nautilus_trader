@@ -108,6 +108,7 @@ block_unestimated_risk_capital = true
 # allow_csv_bridge = false
 require_earnings_events = false
 stale_after_days = 1
+horizon_days = 90
 block_days_before_earnings = 1
 block_days_after_earnings = 1
 
