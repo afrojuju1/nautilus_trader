@@ -38,9 +38,9 @@ use crate::{
 };
 use chrono::{DateTime, Duration, Utc};
 use nautilus_infrastructure::sql::operational::{
-    CandidateLedgerSummaryFilters, StrategyStateMetadata, StrategyStateStorageSummary,
-    load_strategy_state_metadata, load_strategy_state_storage_summary,
-    read_candidate_ledger_records,
+    CandidateLedgerReadFilters, CandidateLedgerReadOrder, OperationalRepository,
+    StrategyStateMetadata, StrategyStateStorageSummary, load_strategy_state_metadata,
+    load_strategy_state_storage_summary, read_candidate_ledger_records_matching,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -452,14 +452,9 @@ impl OperatorConfig {
                     None
                 }
             };
-            let filters = CandidateLedgerSummaryFilters {
-                since: trade_date.checked_sub_signed(Duration::days(7)),
-                until: None,
-            };
-            let records = match read_candidate_ledger_records(
+            let records = match load_operator_candidate_ledger_records(
                 repository,
                 strategy_config.operational_account_id(),
-                filters,
             )
             .await
             {
@@ -572,6 +567,38 @@ fn strategy_profile_statuses(config: &AlpacaOptionsRuntimeConfig) -> Vec<Strateg
             risk: profile.risk.to_json_value(),
         })
         .collect()
+}
+
+async fn load_operator_candidate_ledger_records(
+    repository: &OperationalRepository,
+    account_id: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let mut records = read_candidate_ledger_records_matching(
+        repository,
+        account_id,
+        CandidateLedgerReadFilters {
+            record_type: Some("scanner_result".to_string()),
+            limit: Some(1),
+            order: CandidateLedgerReadOrder::Desc,
+            ..Default::default()
+        },
+    )
+    .await?;
+    records.extend(
+        read_candidate_ledger_records_matching(
+            repository,
+            account_id,
+            CandidateLedgerReadFilters {
+                record_type: Some("candidate_alert".to_string()),
+                alert_type: Some("selected_candidate".to_string()),
+                limit: Some(1),
+                order: CandidateLedgerReadOrder::Desc,
+                ..Default::default()
+            },
+        )
+        .await?,
+    );
+    Ok(records)
 }
 
 fn submitting_profile_ids(config: &AlpacaOptionsRuntimeConfig) -> Vec<String> {

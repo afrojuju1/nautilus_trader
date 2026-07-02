@@ -24,7 +24,7 @@ use std::{
 use crate::options_runtime::AlpacaOptionsRuntimeConfig;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use nautilus_infrastructure::sql::operational::{
-    CandidateLedgerSummaryFilters, read_candidate_ledger_records,
+    CandidateLedgerReadFilters, CandidateLedgerReadOrder, read_candidate_ledger_records_matching,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -94,12 +94,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .unwrap_or_else(|| default_alert_state_path(&account_id));
     let cutoff = Utc::now() - Duration::minutes(args.lookback_minutes.max(1));
 
-    let records = read_candidate_ledger_records(
+    let records = read_candidate_ledger_records_matching(
         storage,
         &account_id,
-        CandidateLedgerSummaryFilters {
+        CandidateLedgerReadFilters {
             since: Some(trade_date_filter),
             until: Some(trade_date_filter),
+            since_ts_utc: Some(cutoff),
+            record_type: Some("candidate_alert".to_string()),
+            order: CandidateLedgerReadOrder::Asc,
+            ..Default::default()
         },
     )
     .await?;

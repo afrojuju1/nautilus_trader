@@ -6,9 +6,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, Utc};
 use nautilus_infrastructure::sql::operational::{
-    CandidateLedgerSummaryFilters, read_candidate_ledger_records,
+    CandidateLedgerReadFilters, CandidateLedgerReadOrder, read_candidate_ledger_records_matching,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -438,25 +438,29 @@ async fn load_candidate_ledger_records(
     let Some(repository) = &config.operational_repository else {
         return (Vec::new(), None);
     };
-    let filters = CandidateLedgerSummaryFilters {
-        since: ledger_since_date(options),
-        until: None,
+    let filters = CandidateLedgerReadFilters {
+        since_ts_utc: ledger_since_ts(options),
+        record_type: Some("scanner_result".to_string()),
+        order: CandidateLedgerReadOrder::Asc,
+        ..Default::default()
     };
-    match read_candidate_ledger_records(repository, config.operational_account_id(), filters).await
+    match read_candidate_ledger_records_matching(
+        repository,
+        config.operational_account_id(),
+        filters,
+    )
+    .await
     {
         Ok(records) => (records, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
     }
 }
 
-fn ledger_since_date(options: ScannerReportOptions) -> Option<NaiveDate> {
+fn ledger_since_ts(options: ScannerReportOptions) -> Option<DateTime<Utc>> {
     if options.since_secs == 0 {
         return None;
     }
-    let days = ((options.since_secs + 86_399) / 86_400).max(1);
-    Utc::now()
-        .date_naive()
-        .checked_sub_signed(Duration::days(days))
+    Some(Utc::now() - Duration::seconds(options.since_secs))
 }
 
 fn evidence_key(evidence: &Value) -> String {

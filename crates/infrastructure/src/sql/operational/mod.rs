@@ -12,7 +12,9 @@ pub mod performance_ledger;
 pub mod state;
 
 pub use candidate_ledger::{
-    CandidateLedgerSummaryFilters, append_candidate_ledger_record, read_candidate_ledger_records,
+    CandidateLedgerReadFilters, CandidateLedgerReadOrder, CandidateLedgerSummaryFilters,
+    append_candidate_ledger_record, read_candidate_ledger_records,
+    read_candidate_ledger_records_matching,
 };
 pub use lease::{
     RuntimeLeaseRequest, RuntimeLeaseStatus, acquire_runtime_lease, heartbeat_runtime_lease,
