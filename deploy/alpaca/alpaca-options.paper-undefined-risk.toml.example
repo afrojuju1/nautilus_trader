@@ -13,6 +13,7 @@ state_path = "/home/ade/.local/state/nautilus_trader/alpaca/paper-undefined-risk
 id = "naked_call_short_premium"
 family = "naked_call"
 mode = "live"
+universe_groups = ["undefined_risk_allowed"]
 quantity = 1
 
 [strategies.scanner]
@@ -22,6 +23,7 @@ max_buying_power_usage_pct = 0.03
 id = "naked_put_short_premium"
 family = "naked_put"
 mode = "live"
+universe_groups = ["undefined_risk_allowed"]
 quantity = 1
 
 [strategies.scanner]
@@ -31,6 +33,7 @@ max_buying_power_usage_pct = 0.03
 id = "naked_call_1_3dte_short_premium"
 family = "naked_call_1_3dte"
 mode = "live"
+universe_groups = ["undefined_risk_allowed"]
 quantity = 1
 
 [strategies.scanner]
@@ -40,6 +43,7 @@ max_buying_power_usage_pct = 0.03
 id = "naked_put_1_3dte_short_premium"
 family = "naked_put_1_3dte"
 mode = "live"
+universe_groups = ["undefined_risk_allowed"]
 quantity = 1
 
 [strategies.scanner]

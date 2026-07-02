@@ -14,7 +14,7 @@ state_path = "/home/ade/.local/state/nautilus_trader/alpaca_options_state.json"
 id = "iron_condor_watchlist"
 family = "iron_condor"
 mode = "dry_run"
-underlyings = ["SPY", "QQQ", "IWM", "DIA", "GLD", "GDX", "SLV", "TLT", "XLE", "XLF", "XLK", "XLV", "XLY", "XLI", "XLP", "XLU", "XLB", "XLC", "SMH", "USO", "XOP", "XOM"]
+universe_groups = ["core_liquid_options"]
 quantity = 1
 
 [universe]

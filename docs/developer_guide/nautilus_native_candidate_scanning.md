@@ -306,8 +306,11 @@ Target model:
 
 - `CandidateEngine` is pure. It ranks option candidates from normalized inputs and returns
   scanner diagnostics, rejection counts, and ranked candidates.
-- `[[strategies]]` profiles own live scan intent: family, mode, underlyings, quantity, per-profile
-  scanner overrides, and risk overrides.
+- `[[strategies]]` profiles own live scan intent: family, mode, universe groups or explicit
+  underlyings, quantity, per-profile scanner overrides, and risk overrides.
+- `universe_groups` are named static baskets of underlyings. Profiles reference groups and may add
+  or exclude explicit underlyings; the resolved profile still produces source-neutral
+  profile/underlying intents.
 - The source-neutral option-universe resolver turns those profiles into concrete `OptionSeriesId`
   selections. Fixed expiries remain diagnostic and replay filters, not live control-plane state.
 - Alpaca REST contract and snapshot loading is input acquisition, not strategy logic.
@@ -332,6 +335,8 @@ Implemented refactor:
    candidate engine.
 7. Collapsed live family-flag control paths so profile blocks are the canonical scanner/admission
    model. Diagnostics may synthesize temporary profiles, but they do not mutate live runtime flags.
+8. Added named universe groups to remove repeated ticker lists from profiles while keeping dynamic
+   universe screens reserved for a later materialized-snapshot design.
 
 Current code ownership:
 

@@ -95,6 +95,8 @@ const CANDIDATE_ALERT_DEBIT_MIN_SCORE: f64 = 80.0;
 pub struct AlpacaOptionsRuntimeConfig {
     /// Underlyings to scan.
     pub underlyings: Vec<String>,
+    /// Named reusable underlying universes loaded from config.
+    pub universe_groups: BTreeMap<String, Vec<String>>,
     /// Resolved strategy profiles that define scan composition.
     pub strategy_profiles: Vec<AlpacaOptionsStrategyProfile>,
     /// Maximum active strategy entries. `None` means unlimited.
@@ -379,6 +381,12 @@ pub struct AlpacaOptionsStrategyProfile {
     pub family: AlpacaOptionsStrategyFamily,
     /// Opening-order mode for this profile.
     pub mode: AlpacaOptionsStrategyMode,
+    /// Named universe groups referenced by this profile.
+    pub universe_groups: Vec<String>,
+    /// Directly included underlyings configured on this profile.
+    pub include_underlyings: Vec<String>,
+    /// Excluded underlyings removed after group/direct expansion.
+    pub exclude_underlyings: Vec<String>,
     /// Underlyings scanned by this profile.
     pub underlyings: Vec<String>,
     /// Contract quantity for this profile.
@@ -414,13 +422,32 @@ impl AlpacaOptionsStrategyProfile {
     #[must_use]
     pub fn summary(&self) -> String {
         let risk = self.risk.summary();
+        let universe = if self.universe_groups.is_empty()
+            && self.include_underlyings.is_empty()
+            && self.exclude_underlyings.is_empty()
+        {
+            self.underlyings.join("|")
+        } else {
+            let mut parts = Vec::new();
+            if !self.universe_groups.is_empty() {
+                parts.push(format!("groups={}", self.universe_groups.join("|")));
+            }
+            if !self.include_underlyings.is_empty() {
+                parts.push(format!("include={}", self.include_underlyings.join("|")));
+            }
+            if !self.exclude_underlyings.is_empty() {
+                parts.push(format!("exclude={}", self.exclude_underlyings.join("|")));
+            }
+            parts.push(format!("resolved={}", self.underlyings.join("|")));
+            parts.join(";")
+        };
         if risk.is_empty() {
             format!(
                 "{}:{}:{}:{}:qty={}",
                 self.id,
                 self.family.as_str(),
                 self.mode.as_str(),
-                self.underlyings.join("|"),
+                universe,
                 self.quantity,
             )
         } else {
@@ -429,7 +456,7 @@ impl AlpacaOptionsStrategyProfile {
                 self.id,
                 self.family.as_str(),
                 self.mode.as_str(),
-                self.underlyings.join("|"),
+                universe,
                 self.quantity,
                 risk,
             )
@@ -900,12 +927,35 @@ impl AlpacaOptionsRuntimeConfig {
         )
     }
 
+    /// Returns strategy families that can currently submit opening orders.
+    #[must_use]
+    pub fn submitting_strategy_family_names(&self) -> Vec<&'static str> {
+        if !self.open_orders_enabled {
+            return Vec::new();
+        }
+        unique_strategy_names(
+            self.strategy_profiles
+                .iter()
+                .filter(|profile| matches!(profile.mode, AlpacaOptionsStrategyMode::Live))
+                .map(AlpacaOptionsStrategyProfile::strategy_name),
+        )
+    }
+
     /// Returns compact resolved strategy profile summaries.
     #[must_use]
     pub fn strategy_profile_summaries(&self) -> Vec<String> {
         self.strategy_profiles
             .iter()
             .map(AlpacaOptionsStrategyProfile::summary)
+            .collect()
+    }
+
+    /// Returns compact configured universe group summaries.
+    #[must_use]
+    pub fn universe_group_summaries(&self) -> Vec<String> {
+        self.universe_groups
+            .iter()
+            .map(|(name, members)| format!("{name}:{}", members.join("|")))
             .collect()
     }
 

@@ -18,6 +18,15 @@ entry_start = "09:45"
 entry_end = "14:30"
 entry_timezone = "America/New_York"
 
+[universe_groups.core_liquid_options]
+members = ["SPY", "QQQ", "IWM", "DIA", "GLD", "GDX", "SLV", "TLT", "XLE", "XLF", "XLK", "XLV", "XLY", "XLI", "XLP", "XLU", "XLB", "XLC", "SMH", "USO", "XOP", "XOM"]
+
+[universe_groups.broad_indices]
+members = ["SPY", "QQQ", "IWM", "DIA"]
+
+[universe_groups.undefined_risk_allowed]
+members = ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XLK", "SMH"]
+
 [scanner]
 min_dte = 5
 max_dte = 10

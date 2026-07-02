@@ -114,7 +114,7 @@ fn required_options_level(config: &AlpacaOptionsRuntimeConfig) -> u8 {
     if !config.open_orders_enabled {
         return 0;
     }
-    if config.enabled_strategy_family_names().is_empty() {
+    if config.submitting_strategy_family_names().is_empty() {
         0
     } else {
         // Opening risk requires the configured strategy-family approval level. Close-only mode
@@ -124,7 +124,7 @@ fn required_options_level(config: &AlpacaOptionsRuntimeConfig) -> u8 {
 }
 
 fn has_short_option_leg(config: &AlpacaOptionsRuntimeConfig) -> bool {
-    config.open_orders_enabled && !config.enabled_strategy_family_names().is_empty()
+    !config.submitting_strategy_family_names().is_empty()
 }
 
 fn check_level(field: &str, actual: Option<u8>, required: u8, reasons: &mut Vec<String>) {

@@ -1,6 +1,9 @@
 use nautilus_alpaca::operator::{self, AlpacaOperatorCommand};
 
-use crate::opt::{AlpacaAdapterCommand, AlpacaAdapterOpt, AlpacaAlertsCommand, ForwardedArgs};
+use crate::opt::{
+    AlpacaAdapterCommand, AlpacaAdapterOpt, AlpacaAlertsCommand, AlpacaUniverseCommand,
+    ForwardedArgs,
+};
 
 /// Executes Alpaca adapter operational commands.
 ///
@@ -18,6 +21,11 @@ pub(crate) async fn run_alpaca_command(opt: AlpacaAdapterOpt) -> anyhow::Result<
         AlpacaAdapterCommand::Fleet(args) => {
             run_operator_command(AlpacaOperatorCommand::Fleet, args).await?
         }
+        AlpacaAdapterCommand::Universe(universe) => match universe.command {
+            AlpacaUniverseCommand::Plan(args) => {
+                run_operator_command(AlpacaOperatorCommand::UniversePlan, args).await?
+            }
+        },
         AlpacaAdapterCommand::Alerts(alerts) => match alerts.command {
             AlpacaAlertsCommand::Candidates(args) => {
                 run_operator_command(AlpacaOperatorCommand::CandidateAlerts, args).await?

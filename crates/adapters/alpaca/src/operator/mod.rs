@@ -13,6 +13,7 @@ mod performance_report;
 mod reconciliation_probe;
 mod spread_reconciliation_preview;
 mod sync_strategy_state;
+mod universe_plan;
 mod watch_trade_updates;
 
 static OPERATOR_ARGS: OnceLock<Vec<String>> = OnceLock::new();
@@ -26,6 +27,8 @@ pub enum AlpacaOperatorCommand {
     Account,
     /// Summarizes the configured Alpaca account fleet.
     Fleet,
+    /// Prints the resolved options universe plan.
+    UniversePlan,
     /// Emits candidate alerts from the operational store.
     CandidateAlerts,
     /// Builds performance reports from broker fills and operational ledgers.
@@ -55,6 +58,7 @@ pub async fn run_command(command: AlpacaOperatorCommand, args: Vec<String>) -> a
         AlpacaOperatorCommand::Status => operator_status::run().await,
         AlpacaOperatorCommand::Account => check_account_orders::run().await,
         AlpacaOperatorCommand::Fleet => fleet_status::run().await,
+        AlpacaOperatorCommand::UniversePlan => universe_plan::run().await,
         AlpacaOperatorCommand::CandidateAlerts => candidate_alerts::run().await,
         AlpacaOperatorCommand::Performance => performance_report::run().await,
         AlpacaOperatorCommand::Replay => historical_replay::run().await,

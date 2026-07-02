@@ -40,6 +40,7 @@ pub(super) struct RuntimeConfigFile {
     extends: Option<PathBuf>,
     runtime: RuntimeSection,
     strategies: Vec<StrategyBlockSection>,
+    universe_groups: BTreeMap<String, UniverseGroupSection>,
     universe: UniverseSection,
     scanner: ScannerSection,
     iron_condor: IronCondorSection,
@@ -58,6 +59,7 @@ impl RuntimeConfigFile {
             extends: None,
             runtime: self.runtime.merge_parent(parent.runtime),
             strategies: merge_vec(self.strategies, parent.strategies),
+            universe_groups: merge_map(self.universe_groups, parent.universe_groups),
             universe: self.universe.merge_parent(parent.universe),
             scanner: self.scanner.merge_parent(parent.scanner),
             iron_condor: self.iron_condor.merge_parent(parent.iron_condor),
@@ -116,10 +118,19 @@ struct StrategyBlockSection {
     id: Option<String>,
     family: Option<String>,
     mode: Option<String>,
+    universe_groups: Vec<String>,
     underlyings: Vec<String>,
+    include_underlyings: Vec<String>,
+    exclude_underlyings: Vec<String>,
     quantity: Option<u64>,
     scanner: StrategyScannerSection,
     risk: StrategyRiskOverrideSection,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct UniverseGroupSection {
+    members: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -600,6 +611,7 @@ pub(super) fn build_options_runtime_config(
         .or(file.runtime.interval_secs)
         .unwrap_or(300);
     let underlyings = underlyings_from_sources(cli_underlyings, &file.universe);
+    let universe_groups = universe_groups_from_file(file.universe_groups)?;
     let default_quantity = file.universe.quantity.unwrap_or(1);
     anyhow::ensure!(
         default_quantity > 0,
@@ -608,6 +620,7 @@ pub(super) fn build_options_runtime_config(
     let strategy_profiles = strategy_profiles_from_file(
         file.strategies,
         &underlyings,
+        &universe_groups,
         default_quantity,
         &scanner,
         &iron_condor_scanner,
@@ -651,6 +664,7 @@ pub(super) fn build_options_runtime_config(
     let fleet = load_fleet_config_from_env()?;
     let mut config = AlpacaOptionsRuntimeConfig {
         underlyings: profile_underlyings,
+        universe_groups,
         strategy_profiles,
         max_active_entries: env_parse("ALPACA_MAX_ACTIVE_ENTRIES").or(file.risk.max_active_entries),
         max_daily_submits: env_parse("ALPACA_MAX_DAILY_SUBMITS").or(file.risk.max_daily_submits),
@@ -767,6 +781,7 @@ pub(super) fn build_options_runtime_config(
 fn strategy_profiles_from_file(
     strategies: Vec<StrategyBlockSection>,
     default_underlyings: &[String],
+    universe_groups: &BTreeMap<String, Vec<String>>,
     default_quantity: u64,
     credit_scanner: &PutCreditScannerConfig,
     iron_condor_scanner: &IronCondorScannerConfig,
@@ -779,7 +794,10 @@ fn strategy_profiles_from_file(
             id: Some("put_credit_default".to_string()),
             family: Some("put_credit".to_string()),
             mode: Some("live".to_string()),
+            universe_groups: Vec::new(),
             underlyings: default_underlyings.to_vec(),
+            include_underlyings: Vec::new(),
+            exclude_underlyings: Vec::new(),
             quantity: Some(default_quantity),
             scanner: StrategyScannerSection::default(),
             risk: StrategyRiskOverrideSection::default(),
@@ -815,15 +833,21 @@ fn strategy_profiles_from_file(
             .unwrap_or(AlpacaOptionsStrategyMode::Live.as_str())
             .parse::<AlpacaOptionsStrategyMode>()
             .map_err(|error| anyhow::anyhow!("{error} in profile {id}"))?;
-        let underlyings = split_strings(strategy.underlyings)
-            .into_iter()
-            .map(|value| value.to_ascii_uppercase())
-            .collect::<Vec<_>>();
-        let underlyings = if underlyings.is_empty() {
-            default_underlyings.to_vec()
-        } else {
-            underlyings
-        };
+        let universe_groups_requested = split_strings(strategy.universe_groups.clone());
+        let include_underlyings = normalized_underlyings(
+            split_strings(strategy.underlyings.clone())
+                .into_iter()
+                .chain(split_strings(strategy.include_underlyings.clone()).into_iter()),
+        );
+        let exclude_underlyings =
+            normalized_underlyings(split_strings(strategy.exclude_underlyings.clone()));
+        let underlyings = expanded_strategy_underlyings(
+            &id,
+            &universe_groups_requested,
+            &include_underlyings,
+            &exclude_underlyings,
+            universe_groups,
+        )?;
         anyhow::ensure!(
             !underlyings.is_empty(),
             "Alpaca strategy profile {id} resolved no underlyings"
@@ -861,6 +885,9 @@ fn strategy_profiles_from_file(
             id,
             family,
             mode,
+            universe_groups: universe_groups_requested,
+            include_underlyings,
+            exclude_underlyings,
             underlyings,
             quantity,
             scanner,
@@ -1102,6 +1129,78 @@ fn underlyings_from_profiles(profiles: &[AlpacaOptionsStrategyProfile]) -> Vec<S
         .collect()
 }
 
+fn universe_groups_from_file(
+    groups: BTreeMap<String, UniverseGroupSection>,
+) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
+    let mut resolved = BTreeMap::new();
+    for (name, group) in groups {
+        let name = name.trim().to_string();
+        anyhow::ensure!(!name.is_empty(), "universe group names must not be empty");
+        let members = normalized_underlyings(split_strings(group.members));
+        anyhow::ensure!(
+            !members.is_empty(),
+            "universe group {name} must contain at least one member"
+        );
+        resolved.insert(name, members);
+    }
+    Ok(resolved)
+}
+
+fn expanded_strategy_underlyings(
+    profile_id: &str,
+    group_names: &[String],
+    include_underlyings: &[String],
+    exclude_underlyings: &[String],
+    universe_groups: &BTreeMap<String, Vec<String>>,
+) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(
+        !group_names.is_empty() || !include_underlyings.is_empty(),
+        "Alpaca strategy profile {profile_id} requires universe_groups, underlyings, or include_underlyings"
+    );
+
+    let mut underlyings = Vec::new();
+    for group_name in group_names {
+        let Some(members) = universe_groups.get(group_name) else {
+            anyhow::bail!(
+                "Alpaca strategy profile {profile_id} references unknown universe group {group_name}"
+            );
+        };
+        for member in members {
+            push_unique_underlying(&mut underlyings, member.clone());
+        }
+    }
+    for underlying in include_underlyings {
+        push_unique_underlying(&mut underlyings, underlying.clone());
+    }
+
+    if !exclude_underlyings.is_empty() {
+        underlyings.retain(|underlying| !exclude_underlyings.contains(underlying));
+    }
+
+    anyhow::ensure!(
+        !underlyings.is_empty(),
+        "Alpaca strategy profile {profile_id} resolved no underlyings after excludes"
+    );
+    Ok(underlyings)
+}
+
+fn normalized_underlyings(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim().to_ascii_uppercase();
+        if !value.is_empty() {
+            push_unique_underlying(&mut normalized, value);
+        }
+    }
+    normalized
+}
+
+fn push_unique_underlying(underlyings: &mut Vec<String>, underlying: String) {
+    if !underlyings.contains(&underlying) {
+        underlyings.push(underlying);
+    }
+}
+
 fn apply_fleet_policy(config: &mut AlpacaOptionsRuntimeConfig) {
     let Some(fleet) = &config.fleet else {
         return;
@@ -1119,8 +1218,7 @@ fn apply_fleet_policy(config: &mut AlpacaOptionsRuntimeConfig) {
                 account.id
             ));
         }
-        if has_long_premium_profiles(&config.strategy_profiles) && !account.permissions.long_premium
-        {
+        if has_long_premium_profiles(config) && !account.permissions.long_premium {
             config.fleet_policy_blocks.push(format!(
                 "fleet_permission_long_premium_required:{}",
                 account.id
@@ -1132,13 +1230,13 @@ fn apply_fleet_policy(config: &mut AlpacaOptionsRuntimeConfig) {
                 account.id
             ));
         }
-        if has_naked_call_profiles(&config.strategy_profiles) && !account.permissions.naked_calls {
+        if has_naked_call_profiles(config) && !account.permissions.naked_calls {
             config.fleet_policy_blocks.push(format!(
                 "fleet_permission_naked_calls_required:{}",
                 account.id
             ));
         }
-        if has_naked_put_profiles(&config.strategy_profiles) && !account.permissions.naked_puts {
+        if has_naked_put_profiles(config) && !account.permissions.naked_puts {
             config.fleet_policy_blocks.push(format!(
                 "fleet_permission_naked_puts_required:{}",
                 account.id
@@ -1172,9 +1270,9 @@ fn apply_fleet_policy(config: &mut AlpacaOptionsRuntimeConfig) {
 }
 
 fn has_defined_risk_strategies(config: &AlpacaOptionsRuntimeConfig) -> bool {
-    config.strategy_profiles.iter().any(|profile| {
+    has_live_open_profile(config, |family| {
         matches!(
-            profile.family,
+            family,
             AlpacaOptionsStrategyFamily::PutCredit
                 | AlpacaOptionsStrategyFamily::CallCredit
                 | AlpacaOptionsStrategyFamily::IronCondor
@@ -1183,39 +1281,46 @@ fn has_defined_risk_strategies(config: &AlpacaOptionsRuntimeConfig) -> bool {
 }
 
 fn has_undefined_risk_strategies(config: &AlpacaOptionsRuntimeConfig) -> bool {
-    config
-        .strategy_profiles
-        .iter()
-        .any(|profile| is_naked_family(profile.family))
+    has_live_open_profile(config, is_naked_family)
 }
 
-fn has_long_premium_profiles(profiles: &[AlpacaOptionsStrategyProfile]) -> bool {
-    profiles.iter().any(|profile| {
+fn has_long_premium_profiles(config: &AlpacaOptionsRuntimeConfig) -> bool {
+    has_live_open_profile(config, |family| {
         matches!(
-            profile.family,
+            family,
             AlpacaOptionsStrategyFamily::PutDebit | AlpacaOptionsStrategyFamily::CallDebit
         )
     })
 }
 
-fn has_naked_call_profiles(profiles: &[AlpacaOptionsStrategyProfile]) -> bool {
-    profiles.iter().any(|profile| {
+fn has_naked_call_profiles(config: &AlpacaOptionsRuntimeConfig) -> bool {
+    has_live_open_profile(config, |family| {
         matches!(
-            profile.family,
+            family,
             AlpacaOptionsStrategyFamily::NakedCall
                 | AlpacaOptionsStrategyFamily::NakedCallOneToThreeDte
         )
     })
 }
 
-fn has_naked_put_profiles(profiles: &[AlpacaOptionsStrategyProfile]) -> bool {
-    profiles.iter().any(|profile| {
+fn has_naked_put_profiles(config: &AlpacaOptionsRuntimeConfig) -> bool {
+    has_live_open_profile(config, |family| {
         matches!(
-            profile.family,
+            family,
             AlpacaOptionsStrategyFamily::NakedPut
                 | AlpacaOptionsStrategyFamily::NakedPutOneToThreeDte
         )
     })
+}
+
+fn has_live_open_profile(
+    config: &AlpacaOptionsRuntimeConfig,
+    predicate: impl Fn(AlpacaOptionsStrategyFamily) -> bool,
+) -> bool {
+    config.open_orders_enabled
+        && config.strategy_profiles.iter().any(|profile| {
+            matches!(profile.mode, AlpacaOptionsStrategyMode::Live) && predicate(profile.family)
+        })
 }
 
 fn is_naked_family(family: AlpacaOptionsStrategyFamily) -> bool {

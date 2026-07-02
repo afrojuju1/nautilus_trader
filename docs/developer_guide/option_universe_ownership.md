@@ -18,6 +18,13 @@ resolution diagnostics. Venue adapters provide instruments, quotes, Greeks, and 
 translation. Once a concrete `OptionSeriesId` is selected, Nautilus `DataEngine` and
 `OptionChainManager` own subscription setup, rebalancing, snapshot timing, and teardown.
 
+Profiles may reference named `universe_groups` so common baskets such as broad indices, liquid ETFs,
+or undefined-risk allowlists are maintained once and reused by multiple strategy families. Group
+expansion is a configuration convenience before intent resolution; it does not move universe
+ownership out of the profile. Dynamic universe screens should later materialize a bounded snapshot
+before the live session and feed the same profile/underlying intent model rather than mutating
+subscriptions opportunistically.
+
 Live runtime code must not use a fixed option expiry as the control plane. A single date such as
 `ALPACA_OPTION_CHAIN_EXPIRY` can be useful for compare tools, historical replay, or a bounded
 diagnostic run, but it must not decide the production live universe.

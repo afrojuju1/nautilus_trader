@@ -192,6 +192,8 @@ pub enum AlpacaAdapterCommand {
     Account(ForwardedArgs),
     /// Summarizes configured Alpaca accounts.
     Fleet(ForwardedArgs),
+    /// Prints Alpaca options universe configuration plans.
+    Universe(AlpacaUniverseOpt),
     /// Emits Alpaca candidate alerts.
     Alerts(AlpacaAlertsOpt),
     /// Builds Alpaca-backed performance reports.
@@ -208,6 +210,23 @@ pub enum AlpacaAdapterCommand {
     Reconciliation(ForwardedArgs),
     /// Probes Alpaca trade-update WebSocket authorization and listening.
     TradeUpdates(ForwardedArgs),
+}
+
+#[cfg(feature = "alpaca")]
+/// Alpaca universe planning commands.
+#[derive(Parser, Debug, Clone)]
+#[command(about = "Alpaca universe planning operations", long_about = None)]
+pub struct AlpacaUniverseOpt {
+    #[clap(subcommand)]
+    pub command: AlpacaUniverseCommand,
+}
+
+#[cfg(feature = "alpaca")]
+/// Available Alpaca universe planning commands.
+#[derive(Parser, Debug, Clone)]
+pub enum AlpacaUniverseCommand {
+    /// Prints the resolved options universe plan.
+    Plan(ForwardedArgs),
 }
 
 #[cfg(feature = "alpaca")]

@@ -30,6 +30,7 @@ x-alpaca-runtime: &alpaca-runtime
     ALPACA_STATE_PATH: /state/alpaca_options_state.json
     NAUTILUS_ALPACA_ACCOUNT: ${NAUTILUS_ALPACA_DOCKER_ACCOUNT:-${NAUTILUS_ALPACA_ACCOUNT:-}}
     NAUTILUS_ALPACA_SERVICE: ${NAUTILUS_ALPACA_DOCKER_SERVICE:-alpaca-options-container}
+    NAUTILUS_ALPACA_FLEET_CONFIG: /config/fleet.toml
     NAUTILUS_ALPACA_LOG_DIR: /state/logs
     NAUTILUS_ALPACA_LOCK_DIR: /state/locks
     ALPACA_OPEN_ORDERS: ${NAUTILUS_ALPACA_DOCKER_OPEN_ORDERS:-${ALPACA_OPEN_ORDERS:-false}}
@@ -80,6 +81,7 @@ x-alpaca-runtime: &alpaca-runtime
     - alpaca-state:/state
     - ${NAUTILUS_ALPACA_DOCKER_SCHEDULED_EVENT_ROOT:-alpaca-scheduled-events}:/state/scheduled_events:ro
     - ${NAUTILUS_ALPACA_DOCKER_EARNINGS_DIR:-alpaca-earnings}:/state/earnings:ro
+    - ${NAUTILUS_ALPACA_DOCKER_FLEET_CONFIG:-./alpaca-fleet.toml.example}:/config/fleet.toml:ro
     - ${NAUTILUS_ALPACA_DOCKER_BASE_CONFIG:-./alpaca-options.base.toml.example}:/config/base-options.toml:ro
     - ${NAUTILUS_ALPACA_DOCKER_BASE_CONFIG:-./alpaca-options.base.toml.example}:/config/base-options-engine.toml:ro
     - ${NAUTILUS_ALPACA_DOCKER_CONFIG:-./alpaca-options.toml.example}:/config/options.toml:ro
