@@ -26,11 +26,11 @@ use chrono::{Datelike, NaiveDate};
 #[cfg(feature = "live")]
 use nautilus_core::UnixNanos;
 #[cfg(feature = "live")]
-use nautilus_trading::scheduled_events::ScheduledEventObservation;
+use nautilus_trading::scheduled_events::{ApprovedScheduledEvent, ScheduledEventObservation};
 use thiserror::Error;
 
 #[cfg(feature = "live")]
-const EARNINGS_EVENT_TYPE: &str = "earnings_report";
+pub(crate) const EARNINGS_EVENT_TYPE: &str = "earnings_report";
 #[cfg(feature = "live")]
 const US_EQUITY_EVENT_TIMEZONE: &str = "America/New_York";
 
@@ -396,6 +396,26 @@ pub fn earnings_events_to_observations(
                 ts_event: unix_nanos_from_report_date(event.report_date),
                 ts_init: unix_nanos_from_utc(provenance.source_fetched_at_utc),
             }
+        })
+        .collect()
+}
+
+/// Converts approved scheduled-event records into Alpaca event-shock inputs.
+#[cfg(feature = "live")]
+#[must_use]
+pub fn earnings_events_from_approved_scheduled_events(
+    events: &[ApprovedScheduledEvent],
+) -> Vec<EarningsEvent> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let report_date = NaiveDate::parse_from_str(&event.event_date, "%Y-%m-%d").ok()?;
+            Some(EarningsEvent {
+                underlying: event.underlying.to_ascii_uppercase(),
+                report_date,
+                timing: event.timing.parse().unwrap_or(EarningsTiming::Unknown),
+                source: event.source_set.clone(),
+            })
         })
         .collect()
 }

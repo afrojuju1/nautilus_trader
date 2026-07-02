@@ -100,12 +100,14 @@ max_active_entries_per_underlying = 1
 block_unestimated_risk_capital = true
 
 [event_shock]
-# Optional CSV bridge for symbol-level entry blocks until approved scheduled events are loaded from
-# the Parquet catalog.
+# Approved scheduled events are loaded from the source-neutral ParquetDataCatalog.
+# Empty values use $NAUTILUS_SCHEDULED_EVENT_CATALOG, then the Nautilus state default.
+# scheduled_event_catalog_path = "~/.local/state/nautilus_trader/scheduled_events/catalog"
+# Optional CSV bridge for validation only. Set allow_csv_bridge = true before using it.
 # earnings_events_path = "~/.local/state/nautilus_trader/earnings/earnings_events_approved.csv"
-# Container deployments can set ALPACA_EVENT_SHOCK_EARNINGS_EVENTS_PATH to
-# /state/earnings/earnings_events_approved.csv when mounting the CSV bridge.
+# allow_csv_bridge = false
 require_earnings_events = false
+stale_after_days = 1
 block_days_before_earnings = 1
 block_days_after_earnings = 1
 

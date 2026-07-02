@@ -844,6 +844,38 @@ fn print_config_check(config: &AlpacaOptionsRuntimeConfig) -> anyhow::Result<()>
         config.candidate_ledger_enabled,
         config.candidate_ledger_max_candidates,
     );
+    println!(
+        "event_shock: source={} scheduled_event_catalog_path={} events={} catalog_events={} sources={} policy_versions={} coverage_start={} coverage_end={} freshness={} unavailable_reason={} rejected={} csv_bridge_enabled={} csv_bridge_path={} dry_run_only={} required={}",
+        config.event_shock.source,
+        config.event_shock.scheduled_event_catalog_path.display(),
+        config.event_shock.event_count,
+        config.event_shock.catalog_event_count,
+        format_string_list(&config.event_shock.source_set),
+        format_string_list(&config.event_shock.policy_versions),
+        config
+            .event_shock
+            .coverage_start
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        config
+            .event_shock
+            .coverage_end
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        config.event_shock.freshness,
+        config
+            .event_shock
+            .unavailable_reason
+            .as_deref()
+            .unwrap_or("none"),
+        config.event_shock.rejected_count,
+        config.event_shock.csv_bridge_enabled,
+        config
+            .event_shock
+            .csv_bridge_path
+            .as_ref()
+            .map_or_else(|| "none".to_string(), |path| path.display().to_string()),
+        config.event_shock.dry_run_only,
+        config.event_shock.required,
+    );
     Ok(())
 }
 
@@ -857,4 +889,12 @@ fn option_stream_max_quote_symbols_from_env() -> anyhow::Result<usize> {
 
 fn format_limit(limit: Option<usize>) -> String {
     limit.map_or_else(|| "unlimited".to_string(), |value| value.to_string())
+}
+
+fn format_string_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(",")
+    }
 }

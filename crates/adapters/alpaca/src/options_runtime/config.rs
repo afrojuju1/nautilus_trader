@@ -7,22 +7,31 @@ use std::{
     str::FromStr,
 };
 
-use chrono::NaiveTime;
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use nautilus_infrastructure::sql::operational::OPERATIONAL_SCHEMA_DEFAULT;
-use nautilus_trading::options::candidates::{
-    DebitSpreadScannerConfig, IronCondorScannerConfig, NakedOptionScannerConfig,
-    PutCreditScannerConfig,
+use nautilus_trading::{
+    options::candidates::{
+        DebitSpreadScannerConfig, IronCondorScannerConfig, NakedOptionScannerConfig,
+        PutCreditScannerConfig,
+    },
+    scheduled_events::{
+        ApprovedScheduledEventLoadReport, ApprovedScheduledEventLoadRequest,
+        SCHEDULED_EVENT_CATALOG_ENV, ScheduledEventLoadFreshness,
+        default_scheduled_event_catalog_path, load_approved_scheduled_events,
+    },
 };
 use serde::Deserialize;
 
-use crate::earnings::load_earnings_events_csv;
+use crate::earnings::{
+    EARNINGS_EVENT_TYPE, earnings_events_from_approved_scheduled_events, load_earnings_events_csv,
+};
 use crate::{fleet::load_fleet_config_from_env, runtime::StrategyState};
 
 use super::{
     AlpacaOptionsRuntimeConfig, AlpacaOptionsStrategyFamily, AlpacaOptionsStrategyMode,
     AlpacaOptionsStrategyProfile, AlpacaOptionsStrategyRiskOverrides,
-    AlpacaOptionsStrategyScannerConfig,
+    AlpacaOptionsStrategyScannerConfig, EventShockRuntimeStatus,
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -455,8 +464,11 @@ impl RiskSection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct EventShockSection {
+    scheduled_event_catalog_path: Option<PathBuf>,
     earnings_events_path: Option<PathBuf>,
     require_earnings_events: Option<bool>,
+    allow_csv_bridge: Option<bool>,
+    stale_after_days: Option<i64>,
     block_days_before_earnings: Option<i64>,
     block_days_after_earnings: Option<i64>,
 }
@@ -464,10 +476,15 @@ struct EventShockSection {
 impl EventShockSection {
     fn merge_parent(self, parent: Self) -> Self {
         Self {
+            scheduled_event_catalog_path: self
+                .scheduled_event_catalog_path
+                .or(parent.scheduled_event_catalog_path),
             earnings_events_path: self.earnings_events_path.or(parent.earnings_events_path),
             require_earnings_events: self
                 .require_earnings_events
                 .or(parent.require_earnings_events),
+            allow_csv_bridge: self.allow_csv_bridge.or(parent.allow_csv_bridge),
+            stale_after_days: self.stale_after_days.or(parent.stale_after_days),
             block_days_before_earnings: self
                 .block_days_before_earnings
                 .or(parent.block_days_before_earnings),
@@ -600,7 +617,31 @@ pub(super) fn build_options_runtime_config(
         .first()
         .map_or(default_quantity, |profile| profile.quantity);
     let profile_underlyings = underlyings_from_profiles(&strategy_profiles);
-    let event_shock_earnings_events = load_event_shock_earnings_events(&file.event_shock)?;
+    let event_shock_block_days_before_earnings =
+        env_parse("ALPACA_EVENT_SHOCK_BLOCK_DAYS_BEFORE_EARNINGS")
+            .or(file.event_shock.block_days_before_earnings)
+            .unwrap_or(1)
+            .max(0);
+    let event_shock_block_days_after_earnings =
+        env_parse("ALPACA_EVENT_SHOCK_BLOCK_DAYS_AFTER_EARNINGS")
+            .or(file.event_shock.block_days_after_earnings)
+            .unwrap_or(1)
+            .max(0);
+    let entry_timezone = file
+        .universe
+        .entry_timezone
+        .as_deref()
+        .unwrap_or("America/New_York")
+        .parse::<Tz>()?;
+    let as_of_utc = Utc::now();
+    let event_shock_load = load_event_shock_earnings_events(
+        &file.event_shock,
+        &profile_underlyings,
+        as_of_utc.with_timezone(&entry_timezone).date_naive(),
+        as_of_utc,
+        event_shock_block_days_before_earnings,
+        event_shock_block_days_after_earnings,
+    )?;
     let close_price_cushion = env_parse("ALPACA_CLOSE_PRICE_CUSHION")
         .or(file.management.close_price_cushion)
         .unwrap_or(0.0)
@@ -625,19 +666,10 @@ pub(super) fn build_options_runtime_config(
         block_unestimated_risk_capital: env_bool("ALPACA_BLOCK_UNESTIMATED_RISK_CAPITAL")
             .or(file.risk.block_unestimated_risk_capital)
             .unwrap_or(true),
-        event_shock_earnings_events,
-        event_shock_block_days_before_earnings: env_parse(
-            "ALPACA_EVENT_SHOCK_BLOCK_DAYS_BEFORE_EARNINGS",
-        )
-        .or(file.event_shock.block_days_before_earnings)
-        .unwrap_or(1)
-        .max(0),
-        event_shock_block_days_after_earnings: env_parse(
-            "ALPACA_EVENT_SHOCK_BLOCK_DAYS_AFTER_EARNINGS",
-        )
-        .or(file.event_shock.block_days_after_earnings)
-        .unwrap_or(1)
-        .max(0),
+        event_shock_earnings_events: event_shock_load.events,
+        event_shock: event_shock_load.status,
+        event_shock_block_days_before_earnings,
+        event_shock_block_days_after_earnings,
         sectors: sector_map_from_file(file.risk.sectors),
         max_iterations: env_parse("ALPACA_MAX_ITERATIONS")
             .or(file.runtime.max_iterations)
@@ -705,12 +737,7 @@ pub(super) fn build_options_runtime_config(
             .unwrap_or(false),
         entry_start: parse_time_value(file.universe.entry_start.as_deref(), "09:45")?,
         entry_end: parse_time_value(file.universe.entry_end.as_deref(), "14:30")?,
-        entry_timezone: file
-            .universe
-            .entry_timezone
-            .as_deref()
-            .unwrap_or("America/New_York")
-            .parse::<Tz>()?,
+        entry_timezone,
         state_path: env::var("ALPACA_STATE_PATH")
             .map(PathBuf::from)
             .ok()
@@ -1479,10 +1506,40 @@ fn parse_time_value(value: Option<&str>, default: &str) -> anyhow::Result<NaiveT
     )?)
 }
 
+struct EventShockLoad {
+    events: Vec<crate::earnings::EarningsEvent>,
+    status: EventShockRuntimeStatus,
+}
+
 fn load_event_shock_earnings_events(
     config: &EventShockSection,
-) -> anyhow::Result<Vec<crate::earnings::EarningsEvent>> {
-    let path = env::var_os("ALPACA_EVENT_SHOCK_EARNINGS_EVENTS_PATH")
+    underlyings: &[String],
+    as_of_date: NaiveDate,
+    as_of_utc: DateTime<Utc>,
+    block_days_before_earnings: i64,
+    block_days_after_earnings: i64,
+) -> anyhow::Result<EventShockLoad> {
+    let catalog_path = event_shock_catalog_path(config);
+    let mut request =
+        ApprovedScheduledEventLoadRequest::new(EARNINGS_EVENT_TYPE, as_of_date, as_of_utc);
+    request.lookback_days = block_days_after_earnings;
+    request.horizon_days = block_days_before_earnings;
+    request.underlyings = underlyings.to_vec();
+    request.stale_after_days = env_parse("ALPACA_EVENT_SHOCK_STALE_AFTER_DAYS")
+        .or(config.stale_after_days)
+        .unwrap_or(1)
+        .max(0);
+
+    let report = load_approved_scheduled_events(&catalog_path, &request).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to load approved scheduled earnings events from {}: {error}",
+            catalog_path.display()
+        )
+    })?;
+    let csv_bridge_enabled = env_bool("ALPACA_EVENT_SHOCK_ALLOW_CSV_BRIDGE")
+        .or(config.allow_csv_bridge)
+        .unwrap_or(false);
+    let csv_bridge_path = env::var_os("ALPACA_EVENT_SHOCK_EARNINGS_EVENTS_PATH")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .or_else(|| config.earnings_events_path.clone());
@@ -1490,20 +1547,82 @@ fn load_event_shock_earnings_events(
         .or(config.require_earnings_events)
         .unwrap_or(false);
 
-    let Some(path) = path else {
-        anyhow::ensure!(
-            !required,
-            "event_shock.require_earnings_events is true but no earnings_events_path is configured"
-        );
-        return Ok(Vec::new());
+    let mut events = if report.freshness == ScheduledEventLoadFreshness::Fresh {
+        earnings_events_from_approved_scheduled_events(&report.events)
+    } else {
+        Vec::new()
     };
+    let mut source = if report.freshness == ScheduledEventLoadFreshness::Fresh {
+        "scheduled_event_catalog".to_string()
+    } else {
+        "none".to_string()
+    };
+    let mut dry_run_only = report.freshness != ScheduledEventLoadFreshness::Fresh;
 
-    load_earnings_events_csv(&path).map_err(|error| {
-        anyhow::anyhow!(
-            "failed to load event-shock earnings events {}: {error}",
-            path.display()
-        )
+    if events.is_empty()
+        && csv_bridge_enabled
+        && let Some(path) = csv_bridge_path.as_ref()
+    {
+        events = load_earnings_events_csv(path).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to load event-shock CSV bridge events {}: {error}",
+                path.display()
+            )
+        })?;
+        source = "csv_bridge".to_string();
+        dry_run_only = true;
+    }
+
+    Ok(EventShockLoad {
+        status: event_shock_status(
+            source,
+            catalog_path,
+            events.len(),
+            &report,
+            csv_bridge_enabled,
+            csv_bridge_path,
+            dry_run_only,
+            required,
+        ),
+        events,
     })
+}
+
+fn event_shock_catalog_path(config: &EventShockSection) -> PathBuf {
+    env::var_os(SCHEDULED_EVENT_CATALOG_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| config.scheduled_event_catalog_path.clone())
+        .unwrap_or_else(default_scheduled_event_catalog_path)
+}
+
+fn event_shock_status(
+    source: String,
+    catalog_path: PathBuf,
+    event_count: usize,
+    report: &ApprovedScheduledEventLoadReport,
+    csv_bridge_enabled: bool,
+    csv_bridge_path: Option<PathBuf>,
+    dry_run_only: bool,
+    required: bool,
+) -> EventShockRuntimeStatus {
+    EventShockRuntimeStatus {
+        source,
+        scheduled_event_catalog_path: catalog_path,
+        event_count,
+        catalog_event_count: report.event_count,
+        source_set: report.source_set.clone(),
+        policy_versions: report.policy_versions.clone(),
+        coverage_start: report.coverage_start,
+        coverage_end: report.coverage_end,
+        freshness: report.freshness.as_str().to_string(),
+        unavailable_reason: report.unavailable_reason.clone(),
+        rejected_count: report.rejected_count,
+        csv_bridge_enabled,
+        csv_bridge_path,
+        dry_run_only,
+        required,
+    }
 }
 
 fn default_config_path() -> PathBuf {
@@ -1635,7 +1754,10 @@ max_portfolio_risk_capital_usd = 1000.0
 block_unestimated_risk_capital = true
 
 [event_shock]
+scheduled_event_catalog_path = "/tmp/scheduled_events/catalog"
 earnings_events_path = "/tmp/earnings_events_approved.csv"
+allow_csv_bridge = true
+stale_after_days = 2
 block_days_before_earnings = 2
 
 [risk.sectors]
@@ -1690,9 +1812,15 @@ GDX = "metals"
         assert_eq!(merged.risk.max_portfolio_risk_capital_usd, Some(1000.0));
         assert_eq!(merged.risk.block_unestimated_risk_capital, Some(true));
         assert_eq!(
+            merged.event_shock.scheduled_event_catalog_path,
+            Some(PathBuf::from("/tmp/scheduled_events/catalog")),
+        );
+        assert_eq!(
             merged.event_shock.earnings_events_path,
             Some(PathBuf::from("/tmp/earnings_events_approved.csv")),
         );
+        assert_eq!(merged.event_shock.allow_csv_bridge, Some(true));
+        assert_eq!(merged.event_shock.stale_after_days, Some(2));
         assert_eq!(merged.event_shock.block_days_before_earnings, Some(2));
         assert_eq!(
             merged.risk.sectors.get("SPY").map(String::as_str),
@@ -1847,8 +1975,11 @@ max_hold_secs = 3600
 expiration_exit_days = 2
 
 [event_shock]
+scheduled_event_catalog_path = "/tmp/scheduled_events/catalog"
 earnings_events_path = "/tmp/earnings_events_approved.csv"
 require_earnings_events = true
+allow_csv_bridge = true
+stale_after_days = 2
 block_days_before_earnings = 3
 block_days_after_earnings = 2
 "#,
@@ -1944,10 +2075,16 @@ block_days_after_earnings = 2
         assert_eq!(config.management.max_close_attempts, Some(4));
         assert_eq!(config.management.close_reprice_cooldown_secs, Some(45));
         assert_eq!(
+            config.event_shock.scheduled_event_catalog_path,
+            Some(PathBuf::from("/tmp/scheduled_events/catalog")),
+        );
+        assert_eq!(
             config.event_shock.earnings_events_path,
             Some(PathBuf::from("/tmp/earnings_events_approved.csv")),
         );
         assert_eq!(config.event_shock.require_earnings_events, Some(true));
+        assert_eq!(config.event_shock.allow_csv_bridge, Some(true));
+        assert_eq!(config.event_shock.stale_after_days, Some(2));
         assert_eq!(config.event_shock.block_days_before_earnings, Some(3));
         assert_eq!(config.event_shock.block_days_after_earnings, Some(2));
     }

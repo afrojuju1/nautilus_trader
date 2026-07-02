@@ -23,7 +23,7 @@ use std::{
     sync::Arc,
 };
 
-use chrono::NaiveTime;
+use chrono::{NaiveDate, NaiveTime};
 use chrono_tz::Tz;
 use nautilus_infrastructure::sql::operational::{self, OperationalRepository};
 use nautilus_trading::options::{
@@ -115,6 +115,8 @@ pub struct AlpacaOptionsRuntimeConfig {
     pub block_unestimated_risk_capital: bool,
     /// Approved earnings events used by the event-shock admission guard.
     pub event_shock_earnings_events: Vec<EarningsEvent>,
+    /// Diagnostics for the scheduled-event event-shock load.
+    pub event_shock: EventShockRuntimeStatus,
     /// Calendar days before an earnings report to block new entries.
     pub event_shock_block_days_before_earnings: i64,
     /// Calendar days after an earnings report to block new entries.
@@ -213,6 +215,41 @@ pub struct AlpacaOptionsRuntimeConfig {
     pub operational_schema: String,
     /// Optional account ID override for persisted records.
     pub operational_account_id: Option<String>,
+}
+
+/// Runtime diagnostics for scheduled-event-backed event shock inputs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventShockRuntimeStatus {
+    /// Runtime source used for scanner and admission event input.
+    pub source: String,
+    /// Scheduled-event catalog queried by the runtime loader.
+    pub scheduled_event_catalog_path: PathBuf,
+    /// Event count consumed by scanner and admission after source selection.
+    pub event_count: usize,
+    /// Approved scheduled-event count returned by the catalog loader.
+    pub catalog_event_count: usize,
+    /// Source labels represented by the approved catalog dataset.
+    pub source_set: Vec<String>,
+    /// Approval policy versions represented by the approved catalog dataset.
+    pub policy_versions: Vec<String>,
+    /// Minimum approved event date present for matching underlyings.
+    pub coverage_start: Option<NaiveDate>,
+    /// Maximum approved event date present for matching underlyings.
+    pub coverage_end: Option<NaiveDate>,
+    /// Loader freshness status.
+    pub freshness: String,
+    /// Loader reason when data is unavailable or not fresh.
+    pub unavailable_reason: Option<String>,
+    /// Rejected approved-event records present in the matching dataset.
+    pub rejected_count: usize,
+    /// Whether the legacy CSV bridge is enabled.
+    pub csv_bridge_enabled: bool,
+    /// Legacy CSV bridge path, when configured.
+    pub csv_bridge_path: Option<PathBuf>,
+    /// Whether event-load freshness/source should force dry-run-only behavior.
+    pub dry_run_only: bool,
+    /// Whether event-shock events were configured as required by the operator.
+    pub required: bool,
 }
 
 /// Runtime strategy profile mode.

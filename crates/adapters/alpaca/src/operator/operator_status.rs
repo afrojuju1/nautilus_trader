@@ -31,7 +31,7 @@ use crate::{
         client::AlpacaHttpClient,
         models::{AlpacaAccount, AlpacaActivity, AlpacaOrder, AlpacaPosition, ListOrdersRequest},
     },
-    options_runtime::AlpacaOptionsRuntimeConfig,
+    options_runtime::{AlpacaOptionsRuntimeConfig, EventShockRuntimeStatus},
     runtime::{StrategyState, read_operator_events},
 };
 use chrono::{DateTime, Duration, Utc};
@@ -63,6 +63,7 @@ struct OperatorConfig {
     sectors: BTreeMap<String, String>,
     fleet_account_id: Option<String>,
     fleet_policy_blocks: Vec<String>,
+    event_shock: EventShockStatus,
     operational_store: OperationalStoreStatus,
     strategy_state_metadata: Option<StrategyStateMetadata>,
     strategy_state_storage_summary: Option<StrategyStateStorageSummary>,
@@ -90,6 +91,7 @@ struct OperatorStatus {
     strategy_state: StrategyStateStatus,
     active_entries: Vec<ActiveEntryStatus>,
     risk: RiskStatus,
+    event_shock: EventShockStatus,
     last_scan: Option<Value>,
     regime_coverage: Option<RegimeCoverageStatus>,
     universe: Option<UniverseStatus>,
@@ -203,6 +205,25 @@ struct RiskStatus {
     max_active_entries_per_underlying: Option<usize>,
     active_entries_by_sector: BTreeMap<String, usize>,
     max_active_entries_per_sector: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct EventShockStatus {
+    source: String,
+    scheduled_event_catalog_path: String,
+    event_count: usize,
+    catalog_event_count: usize,
+    source_set: Vec<String>,
+    policy_versions: Vec<String>,
+    coverage_start: Option<String>,
+    coverage_end: Option<String>,
+    freshness: String,
+    unavailable_reason: Option<String>,
+    rejected_count: usize,
+    csv_bridge_enabled: bool,
+    csv_bridge_path: Option<String>,
+    dry_run_only: bool,
+    required: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -446,6 +467,7 @@ impl OperatorConfig {
             sectors: strategy_config.sectors,
             fleet_account_id: strategy_config.fleet_account_id,
             fleet_policy_blocks: strategy_config.fleet_policy_blocks,
+            event_shock: event_shock_status(&strategy_config.event_shock),
             operational_store,
             strategy_state_metadata,
             strategy_state_storage_summary,
@@ -632,6 +654,7 @@ fn build_status(
         active_entries_by_sector,
         max_active_entries_per_sector: config.max_active_entries_per_sector,
     };
+    let event_shock = config.event_shock.clone();
 
     let service = ServiceStatus {
         name: config.service_name.clone(),
@@ -707,6 +730,7 @@ fn build_status(
         strategy_state,
         active_entries,
         risk,
+        event_shock,
         last_scan,
         regime_coverage,
         universe,
@@ -719,6 +743,29 @@ fn build_status(
         last_lifecycle_event,
         last_broker_event,
         alerts,
+    }
+}
+
+fn event_shock_status(status: &EventShockRuntimeStatus) -> EventShockStatus {
+    EventShockStatus {
+        source: status.source.clone(),
+        scheduled_event_catalog_path: status.scheduled_event_catalog_path.display().to_string(),
+        event_count: status.event_count,
+        catalog_event_count: status.catalog_event_count,
+        source_set: status.source_set.clone(),
+        policy_versions: status.policy_versions.clone(),
+        coverage_start: status.coverage_start.map(|date| date.to_string()),
+        coverage_end: status.coverage_end.map(|date| date.to_string()),
+        freshness: status.freshness.clone(),
+        unavailable_reason: status.unavailable_reason.clone(),
+        rejected_count: status.rejected_count,
+        csv_bridge_enabled: status.csv_bridge_enabled,
+        csv_bridge_path: status
+            .csv_bridge_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        dry_run_only: status.dry_run_only,
+        required: status.required,
     }
 }
 
@@ -776,6 +823,22 @@ fn build_alerts(
             AlertSeverity::Critical,
             "fleet_policy_block",
             format!("fleet policy is blocking new entries: {block}"),
+        ));
+    }
+    if config.event_shock.dry_run_only {
+        alerts.push(alert(
+            AlertSeverity::Warning,
+            "event_load_dry_run_only",
+            format!(
+                "event-load source={} freshness={} reason={}",
+                config.event_shock.source,
+                config.event_shock.freshness,
+                config
+                    .event_shock
+                    .unavailable_reason
+                    .as_deref()
+                    .unwrap_or("none"),
+            ),
         ));
     }
     if orders.recent_rejected > 0 {
@@ -1218,6 +1281,36 @@ fn print_human_status(status: &OperatorStatus) {
         format_limit(status.risk.max_open_orders),
         format_limit(status.risk.max_active_entries_per_underlying),
         format_limit(status.risk.max_active_entries_per_sector),
+    );
+    println!(
+        "event_shock: source={} scheduled_event_catalog_path={} events={} catalog_events={} sources={} policy_versions={} coverage_start={} coverage_end={} freshness={} unavailable_reason={} rejected={} csv_bridge_enabled={} csv_bridge_path={} dry_run_only={} required={}",
+        status.event_shock.source,
+        status.event_shock.scheduled_event_catalog_path,
+        status.event_shock.event_count,
+        status.event_shock.catalog_event_count,
+        format_strings(&status.event_shock.source_set),
+        format_strings(&status.event_shock.policy_versions),
+        status
+            .event_shock
+            .coverage_start
+            .as_deref()
+            .unwrap_or("none"),
+        status.event_shock.coverage_end.as_deref().unwrap_or("none"),
+        status.event_shock.freshness,
+        status
+            .event_shock
+            .unavailable_reason
+            .as_deref()
+            .unwrap_or("none"),
+        status.event_shock.rejected_count,
+        status.event_shock.csv_bridge_enabled,
+        status
+            .event_shock
+            .csv_bridge_path
+            .as_deref()
+            .unwrap_or("none"),
+        status.event_shock.dry_run_only,
+        status.event_shock.required,
     );
     println!(
         "last_scan: {}",
