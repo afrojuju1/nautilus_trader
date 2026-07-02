@@ -235,10 +235,20 @@ docker compose \
   run --rm alpaca-status
 ```
 
-When Docker owns the runtime, prefer the Docker status commands above plus
-`docker compose --env-file .env -f deploy/alpaca/compose.yml --profile engine ps`. The
-`alpaca-control fleet` command is systemd-oriented and reports systemd account services as inactive
-when Docker is the active owner.
+When Docker owns the runtime, the Docker container is the service supervisor. Prefer:
+
+```bash
+docker compose --env-file .env -f deploy/alpaca/compose.yml --profile engine ps
+docker exec nautilus-alpaca-alpaca-options-1 nautilus adapters alpaca status --json
+docker exec nautilus-alpaca-alpaca-options-1 nautilus adapters alpaca doctor --json
+docker exec nautilus-alpaca-alpaca-options-1 alpaca-options-node --check-config
+```
+
+Host-side `nautilus adapters alpaca status --json` detects the running Docker container so it does
+not report a disabled `alpaca-options.service` as a broken engine. For exact in-container logs,
+state paths, and universe events, run the command through `docker exec`. The `alpaca-control fleet`
+command is systemd-oriented and reports systemd account services as inactive when Docker is the
+active owner.
 
 The Docker defaults keep `ALPACA_OPEN_ORDERS=false` and `ALPACA_CLOSE_ORDERS=false`. To run the
 actual containerized engine, make the paper-trading intent explicit in the repo `.env` or shell,
@@ -275,7 +285,12 @@ the repo `.env`, set `ALPACA_MAX_ITERATIONS=1`, keep quantity at `1`, and set
 the Alpaca paper dashboard or API before continuing. Do not leave accepted smoke orders working
 unless the test explicitly requires it.
 
-To enable start on user login:
+## Optional Systemd Runtime
+
+Use systemd only for a direct host runtime. Do not treat `alpaca-options.service` being disabled as
+a failure when the Docker compose `alpaca-options` service is the active owner.
+
+To enable direct systemd start on user login:
 
 ```bash
 systemctl --user enable alpaca-options.service
@@ -646,24 +661,27 @@ realized-trade records.
 Normal overnight monitoring:
 
 ```bash
-nautilus adapters alpaca status --json
-nautilus adapters alpaca fleet --json
-cargo run -p nautilus-cli --features alpaca --bin nautilus -- adapters alpaca account
+docker compose --env-file .env -f deploy/alpaca/compose.yml --profile engine ps
+docker exec nautilus-alpaca-alpaca-options-1 nautilus adapters alpaca status --json
+docker exec nautilus-alpaca-alpaca-options-1 nautilus adapters alpaca doctor --json
+docker exec nautilus-alpaca-alpaca-options-1 nautilus adapters alpaca account
 ```
 
-Expected overnight state with an open managed spread is service `active`, open orders `0`, unmanaged
-positions `0`, and `last_decision.reason = outside_entry_window`.
+Expected overnight state with an open managed spread is Docker service `Up`; host-side operator
+status reports `service.supervisor = docker`; in-container operator status reports
+`service.supervisor = container`; open orders are `0`; unmanaged positions are `0`; and
+`last_decision.reason = outside_entry_window`.
 
 Force flatten:
 
 ```bash
 sed -i 's/^ALPACA_FORCE_FLATTEN=.*/ALPACA_FORCE_FLATTEN=true/' \
   .env
-systemctl --user restart alpaca-options.service
-nautilus adapters alpaca status --json
+docker compose --env-file .env -f deploy/alpaca/compose.yml --profile engine up -d --force-recreate alpaca-options
+docker exec nautilus-alpaca-alpaca-options-1 nautilus adapters alpaca status --json
 ```
 
-After the account is flat, set `ALPACA_FORCE_FLATTEN=false` and restart the service.
+After the account is flat, set `ALPACA_FORCE_FLATTEN=false` and recreate the Docker service.
 
 Stuck close order:
 

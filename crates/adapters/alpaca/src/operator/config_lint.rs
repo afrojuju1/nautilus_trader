@@ -124,6 +124,10 @@ pub(crate) fn build_config_lint_report(include_pre_roll: bool) -> ConfigLintRepo
 }
 
 pub(crate) fn build_pre_roll_report() -> PreRollReport {
+    if running_in_container() {
+        return build_container_pre_roll_report();
+    }
+
     let mut checks = Vec::new();
     let mut issues = Vec::new();
     for mount in docker_mount_specs() {
@@ -147,6 +151,44 @@ pub(crate) fn build_pre_roll_report() -> PreRollReport {
                     check.name, check.host_source
                 ),
                 Some(check.host_source.clone()),
+            ));
+        }
+        checks.push(check);
+    }
+
+    let ok = issues.is_empty();
+    PreRollReport {
+        checked_at_utc: Utc::now().to_rfc3339(),
+        ok,
+        checks,
+        issues,
+    }
+}
+
+fn build_container_pre_roll_report() -> PreRollReport {
+    let mut checks = Vec::new();
+    let mut issues = Vec::new();
+    for mount in container_mount_specs() {
+        let check = check_container_mount(mount);
+        if check.status == "missing" {
+            issues.push(issue(
+                "error",
+                "container_mount_missing",
+                format!(
+                    "{} container path {} does not exist",
+                    check.name, check.container_path
+                ),
+                Some(check.container_path.to_string()),
+            ));
+        } else if check.status == "not_container_readable" {
+            issues.push(issue(
+                "error",
+                "container_mount_not_readable",
+                format!(
+                    "{} container path {} is not readable by the runtime user",
+                    check.name, check.container_path
+                ),
+                Some(check.container_path.to_string()),
             ));
         }
         checks.push(check);
@@ -382,9 +424,51 @@ struct DockerMountSpec {
 }
 
 #[derive(Clone, Debug)]
+struct ContainerMountSpec {
+    name: &'static str,
+    container_path: &'static str,
+    expect_dir: bool,
+}
+
+#[derive(Clone, Debug)]
 enum MountDefault {
     NamedVolume(&'static str),
     ComposeFile(&'static str),
+}
+
+fn container_mount_specs() -> Vec<ContainerMountSpec> {
+    vec![
+        ContainerMountSpec {
+            name: "scheduled_events",
+            container_path: "/state/scheduled_events",
+            expect_dir: true,
+        },
+        ContainerMountSpec {
+            name: "earnings",
+            container_path: "/state/earnings",
+            expect_dir: true,
+        },
+        ContainerMountSpec {
+            name: "fleet_config",
+            container_path: "/config/fleet.toml",
+            expect_dir: false,
+        },
+        ContainerMountSpec {
+            name: "base_config",
+            container_path: "/config/base-options.toml",
+            expect_dir: false,
+        },
+        ContainerMountSpec {
+            name: "base_engine_config",
+            container_path: "/config/base-options-engine.toml",
+            expect_dir: false,
+        },
+        ContainerMountSpec {
+            name: "runtime_config",
+            container_path: "/config/options.toml",
+            expect_dir: false,
+        },
+    ]
 }
 
 fn docker_mount_specs() -> Vec<DockerMountSpec> {
@@ -425,6 +509,33 @@ fn docker_mount_specs() -> Vec<DockerMountSpec> {
             expect_dir: false,
         },
     ]
+}
+
+fn check_container_mount(spec: ContainerMountSpec) -> PreRollCheck {
+    let path = PathBuf::from(spec.container_path);
+    let metadata = fs::metadata(&path);
+    let exists = metadata.is_ok();
+    let container_readable = metadata.as_ref().ok().map(|metadata| {
+        metadata_shape_matches(metadata, spec.expect_dir) && metadata_container_readable(metadata)
+    });
+    let status = if !exists {
+        "missing"
+    } else if container_readable == Some(false) {
+        "not_container_readable"
+    } else {
+        "ok"
+    };
+    PreRollCheck {
+        name: spec.name,
+        env_var: None,
+        container_path: spec.container_path,
+        host_source: spec.container_path.to_string(),
+        source_kind: "container_path",
+        exists: Some(exists),
+        container_readable,
+        mode: metadata.as_ref().ok().and_then(metadata_mode),
+        status,
+    }
 }
 
 fn check_mount(spec: DockerMountSpec) -> PreRollCheck {
@@ -476,6 +587,11 @@ fn check_mount(spec: DockerMountSpec) -> PreRollCheck {
             }
         }
     }
+}
+
+fn running_in_container() -> bool {
+    Path::new("/.dockerenv").exists()
+        || env::var("NAUTILUS_ALPACA_SERVICE").as_deref() == Ok("alpaca-options-container")
 }
 
 #[derive(Clone, Debug)]

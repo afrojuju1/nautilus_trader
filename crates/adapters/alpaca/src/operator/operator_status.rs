@@ -18,7 +18,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -126,9 +126,12 @@ enum EngineState {
 #[derive(Debug, Serialize)]
 struct ServiceStatus {
     name: String,
+    supervisor: String,
     fleet_account_id: Option<String>,
     active: Option<bool>,
     active_state: Option<String>,
+    docker_container: Option<String>,
+    docker_status: Option<String>,
     lock_file: String,
     lock_file_exists: bool,
     log_file: String,
@@ -755,12 +758,16 @@ fn build_status(
         max_active_entries_per_sector: config.max_active_entries_per_sector,
     };
     let event_shock = config.event_shock.clone();
+    let supervisor = service_supervisor_status(&config.service_name);
 
     let service = ServiceStatus {
         name: config.service_name.clone(),
+        supervisor: supervisor.supervisor,
         fleet_account_id: config.fleet_account_id.clone(),
-        active: service_active(&config.service_name),
-        active_state: service_active_state(&config.service_name),
+        active: supervisor.active,
+        active_state: supervisor.active_state,
+        docker_container: supervisor.docker_container,
+        docker_status: supervisor.docker_status,
         lock_file: config.lock_path.display().to_string(),
         lock_file_exists: config.lock_path.exists(),
         log_file: config.log_path.display().to_string(),
@@ -989,7 +996,10 @@ fn build_alerts(
         alerts.push(alert(
             AlertSeverity::Critical,
             "service_inactive",
-            format!("{} is not active", service.name),
+            format!(
+                "{} supervisor reports {} is not active",
+                service.supervisor, service.name
+            ),
         ));
     }
     if account.status != "ACTIVE" {
@@ -1298,9 +1308,12 @@ fn print_human_status(status: &OperatorStatus) {
         status.next_action,
     );
     println!(
-        "service: name={} active={} open_orders={} close_orders={} strategy_profiles={} submitting_profiles={} lock={} log={}",
+        "service: name={} supervisor={} active={} docker_container={} docker_status={} open_orders={} close_orders={} strategy_profiles={} submitting_profiles={} lock={} log={}",
         status.service.name,
+        status.service.supervisor,
         status.service.active_state.as_deref().unwrap_or("unknown"),
+        status.service.docker_container.as_deref().unwrap_or("none"),
+        status.service.docker_status.as_deref().unwrap_or("none"),
         status.service.open_orders_enabled,
         status.service.close_orders_enabled,
         status.service.strategy_profile_summaries.join(","),
@@ -2097,21 +2110,98 @@ fn parse_utc(value: &str) -> Option<DateTime<Utc>> {
         .ok()
 }
 
-fn service_active(service_name: &str) -> Option<bool> {
-    Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", service_name])
-        .status()
-        .ok()
-        .map(|status| status.success())
+#[derive(Debug)]
+struct ServiceSupervisorStatus {
+    supervisor: String,
+    active: Option<bool>,
+    active_state: Option<String>,
+    docker_container: Option<String>,
+    docker_status: Option<String>,
 }
 
-fn service_active_state(service_name: &str) -> Option<String> {
+fn service_supervisor_status(service_name: &str) -> ServiceSupervisorStatus {
+    if running_in_container() {
+        return ServiceSupervisorStatus {
+            supervisor: "container".to_string(),
+            active: Some(true),
+            active_state: Some("container:running".to_string()),
+            docker_container: None,
+            docker_status: None,
+        };
+    }
+
+    let systemd_state = systemd_active_state(service_name);
+    if systemd_state.as_deref() == Some("active") {
+        return ServiceSupervisorStatus {
+            supervisor: "systemd".to_string(),
+            active: Some(true),
+            active_state: systemd_state,
+            docker_container: None,
+            docker_status: None,
+        };
+    }
+
+    if let Some((container, status)) = docker_alpaca_options_status()
+        && status == "running"
+    {
+        return ServiceSupervisorStatus {
+            supervisor: "docker".to_string(),
+            active: Some(true),
+            active_state: Some("docker:running".to_string()),
+            docker_container: Some(container),
+            docker_status: Some(status),
+        };
+    }
+
+    ServiceSupervisorStatus {
+        supervisor: if service_name.ends_with(".service") {
+            "systemd".to_string()
+        } else {
+            "unknown".to_string()
+        },
+        active: systemd_state.as_ref().map(|state| state == "active"),
+        active_state: systemd_state,
+        docker_container: None,
+        docker_status: None,
+    }
+}
+
+fn running_in_container() -> bool {
+    Path::new("/.dockerenv").exists()
+        || env::var("NAUTILUS_ALPACA_SERVICE").as_deref() == Ok("alpaca-options-container")
+}
+
+fn systemd_active_state(service_name: &str) -> Option<String> {
+    if !service_name.ends_with(".service") {
+        return None;
+    }
     Command::new("systemctl")
         .args(["--user", "is-active", service_name])
         .output()
         .ok()
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn docker_alpaca_options_status() -> Option<(String, String)> {
+    let container = env::var("NAUTILUS_ALPACA_DOCKER_CONTAINER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "nautilus-alpaca-alpaca-options-1".to_string());
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{.State.Status}}",
+            container.as_str(),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!status.is_empty()).then_some((container, status))
 }
 
 fn asset_class_is(position: &AlpacaPosition, expected: &str) -> bool {

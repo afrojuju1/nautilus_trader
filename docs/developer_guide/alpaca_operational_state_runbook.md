@@ -67,7 +67,9 @@ docker compose --env-file .env -f deploy/alpaca/compose.yml --profile engine up 
 Validate that migration `202606300001` is applied and that the replacement rows were backfilled:
 
 ```bash
+docker compose --env-file .env -f deploy/alpaca/compose.yml --profile engine ps
 docker exec nautilus-alpaca-alpaca-options-1 nautilus adapters alpaca status --json
+docker exec nautilus-alpaca-alpaca-options-1 nautilus adapters alpaca doctor --json
 docker compose --env-file .env -f deploy/alpaca/compose.yml exec -T postgres \
   sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
     SELECT MAX(version) AS latest_migration
@@ -86,6 +88,7 @@ docker compose --env-file .env -f deploy/alpaca/compose.yml exec -T postgres \
 
 Expected operator signs:
 
+- Docker compose reports `alpaca-options` as `Up`.
 - `operational_store.latest_migration_version` is at least `202606300001`.
 - `strategy_state.db_rows` is non-null.
 - `strategy_state.broker_leg_evidence` is non-null.
