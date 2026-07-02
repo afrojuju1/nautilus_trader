@@ -343,7 +343,7 @@ fn dedupe_observations(
         );
         match by_source_event.get(&key) {
             Some(existing)
-                if compare_observation_freshness(observation, existing, config).is_lt() => {}
+                if compare_observation_freshness(existing, observation, config).is_lt() => {}
             _ => {
                 by_source_event.insert(key, observation.clone());
             }
@@ -805,6 +805,24 @@ mod tests {
         assert_eq!(decisions[0].conflict_reason, "timing_unknown");
         assert_eq!(approved[0].approval_status, "block_only");
         assert!(approved[0].diagnostic_reason.contains("timing_unknown"));
+    }
+
+    #[test]
+    fn resolver_dedupes_to_fresher_duplicate_observation() {
+        let mut older = observation("AAPL", "2026-05-05", "before_open", "alpha_vantage", 1);
+        older.source_event_id = "AAPL:2026-05-05".to_string();
+        let mut newer = observation("AAPL", "2026-05-05", "after_close", "alpha_vantage", 2);
+        newer.source_event_id = older.source_event_id.clone();
+
+        let decisions = resolve_scheduled_event_observations(
+            &[older, newer],
+            &ScheduledEventResolverConfig::default(),
+            fixed_utc(),
+        );
+
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].timing, "after_close");
+        assert_eq!(decisions[0].status, "confirmed");
     }
 
     #[test]
