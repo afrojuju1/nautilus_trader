@@ -826,8 +826,7 @@ fn build_status(
     let last_management_block = latest_event(events, "management_block");
     let last_active_risk_quote_cache = latest_event(events, "active_risk_quote_cache");
     let last_option_market_data_stream = latest_event(events, "option_market_data_stream");
-    let last_lifecycle_event = latest_event(events, "option_lifecycle_poll")
-        .or_else(|| latest_event(events, "option_lifecycle_poll_error"));
+    let last_lifecycle_event = latest_lifecycle_event(events).cloned();
     let last_broker_event = latest_broker_event(recent_orders, activities);
 
     let mut alerts = build_alerts(
@@ -1261,18 +1260,22 @@ fn build_alerts(
             "active-risk option quotes are stale for at least one managed entry".to_string(),
         ));
     }
-    if recent_event_count(events, "option_lifecycle_poll_error", 3600) > 0 {
+    if let Some(error) = unresolved_recent_lifecycle_poll_error(events, 3600) {
+        let message = error.get("error").and_then(Value::as_str).map_or_else(
+            || "the latest option lifecycle risk poll failed".to_string(),
+            |error| format!("the latest option lifecycle risk poll failed: {error}"),
+        );
         alerts.push(alert(
             AlertSeverity::Critical,
             "option_lifecycle_poll_error",
-            "the option lifecycle risk poller failed in the last hour".to_string(),
+            message,
         ));
     }
-    if let Some(event) = latest_recent_lifecycle_block(events, 86_400) {
+    if let Some(event) = latest_current_lifecycle_block(events, 86_400) {
         alerts.push(alert(
             AlertSeverity::Critical,
             "option_lifecycle_block",
-            format!("recent option lifecycle block: {}", compact_json(event)),
+            format!("current option lifecycle block: {}", compact_json(event)),
         ));
     }
     if recent_event_count(events, "runner_start", 3600) > 1 {
@@ -1936,6 +1939,24 @@ fn latest_event(events: &[Value], event_type: &str) -> Option<Value> {
         .cloned()
 }
 
+fn latest_lifecycle_event(events: &[Value]) -> Option<&Value> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| {
+            matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("option_lifecycle_poll" | "option_lifecycle_poll_error")
+            )
+        })
+        .max_by_key(|event| {
+            event
+                .get("ts_utc")
+                .and_then(Value::as_str)
+                .and_then(parse_utc)
+        })
+}
+
 fn latest_candidate_ledger_record(records: &[Value], record_type: &str) -> Option<Value> {
     records
         .iter()
@@ -1999,9 +2020,21 @@ fn recent_management_block_reason(events: &[Value], reason: &str, lookback_secs:
     })
 }
 
-fn latest_recent_lifecycle_block(events: &[Value], lookback_secs: i64) -> Option<&Value> {
+fn unresolved_recent_lifecycle_poll_error(events: &[Value], lookback_secs: i64) -> Option<&Value> {
     let cutoff = Utc::now() - Duration::seconds(lookback_secs);
-    events.iter().rev().find(|event| {
+    latest_lifecycle_event(events).filter(|event| {
+        event.get("type").and_then(Value::as_str) == Some("option_lifecycle_poll_error")
+            && event
+                .get("ts_utc")
+                .and_then(Value::as_str)
+                .and_then(parse_utc)
+                .is_some_and(|ts| ts >= cutoff)
+    })
+}
+
+fn latest_current_lifecycle_block(events: &[Value], lookback_secs: i64) -> Option<&Value> {
+    let cutoff = Utc::now() - Duration::seconds(lookback_secs);
+    latest_lifecycle_event(events).filter(|event| {
         event.get("type").and_then(Value::as_str) == Some("option_lifecycle_poll")
             && event
                 .get("ts_utc")
