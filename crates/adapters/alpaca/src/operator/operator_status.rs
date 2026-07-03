@@ -91,6 +91,7 @@ struct OperatorStatus {
     next_action: String,
     engine_state: EngineState,
     service: ServiceStatus,
+    runtime_runner: Option<RuntimeRunnerStatus>,
     operational_store: OperationalStoreStatus,
     account: AccountStatus,
     orders: OrdersStatus,
@@ -100,6 +101,7 @@ struct OperatorStatus {
     active_entries: Vec<ActiveEntryStatus>,
     risk: RiskStatus,
     event_shock: EventShockStatus,
+    scanner_lifecycle: ScannerLifecycleStatus,
     last_scan: Option<Value>,
     regime_coverage: Option<RegimeCoverageStatus>,
     universe: Option<UniverseStatus>,
@@ -278,6 +280,46 @@ struct RegimeCoverageStatus {
     has_underlying_trend_vol: bool,
     has_option_liquidity: bool,
     has_event_load: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeRunnerStatus {
+    source: String,
+    node_state: Option<String>,
+    age_secs: Option<i64>,
+    stale: bool,
+    interval_secs: Option<u64>,
+    elapsed_secs: Option<f64>,
+    elapsed_delta_secs: Option<f64>,
+    total_dispatch_delta: Option<u64>,
+    total_dispatch_rate_per_sec: Option<f64>,
+    total_queue_depth: Option<usize>,
+    max_queue_depth: Option<usize>,
+    dispatch_busy_ratio: Option<f64>,
+    maintenance_busy_ratio: Option<f64>,
+    external_msgbus_busy_ratio: Option<f64>,
+    channels: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct ScannerLifecycleStatus {
+    node_alive: bool,
+    runtime_runner_fresh: bool,
+    universe_resolved: bool,
+    option_chain_subscribed: bool,
+    option_chain_slice_received: bool,
+    candidate_scan_produced: bool,
+    entry_strategy_consumed_candidate_data: bool,
+    selected_series: usize,
+    subscribed_series: usize,
+    scanned_series: usize,
+    latest_runtime_runner_at_utc: Option<String>,
+    latest_universe_resolution_at_utc: Option<String>,
+    latest_option_chain_subscription_at_utc: Option<String>,
+    latest_option_chain_slice_at_utc: Option<String>,
+    latest_candidate_scan_at_utc: Option<String>,
+    latest_candidate_data_consumed_at_utc: Option<String>,
+    latest_candidate_data_consumed: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -828,10 +870,20 @@ fn build_status(
     let last_option_market_data_stream = latest_event(events, "option_market_data_stream");
     let last_lifecycle_event = latest_lifecycle_event(events).cloned();
     let last_broker_event = latest_broker_event(recent_orders, activities);
+    let runtime_runner = runtime_runner_status(events);
+    let scanner_lifecycle = scanner_lifecycle_status(
+        service.active == Some(true),
+        runtime_runner.as_ref(),
+        universe.as_ref(),
+        last_scan.as_ref(),
+        events,
+    );
 
     let mut alerts = build_alerts(
         config,
         &service,
+        runtime_runner.as_ref(),
+        &scanner_lifecycle,
         &account_status,
         &orders_status,
         &positions_status,
@@ -863,6 +915,7 @@ fn build_status(
         next_action: health.next_action,
         engine_state,
         service,
+        runtime_runner,
         operational_store: config.operational_store.clone(),
         account: account_status,
         orders: orders_status,
@@ -872,6 +925,7 @@ fn build_status(
         active_entries,
         risk,
         event_shock,
+        scanner_lifecycle,
         last_scan,
         regime_coverage,
         universe,
@@ -1007,6 +1061,8 @@ fn event_shock_status(status: &EventShockRuntimeStatus) -> EventShockStatus {
 fn build_alerts(
     config: &OperatorConfig,
     service: &ServiceStatus,
+    runtime_runner: Option<&RuntimeRunnerStatus>,
+    scanner_lifecycle: &ScannerLifecycleStatus,
     account: &AccountStatus,
     orders: &OrdersStatus,
     positions: &PositionsStatus,
@@ -1027,6 +1083,42 @@ fn build_alerts(
                 service.supervisor, service.name
             ),
         ));
+    }
+    if scanner_lifecycle.node_alive && !scanner_lifecycle.runtime_runner_fresh {
+        if let Some(runner) = runtime_runner {
+            if runner.stale {
+                alerts.push(alert(
+                    AlertSeverity::Warning,
+                    "runtime_runner_snapshot_stale",
+                    format!(
+                        "latest runtime runner snapshot is stale: age_secs={}",
+                        runner
+                            .age_secs
+                            .map_or_else(|| "unknown".to_string(), |value| value.to_string())
+                    ),
+                ));
+            }
+        } else if latest_recent_event(events, "runner_start", 600).is_some() {
+            alerts.push(alert(
+                AlertSeverity::Warning,
+                "runtime_runner_snapshot_missing",
+                "runner started recently but no runtime runner snapshot was emitted".to_string(),
+            ));
+        }
+    }
+    if let Some(runner) = runtime_runner
+        && let Some(depth) = runner.max_queue_depth
+    {
+        let warn_depth = env_u64("ALPACA_OPERATOR_RUNNER_QUEUE_DEPTH_WARN", 100) as usize;
+        if depth >= warn_depth {
+            alerts.push(alert(
+                AlertSeverity::Warning,
+                "runtime_runner_queue_backlog",
+                format!(
+                    "runtime runner queue depth reached warning threshold: {depth}/{warn_depth}"
+                ),
+            ));
+        }
     }
     if account.status != "ACTIVE" {
         alerts.push(alert(
@@ -1278,11 +1370,11 @@ fn build_alerts(
             format!("current option lifecycle block: {}", compact_json(event)),
         ));
     }
-    if recent_event_count(events, "runner_start", 3600) > 1 {
+    if recent_event_count(events, "runner_start", 900) >= 5 {
         alerts.push(alert(
             AlertSeverity::Warning,
             "service_restart_recent",
-            "the runner emitted multiple start events in the last hour".to_string(),
+            "the runner emitted at least five start events in the last 15 minutes".to_string(),
         ));
     }
     if recent_event_count(events, "websocket_disconnect", 3600) > 0 {
@@ -1350,6 +1442,13 @@ fn print_human_status(status: &OperatorStatus) {
         status.service.submitting_profiles.join(","),
         status.service.lock_file,
         status.service.log_file,
+    );
+    println!(
+        "runtime_runner: {}",
+        status
+            .runtime_runner
+            .as_ref()
+            .map_or_else(|| "none".to_string(), runtime_runner_line)
     );
     println!(
         "operational_store: enabled={} schema={} applied_migrations={} latest_migration_version={} dirty_migration_version={}",
@@ -1565,6 +1664,10 @@ fn print_human_status(status: &OperatorStatus) {
         status.event_shock.required,
     );
     println!(
+        "scanner_lifecycle: {}",
+        scanner_lifecycle_line(&status.scanner_lifecycle)
+    );
+    println!(
         "last_scan: {}",
         status
             .last_scan
@@ -1684,6 +1787,89 @@ async fn latest_activities(client: &AlpacaHttpClient) -> anyhow::Result<Vec<Alpa
         ..crate::http::models::ListActivitiesRequest::option_reconciliation()
     };
     Ok(client.account_activities(&request).await?)
+}
+
+fn runtime_runner_status(events: &[Value]) -> Option<RuntimeRunnerStatus> {
+    let snapshot = latest_event(events, "runtime_runner_snapshot")?;
+    let interval_secs = value_u64(&snapshot, "interval_secs");
+    let age_secs = snapshot
+        .get("ts_utc")
+        .and_then(Value::as_str)
+        .and_then(parse_utc)
+        .map(|ts| Utc::now().signed_duration_since(ts).num_seconds().max(0));
+    let stale_after_secs = interval_secs
+        .and_then(|value| i64::try_from(value).ok())
+        .map(|value| value.saturating_mul(4).max(120))
+        .unwrap_or(120);
+    let disabled = snapshot.get("event").and_then(Value::as_str) == Some("disabled");
+    let stale = !disabled && age_secs.is_some_and(|age| age > stale_after_secs);
+
+    Some(RuntimeRunnerStatus {
+        source: "operator_event".to_string(),
+        node_state: snapshot
+            .get("node_state")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        age_secs,
+        stale,
+        interval_secs,
+        elapsed_secs: value_u64(&snapshot, "elapsed_ns").map(|value| value as f64 / 1e9),
+        elapsed_delta_secs: value_f64(&snapshot, "elapsed_delta_secs"),
+        total_dispatch_delta: value_u64(&snapshot, "total_dispatch_delta"),
+        total_dispatch_rate_per_sec: value_f64(&snapshot, "total_dispatch_rate_per_sec"),
+        total_queue_depth: value_usize(&snapshot, "total_queue_depth"),
+        max_queue_depth: value_usize(&snapshot, "max_queue_depth"),
+        dispatch_busy_ratio: value_f64(&snapshot, "dispatch_busy_ratio"),
+        maintenance_busy_ratio: value_f64(&snapshot, "maintenance_busy_ratio"),
+        external_msgbus_busy_ratio: value_f64(&snapshot, "external_msgbus_busy_ratio"),
+        channels: snapshot.get("channels").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn scanner_lifecycle_status(
+    node_alive: bool,
+    runtime_runner: Option<&RuntimeRunnerStatus>,
+    universe: Option<&UniverseStatus>,
+    last_scan: Option<&Value>,
+    events: &[Value],
+) -> ScannerLifecycleStatus {
+    let latest_runtime_runner = latest_event(events, "runtime_runner_snapshot");
+    let latest_universe_resolution = latest_event(events, "option_universe_resolution");
+    let latest_subscription = latest_event(events, "option_universe_subscription");
+    let latest_slice = latest_event(events, "option_chain_scan_queue")
+        .or_else(|| latest_event(events, "option_chain_scan_result"));
+    let latest_candidate_scan = latest_event(events, "option_chain_candidate_scan");
+    let latest_candidate_data_consumed = latest_event(events, "options_candidate_data_consumed");
+
+    ScannerLifecycleStatus {
+        node_alive,
+        runtime_runner_fresh: runtime_runner.is_some_and(|runner| !runner.stale),
+        universe_resolved: universe
+            .is_some_and(|status| status.selected > 0 || status.skipped > 0 || status.failed > 0),
+        option_chain_subscribed: universe.is_some_and(|status| status.subscribed > 0)
+            || latest_subscription.is_some(),
+        option_chain_slice_received: latest_slice.is_some(),
+        candidate_scan_produced: last_scan.is_some() || latest_candidate_scan.is_some(),
+        entry_strategy_consumed_candidate_data: latest_candidate_data_consumed.is_some(),
+        selected_series: universe.map_or(0, |status| status.selected),
+        subscribed_series: universe.map_or(0, |status| status.subscribed),
+        scanned_series: universe.map_or(0, |status| status.scanned),
+        latest_runtime_runner_at_utc: latest_runtime_runner.as_ref().and_then(event_ts_utc),
+        latest_universe_resolution_at_utc: latest_universe_resolution
+            .as_ref()
+            .and_then(event_ts_utc),
+        latest_option_chain_subscription_at_utc: latest_subscription
+            .as_ref()
+            .and_then(event_ts_utc),
+        latest_option_chain_slice_at_utc: latest_slice.as_ref().and_then(event_ts_utc),
+        latest_candidate_scan_at_utc: last_scan
+            .and_then(event_ts_utc)
+            .or_else(|| latest_candidate_scan.as_ref().and_then(event_ts_utc)),
+        latest_candidate_data_consumed_at_utc: latest_candidate_data_consumed
+            .as_ref()
+            .and_then(event_ts_utc),
+        latest_candidate_data_consumed,
+    }
 }
 
 fn regime_coverage_status(
@@ -1905,6 +2091,21 @@ fn value_usize(value: &Value, key: &str) -> Option<usize> {
         .get(key)
         .and_then(Value::as_u64)
         .and_then(|raw| usize::try_from(raw).ok())
+}
+
+fn value_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(Value::as_u64)
+}
+
+fn value_f64(value: &Value, key: &str) -> Option<f64> {
+    value.get(key).and_then(Value::as_f64)
+}
+
+fn event_ts_utc(value: &Value) -> Option<String> {
+    value
+        .get("ts_utc")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn extend_string_set(value: Option<&Value>, output: &mut BTreeSet<String>) {
@@ -2294,6 +2495,57 @@ fn home_dir() -> PathBuf {
 
 fn non_empty(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.to_string())
+}
+
+fn runtime_runner_line(status: &RuntimeRunnerStatus) -> String {
+    format!(
+        "source={} node_state={} age_secs={} stale={} interval_secs={} total_queue_depth={} max_queue_depth={} dispatch_rate_per_sec={} dispatch_busy_ratio={}",
+        status.source,
+        status.node_state.as_deref().unwrap_or("unknown"),
+        status
+            .age_secs
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        status.stale,
+        status
+            .interval_secs
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        status
+            .total_queue_depth
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        status
+            .max_queue_depth
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        status
+            .total_dispatch_rate_per_sec
+            .map_or_else(|| "unknown".to_string(), |value| format!("{value:.2}")),
+        status
+            .dispatch_busy_ratio
+            .map_or_else(|| "unknown".to_string(), |value| format!("{value:.3}")),
+    )
+}
+
+fn scanner_lifecycle_line(status: &ScannerLifecycleStatus) -> String {
+    format!(
+        "node_alive={} runner_fresh={} universe_resolved={} option_chain_subscribed={} option_chain_slice_received={} candidate_scan_produced={} entry_strategy_consumed={} selected_series={} subscribed_series={} scanned_series={} latest_scan={} latest_consumed={}",
+        status.node_alive,
+        status.runtime_runner_fresh,
+        status.universe_resolved,
+        status.option_chain_subscribed,
+        status.option_chain_slice_received,
+        status.candidate_scan_produced,
+        status.entry_strategy_consumed_candidate_data,
+        status.selected_series,
+        status.subscribed_series,
+        status.scanned_series,
+        status
+            .latest_candidate_scan_at_utc
+            .as_deref()
+            .unwrap_or("none"),
+        status
+            .latest_candidate_data_consumed_at_utc
+            .as_deref()
+            .unwrap_or("none"),
+    )
 }
 
 fn regime_coverage_line(status: &RegimeCoverageStatus) -> String {

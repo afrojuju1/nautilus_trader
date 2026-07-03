@@ -134,6 +134,28 @@ flowchart LR
     RegimeActor --> FeatureStore
 ```
 
+## Native Integration Points
+
+This work should plug into existing Nautilus runtime surfaces instead of inventing a generic
+scanner framework or using the Rust plug-in config path. `LiveNodeConfig.plugins` exists in the
+Rust live config, but host-side plug-in loading is not the scanner architecture for this fork yet.
+
+Use these integration points:
+
+- `LiveNode` runner metrics for process health. The Alpaca options node may sample
+  `LiveNodeHandle::metrics_snapshot()` and emit compact operator events, but the metrics remain
+  runtime telemetry rather than strategy state or Postgres facts.
+- `DataEngine` and `OptionChainManager` for option-chain subscription ownership. The Alpaca-housed
+  scan actor may request profile-resolved `OptionSeriesId` subscriptions, but `DataEngine` and
+  `OptionChainManager` own quote/Greeks subscriptions and `OptionChainSlice` assembly.
+- `OptionChainSlice` for live market-state input. Candidate scanning should consume slices through
+  the same normalized candidate-engine adapter used by replay and diagnostics.
+- Scheduled-event `CustomData` in `ParquetDataCatalog` for earnings and event-load inputs. Runtime
+  code consumes approved scheduled events through a read-only loader, not provider payloads or CSVs.
+- Existing operator events, status, and doctor reports for live observability. Scanner lifecycle
+  visibility should derive from runtime events such as universe resolution, option-chain
+  subscription, scan queue/result, candidate scan, and candidate-data consumption.
+
 ## Runtime Flow
 
 ```mermaid

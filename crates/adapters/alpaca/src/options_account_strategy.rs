@@ -2681,7 +2681,27 @@ impl DataActor for AlpacaOptionsAccountStrategy {
         let Some(candidates) = data.data.as_any().downcast_ref::<OptionsCandidateData>() else {
             return Ok(());
         };
-        self.submit_candidate_data(candidates)?;
+        let ranked_entries = candidates.candidates.ranked_entries().len();
+        let selected = candidates.candidates.selected_entry();
+        let selected_underlying = selected.map(|entry| entry.underlying().to_string());
+        let selected_strategy = selected.map(|entry| entry.strategy_name().to_string());
+        let selected_profile_id = selected.map(|entry| entry.profile.id.clone());
+        let selected_score = selected.map(ProfiledOptionsEntry::score);
+        let submitted = self.submit_candidate_data(candidates)?.is_some();
+        emit_operator_event(
+            "options_candidate_data_consumed",
+            json!({
+                "event": "processed",
+                "trade_date": candidates.candidates.trade_date,
+                "ranked_entries": ranked_entries,
+                "selected": selected_underlying.is_some(),
+                "selected_underlying": selected_underlying,
+                "selected_strategy": selected_strategy,
+                "selected_profile_id": selected_profile_id,
+                "selected_score": selected_score,
+                "submitted": submitted,
+            }),
+        );
         Ok(())
     }
 }

@@ -10,6 +10,8 @@ use super::{
 };
 use crate::operator;
 
+const DEFAULT_SCANNER_SINCE_SECS: i64 = 600;
+
 #[derive(Debug, Serialize)]
 struct DoctorReport {
     checked_at_utc: String,
@@ -20,11 +22,13 @@ struct DoctorReport {
     config: ConfigLintReport,
     pre_roll: Option<PreRollReport>,
     service: Option<Value>,
+    runtime_runner: Option<Value>,
     fleet: Option<Value>,
     account: Option<Value>,
     event_shock: Option<Value>,
     broker: Option<Value>,
     universe: Option<Value>,
+    scanner_lifecycle: Option<Value>,
     scanner: Option<Value>,
     scanner_error: Option<String>,
 }
@@ -115,9 +119,11 @@ async fn build_doctor_report(options: DoctorOptions) -> anyhow::Result<DoctorRep
     }
 
     let service = status_field(status.as_ref(), "service");
+    let runtime_runner = status_field(status.as_ref(), "runtime_runner");
     let account = status_field(status.as_ref(), "account");
     let event_shock = status_field(status.as_ref(), "event_shock");
     let universe = status_field(status.as_ref(), "universe");
+    let scanner_lifecycle = status_field(status.as_ref(), "scanner_lifecycle");
     let broker = status.as_ref().map(|status| {
         json!({
             "orders": status.get("orders").cloned().unwrap_or(Value::Null),
@@ -150,11 +156,13 @@ async fn build_doctor_report(options: DoctorOptions) -> anyhow::Result<DoctorRep
         config,
         pre_roll,
         service,
+        runtime_runner,
         fleet,
         account,
         event_shock,
         broker,
         universe,
+        scanner_lifecycle,
         scanner,
         scanner_error,
     })
@@ -163,7 +171,7 @@ async fn build_doctor_report(options: DoctorOptions) -> anyhow::Result<DoctorRep
 fn parse_args(args: &[String]) -> anyhow::Result<DoctorOptions> {
     let mut options = DoctorOptions {
         json_output: false,
-        scanner_since_secs: 86_400,
+        scanner_since_secs: DEFAULT_SCANNER_SINCE_SECS,
     };
     let mut index = 0;
     while index < args.len() {
@@ -233,6 +241,12 @@ fn print_human_report(report: &DoctorReport) {
     if let Some(broker) = &report.broker {
         println!("broker: {}", compact_json(broker));
     }
+    if let Some(runtime_runner) = &report.runtime_runner {
+        println!("runtime_runner: {}", compact_json(runtime_runner));
+    }
+    if let Some(scanner_lifecycle) = &report.scanner_lifecycle {
+        println!("scanner_lifecycle: {}", compact_json(scanner_lifecycle));
+    }
     if let Some(event_shock) = &report.event_shock {
         println!("event_shock: {}", compact_json(event_shock));
     }
@@ -250,7 +264,7 @@ fn print_usage() {
          \n\
          Runs one-shot Alpaca options operator validation: config lint, Docker pre-roll mount\n\
          checks, live status, broker/account state, event-shock readiness, universe state, and\n\
-         scanner quality."
+         recent scanner quality. Use --scanner-since-secs 86400 for a daily scanner report."
     );
 }
 

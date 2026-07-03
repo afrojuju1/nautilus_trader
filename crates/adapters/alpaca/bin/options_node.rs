@@ -36,7 +36,9 @@ use nautilus_infrastructure::sql::operational::{
     StrategyStateMutation, acquire_runtime_lease, persist_strategy_state_mutation,
     release_runtime_lease,
 };
-use nautilus_live::node::LiveNode;
+use nautilus_live::node::{
+    LiveNode, LiveNodeHandle, NodeState, RunnerChannelMetricsSnapshot, RunnerMetricsSnapshot,
+};
 use nautilus_model::{
     data::option_chain::StrikeRange,
     identifiers::{AccountId, ActorId, ClientId, StrategyId, TraderId},
@@ -50,6 +52,8 @@ const DEFAULT_SNAPSHOT_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_STRIKES_ABOVE: usize = 10;
 const DEFAULT_STRIKES_BELOW: usize = 10;
 const DEFAULT_RUNTIME_LEASE_TTL_SECS: u64 = 300;
+const DEFAULT_RUNTIME_METRICS_INTERVAL_SECS: u64 = 30;
+const RUNTIME_METRICS_INTERVAL_ENV: &str = "ALPACA_RUNTIME_METRICS_INTERVAL_SECS";
 
 struct LiveSubmitPersistence {
     state: StrategyStatePersistenceHandle,
@@ -286,6 +290,9 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
+    let runtime_metrics_interval_secs = runtime_metrics_interval_secs_from_env()?;
+    start_runtime_metrics_sampler(node.handle(), runtime_metrics_interval_secs);
+
     if let Some(max_runtime_secs) = args.max_runtime_secs {
         let handle = node.handle();
         tokio::spawn(async move {
@@ -295,7 +302,20 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    emit_operator_event(
+        "runner_start",
+        json!({
+            "runtime_metrics_interval_secs": runtime_metrics_interval_secs,
+        }),
+    );
     let run_result = node.run().await;
+    emit_operator_event(
+        "runner_stop",
+        json!({
+            "ok": run_result.is_ok(),
+            "error": run_result.as_ref().err().map(ToString::to_string),
+        }),
+    );
     if let Some(persistence) = live_submit_persistence {
         persistence.release().await;
     }
@@ -315,6 +335,156 @@ async fn release_live_submit_persistence_on_error<T>(
             }
             Err(error)
         }
+    }
+}
+
+fn runtime_metrics_interval_secs_from_env() -> anyhow::Result<u64> {
+    match env::var(RUNTIME_METRICS_INTERVAL_ENV) {
+        Ok(value) if value.trim().is_empty() => Ok(DEFAULT_RUNTIME_METRICS_INTERVAL_SECS),
+        Ok(value) => value.trim().parse::<u64>().with_context(|| {
+            format!(
+                "{RUNTIME_METRICS_INTERVAL_ENV} must be a non-negative integer number of seconds"
+            )
+        }),
+        Err(env::VarError::NotPresent) => Ok(DEFAULT_RUNTIME_METRICS_INTERVAL_SECS),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to read {RUNTIME_METRICS_INTERVAL_ENV}"))
+        }
+    }
+}
+
+fn start_runtime_metrics_sampler(handle: LiveNodeHandle, interval_secs: u64) {
+    if interval_secs == 0 {
+        emit_operator_event(
+            "runtime_runner_snapshot",
+            json!({
+                "event": "disabled",
+                "interval_secs": 0,
+            }),
+        );
+        return;
+    }
+
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(interval_secs);
+        let mut previous = handle.metrics_snapshot();
+        tokio::time::sleep(interval).await;
+
+        loop {
+            let snapshot = handle.metrics_snapshot();
+            let state = handle.state();
+            emit_runtime_runner_snapshot(interval_secs, state, previous, snapshot);
+            previous = snapshot;
+
+            if matches!(state, NodeState::Stopped) {
+                break;
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+fn emit_runtime_runner_snapshot(
+    interval_secs: u64,
+    state: NodeState,
+    previous: RunnerMetricsSnapshot,
+    snapshot: RunnerMetricsSnapshot,
+) {
+    let elapsed_delta_ns = snapshot.elapsed_ns.saturating_sub(previous.elapsed_ns);
+    let elapsed_delta_secs = elapsed_delta_ns as f64 / 1_000_000_000.0;
+    let total_dispatch_delta = channel_dispatch_delta(previous.time_events, snapshot.time_events)
+        + channel_dispatch_delta(previous.exec_events, snapshot.exec_events)
+        + channel_dispatch_delta(previous.exec_commands, snapshot.exec_commands)
+        + channel_dispatch_delta(previous.data_events, snapshot.data_events)
+        + channel_dispatch_delta(previous.data_commands, snapshot.data_commands);
+    let total_queue_depth = snapshot.time_events.queue_depth
+        + snapshot.exec_events.queue_depth
+        + snapshot.exec_commands.queue_depth
+        + snapshot.data_events.queue_depth
+        + snapshot.data_commands.queue_depth;
+    let max_queue_depth = [
+        snapshot.time_events.queue_depth,
+        snapshot.exec_events.queue_depth,
+        snapshot.exec_commands.queue_depth,
+        snapshot.data_events.queue_depth,
+        snapshot.data_commands.queue_depth,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or_default();
+
+    emit_operator_event(
+        "runtime_runner_snapshot",
+        json!({
+            "event": "sampled",
+            "node_state": format!("{state:?}").to_ascii_lowercase(),
+            "interval_secs": interval_secs,
+            "elapsed_ns": snapshot.elapsed_ns,
+            "elapsed_delta_ns": elapsed_delta_ns,
+            "elapsed_delta_secs": elapsed_delta_secs,
+            "total_dispatch_delta": total_dispatch_delta,
+            "total_dispatch_rate_per_sec": rate_per_sec(total_dispatch_delta, elapsed_delta_secs),
+            "total_queue_depth": total_queue_depth,
+            "max_queue_depth": max_queue_depth,
+            "dispatch_busy_ratio": busy_ratio(snapshot.dispatch_busy_ns, snapshot.elapsed_ns),
+            "maintenance_busy_ratio": busy_ratio(snapshot.maintenance_busy_ns, snapshot.elapsed_ns),
+            "external_msgbus_busy_ratio": busy_ratio(snapshot.external_msgbus_busy_ns, snapshot.elapsed_ns),
+            "channels": {
+                "time_events": runtime_channel_snapshot(previous.time_events, snapshot.time_events, snapshot.elapsed_ns, elapsed_delta_secs),
+                "exec_events": runtime_channel_snapshot(previous.exec_events, snapshot.exec_events, snapshot.elapsed_ns, elapsed_delta_secs),
+                "exec_commands": runtime_channel_snapshot(previous.exec_commands, snapshot.exec_commands, snapshot.elapsed_ns, elapsed_delta_secs),
+                "data_events": runtime_channel_snapshot(previous.data_events, snapshot.data_events, snapshot.elapsed_ns, elapsed_delta_secs),
+                "data_commands": runtime_channel_snapshot(previous.data_commands, snapshot.data_commands, snapshot.elapsed_ns, elapsed_delta_secs),
+            },
+        }),
+    );
+}
+
+fn runtime_channel_snapshot(
+    previous: RunnerChannelMetricsSnapshot,
+    snapshot: RunnerChannelMetricsSnapshot,
+    elapsed_ns: u64,
+    elapsed_delta_secs: f64,
+) -> serde_json::Value {
+    let dispatched_delta = channel_dispatch_delta(previous, snapshot);
+    json!({
+        "dispatched": snapshot.dispatched,
+        "dispatched_delta": dispatched_delta,
+        "dispatch_rate_per_sec": rate_per_sec(dispatched_delta, elapsed_delta_secs),
+        "queue_depth": snapshot.queue_depth,
+        "last_dispatch_at_ns": snapshot.last_dispatch_at_ns,
+        "last_dispatch_age_ms": last_dispatch_age_ms(snapshot, elapsed_ns),
+    })
+}
+
+fn channel_dispatch_delta(
+    previous: RunnerChannelMetricsSnapshot,
+    snapshot: RunnerChannelMetricsSnapshot,
+) -> u64 {
+    snapshot.dispatched.saturating_sub(previous.dispatched)
+}
+
+fn rate_per_sec(count: u64, elapsed_secs: f64) -> f64 {
+    if elapsed_secs <= 0.0 {
+        0.0
+    } else {
+        count as f64 / elapsed_secs
+    }
+}
+
+fn busy_ratio(busy_ns: u64, elapsed_ns: u64) -> f64 {
+    if elapsed_ns == 0 {
+        0.0
+    } else {
+        (busy_ns as f64 / elapsed_ns as f64).clamp(0.0, 1.0)
+    }
+}
+
+fn last_dispatch_age_ms(snapshot: RunnerChannelMetricsSnapshot, elapsed_ns: u64) -> Option<u64> {
+    if snapshot.last_dispatch_at_ns == 0 {
+        None
+    } else {
+        Some(elapsed_ns.saturating_sub(snapshot.last_dispatch_at_ns) / 1_000_000)
     }
 }
 

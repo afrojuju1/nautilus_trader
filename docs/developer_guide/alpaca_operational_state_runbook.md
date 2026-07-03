@@ -92,6 +92,12 @@ Expected operator signs:
 - `operational_store.latest_migration_version` is at least `202606300001`.
 - `strategy_state.db_rows` is non-null.
 - `strategy_state.broker_leg_evidence` is non-null.
+- `runtime_runner` is present after the rebuilt `alpaca-options-node` has run for at least one
+  `ALPACA_RUNTIME_METRICS_INTERVAL_SECS` interval, unless runtime metrics sampling is explicitly
+  disabled with `ALPACA_RUNTIME_METRICS_INTERVAL_SECS=0`.
+- `scanner_lifecycle` distinguishes the live option path: service alive, universe resolved,
+  option-chain subscribed, option-chain slice received, candidate scan produced, and entry strategy
+  consumed candidate data.
 - Existing active broker exposure is represented in `spread_reconciliation_preview`.
 
 ## Restore
