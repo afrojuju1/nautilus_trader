@@ -54,7 +54,7 @@ See [Processes and threads](../concepts/architecture.md#processes-and-threads) f
 details.
 :::
 
-See the [Backtesting](../concepts/backtesting.md) concept guide for help choosing an
+See the [Backtesting](../concepts/backtesting/) concept guide for help choosing an
 API level.
 
 ## Examples in the repository

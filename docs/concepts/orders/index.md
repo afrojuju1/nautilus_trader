@@ -266,7 +266,7 @@ the emulation lifecycle, supported types, querying, and best practices.
 
 ## Related guides
 
-- [Events](../events.md) - Order events, position events, and handler dispatch.
+- [Events](../events/) - Order events, position events, and handler dispatch.
 - [Execution](../execution.md) - Order execution and fill handling.
 - [Positions](../positions.md) - Positions created from order fills.
 - [Strategies](../strategies.md) - Order management from strategies.

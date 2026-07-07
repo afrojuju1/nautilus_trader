@@ -75,6 +75,7 @@ use crate::{
         rate_limits::{WeightedLimiter, exec_action_weight},
     },
     websocket::{
+        book::{BookStreamOptions, BookStreamRegistry, BookStreamRelease, BookStreamUse},
         enums::HyperliquidWsChannel,
         handler::{FeedHandler, HandlerCommand},
         messages::{
@@ -126,6 +127,8 @@ pub struct HyperliquidWebSocketClient {
     out_rx: Option<tokio::sync::mpsc::UnboundedReceiver<NautilusWsMessage>>,
     auth_tracker: AuthTracker,
     subscriptions: SubscriptionState,
+    book_streams: BookStreamRegistry,
+    quote_streams: Arc<DashMap<Ustr, ()>>,
     instruments: Arc<AtomicMap<Ustr, InstrumentAny>>,
     bar_types: Arc<AtomicMap<String, BarType>>,
     asset_context_subs: Arc<DashMap<Ustr, AHashSet<AssetContextDataType>>>,
@@ -151,6 +154,8 @@ impl Clone for HyperliquidWebSocketClient {
             out_rx: None,
             auth_tracker: self.auth_tracker.clone(),
             subscriptions: self.subscriptions.clone(),
+            book_streams: self.book_streams.clone(),
+            quote_streams: Arc::clone(&self.quote_streams),
             instruments: Arc::clone(&self.instruments),
             bar_types: Arc::clone(&self.bar_types),
             asset_context_subs: Arc::clone(&self.asset_context_subs),
@@ -193,6 +198,8 @@ impl HyperliquidWebSocketClient {
             signal: Arc::new(AtomicBool::new(false)),
             auth_tracker: AuthTracker::new(),
             subscriptions: SubscriptionState::new(':'),
+            book_streams: BookStreamRegistry::default(),
+            quote_streams: Arc::new(DashMap::new()),
             instruments: Arc::new(AtomicMap::new()),
             bar_types: Arc::new(AtomicMap::new()),
             asset_context_subs: Arc::new(DashMap::new()),
@@ -221,6 +228,11 @@ impl HyperliquidWebSocketClient {
             log::warn!("WebSocket already connected");
             return Ok(());
         }
+
+        // A fresh socket has no venue-side subscriptions; stale book stream
+        // entries must not gate the venue subscribe for re-subscriptions
+        self.book_streams.clear();
+
         let (message_handler, raw_rx) = channel_message_handler();
         let cfg = WebSocketConfig {
             url: self.url.clone(),
@@ -284,6 +296,7 @@ impl HyperliquidWebSocketClient {
         let signal = Arc::clone(&self.signal);
         let account_id = self.account_id;
         let subscriptions = self.subscriptions.clone();
+        let book_streams = self.book_streams.clone();
         let cmd_tx_for_reconnect = cmd_tx.clone();
         let cloid_cache = Arc::clone(&self.cloid_cache);
         let post_router = Arc::clone(&self.post_router);
@@ -314,7 +327,20 @@ impl HyperliquidWebSocketClient {
 
                 for topic in topics {
                     match subscription_from_topic(&topic) {
-                        Ok(subscription) => {
+                        Ok(mut subscription) => {
+                            // Topic text cannot carry l2Book precision options;
+                            // replay the shape the stream was opened with
+                            if let SubscriptionRequest::L2Book {
+                                coin,
+                                n_sig_figs,
+                                mantissa,
+                            } = &mut subscription
+                                && let Some(options) = book_streams.options(coin)
+                            {
+                                *n_sig_figs = options.n_sig_figs;
+                                *mantissa = options.mantissa;
+                            }
+
                             if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe {
                                 subscriptions: vec![subscription],
                             }) {
@@ -422,6 +448,17 @@ impl HyperliquidWebSocketClient {
         }
         log::debug!("Disconnected");
         Ok(())
+    }
+
+    /// Requests a full transport reconnect.
+    ///
+    /// Transitions the connection from `Active` to `Reconnect`; the network
+    /// layer re-establishes the socket with backoff and the handler replays all
+    /// active subscriptions once reconnected. Returns `false` when the
+    /// connection is not active (already reconnecting, disconnecting, or
+    /// closed), leaving any in-flight transition untouched.
+    pub fn request_reconnect(&self) -> bool {
+        ConnectionMode::request_reconnect(&self.connection_mode.load())
     }
 
     /// Send a typed exchange action through the Hyperliquid WebSocket post API.
@@ -1129,6 +1166,10 @@ impl HyperliquidWebSocketClient {
 
     /// Subscribe to L2 order book with optional `nSigFigs` / `mantissa`
     /// precision controls passed through to the venue's `l2Book` stream.
+    ///
+    /// One venue `l2Book` stream per coin is shared with depth10 snapshots;
+    /// the first logical use opens the stream and its options win. Requesting
+    /// different options while the stream is active logs a warning.
     pub async fn subscribe_book_with_options(
         &self,
         instrument_id: InstrumentId,
@@ -1147,18 +1188,7 @@ impl HyperliquidWebSocketClient {
             .send(HandlerCommand::UpdateInstrument(instrument.clone()))
             .map_err(|e| anyhow::anyhow!("Failed to send UpdateInstrument command: {e}"))?;
 
-        let subscription = SubscriptionRequest::L2Book {
-            coin,
-            mantissa,
-            n_sig_figs,
-        };
-
-        cmd_tx
-            .send(HandlerCommand::Subscribe {
-                subscriptions: vec![subscription],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
-        Ok(())
+        self.send_book_stream_subscribe(&cmd_tx, coin, BookStreamUse::Deltas, n_sig_figs, mantissa)
     }
 
     /// Subscribe to order book depth-10 snapshots.
@@ -1173,6 +1203,10 @@ impl HyperliquidWebSocketClient {
 
     /// Subscribe to depth-10 snapshots with optional `nSigFigs` /
     /// `mantissa` precision controls.
+    ///
+    /// Shares the coin's `l2Book` stream with deltas subscribers; the first
+    /// logical use opens the stream and its options win. Requesting different
+    /// options while the stream is active logs a warning.
     pub async fn subscribe_book_depth10_with_options(
         &self,
         instrument_id: InstrumentId,
@@ -1197,26 +1231,13 @@ impl HyperliquidWebSocketClient {
             })
             .map_err(|e| anyhow::anyhow!("Failed to send SetDepth10Sub command: {e}"))?;
 
-        let subscription = SubscriptionRequest::L2Book {
-            coin,
-            mantissa,
-            n_sig_figs,
-        };
-
-        cmd_tx
-            .send(HandlerCommand::Subscribe {
-                subscriptions: vec![subscription],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
-        Ok(())
+        self.send_book_stream_subscribe(&cmd_tx, coin, BookStreamUse::Depth10, n_sig_figs, mantissa)
     }
 
     /// Unsubscribe from order book depth-10 snapshots.
     ///
-    /// Clears the depth10 emission flag only; the underlying `l2Book`
-    /// stream stays open so active deltas subscribers keep receiving
-    /// updates. Call [`Self::unsubscribe_book`] separately to tear down
-    /// the stream entirely.
+    /// Clears the depth10 emission flag and tears down the underlying
+    /// `l2Book` stream unless active deltas subscribers still need it.
     pub async fn unsubscribe_book_depth10(
         &self,
         instrument_id: InstrumentId,
@@ -1226,15 +1247,16 @@ impl HyperliquidWebSocketClient {
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
-        self.cmd_tx
-            .read()
-            .await
+        let cmd_tx = self.cmd_tx.read().await;
+
+        cmd_tx
             .send(HandlerCommand::SetDepth10Sub {
                 coin,
                 subscribed: false,
             })
             .map_err(|e| anyhow::anyhow!("Failed to send SetDepth10Sub command: {e}"))?;
-        Ok(())
+
+        self.send_book_stream_unsubscribe(&cmd_tx, coin, BookStreamUse::Depth10)
     }
 
     /// Subscribe to best bid/offer (BBO) quotes for an instrument.
@@ -1245,19 +1267,22 @@ impl HyperliquidWebSocketClient {
         let coin = instrument.raw_symbol().inner();
 
         let cmd_tx = self.cmd_tx.read().await;
+        self.quote_streams.insert(coin, ());
 
         // Update the handler's coin→instrument mapping for this subscription
-        cmd_tx
-            .send(HandlerCommand::UpdateInstrument(instrument.clone()))
-            .map_err(|e| anyhow::anyhow!("Failed to send UpdateInstrument command: {e}"))?;
+        if let Err(e) = cmd_tx.send(HandlerCommand::UpdateInstrument(instrument.clone())) {
+            self.quote_streams.remove(&coin);
+            anyhow::bail!("Failed to send UpdateInstrument command: {e}");
+        }
 
         let subscription = SubscriptionRequest::Bbo { coin };
 
-        cmd_tx
-            .send(HandlerCommand::Subscribe {
-                subscriptions: vec![subscription],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+        if let Err(e) = cmd_tx.send(HandlerCommand::Subscribe {
+            subscriptions: vec![subscription],
+        }) {
+            self.quote_streams.remove(&coin);
+            anyhow::bail!("Failed to send subscribe command: {e}");
+        }
         Ok(())
     }
 
@@ -1467,25 +1492,120 @@ impl HyperliquidWebSocketClient {
     }
 
     /// Unsubscribe from L2 order book for an instrument.
+    ///
+    /// Tears down the venue `l2Book` stream unless active depth10 subscribers
+    /// still need it.
     pub async fn unsubscribe_book(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
         let instrument = self
             .get_instrument(&instrument_id)
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let coin = instrument.raw_symbol().inner();
 
-        let subscription = SubscriptionRequest::L2Book {
-            coin,
-            mantissa: None,
-            n_sig_figs: None,
+        let cmd_tx = self.cmd_tx.read().await;
+
+        self.send_book_stream_unsubscribe(&cmd_tx, coin, BookStreamUse::Deltas)
+    }
+
+    /// Resubscribes the venue `l2Book` stream for an instrument in place.
+    ///
+    /// Sends an unsubscribe immediately followed by a subscribe, both echoing
+    /// the stream's original precision options (the venue matches unsubscribes
+    /// by full payload). Registry state is left untouched so the logical
+    /// deltas/depth10 uses and first-wins options survive the cycle. Used by
+    /// stale-stream recovery, where a plain subscribe would be gated off by
+    /// the existing registry entry.
+    pub async fn resubscribe_book(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        let instrument = self
+            .get_instrument(&instrument_id)
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
+        let coin = instrument.raw_symbol().inner();
+
+        // Serialize the registry check with read-locked subscribe/unsubscribe senders
+        let cmd_tx = self.cmd_tx.write().await;
+
+        let Some(options) = self.book_streams.options(&coin) else {
+            log::debug!("Skipping l2Book resubscribe for {coin}: stream no longer registered");
+            return Ok(());
         };
 
-        self.cmd_tx
-            .read()
-            .await
-            .send(HandlerCommand::Unsubscribe {
-                subscriptions: vec![subscription],
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+        let subscription = SubscriptionRequest::L2Book {
+            coin,
+            mantissa: options.mantissa,
+            n_sig_figs: options.n_sig_figs,
+        };
+
+        Self::send_stream_resubscribe(&cmd_tx, subscription)
+    }
+
+    fn send_book_stream_subscribe(
+        &self,
+        cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+        coin: Ustr,
+        stream_use: BookStreamUse,
+        n_sig_figs: Option<u32>,
+        mantissa: Option<u32>,
+    ) -> anyhow::Result<()> {
+        let registration = self.book_streams.register(
+            coin,
+            stream_use,
+            BookStreamOptions {
+                n_sig_figs,
+                mantissa,
+            },
+        );
+
+        if registration.options_mismatch {
+            log::warn!(
+                "Requested l2Book options for {coin} (n_sig_figs={n_sig_figs:?}, mantissa={mantissa:?}) \
+                differ from the active stream ({:?}), keeping active options",
+                registration.options,
+            );
+        }
+
+        if registration.subscribe {
+            let subscription = SubscriptionRequest::L2Book {
+                coin,
+                mantissa: registration.options.mantissa,
+                n_sig_figs: registration.options.n_sig_figs,
+            };
+
+            cmd_tx
+                .send(HandlerCommand::Subscribe {
+                    subscriptions: vec![subscription],
+                })
+                .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn send_book_stream_unsubscribe(
+        &self,
+        cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+        coin: Ustr,
+        stream_use: BookStreamUse,
+    ) -> anyhow::Result<()> {
+        match self.book_streams.release(&coin, stream_use) {
+            BookStreamRelease::Unsubscribe(options) => {
+                let subscription = SubscriptionRequest::L2Book {
+                    coin,
+                    mantissa: options.mantissa,
+                    n_sig_figs: options.n_sig_figs,
+                };
+
+                cmd_tx
+                    .send(HandlerCommand::Unsubscribe {
+                        subscriptions: vec![subscription],
+                    })
+                    .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+            }
+            BookStreamRelease::Retained => {
+                let remaining_use = match stream_use {
+                    BookStreamUse::Deltas => "depth10",
+                    BookStreamUse::Depth10 => "deltas",
+                };
+                log::debug!("Keeping shared l2Book stream for {coin}: {remaining_use} use remains");
+            }
+        }
         Ok(())
     }
 
@@ -1497,14 +1617,53 @@ impl HyperliquidWebSocketClient {
         let coin = instrument.raw_symbol().inner();
 
         let subscription = SubscriptionRequest::Bbo { coin };
+        let cmd_tx = self.cmd_tx.read().await;
 
-        self.cmd_tx
-            .read()
-            .await
+        self.quote_streams.remove(&coin);
+
+        cmd_tx
             .send(HandlerCommand::Unsubscribe {
                 subscriptions: vec![subscription],
             })
             .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+        Ok(())
+    }
+
+    /// Resubscribes the venue `bbo` stream for an instrument in place
+    /// (unsubscribe immediately followed by subscribe). Used by stale-stream
+    /// recovery.
+    pub async fn resubscribe_quotes(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        let instrument = self
+            .get_instrument(&instrument_id)
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
+        let coin = instrument.raw_symbol().inner();
+
+        // Keep the registration check atomic with the resubscribe pair
+        let cmd_tx = self.cmd_tx.write().await;
+
+        if !self.quote_streams.contains_key(&coin) {
+            log::debug!("Skipping bbo resubscribe for {coin}: stream no longer registered");
+            return Ok(());
+        }
+
+        Self::send_stream_resubscribe(&cmd_tx, SubscriptionRequest::Bbo { coin })
+    }
+
+    fn send_stream_resubscribe(
+        cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+        subscription: SubscriptionRequest,
+    ) -> anyhow::Result<()> {
+        cmd_tx
+            .send(HandlerCommand::Unsubscribe {
+                subscriptions: vec![subscription.clone()],
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+
+        cmd_tx
+            .send(HandlerCommand::Subscribe {
+                subscriptions: vec![subscription],
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
         Ok(())
     }
 

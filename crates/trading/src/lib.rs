@@ -102,6 +102,7 @@ pub mod _macro_reexports {
 }
 
 pub mod algorithm;
+pub mod controller;
 pub mod options;
 pub mod scheduled_events;
 pub mod sessions;
@@ -114,6 +115,7 @@ pub use algorithm::{
     ExecutionAlgorithm, ExecutionAlgorithmConfig, ExecutionAlgorithmCore, ExecutionAlgorithmNative,
     ImportableExecAlgorithmConfig, TwapAlgorithm, TwapAlgorithmConfig,
 };
+pub use controller::ImportableControllerConfig;
 pub use strategy::{
     ImportableStrategyConfig, Strategy, StrategyConfig, StrategyCore, StrategyNative,
 };

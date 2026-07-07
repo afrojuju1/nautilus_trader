@@ -41,30 +41,30 @@ omit the callback, the event is delivered to `on_event` instead.
 ## Order events
 
 Each order event corresponds to a state transition in the
-[order state machine](orders/index.md#order-state-flow). The `ExecutionEngine`
+[order state machine](../orders/index.md#order-state-flow). The `ExecutionEngine`
 applies the event to the order, updates the `Cache`, and publishes it on the
 `MessageBus`. The table below shows the primary transitions; partially filled
 and triggered orders support additional transitions documented in the full
-[order state flow](orders/index.md#order-state-flow).
+[order state flow](../orders/index.md#order-state-flow).
 
-| Event                  | Primary transition                  | Handler                    |
-|------------------------|-------------------------------------|----------------------------|
-| `OrderInitialized`     | (created locally)                   | `on_order_initialized`     |
-| `OrderDenied`          | Initialized -> Denied               | `on_order_denied`          |
-| `OrderEmulated`        | Initialized -> Emulated             | `on_order_emulated`        |
-| `OrderReleased`        | Emulated -> Released                | `on_order_released`        |
-| `OrderSubmitted`       | Initialized/Released -> Submitted   | `on_order_submitted`       |
-| `OrderAccepted`        | Submitted -> Accepted               | `on_order_accepted`        |
-| `OrderRejected`        | Submitted -> Rejected               | `on_order_rejected`        |
-| `OrderTriggered`       | Accepted -> Triggered               | `on_order_triggered`       |
-| `OrderPendingUpdate`   | Accepted -> PendingUpdate           | `on_order_pending_update`  |
-| `OrderPendingCancel`   | Accepted -> PendingCancel           | `on_order_pending_cancel`  |
-| `OrderUpdated`         | PendingUpdate -> Accepted           | `on_order_updated`         |
-| `OrderModifyRejected`  | PendingUpdate -> Accepted           | `on_order_modify_rejected` |
-| `OrderCancelRejected`  | PendingCancel -> Accepted           | `on_order_cancel_rejected` |
-| `OrderCanceled`        | PendingCancel/Accepted -> Canceled  | `on_order_canceled`        |
-| `OrderExpired`         | Accepted -> Expired                 | `on_order_expired`         |
-| `OrderFilled`          | Accepted -> Filled/PartiallyFilled  | `on_order_filled`          |
+| Event                                             | Primary transition                 | Handler                    |
+|---------------------------------------------------|------------------------------------|----------------------------|
+| [`OrderInitialized`](order_initialized.md)        | (created locally)                  | `on_order_initialized`     |
+| [`OrderDenied`](order_denied.md)                  | Initialized -> Denied              | `on_order_denied`          |
+| [`OrderEmulated`](order_emulated.md)              | Initialized -> Emulated            | `on_order_emulated`        |
+| [`OrderReleased`](order_released.md)              | Emulated -> Released               | `on_order_released`        |
+| [`OrderSubmitted`](order_submitted.md)            | Initialized/Released -> Submitted  | `on_order_submitted`       |
+| [`OrderAccepted`](order_accepted.md)              | Submitted -> Accepted              | `on_order_accepted`        |
+| [`OrderRejected`](order_rejected.md)              | Submitted -> Rejected              | `on_order_rejected`        |
+| [`OrderTriggered`](order_triggered.md)            | Accepted -> Triggered              | `on_order_triggered`       |
+| [`OrderPendingUpdate`](order_pending_update.md)   | Accepted -> PendingUpdate          | `on_order_pending_update`  |
+| [`OrderPendingCancel`](order_pending_cancel.md)   | Accepted -> PendingCancel          | `on_order_pending_cancel`  |
+| [`OrderUpdated`](order_updated.md)                | PendingUpdate -> previous status   | `on_order_updated`         |
+| [`OrderModifyRejected`](order_modify_rejected.md) | PendingUpdate -> previous status   | `on_order_modify_rejected` |
+| [`OrderCancelRejected`](order_cancel_rejected.md) | PendingCancel -> previous status   | `on_order_cancel_rejected` |
+| [`OrderCanceled`](order_canceled.md)              | PendingCancel/Accepted -> Canceled | `on_order_canceled`        |
+| [`OrderExpired`](order_expired.md)                | Accepted -> Expired                | `on_order_expired`         |
+| [`OrderFilled`](order_filled.md)                  | Accepted -> Filled/PartiallyFilled | `on_order_filled`          |
 
 ### Common order event fields
 
@@ -83,13 +83,14 @@ All order events share these fields:
 | `ts_event`         | Timestamp when the event occurred.       |
 | `ts_init`          | Timestamp when the event was created.    |
 
-Individual events add type-specific fields (e.g. `OrderFilled` adds
-`last_qty`, `last_px`, `trade_id`, `commission`). See the API reference
-for the full field list per event type.
+Each order event's page lists the type-specific fields it adds beyond this
+common set, plus which optional common fields are populated. For example,
+[`OrderFilled`](order_filled.md) adds `last_qty`, `last_px`, `trade_id`, and
+`commission`.
 
 :::tip
 Override `on_order_event` to handle all order events in one place. The specific
-handlers fire first, so you can mix both approaches.
+handlers fire first, so you can combine both approaches.
 :::
 
 ## Position events
@@ -98,11 +99,11 @@ Position events are a direct consequence of fill events. The `ExecutionEngine`
 processes each `OrderFilled`, updates or creates a position, and emits the
 corresponding position event.
 
-| Event               | When it fires                             | Handler               |
-|---------------------|-------------------------------------------|-----------------------|
-| `PositionOpened`    | First fill creates a new position.        | `on_position_opened`  |
-| `PositionChanged`   | Subsequent fill changes quantity or side. | `on_position_changed` |
-| `PositionClosed`    | Fill reduces quantity to zero.            | `on_position_closed`  |
+| Event                                    | When it fires                             | Handler               |
+|------------------------------------------|-------------------------------------------|-----------------------|
+| [`PositionOpened`](position_opened.md)   | First fill creates a new position.        | `on_position_opened`  |
+| [`PositionChanged`](position_changed.md) | Subsequent fill changes quantity or side. | `on_position_changed` |
+| [`PositionClosed`](position_closed.md)   | Fill reduces quantity to zero.            | `on_position_closed`  |
 
 ### From fill to position: the causal chain
 
@@ -157,6 +158,11 @@ sequenceDiagram
 
 ### Position event fields
 
+Every position event exposes all of these fields (they are defined on the `PositionEvent`
+base). A check mark means the field carries a meaningful value for that event; a dash means
+it is left at its zero or default (for example `avg_px_close` and `duration_ns` before a
+position closes).
+
 | Field                | Opened | Changed | Closed | Description                       |
 |----------------------|--------|---------|--------|-----------------------------------|
 | `trader_id`          | ✓      | ✓       | ✓      | Trader instance identifier.       |
@@ -170,17 +176,17 @@ sequenceDiagram
 | `side`               | ✓      | ✓       | ✓      | Current position side.            |
 | `signed_qty`         | ✓      | ✓       | ✓      | Signed quantity (negative=short). |
 | `quantity`           | ✓      | ✓       | ✓      | Unsigned position quantity.       |
-| `peak_qty`           | -      | ✓       | ✓      | Largest quantity held.            |
+| `peak_qty`           | ✓      | ✓       | ✓      | Largest quantity held.            |
 | `last_qty`           | ✓      | ✓       | ✓      | Quantity of the last fill.        |
 | `last_px`            | ✓      | ✓       | ✓      | Price of the last fill.           |
 | `currency`           | ✓      | ✓       | ✓      | Settlement currency.              |
 | `avg_px_open`        | ✓      | ✓       | ✓      | Average entry price.              |
 | `avg_px_close`       | -      | ✓       | ✓      | Average exit price.               |
 | `realized_return`    | -      | ✓       | ✓      | Realized return as a ratio.       |
-| `realized_pnl`       | -      | ✓       | ✓      | Realized profit and loss.         |
+| `realized_pnl`       | ✓      | ✓       | ✓      | Realized profit and loss.         |
 | `unrealized_pnl`     | -      | ✓       | ✓      | Unrealized profit and loss.       |
 | `duration_ns`        | -      | -       | ✓      | Time held in nanoseconds.         |
-| `ts_opened`          | -      | ✓       | ✓      | Timestamp when position opened.   |
+| `ts_opened`          | ✓      | ✓       | ✓      | Timestamp when position opened.   |
 | `ts_closed`          | -      | -       | ✓      | Timestamp when position closed.   |
 | `event_id`           | ✓      | ✓       | ✓      | Unique event identifier.          |
 | `ts_event`           | ✓      | ✓       | ✓      | Timestamp of the triggering fill. |
@@ -211,7 +217,8 @@ opening_order_id = position.opening_order_id
 
 Account state contains balances, margins, account type, and base currency.
 The `Portfolio` subscribes to these events internally to maintain exposure
-and balance tracking.
+and balance tracking. See [`AccountState`](account_state.md) for the full
+field list.
 
 ## Event subscriptions
 
@@ -230,12 +237,12 @@ These are useful for monitoring actors that track execution quality or fill
 rates across strategies without participating in order management.
 
 For details and examples, see
-[Order event subscriptions](actors.md#order-event-subscriptions).
+[Order event subscriptions](../actors.md#order-event-subscriptions).
 
 ## Related guides
 
-- [Orders](orders/) - Order types and state machine.
-- [Positions](positions.md) - Position lifecycle and PnL.
-- [Execution](execution.md) - Execution flow and risk checks.
-- [Strategies](strategies.md) - Handler implementations in strategies.
-- [Architecture](architecture.md) - Data and execution flow patterns.
+- [Orders](../orders/) - Order types and state machine.
+- [Positions](../positions.md) - Position lifecycle and PnL.
+- [Execution](../execution.md) - Execution flow and risk checks.
+- [Strategies](../strategies.md) - Handler implementations in strategies.
+- [Architecture](../architecture.md) - Data and execution flow patterns.

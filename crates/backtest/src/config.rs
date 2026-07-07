@@ -30,8 +30,8 @@ use nautilus_data::engine::config::DataEngineConfig;
 use nautilus_execution::{
     engine::config::ExecutionEngineConfig,
     models::{
-        fee::FeeModelAny,
-        fill::FillModelAny,
+        fee::{FeeModelAny, FeeModelHandle},
+        fill::{FillModelAny, FillModelHandle},
         latency::{LatencyModel, LatencyModelAny},
     },
 };
@@ -45,6 +45,7 @@ use nautilus_model::{
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
 use nautilus_system::config::{NautilusKernelConfig, StreamingConfig};
+use nautilus_trading::ImportableControllerConfig;
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
@@ -168,6 +169,8 @@ pub struct BacktestEngineConfig {
     pub exec_engine: Option<ExecutionEngineConfig>,
     /// The portfolio configuration.
     pub portfolio: Option<PortfolioConfig>,
+    /// The importable controller configuration.
+    pub controller: Option<ImportableControllerConfig>,
     /// The configuration for streaming to feather files.
     pub streaming: Option<StreamingConfig>,
     /// If logging should be bypassed.
@@ -297,9 +300,9 @@ pub struct SimulatedVenueConfig {
     #[builder(default)]
     pub modules: Vec<Box<dyn SimulationModule>>,
     #[builder(default)]
-    pub fill_model: FillModelAny,
+    pub fill_model: FillModelHandle,
     #[builder(default)]
-    pub fee_model: FeeModelAny,
+    pub fee_model: FeeModelHandle,
     pub latency_model: Option<Box<dyn LatencyModel>>,
     #[builder(default = false)]
     pub routing: bool,

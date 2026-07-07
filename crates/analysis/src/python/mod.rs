@@ -53,6 +53,10 @@ pub fn analysis(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::statistics::sharpe_ratio::SharpeRatio>()?;
     m.add_class::<crate::statistics::sortino_ratio::SortinoRatio>()?;
     m.add_class::<crate::statistics::tail_ratio::TailRatio>()?;
+    m.add_class::<crate::statistics::ulcer_index::UlcerIndex>()?;
+    m.add_class::<crate::statistics::omega_ratio::OmegaRatio>()?;
+    m.add_class::<crate::statistics::value_at_risk::ValueAtRisk>()?;
+    m.add_class::<crate::statistics::expected_shortfall::ExpectedShortfall>()?;
 
     // Statistics - PnL-based
     m.add_class::<crate::statistics::expectancy::Expectancy>()?;
@@ -70,9 +74,11 @@ pub fn analysis(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Statistics - Benchmark-relative
     m.add_class::<crate::statistics::alpha::Alpha>()?;
     m.add_class::<crate::statistics::beta_ratio::BetaRatio>()?;
+    m.add_class::<crate::statistics::down_capture_ratio::DownCaptureRatio>()?;
     m.add_class::<crate::statistics::information_ratio::InformationRatio>()?;
     m.add_class::<crate::statistics::tracking_error::TrackingError>()?;
     m.add_class::<crate::statistics::treynor_ratio::TreynorRatio>()?;
+    m.add_class::<crate::statistics::up_capture_ratio::UpCaptureRatio>()?;
 
     Ok(())
 }

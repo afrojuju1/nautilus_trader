@@ -49,7 +49,10 @@ use nautilus_trading::examples::{
 };
 use nautilus_trading::{
     ImportableExecAlgorithmConfig, ImportableStrategyConfig,
-    python::strategy::{PyStrategy, PyStrategyInner},
+    python::{
+        algorithm::PyExecutionAlgorithm,
+        strategy::{PyStrategy, PyStrategyInner},
+    },
 };
 use pyo3::{
     prelude::*,
@@ -108,24 +111,28 @@ impl LiveNode {
         }
     }
 
+    /// Gets the node's environment.
     #[getter]
     #[pyo3(name = "environment")]
     fn py_environment(&self) -> Environment {
         self.environment()
     }
 
+    /// Gets the node's trader ID.
     #[getter]
     #[pyo3(name = "trader_id")]
     fn py_trader_id(&self) -> TraderId {
         self.trader_id()
     }
 
+    /// Gets the node's instance ID.
     #[getter]
     #[pyo3(name = "instance_id")]
     const fn py_instance_id(&self) -> UUID4 {
         self.instance_id()
     }
 
+    /// Checks if the live node is currently running.
     #[getter]
     #[pyo3(name = "is_running")]
     fn py_is_running(&self) -> bool {
@@ -153,6 +160,27 @@ impl LiveNode {
         get_runtime().block_on(async { self.start().await.map_err(to_pyruntime_err) })
     }
 
+    /// Run the live node with automatic shutdown handling.
+    ///
+    /// This method starts the node, runs indefinitely, and handles graceful shutdown
+    /// on interrupt signals.
+    ///
+    /// # Thread Safety
+    ///
+    /// The event loop runs directly on the current thread (not spawned) because the
+    /// msgbus uses thread-local storage. Endpoints registered by the kernel are only
+    /// accessible from the same thread.
+    ///
+    /// # Shutdown Sequence
+    ///
+    /// 1. Signal received (SIGINT, SIGTERM, or handle stop).
+    /// 2. Trader components stopped (triggers order cancellations, etc.).
+    /// 3. Event loop continues processing residual events for the configured grace period.
+    /// 4. Kernel finalized, clients disconnected, remaining events drained.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node fails to start or encounters a runtime error.
     #[pyo3(name = "run")]
     fn py_run(&mut self, py: Python) -> PyResult<()> {
         if self.is_running() {
@@ -569,9 +597,9 @@ impl LiveNode {
 
         log::info!("Importing exec algorithm from module: {module_name} class: {class_name}");
 
-        // Phase 1: Create and configure the Python exec algorithm, extract its actor_id
-        let (python_exec_algorithm, actor_id) =
-            Python::attach(|py| -> anyhow::Result<(Py<PyAny>, ActorId)> {
+        // Phase 1: Create and configure the Python exec algorithm.
+        let (python_exec_algorithm, py_execution_algorithm, actor_id) = Python::attach(
+            |py| -> anyhow::Result<(Py<PyAny>, Option<PyExecutionAlgorithm>, ActorId)> {
                 let algo_module = py
                     .import(module_name)
                     .map_err(|e| anyhow::anyhow!("Failed to import module {module_name}: {e}"))?;
@@ -589,6 +617,25 @@ impl LiveNode {
                 };
 
                 log::debug!("Created Python exec algorithm instance: {python_exec_algorithm:?}");
+
+                if let Ok(mut py_exec_algorithm_ref) =
+                    python_exec_algorithm.extract::<PyRefMut<PyExecutionAlgorithm>>()
+                {
+                    if let Some(config_obj) = config_instance.as_ref() {
+                        configure_py_execution_algorithm(&mut py_exec_algorithm_ref, config_obj)?;
+                    }
+
+                    py_exec_algorithm_ref
+                        .set_python_instance(python_exec_algorithm.clone().unbind());
+                    let actor_id =
+                        ActorId::from(py_exec_algorithm_ref.exec_algorithm_id().inner().as_str());
+
+                    return Ok((
+                        python_exec_algorithm.unbind(),
+                        Some(py_exec_algorithm_ref.clone()),
+                        actor_id,
+                    ));
+                }
 
                 let mut py_data_actor_ref = python_exec_algorithm
                     .extract::<PyRefMut<PyDataActor>>()
@@ -629,9 +676,19 @@ impl LiveNode {
 
                 let actor_id = py_data_actor_ref.actor_id();
 
-                Ok((python_exec_algorithm.unbind(), actor_id))
-            })
-            .map_err(to_pyruntime_err)?;
+                Ok((python_exec_algorithm.unbind(), None, actor_id))
+            },
+        )
+        .map_err(to_pyruntime_err)?;
+
+        if let Some(py_execution_algorithm) = py_execution_algorithm {
+            let exec_algorithm_id = py_execution_algorithm.exec_algorithm_id();
+            self.add_exec_algorithm(py_execution_algorithm)
+                .map_err(to_pyruntime_err)?;
+
+            log::info!("Registered Python exec algorithm {exec_algorithm_id}");
+            return Ok(());
+        }
 
         let exec_algorithm_id = ExecAlgorithmId::from(actor_id.inner().as_str());
 
@@ -1363,6 +1420,40 @@ fn extract_bool_config_attr(config_obj: &Bound<'_, PyAny>, attr: &str) -> Option
         .getattr(attr)
         .ok()
         .and_then(|val| val.extract::<bool>().ok())
+}
+
+fn configure_py_execution_algorithm(
+    py_exec_algorithm_ref: &mut PyRefMut<'_, PyExecutionAlgorithm>,
+    config_obj: &Bound<'_, PyAny>,
+) -> anyhow::Result<()> {
+    let id_attr = config_obj
+        .getattr("exec_algorithm_id")
+        .ok()
+        .filter(|v| !v.is_none())
+        .or_else(|| config_obj.getattr("actor_id").ok().filter(|v| !v.is_none()));
+
+    if let Some(id_value) = id_attr {
+        let exec_algorithm_id = if let Ok(eaid) = id_value.extract::<ExecAlgorithmId>() {
+            eaid
+        } else if let Ok(aid) = id_value.extract::<ActorId>() {
+            ExecAlgorithmId::new_checked(aid.inner().as_str())?
+        } else if let Ok(id_str) = id_value.extract::<String>() {
+            ExecAlgorithmId::new_checked(&id_str)?
+        } else {
+            anyhow::bail!("Invalid `exec_algorithm_id`/`actor_id` type");
+        };
+        py_exec_algorithm_ref.set_exec_algorithm_id(exec_algorithm_id);
+    }
+
+    if let Some(val) = extract_bool_config_attr(config_obj, "log_events") {
+        py_exec_algorithm_ref.set_log_events(val);
+    }
+
+    if let Some(val) = extract_bool_config_attr(config_obj, "log_commands") {
+        py_exec_algorithm_ref.set_log_commands(val);
+    }
+
+    Ok(())
 }
 
 fn extract_external_order_claims_config_attr(

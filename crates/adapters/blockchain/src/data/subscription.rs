@@ -29,11 +29,15 @@ pub struct DefiDataSubscriptionManager {
     pool_burn_event_encoded: AHashMap<DexType, String>,
     pool_collect_event_encoded: AHashMap<DexType, String>,
     pool_flash_event_encoded: AHashMap<DexType, String>,
+    pool_fee_protocol_update_event_encoded: AHashMap<DexType, String>,
+    pool_fee_protocol_collect_event_encoded: AHashMap<DexType, String>,
     subscribed_pool_swaps: AHashMap<DexType, AHashSet<Address>>,
     subscribed_pool_mints: AHashMap<DexType, AHashSet<Address>>,
     subscribed_pool_burns: AHashMap<DexType, AHashSet<Address>>,
     subscribed_pool_collects: AHashMap<DexType, AHashSet<Address>>,
     subscribed_pool_flashes: AHashMap<DexType, AHashSet<Address>>,
+    subscribed_pool_fee_protocol_updates: AHashMap<DexType, AHashSet<Address>>,
+    subscribed_pool_fee_protocol_collects: AHashMap<DexType, AHashSet<Address>>,
 }
 
 impl Default for DefiDataSubscriptionManager {
@@ -52,11 +56,15 @@ impl DefiDataSubscriptionManager {
             pool_mint_event_encoded: AHashMap::new(),
             pool_collect_event_encoded: AHashMap::new(),
             pool_flash_event_encoded: AHashMap::new(),
+            pool_fee_protocol_update_event_encoded: AHashMap::new(),
+            pool_fee_protocol_collect_event_encoded: AHashMap::new(),
             subscribed_pool_burns: AHashMap::new(),
             subscribed_pool_mints: AHashMap::new(),
             subscribed_pool_swaps: AHashMap::new(),
             subscribed_pool_collects: AHashMap::new(),
             subscribed_pool_flashes: AHashMap::new(),
+            subscribed_pool_fee_protocol_updates: AHashMap::new(),
+            subscribed_pool_fee_protocol_collects: AHashMap::new(),
         }
     }
 
@@ -82,6 +90,14 @@ impl DefiDataSubscriptionManager {
         }
 
         if let Some(addresses) = self.subscribed_pool_flashes.get(dex) {
+            unique_addresses.extend(addresses.iter().copied());
+        }
+
+        if let Some(addresses) = self.subscribed_pool_fee_protocol_updates.get(dex) {
+            unique_addresses.extend(addresses.iter().copied());
+        }
+
+        if let Some(addresses) = self.subscribed_pool_fee_protocol_collects.get(dex) {
             unique_addresses.extend(addresses.iter().copied());
         }
 
@@ -113,7 +129,156 @@ impl DefiDataSubscriptionManager {
             result.push(flash_event_signature.clone());
         }
 
+        if let Some(fee_protocol_update_event_signature) =
+            self.pool_fee_protocol_update_event_encoded.get(dex)
+        {
+            result.push(fee_protocol_update_event_signature.clone());
+        }
+
+        if let Some(fee_protocol_collect_event_signature) =
+            self.pool_fee_protocol_collect_event_encoded.get(dex)
+        {
+            result.push(fee_protocol_collect_event_signature.clone());
+        }
+
         result
+    }
+
+    /// Gets event signatures with at least one subscribed pool address for a given DEX.
+    #[must_use]
+    pub fn get_active_subscribed_dex_event_signatures(&self, dex: &DexType) -> Vec<String> {
+        let mut result = Vec::new();
+
+        if self
+            .subscribed_pool_swaps
+            .get(dex)
+            .is_some_and(|addresses| !addresses.is_empty())
+            && let Some(signature) = self.pool_swap_event_encoded.get(dex)
+        {
+            result.push(signature.clone());
+        }
+
+        if self
+            .subscribed_pool_mints
+            .get(dex)
+            .is_some_and(|addresses| !addresses.is_empty())
+            && let Some(signature) = self.pool_mint_event_encoded.get(dex)
+        {
+            result.push(signature.clone());
+        }
+
+        if self
+            .subscribed_pool_burns
+            .get(dex)
+            .is_some_and(|addresses| !addresses.is_empty())
+            && let Some(signature) = self.pool_burn_event_encoded.get(dex)
+        {
+            result.push(signature.clone());
+        }
+
+        if self
+            .subscribed_pool_collects
+            .get(dex)
+            .is_some_and(|addresses| !addresses.is_empty())
+            && let Some(signature) = self.pool_collect_event_encoded.get(dex)
+        {
+            result.push(signature.clone());
+        }
+
+        if self
+            .subscribed_pool_flashes
+            .get(dex)
+            .is_some_and(|addresses| !addresses.is_empty())
+            && let Some(signature) = self.pool_flash_event_encoded.get(dex)
+        {
+            result.push(signature.clone());
+        }
+
+        if self
+            .subscribed_pool_fee_protocol_updates
+            .get(dex)
+            .is_some_and(|addresses| !addresses.is_empty())
+            && let Some(signature) = self.pool_fee_protocol_update_event_encoded.get(dex)
+        {
+            result.push(signature.clone());
+        }
+
+        if self
+            .subscribed_pool_fee_protocol_collects
+            .get(dex)
+            .is_some_and(|addresses| !addresses.is_empty())
+            && let Some(signature) = self.pool_fee_protocol_collect_event_encoded.get(dex)
+        {
+            result.push(signature.clone());
+        }
+
+        result
+    }
+
+    /// Gets pool addresses subscribed to swap events for a given DEX.
+    #[must_use]
+    pub fn get_subscribed_pool_swap_addresses(&self, dex: &DexType) -> Vec<Address> {
+        self.subscribed_pool_swaps
+            .get(dex)
+            .map(|addresses| addresses.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets pool addresses subscribed to mint events for a given DEX.
+    #[must_use]
+    pub fn get_subscribed_pool_mint_addresses(&self, dex: &DexType) -> Vec<Address> {
+        self.subscribed_pool_mints
+            .get(dex)
+            .map(|addresses| addresses.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets pool addresses subscribed to burn events for a given DEX.
+    #[must_use]
+    pub fn get_subscribed_pool_burn_addresses(&self, dex: &DexType) -> Vec<Address> {
+        self.subscribed_pool_burns
+            .get(dex)
+            .map(|addresses| addresses.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets pool addresses subscribed to collect events for a given DEX.
+    #[must_use]
+    pub fn get_subscribed_pool_collect_addresses(&self, dex: &DexType) -> Vec<Address> {
+        self.subscribed_pool_collects
+            .get(dex)
+            .map(|addresses| addresses.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets pool addresses subscribed to flash events for a given DEX.
+    #[must_use]
+    pub fn get_subscribed_pool_flash_addresses(&self, dex: &DexType) -> Vec<Address> {
+        self.subscribed_pool_flashes
+            .get(dex)
+            .map(|addresses| addresses.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets pool addresses subscribed to fee-protocol update events for a given DEX.
+    #[must_use]
+    pub fn get_subscribed_pool_fee_protocol_update_addresses(&self, dex: &DexType) -> Vec<Address> {
+        self.subscribed_pool_fee_protocol_updates
+            .get(dex)
+            .map(|addresses| addresses.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets pool addresses subscribed to fee-protocol collect events for a given DEX.
+    #[must_use]
+    pub fn get_subscribed_pool_fee_protocol_collect_addresses(
+        &self,
+        dex: &DexType,
+    ) -> Vec<Address> {
+        self.subscribed_pool_fee_protocol_collects
+            .get(dex)
+            .map(|addresses| addresses.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Gets the swap event signature for a specific DEX.
@@ -137,6 +302,34 @@ impl DefiDataSubscriptionManager {
     #[must_use]
     pub fn get_dex_pool_collect_event_signature(&self, dex: &DexType) -> Option<String> {
         self.pool_collect_event_encoded.get(dex).cloned()
+    }
+
+    /// Gets the flash event signature for a specific DEX.
+    #[must_use]
+    pub fn get_dex_pool_flash_event_signature(&self, dex: &DexType) -> Option<String> {
+        self.pool_flash_event_encoded.get(dex).cloned()
+    }
+
+    /// Gets the fee-protocol update event signature for a specific DEX.
+    #[must_use]
+    pub fn get_dex_pool_fee_protocol_update_event_signature(
+        &self,
+        dex: &DexType,
+    ) -> Option<String> {
+        self.pool_fee_protocol_update_event_encoded
+            .get(dex)
+            .cloned()
+    }
+
+    /// Gets the fee-protocol collect event signature for a specific DEX.
+    #[must_use]
+    pub fn get_dex_pool_fee_protocol_collect_event_signature(
+        &self,
+        dex: &DexType,
+    ) -> Option<String> {
+        self.pool_fee_protocol_collect_event_encoded
+            .get(dex)
+            .cloned()
     }
 
     /// Normalizes an event signature to a consistent format.
@@ -203,6 +396,32 @@ impl DefiDataSubscriptionManager {
         }
 
         log::debug!("Registered DEX for subscriptions: {dex:?}");
+    }
+
+    /// Registers optional fee-protocol event signatures for subscription management.
+    pub fn register_dex_fee_protocol_events(
+        &mut self,
+        dex: DexType,
+        fee_protocol_update_event_signature: Option<&str>,
+        fee_protocol_collect_event_signature: Option<&str>,
+    ) {
+        if let Some(fee_protocol_update_event_signature) = fee_protocol_update_event_signature {
+            self.subscribed_pool_fee_protocol_updates
+                .insert(dex, AHashSet::new());
+            self.pool_fee_protocol_update_event_encoded.insert(
+                dex,
+                Self::normalize_topic(fee_protocol_update_event_signature),
+            );
+        }
+
+        if let Some(fee_protocol_collect_event_signature) = fee_protocol_collect_event_signature {
+            self.subscribed_pool_fee_protocol_collects
+                .insert(dex, AHashSet::new());
+            self.pool_fee_protocol_collect_event_encoded.insert(
+                dex,
+                Self::normalize_topic(fee_protocol_collect_event_signature),
+            );
+        }
     }
 
     /// Subscribes to swap events for a specific pool address on a DEX.
@@ -292,6 +511,34 @@ impl DefiDataSubscriptionManager {
             pool_set.remove(&address);
         } else {
             log::error!("DEX not registered for flash subscriptions: {dex:?}");
+        }
+    }
+
+    /// Subscribes to fee-protocol update events for a specific pool address on a DEX.
+    pub fn subscribe_fee_protocol_updates(&mut self, dex: DexType, address: Address) {
+        if let Some(pool_set) = self.subscribed_pool_fee_protocol_updates.get_mut(&dex) {
+            pool_set.insert(address);
+        }
+    }
+
+    /// Unsubscribes from fee-protocol update events for a specific pool address on a DEX.
+    pub fn unsubscribe_fee_protocol_updates(&mut self, dex: DexType, address: Address) {
+        if let Some(pool_set) = self.subscribed_pool_fee_protocol_updates.get_mut(&dex) {
+            pool_set.remove(&address);
+        }
+    }
+
+    /// Subscribes to fee-protocol collect events for a specific pool address on a DEX.
+    pub fn subscribe_fee_protocol_collects(&mut self, dex: DexType, address: Address) {
+        if let Some(pool_set) = self.subscribed_pool_fee_protocol_collects.get_mut(&dex) {
+            pool_set.insert(address);
+        }
+    }
+
+    /// Unsubscribes from fee-protocol collect events for a specific pool address on a DEX.
+    pub fn unsubscribe_fee_protocol_collects(&mut self, dex: DexType, address: Address) {
+        if let Some(pool_set) = self.subscribed_pool_fee_protocol_collects.get_mut(&dex) {
+            pool_set.remove(&address);
         }
     }
 }
@@ -442,6 +689,70 @@ mod tests {
         assert!(swap_sig.is_some() && swap_sig.unwrap().starts_with("0x"));
         assert!(mint_sig.is_some() && mint_sig.unwrap().starts_with("0x"));
         assert!(burn_sig.is_some() && burn_sig.unwrap().starts_with("0x"));
+    }
+
+    #[rstest]
+    fn test_active_event_signatures_only_include_subscribed_event_types(
+        mut registered_manager: DefiDataSubscriptionManager,
+    ) {
+        let pool_address = address!("1234567890123456789012345678901234567890");
+        let swap_sig = registered_manager
+            .get_dex_pool_swap_event_signature(&DexType::UniswapV3)
+            .unwrap();
+        let collect_sig = registered_manager
+            .get_dex_pool_collect_event_signature(&DexType::UniswapV3)
+            .unwrap();
+
+        assert!(
+            registered_manager
+                .get_active_subscribed_dex_event_signatures(&DexType::UniswapV3)
+                .is_empty()
+        );
+
+        registered_manager.subscribe_swaps(DexType::UniswapV3, pool_address);
+        assert_eq!(
+            registered_manager.get_active_subscribed_dex_event_signatures(&DexType::UniswapV3),
+            vec![swap_sig]
+        );
+
+        registered_manager.subscribe_collects(DexType::UniswapV3, pool_address);
+        let active_signatures =
+            registered_manager.get_active_subscribed_dex_event_signatures(&DexType::UniswapV3);
+
+        assert_eq!(active_signatures.len(), 2);
+        assert!(active_signatures.contains(&collect_sig));
+    }
+
+    #[rstest]
+    fn test_fee_protocol_events_are_active_only_when_subscribed(
+        mut registered_manager: DefiDataSubscriptionManager,
+    ) {
+        let pool_address = address!("1234567890123456789012345678901234567890");
+        registered_manager.register_dex_fee_protocol_events(
+            DexType::UniswapV3,
+            Some("SetFeeProtocol(uint8,uint8,uint8,uint8)"),
+            Some("CollectProtocol(address,address,uint128,uint128)"),
+        );
+
+        let update_sig = registered_manager
+            .get_dex_pool_fee_protocol_update_event_signature(&DexType::UniswapV3)
+            .unwrap();
+        let collect_sig = registered_manager
+            .get_dex_pool_fee_protocol_collect_event_signature(&DexType::UniswapV3)
+            .unwrap();
+
+        registered_manager.subscribe_fee_protocol_updates(DexType::UniswapV3, pool_address);
+        registered_manager.subscribe_fee_protocol_collects(DexType::UniswapV3, pool_address);
+
+        let active_signatures =
+            registered_manager.get_active_subscribed_dex_event_signatures(&DexType::UniswapV3);
+        let addresses =
+            registered_manager.get_subscribed_dex_contract_addresses(&DexType::UniswapV3);
+
+        assert_eq!(addresses.len(), 1);
+        assert!(addresses.contains(&pool_address));
+        assert!(active_signatures.contains(&update_sig));
+        assert!(active_signatures.contains(&collect_sig));
     }
 
     #[rstest]

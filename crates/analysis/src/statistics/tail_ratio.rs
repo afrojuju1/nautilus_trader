@@ -34,6 +34,10 @@ use crate::{Returns, statistic::PortfolioStatistic};
 /// A value greater than `1` indicates a heavier upside tail (gains larger in
 /// magnitude than losses); a value below `1` indicates a heavier downside tail.
 /// Returns `NaN` for fewer than two returns or when the 5th percentile is zero.
+///
+/// # References
+///
+/// - empyrical `tail_ratio` (<https://github.com/quantopian/empyrical>).
 #[repr(C)]
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(

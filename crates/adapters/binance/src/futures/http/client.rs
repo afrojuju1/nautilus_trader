@@ -535,7 +535,10 @@ impl BinanceRawFuturesHttpClient {
                         default = Some(q);
                     }
                     BinanceRateLimitType::Orders => {
-                        let key = format!("{}:{:?}", BINANCE_ORDERS_RATE_KEY, quota.interval);
+                        let key = format!(
+                            "{}:{}:{:?}",
+                            BINANCE_ORDERS_RATE_KEY, quota.interval_num, quota.interval
+                        );
                         order_keys.push(key.clone());
                         keyed.push((key, q));
                     }
@@ -559,13 +562,25 @@ impl BinanceRawFuturesHttpClient {
 
     fn quota_from(quota: &BinanceRateLimitQuota) -> Option<Quota> {
         let burst = NonZeroU32::new(quota.limit)?;
+        let period = Self::quota_period(quota)?;
+        let replenish_interval_ns = period.as_nanos() / u128::from(quota.limit);
+        let replenish_interval_ns = u64::try_from(replenish_interval_ns).ok()?;
+
+        Quota::with_period(Duration::from_nanos(replenish_interval_ns))
+            .map(|q| q.allow_burst(burst))
+    }
+
+    fn quota_period(quota: &BinanceRateLimitQuota) -> Option<Duration> {
         match quota.interval {
-            BinanceRateLimitInterval::Second => Quota::per_second(burst),
-            BinanceRateLimitInterval::Minute => Some(Quota::per_minute(burst)),
-            BinanceRateLimitInterval::Day => {
-                Quota::with_period(Duration::from_secs(SECONDS_IN_DAY))
-                    .map(|q| q.allow_burst(burst))
+            BinanceRateLimitInterval::Second => {
+                Some(Duration::from_secs(u64::from(quota.interval_num)))
             }
+            BinanceRateLimitInterval::Minute => {
+                Some(Duration::from_secs(60 * u64::from(quota.interval_num)))
+            }
+            BinanceRateLimitInterval::Day => Some(Duration::from_secs(
+                SECONDS_IN_DAY * u64::from(quota.interval_num),
+            )),
             BinanceRateLimitInterval::Unknown => None,
         }
     }
@@ -2671,8 +2686,30 @@ mod tests {
 
         assert!(config.default_quota.is_some());
         assert_eq!(config.order_keys.len(), 2);
-        assert!(config.order_keys.iter().any(|k| k.contains("Second")));
-        assert!(config.order_keys.iter().any(|k| k.contains("Minute")));
+        assert!(
+            config
+                .order_keys
+                .iter()
+                .any(|key| key == "binance:orders:10:Second")
+        );
+        assert!(
+            config
+                .order_keys
+                .iter()
+                .any(|key| key == "binance:orders:1:Minute")
+        );
+
+        let ten_second_quota = config
+            .keyed_quotas
+            .iter()
+            .find(|(key, _)| key == "binance:orders:10:Second")
+            .map(|(_, quota)| quota)
+            .expect("USD-M 10-second order quota");
+        assert_eq!(ten_second_quota.burst_size().get(), 300);
+        assert_eq!(
+            ten_second_quota.replenish_interval(),
+            Duration::from_nanos(33_333_333)
+        );
     }
 
     #[rstest]
@@ -2681,6 +2718,46 @@ mod tests {
 
         assert!(config.default_quota.is_some());
         assert_eq!(config.order_keys.len(), 2);
+        assert!(
+            config
+                .order_keys
+                .iter()
+                .any(|key| key == "binance:orders:1:Second")
+        );
+        assert!(
+            config
+                .order_keys
+                .iter()
+                .any(|key| key == "binance:orders:1:Minute")
+        );
+    }
+
+    #[rstest]
+    fn test_rate_limit_keys_usdm_include_order_buckets() {
+        let client = BinanceRawFuturesHttpClient::new(
+            BinanceProductType::UsdM,
+            BinanceEnvironment::Live,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            client.rate_limit_keys(false),
+            vec![BINANCE_GLOBAL_RATE_KEY.to_string()]
+        );
+        assert_eq!(
+            client.rate_limit_keys(true),
+            vec![
+                BINANCE_GLOBAL_RATE_KEY.to_string(),
+                "binance:orders:10:Second".to_string(),
+                "binance:orders:1:Minute".to_string(),
+            ]
+        );
     }
 
     #[rstest]

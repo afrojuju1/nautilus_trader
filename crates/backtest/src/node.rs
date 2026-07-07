@@ -116,8 +116,12 @@ impl BacktestNode {
                     .cloned()
                     .map(Into::into)
                     .collect();
-                let fill_model = venue_config.fill_model().cloned().unwrap_or_default();
-                let fee_model = venue_config.fee_model().cloned().unwrap_or_default();
+                let fill_model = venue_config
+                    .fill_model()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into();
+                let fee_model = venue_config.fee_model().cloned().unwrap_or_default().into();
                 let latency_model = venue_config.latency_model().cloned().map(Into::into);
                 let sim_config = SimulatedVenueConfig::builder()
                     .venue(Venue::from(venue_config.name().as_str()))

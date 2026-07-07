@@ -50,6 +50,7 @@ use nautilus_system::{
     config::{NautilusKernelConfig, StreamingConfig},
     event_store::EventStoreConfig,
 };
+use nautilus_trading::ImportableControllerConfig;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -512,6 +513,10 @@ impl From<LiveExecEngineConfig> for ExecutionEngineConfig {
             allow_overfills: config.allow_overfills,
             filter_unclaimed_external_orders: config.filter_unclaimed_external_orders,
             external_clients: config.external_clients,
+            // Keep purge intervals on the ExecutionEngine clock-timer path.
+            // LiveNode also dispatches purge checks from its maintenance loop,
+            // but engine timers must remain controlled by the injected Clock
+            // for callers using a custom live/sandbox clock factory.
             purge_closed_orders_interval_mins: config.purge_closed_orders_interval_mins,
             purge_closed_orders_buffer_mins: config.purge_closed_orders_buffer_mins,
             purge_closed_positions_interval_mins: config.purge_closed_positions_interval_mins,
@@ -795,6 +800,8 @@ pub struct LiveNodeConfig {
     /// The execution client configurations.
     #[builder(default)]
     pub exec_clients: HashMap<String, LiveExecClientConfig>,
+    /// The importable controller configuration.
+    pub controller: Option<ImportableControllerConfig>,
     /// The Rust-native plug-in instances to load before startup.
     #[builder(default)]
     pub plugins: Vec<PluginConfig>,
@@ -1296,6 +1303,12 @@ mod tests {
             load_cache: false,
             snapshot_positions_interval_secs: Some(30.0),
             filter_unclaimed_external_orders: true,
+            purge_closed_orders_interval_mins: Some(5),
+            purge_closed_orders_buffer_mins: Some(1),
+            purge_closed_positions_interval_mins: Some(10),
+            purge_closed_positions_buffer_mins: Some(2),
+            purge_account_events_interval_mins: Some(15),
+            purge_account_events_lookback_mins: Some(3),
             ..Default::default()
         };
 
@@ -1304,6 +1317,101 @@ mod tests {
         assert!(!converted.load_cache);
         assert_eq!(converted.snapshot_positions_interval_secs, Some(30.0));
         assert!(converted.filter_unclaimed_external_orders);
+        assert_eq!(converted.purge_closed_orders_interval_mins, Some(5));
+        assert_eq!(converted.purge_closed_orders_buffer_mins, Some(1));
+        assert_eq!(converted.purge_closed_positions_interval_mins, Some(10));
+        assert_eq!(converted.purge_closed_positions_buffer_mins, Some(2));
+        assert_eq!(converted.purge_account_events_interval_mins, Some(15));
+        assert_eq!(converted.purge_account_events_lookback_mins, Some(3));
+    }
+
+    #[rstest]
+    fn test_live_exec_engine_config_converts_to_execution_manager_config() {
+        let config = LiveExecEngineConfig {
+            reconciliation: false,
+            reconciliation_lookback_mins: Some(45),
+            reconciliation_instrument_ids: Some(vec![
+                "ETHUSDT.BINANCE".to_string(),
+                "BTCUSDT.BINANCE".to_string(),
+            ]),
+            filter_unclaimed_external_orders: true,
+            filter_position_reports: true,
+            filtered_client_order_ids: Some(vec!["O-001".to_string(), "O-002".to_string()]),
+            generate_missing_orders: false,
+            inflight_check_interval_ms: 321,
+            inflight_check_threshold_ms: 654,
+            inflight_check_retries: 7,
+            open_check_interval_secs: Some(1.5),
+            open_check_lookback_mins: Some(9),
+            open_check_threshold_ms: 234,
+            open_check_missing_retries: 4,
+            open_check_open_only: false,
+            max_single_order_queries_per_cycle: 8,
+            single_order_query_delay_ms: 76,
+            position_check_interval_secs: Some(2.5),
+            position_check_lookback_mins: 11,
+            position_check_threshold_ms: 345,
+            position_check_retries: 6,
+            purge_closed_orders_buffer_mins: Some(12),
+            purge_closed_positions_buffer_mins: Some(13),
+            purge_account_events_lookback_mins: Some(14),
+            purge_from_database: true,
+            ..Default::default()
+        };
+
+        let converted = ExecutionManagerConfig::from(&config);
+
+        assert!(!converted.reconciliation);
+        assert_eq!(converted.lookback_mins, Some(45));
+        assert_eq!(converted.reconciliation_instrument_ids.len(), 2);
+        assert!(
+            converted
+                .reconciliation_instrument_ids
+                .contains(&InstrumentId::from("ETHUSDT.BINANCE"))
+        );
+        assert!(
+            converted
+                .reconciliation_instrument_ids
+                .contains(&InstrumentId::from("BTCUSDT.BINANCE"))
+        );
+        assert!(converted.filter_unclaimed_external);
+        assert!(converted.filter_position_reports);
+        assert_eq!(converted.filtered_client_order_ids.len(), 2);
+        assert!(
+            converted
+                .filtered_client_order_ids
+                .contains(&ClientOrderId::from("O-001"))
+        );
+        assert!(
+            converted
+                .filtered_client_order_ids
+                .contains(&ClientOrderId::from("O-002"))
+        );
+        assert!(!converted.generate_missing_orders);
+        assert_eq!(converted.inflight_check_interval_ms, 321);
+        assert_eq!(converted.inflight_threshold_ms, 654);
+        assert_eq!(converted.inflight_max_retries, 7);
+        assert_eq!(converted.open_check_interval_secs, Some(1.5));
+        assert_eq!(converted.open_check_lookback_mins, Some(9));
+        assert_eq!(
+            converted.open_check_threshold_ns,
+            234 * NANOSECONDS_IN_MILLISECOND
+        );
+        assert_eq!(converted.open_check_missing_retries, 4);
+        assert!(!converted.open_check_open_only);
+        assert_eq!(converted.max_single_order_queries_per_cycle, 8);
+        assert_eq!(converted.single_order_query_delay_ms, 76);
+        assert_eq!(converted.position_check_interval_secs, Some(2.5));
+        assert_eq!(converted.position_check_lookback_mins, 11);
+        assert_eq!(
+            converted.position_check_threshold_ns,
+            345 * NANOSECONDS_IN_MILLISECOND
+        );
+        assert_eq!(converted.position_check_retries, 6);
+        assert_eq!(converted.purge_closed_orders_buffer_mins, Some(12));
+        assert_eq!(converted.purge_closed_positions_buffer_mins, Some(13));
+        assert_eq!(converted.purge_account_events_lookback_mins, Some(14));
+        assert!(converted.purge_from_database);
     }
 
     #[rstest]

@@ -41,6 +41,7 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model import QuoteTick
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import TradeTick
+from nautilus_trader.trading import ExecutionAlgorithm
 from nautilus_trader.trading import Strategy
 from nautilus_trader.trading import StrategyConfig
 
@@ -431,6 +432,81 @@ class RoutedOrderExecAlgorithm(DataActor):
         type(self).received_exec_algorithm_ids.append(order.exec_algorithm_id)
         type(self).signal_values.append(client_order_id)
         self.publish_signal(self._signal_name, client_order_id)
+
+
+class RoutedOrderExecutionAlgorithm(ExecutionAlgorithm):
+    received_client_order_ids = []
+    received_exec_algorithm_ids = []
+    signal_values = []
+
+    def __init__(self, config: RoutedOrderExecAlgorithmConfig):
+        super().__init__(config)
+        self._signal_name = config.signal_name
+
+    @classmethod
+    def reset_observations(cls):
+        cls.received_client_order_ids = []
+        cls.received_exec_algorithm_ids = []
+        cls.signal_values = []
+
+    def on_start(self):
+        type(self).reset_observations()
+
+    def on_order(self, order):
+        client_order_id = str(order.client_order_id)
+
+        type(self).received_client_order_ids.append(client_order_id)
+        type(self).received_exec_algorithm_ids.append(order.exec_algorithm_id)
+        type(self).signal_values.append(client_order_id)
+        self.publish_signal(self._signal_name, client_order_id)
+
+
+class DoubleSpawnExecutionAlgorithm(ExecutionAlgorithm):
+    cached_primary_quantities = []
+    spawned_exec_algorithm_ids = []
+
+    def __init__(self, config: RoutedOrderExecAlgorithmConfig):
+        super().__init__(config)
+
+    @classmethod
+    def reset_observations(cls):
+        cls.cached_primary_quantities = []
+        cls.spawned_exec_algorithm_ids = []
+
+    def on_start(self):
+        type(self).reset_observations()
+
+    def on_order(self, order):
+        first = self.spawn_market(order, Quantity.from_str("0.03000"))
+        second = self.spawn_market(order, Quantity.from_str("0.02000"))
+        cached_primary = self.cache.order(order.client_order_id)
+
+        type(self).cached_primary_quantities.append(cached_primary.quantity.as_decimal())
+        type(self).spawned_exec_algorithm_ids.extend(
+            [first.exec_algorithm_id, second.exec_algorithm_id],
+        )
+
+
+class OversizedSpawnExecutionAlgorithm(ExecutionAlgorithm):
+    error_messages = []
+
+    def __init__(self, config: RoutedOrderExecAlgorithmConfig):
+        super().__init__(config)
+
+    @classmethod
+    def reset_observations(cls):
+        cls.error_messages = []
+
+    def on_start(self):
+        type(self).reset_observations()
+
+    def on_order(self, order):
+        try:
+            self.spawn_market(order, Quantity.from_str("0.11000"))
+        except ValueError as exc:
+            type(self).error_messages.append(str(exc))
+        else:
+            type(self).error_messages.append("no error")
 
 
 class MarketDataAuditActorConfig(DataActorConfig):

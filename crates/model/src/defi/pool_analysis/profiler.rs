@@ -315,36 +315,58 @@ impl PoolProfiler {
             .simulate_swap_through_ticks(amount_specified, zero_for_one, sqrt_price_limit_x96, true)
             .map_err(|e| Self::wrap_liquidity_error(e, location))?;
 
-        self.apply_swap_quote(&swap_quote);
+        let tick_mismatch = swap.tick != swap_quote.tick_after;
+        let liquidity_mismatch = swap.liquidity != swap_quote.liquidity_after;
+        let sqrt_mismatch = swap.sqrt_price_x96 != swap_quote.sqrt_price_after_x96;
+        let structural_mismatch = tick_mismatch || liquidity_mismatch;
+        if structural_mismatch && !swap_quote.crossed_ticks.is_empty() {
+            log::warn!(
+                "Replay swap simulation diverged after crossing {} ticks on block {}; anchoring event state without simulated tick-cross mutations",
+                swap_quote.crossed_ticks.len(),
+                swap.block
+            );
+            self.apply_swap_quote_without_crossed_ticks(&swap_quote);
+        } else {
+            self.apply_swap_quote(&swap_quote);
+        }
 
         // Verify simulation against event data - correct with event values if mismatch detected
-        if swap.tick != self.state.current_tick {
+        if tick_mismatch {
             log::warn!(
                 "Inconsistency in swap processing: Current tick mismatch: simulated {}, event {} on block {}",
-                self.state.current_tick,
+                swap_quote.tick_after,
                 swap.tick,
                 swap.block
             );
+        }
+
+        if swap.tick != self.state.current_tick {
             self.state.current_tick = swap.tick;
         }
 
-        if swap.liquidity != self.tick_map.liquidity {
+        if liquidity_mismatch {
             log::warn!(
                 "Inconsistency in swap processing: Active liquidity mismatch: simulated {}, event {} on block {}",
-                self.tick_map.liquidity,
+                swap_quote.liquidity_after,
                 swap.liquidity,
                 swap.block
             );
+        }
+
+        if swap.liquidity != self.tick_map.liquidity {
             self.tick_map.liquidity = swap.liquidity;
         }
 
-        if swap.sqrt_price_x96 != self.state.price_sqrt_ratio_x96 {
+        if sqrt_mismatch {
             log::warn!(
                 "Inconsistency in swap processing: Sqrt price mismatch: simulated {}, event {} on block {}",
-                self.state.price_sqrt_ratio_x96,
+                swap_quote.sqrt_price_after_x96,
                 swap.sqrt_price_x96,
                 swap.block
             );
+        }
+
+        if swap.sqrt_price_x96 != self.state.price_sqrt_ratio_x96 {
             self.state.price_sqrt_ratio_x96 = swap.sqrt_price_x96;
         }
 
@@ -641,13 +663,7 @@ impl PoolProfiler {
         self.state.current_tick = swap_quote.tick_after;
         self.state.price_sqrt_ratio_x96 = swap_quote.sqrt_price_after_x96;
 
-        if swap_quote.zero_for_one() {
-            self.state.fee_growth_global_0 = swap_quote.fee_growth_global_after;
-            self.state.protocol_fees_token0 += swap_quote.protocol_fee;
-        } else {
-            self.state.fee_growth_global_1 = swap_quote.fee_growth_global_after;
-            self.state.protocol_fees_token1 += swap_quote.protocol_fee;
-        }
+        self.apply_swap_quote_fee_state(swap_quote);
 
         for crossed in &swap_quote.crossed_ticks {
             let liquidity_net =
@@ -667,6 +683,23 @@ impl PoolProfiler {
             "Liquidity mismatch in apply_swap_quote: computed={}, quote={}",
             self.tick_map.liquidity, swap_quote.liquidity_after
         );
+    }
+
+    fn apply_swap_quote_without_crossed_ticks(&mut self, swap_quote: &SwapQuote) {
+        self.state.current_tick = swap_quote.tick_after;
+        self.state.price_sqrt_ratio_x96 = swap_quote.sqrt_price_after_x96;
+        self.apply_swap_quote_fee_state(swap_quote);
+        self.analytics.total_swaps += 1;
+    }
+
+    fn apply_swap_quote_fee_state(&mut self, swap_quote: &SwapQuote) {
+        if swap_quote.zero_for_one() {
+            self.state.fee_growth_global_0 = swap_quote.fee_growth_global_after;
+            self.state.protocol_fees_token0 += swap_quote.protocol_fee;
+        } else {
+            self.state.fee_growth_global_1 = swap_quote.fee_growth_global_after;
+            self.state.protocol_fees_token1 += swap_quote.protocol_fee;
+        }
     }
 
     /// Wraps a low-level [`LiquidityMathError`](super::error::LiquidityMathError) into a

@@ -5,7 +5,7 @@ Nautilus provides two Rust APIs for backtesting: `BacktestEngine`
 guide covers both.
 
 For background on backtesting concepts, fill models, and matching engine
-behavior, see the [Backtesting](../concepts/backtesting.md) concept guide.
+behavior, see the [Backtesting](../concepts/backtesting/) concept guide.
 For project setup and feature flags, see the
 [Rust](../concepts/rust.md#project-setup) concept guide.
 

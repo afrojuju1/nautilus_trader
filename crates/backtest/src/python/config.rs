@@ -24,7 +24,8 @@ use nautilus_common::{
 use nautilus_core::{UUID4, UnixNanos, python::to_pyvalue_err};
 use nautilus_data::engine::config::DataEngineConfig;
 use nautilus_execution::{
-    engine::config::ExecutionEngineConfig, python::fee::pyobject_to_fee_model_any,
+    engine::config::ExecutionEngineConfig,
+    python::{fee::pyobject_to_fee_model_any, fill::pyobject_to_fill_model_any},
 };
 use nautilus_model::{
     data::BarSpecification,
@@ -34,13 +35,13 @@ use nautilus_model::{
 };
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
+use nautilus_trading::ImportableControllerConfig;
 use pyo3::{Py, PyAny, Python};
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use super::engine::{
-    pyobject_to_fill_model_any, pyobject_to_latency_model_any, pyobject_to_margin_model_any,
-    pyobject_to_simulation_module_any,
+    pyobject_to_latency_model_any, pyobject_to_margin_model_any, pyobject_to_simulation_module_any,
 };
 use crate::config::{
     BacktestDataConfig, BacktestEngineConfig, BacktestRunConfig, BacktestVenueConfig,
@@ -73,6 +74,7 @@ impl BacktestEngineConfig {
         risk_engine = None,
         exec_engine = None,
         portfolio = None,
+        controller = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -96,6 +98,7 @@ impl BacktestEngineConfig {
         risk_engine: Option<RiskEngineConfig>,
         exec_engine: Option<ExecutionEngineConfig>,
         portfolio: Option<PortfolioConfig>,
+        controller: Option<ImportableControllerConfig>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -120,6 +123,7 @@ impl BacktestEngineConfig {
             risk_engine,
             exec_engine,
             portfolio,
+            controller,
             streaming: None,
         }
     }
@@ -232,6 +236,12 @@ impl BacktestEngineConfig {
         self.portfolio
     }
 
+    #[getter]
+    #[pyo3(name = "controller")]
+    fn py_controller(&self) -> Option<ImportableControllerConfig> {
+        self.controller.clone()
+    }
+
     fn __repr__(&self) -> String {
         format!("{self:?}")
     }
@@ -329,7 +339,7 @@ impl BacktestVenueConfig {
             .transpose()?
             .unwrap_or_default();
         let fill_model = fill_model
-            .map(|obj| Python::attach(|py| pyobject_to_fill_model_any(py, obj.bind(py))))
+            .map(|obj| Python::attach(|py| pyobject_to_fill_model_any(obj.bind(py))))
             .transpose()?;
         let latency_model = latency_model
             .map(|obj| Python::attach(|py| pyobject_to_latency_model_any(py, obj.bind(py))))

@@ -1,10 +1,25 @@
 # Interactive Brokers
 
-Interactive Brokers (IB) is a trading platform providing market access across a wide range of financial instruments, including stocks, options, futures, currencies, bonds, funds, and cryptocurrencies. NautilusTrader offers an adapter to integrate with IB using their [Trader Workstation (TWS) API](https://ibkrcampus.com/ibkr-api-page/trader-workstation-api/) through their Python library, [ibapi](https://github.com/nautechsystems/ibapi).
+Interactive Brokers (IB) is a trading platform providing market access across a wide range of
+financial instruments, including stocks, options, futures, currencies, bonds, funds, and
+cryptocurrencies. NautilusTrader offers an adapter to integrate with IB using their
+[Trader Workstation (TWS) API](https://ibkrcampus.com/ibkr-api-page/trader-workstation-api/).
+The v1 legacy path uses the Python [ibapi](https://github.com/nautechsystems/ibapi) package,
+while the v2 path is implemented in Rust under `crates/adapters/interactive_brokers` with PyO3
+bindings for Python v2.
 
-The TWS API is an interface to IB's standalone trading applications: TWS and IB Gateway. Both can be downloaded from the IB website. If you haven't installed TWS or IB Gateway yet, refer to the [Initial Setup](https://ibkrcampus.com/ibkr-api-page/trader-workstation-api/#tws-download) guide. In NautilusTrader, you'll establish a connection to one of these applications via the `InteractiveBrokersClient`.
+The TWS API is an interface to IB's standalone trading applications: TWS and IB Gateway. Both can
+be downloaded from the IB website. If you haven't installed TWS or IB Gateway yet, refer to the
+[Initial Setup](https://ibkrcampus.com/ibkr-api-page/trader-workstation-api/#tws-download) guide.
+In NautilusTrader, you'll establish a connection to one of these applications via the
+`InteractiveBrokersClient`.
 
-Alternatively, you can start with a [dockerized version](https://github.com/gnzsnz/ib-gateway-docker) of the IB Gateway, which is particularly useful when deploying trading strategies on a hosted cloud platform. This requires having [Docker](https://www.docker.com/) installed on your machine, along with the [docker](https://pypi.org/project/docker/) Python package, which NautilusTrader conveniently includes as an extra package.
+Alternatively, you can start with a
+[dockerized version](https://github.com/gnzsnz/ib-gateway-docker) of the IB Gateway, which is
+particularly useful when deploying trading strategies on a hosted cloud platform. This requires
+having [Docker](https://www.docker.com/) installed on your machine, along with the
+[docker](https://pypi.org/project/docker/) Python package, which NautilusTrader conveniently
+includes as an extra package.
 
 :::note
 The standalone TWS and IB Gateway applications require manually inputting username, password, and trading mode (live or paper) at startup. The dockerized version of the IB Gateway handles these steps programmatically.
@@ -30,7 +45,10 @@ Because IB does not provide wheels for `ibapi`, NautilusTrader [repackages](http
 
 ## Examples
 
-You can find live example scripts [here](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/interactive_brokers/).
+- Rust live-node testers:
+  [`crates/adapters/interactive_brokers/examples/`](https://github.com/nautechsystems/nautilus_trader/tree/develop/crates/adapters/interactive_brokers/examples/)
+- Python live examples:
+  [`examples/live/interactive_brokers/`](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/interactive_brokers/)
 
 ## Getting started
 

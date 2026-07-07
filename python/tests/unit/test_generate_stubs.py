@@ -420,6 +420,82 @@ class PyStrategy:
     assert "    @property\n    def trader_id(self) -> model.TraderId | None: ..." in updated
 
 
+def test_collect_rust_class_fixups_detects_cfg_attr_subclass_pyclass(tmp_path):
+    # Arrange
+    rust_file = tmp_path / "crates" / "trading" / "src" / "strategy" / "config.rs"
+    rust_file.parent.mkdir(parents=True)
+    rust_file.write_text(
+        """
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.trading",
+        subclass,
+        from_py_object
+    )
+)]
+pub struct StrategyConfig {}
+""".strip(),
+    )
+
+    # Act
+    fixups = generate_stubs.collect_rust_class_fixups(tmp_path)
+
+    # Assert
+    assert fixups["StrategyConfig"].subclass is True
+
+
+def test_collect_rust_class_fixups_ignores_subclass_in_pyclass_string_values(tmp_path):
+    # Arrange
+    rust_file = tmp_path / "crates" / "test" / "src" / "config.rs"
+    rust_file.parent.mkdir(parents=True)
+    rust_file.write_text(
+        """
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.adapters.subclass",
+        name = "SubclassNamedConfig",
+        from_py_object
+    )
+)]
+pub struct RustConfig {}
+""".strip(),
+    )
+
+    # Act
+    fixups = generate_stubs.collect_rust_class_fixups(tmp_path)
+
+    # Assert
+    assert fixups["RustConfig"].python_name == "SubclassNamedConfig"
+    assert fixups["RustConfig"].subclass is False
+
+
+def test_remove_final_from_subclassable_classes():
+    # Arrange
+    content = """
+@typing.final
+class StrategyConfig:
+    pass
+
+@typing.final
+class NonSubclassable:
+    pass
+""".strip()
+    fixups = {
+        "StrategyConfig": generate_stubs.ClassMethodFixup(subclass=True),
+        "NonSubclassable": generate_stubs.ClassMethodFixup(subclass=False),
+    }
+
+    # Act
+    updated = generate_stubs.remove_final_from_subclassable_classes(content, fixups)
+
+    # Assert
+    assert "@typing.final\nclass StrategyConfig:" not in updated
+    assert "class StrategyConfig:" in updated
+    assert "@typing.final\nclass NonSubclassable:" in updated
+
+
 def test_apply_rust_class_fixups_restores_properties_and_staticmethods():
     # Arrange
     content = """
@@ -1144,6 +1220,37 @@ def test_stub_enum_variants_match_screaming_snake_case():
 
     assert not violations, "Stub enum variants not in SCREAMING_SNAKE_CASE:\n" + "\n".join(
         f"  {v}" for v in violations
+    )
+
+
+def test_subclassable_pyclasses_are_not_final_in_stubs():
+    # Arrange
+    fixups = generate_stubs.collect_rust_class_fixups(WORKSPACE_ROOT)
+    subclassable = {
+        name
+        for rust_name, fixup in fixups.items()
+        if fixup.subclass
+        for name in {rust_name, fixup.python_name or rust_name}
+    }
+    violations: list[str] = []
+
+    # Act
+    for pyi in sorted(STUB_ROOT.rglob("*.pyi")):
+        lines = pyi.read_text().splitlines()
+        for index, line in enumerate(lines[:-1]):
+            if line.strip() != "@typing.final":
+                continue
+
+            class_match = generate_stubs.STUB_CLASS_RE.match(lines[index + 1].strip())
+            if class_match is None or class_match.group(1) not in subclassable:
+                continue
+
+            relative_path = pyi.relative_to(WORKSPACE_ROOT)
+            violations.append(f"{relative_path}:{index + 1}:{class_match.group(1)}")
+
+    # Assert
+    assert not violations, "Subclassable pyclasses marked final:\n" + "\n".join(
+        f"  {violation}" for violation in violations
     )
 
 

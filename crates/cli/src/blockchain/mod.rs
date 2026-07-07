@@ -71,6 +71,7 @@ pub(crate) async fn run_blockchain_command(opt: BlockchainOpt) -> anyhow::Result
             require_existing_snapshot,
             checkpoint_blocks,
             skip_validation,
+            snapshot_from_rpc,
             database,
             multicall_calls_per_rpc_request,
         } => {
@@ -86,6 +87,7 @@ pub(crate) async fn run_blockchain_command(opt: BlockchainOpt) -> anyhow::Result
                 require_existing_snapshot,
                 checkpoint_blocks,
                 skip_validation,
+                snapshot_from_rpc,
                 multicall_calls_per_rpc_request,
             )
             .await
@@ -102,6 +104,7 @@ pub(crate) async fn run_blockchain_command(opt: BlockchainOpt) -> anyhow::Result
             require_existing_snapshot,
             checkpoint_blocks,
             skip_validation,
+            snapshot_from_rpc,
             concurrency,
             database,
             multicall_calls_per_rpc_request,
@@ -119,6 +122,7 @@ pub(crate) async fn run_blockchain_command(opt: BlockchainOpt) -> anyhow::Result
                 require_existing_snapshot,
                 checkpoint_blocks,
                 skip_validation,
+                snapshot_from_rpc,
                 concurrency,
                 multicall_calls_per_rpc_request,
             )

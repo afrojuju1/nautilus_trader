@@ -44,7 +44,8 @@ use nautilus_model::{
     enums::{
         AccountType, AggressorSide, AssetClass, BookAction, BookType, ContingencyType,
         InstrumentCloseType, LiquiditySide, MarketStatus, MarketStatusAction, OmsType, OptionKind,
-        OrderSide, OrderStatus, OrderType, TimeInForce, TrailingOffsetType, TriggerType,
+        OrderSide, OrderStatus, OrderType, RecordFlag, TimeInForce, TrailingOffsetType,
+        TriggerType,
     },
     events::{
         OrderEmulated, OrderEventAny, OrderEventType, OrderFilled, OrderRejected, OrderReleased,
@@ -10190,6 +10191,671 @@ fn test_l1_queue_position_pending_resolved_by_any_side_trade(
             .count(),
         1,
     );
+}
+
+fn get_l3_queue_position_engine(
+    instrument: InstrumentAny,
+) -> (
+    OrderMatchingEngine,
+    Rc<RefCell<Cache>>,
+    TypedIntoMessageSavingHandler<OrderEventAny>,
+) {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+
+    let handler = order_event_handler_with_cache(Rc::clone(&cache));
+
+    let config = OrderMatchingEngineConfig {
+        trade_execution: true,
+        queue_position: true,
+        ..Default::default()
+    };
+
+    let engine = OrderMatchingEngine::new(
+        instrument,
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::default().into(),
+        BookType::L3_MBO,
+        OmsType::Netting,
+        AccountType::Margin,
+        clock,
+        Rc::clone(&cache),
+        config,
+    );
+
+    (engine, cache, handler)
+}
+
+fn process_l3_ask_delta(
+    engine: &mut OrderMatchingEngine,
+    instrument_id: InstrumentId,
+    action: BookAction,
+    order_id: u64,
+    size: &str,
+    sequence: u64,
+) {
+    let delta = OrderBookDeltaTestBuilder::new(instrument_id)
+        .book_action(action)
+        .book_order(BookOrder::new(
+            OrderSide::Sell,
+            Price::from("100.00"),
+            Quantity::from(size),
+            order_id,
+        ))
+        .sequence(sequence)
+        .ts_event(UnixNanos::from(sequence))
+        .ts_init(UnixNanos::from(sequence))
+        .build();
+    engine.process_order_book_delta(&delta).unwrap();
+}
+
+fn process_buyer_trade(
+    engine: &mut OrderMatchingEngine,
+    instrument_id: InstrumentId,
+    size: &str,
+    trade_id: &str,
+    ts: u64,
+) {
+    let trade = TradeTick::new(
+        instrument_id,
+        Price::from("100.00"),
+        Quantity::from(size),
+        AggressorSide::Buyer,
+        TradeId::new(trade_id),
+        UnixNanos::from(ts),
+        UnixNanos::from(ts),
+    );
+    engine.process_trade_tick(&trade);
+}
+
+fn rest_sell_limit_at_100(
+    engine: &mut OrderMatchingEngine,
+    instrument_id: InstrumentId,
+    account_id: AccountId,
+    quantity: &str,
+) {
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_id)
+        .side(OrderSide::Sell)
+        .price(Price::from("100.00"))
+        .quantity(Quantity::from(quantity))
+        .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
+        .submit(true)
+        .build();
+    engine.process_order(&mut order, account_id);
+}
+
+fn get_fill_quantities(handler: &TypedIntoMessageSavingHandler<OrderEventAny>) -> Vec<Quantity> {
+    get_order_event_handler_messages(handler)
+        .iter()
+        .filter_map(|e| match e {
+            OrderEventAny::Filled(f) => Some(f.last_qty),
+            _ => None,
+        })
+        .collect()
+}
+
+#[rstest]
+fn test_l3_queue_position_stranger_cancel_advances_queue_by_canceled_size_only(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    // Core repro for #4370: two strangers (5+5) rest ahead. One cancels
+    // (per-order DELETE), so 5 remains genuinely ahead. A 5-lot trade
+    // consumes only that remaining stranger and must not fill us; the
+    // next trade through fills us.
+    let (mut engine, _cache, handler) = get_l3_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 1, "5.000", 1);
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 2, "5.000", 2);
+
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    // Stranger 1 cancels: queue advances 10 -> 5, not to zero
+    process_l3_ask_delta(
+        &mut engine,
+        instrument_id,
+        BookAction::Delete,
+        1,
+        "5.000",
+        3,
+    );
+
+    // 5-lot trade consumes exactly the remaining stranger
+    process_buyer_trade(&mut engine, instrument_id, "5.000", "1", 4);
+    assert_eq!(
+        get_fill_quantities(&handler),
+        Vec::<Quantity>::new(),
+        "trade only consumed the stranger still ahead, must not fill",
+    );
+
+    // Queue now exhausted: the next trade fills us
+    process_buyer_trade(&mut engine, instrument_id, "5.000", "2", 5);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("5.000")]);
+}
+
+#[rstest]
+fn test_l3_queue_position_delete_behind_does_not_advance_queue(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    // A stranger that arrives after us sits behind us in the queue;
+    // its cancel must not advance our position.
+    let (mut engine, _cache, handler) = get_l3_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 1, "5.000", 1);
+
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    // Stranger 2 joins behind us, then cancels: queue stays at 5
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 2, "5.000", 2);
+    process_l3_ask_delta(
+        &mut engine,
+        instrument_id,
+        BookAction::Delete,
+        2,
+        "5.000",
+        3,
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "5.000", "1", 4);
+    assert_eq!(
+        get_fill_quantities(&handler),
+        Vec::<Quantity>::new(),
+        "trade only consumed the stranger ahead, must not fill",
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "2.000", "2", 5);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("2.000")]);
+}
+
+#[rstest]
+fn test_l3_queue_position_fill_delta_after_trade_does_not_double_advance(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    // MBO feeds emit both the trade tick and the book DELETE removing
+    // the filled resting order. The queue must advance once, not twice.
+    let (mut engine, _cache, handler) = get_l3_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 1, "5.000", 1);
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 2, "5.000", 2);
+
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    // Trade consumes stranger 1: queue 10 -> 5
+    process_buyer_trade(&mut engine, instrument_id, "5.000", "1", 3);
+    assert_eq!(get_fill_quantities(&handler), Vec::<Quantity>::new());
+
+    // The fill's book delta removes stranger 1: already accounted for
+    process_l3_ask_delta(
+        &mut engine,
+        instrument_id,
+        BookAction::Delete,
+        1,
+        "5.000",
+        4,
+    );
+
+    // Trade consumes stranger 2 exactly: queue 5 -> 0, no fill yet
+    process_buyer_trade(&mut engine, instrument_id, "5.000", "2", 5);
+    assert_eq!(
+        get_fill_quantities(&handler),
+        Vec::<Quantity>::new(),
+        "queue must not double-advance from trade plus its fill delta",
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "3.000", "3", 6);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("3.000")]);
+}
+
+#[rstest]
+fn test_l3_queue_position_delete_after_partial_trade_advances_by_tracked_size(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    // A trade partially consumes the front stranger; a later DELETE for it
+    // (carrying its stale original size) must advance the queue by the
+    // remaining tracked size only.
+    let (mut engine, _cache, handler) = get_l3_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 1, "5.000", 1);
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 2, "5.000", 2);
+
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    // Trade partially consumes stranger 1: queue 10 -> 7, tracked 1 = 2
+    process_buyer_trade(&mut engine, instrument_id, "3.000", "1", 3);
+    assert_eq!(get_fill_quantities(&handler), Vec::<Quantity>::new());
+
+    // Stranger 1 cancels; the delta carries the original 5 but only the
+    // tracked 2 remains ahead: queue 7 -> 5
+    process_l3_ask_delta(
+        &mut engine,
+        instrument_id,
+        BookAction::Delete,
+        1,
+        "5.000",
+        4,
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "5.000", "2", 5);
+    assert_eq!(
+        get_fill_quantities(&handler),
+        Vec::<Quantity>::new(),
+        "trade only consumed the remaining stranger, must not fill",
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "2.000", "3", 6);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("2.000")]);
+}
+
+#[rstest]
+fn test_l3_queue_position_stranger_price_move_advances_queue(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    // A stranger ahead modifying to a different price leaves the level:
+    // the queue advances by its full tracked size.
+    let (mut engine, _cache, handler) = get_l3_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 1, "5.000", 1);
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 2, "5.000", 2);
+
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    // Stranger 1 moves to 101.00: queue 10 -> 5
+    let price_move = OrderBookDeltaTestBuilder::new(instrument_id)
+        .book_action(BookAction::Update)
+        .book_order(BookOrder::new(
+            OrderSide::Sell,
+            Price::from("101.00"),
+            Quantity::from("5.000"),
+            1,
+        ))
+        .sequence(3)
+        .ts_event(UnixNanos::from(3))
+        .ts_init(UnixNanos::from(3))
+        .build();
+    engine.process_order_book_delta(&price_move).unwrap();
+
+    process_buyer_trade(&mut engine, instrument_id, "5.000", "1", 4);
+    assert_eq!(
+        get_fill_quantities(&handler),
+        Vec::<Quantity>::new(),
+        "trade only consumed the stranger still ahead, must not fill",
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "2.000", "2", 5);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("2.000")]);
+}
+
+#[rstest]
+fn test_l3_queue_position_aggregate_cap_then_granular_delete_no_double_advance(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    // An F_MBP-flagged update falls back to level-wide capping, which must
+    // mirror into the tracked orders so a later granular DELETE for an
+    // already-capped-away order does not advance the queue again.
+    let (mut engine, _cache, handler) = get_l3_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 1, "5.000", 1);
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 2, "5.000", 2);
+
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    // Aggregate update caps the level to 2: queue 10 -> 2
+    let aggregate_cap = OrderBookDeltaTestBuilder::new(instrument_id)
+        .book_action(BookAction::Update)
+        .book_order(BookOrder::new(
+            OrderSide::Sell,
+            Price::from("100.00"),
+            Quantity::from("2.000"),
+            0,
+        ))
+        .flags(RecordFlag::F_MBP as u8)
+        .sequence(3)
+        .ts_event(UnixNanos::from(3))
+        .ts_init(UnixNanos::from(3))
+        .build();
+    engine.process_order_book_delta(&aggregate_cap).unwrap();
+
+    // Stranger 1 was already capped away: queue stays at 2
+    process_l3_ask_delta(
+        &mut engine,
+        instrument_id,
+        BookAction::Delete,
+        1,
+        "5.000",
+        4,
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "2.000", "1", 5);
+    assert_eq!(
+        get_fill_quantities(&handler),
+        Vec::<Quantity>::new(),
+        "trade only consumed the capped queue, must not fill",
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "2.000", "2", 6);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("2.000")]);
+}
+
+#[rstest]
+fn test_l3_queue_position_aggregate_delete_then_granular_update_stays_front(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    // An F_MBP-flagged delete falls back to level-wide clearing, which must
+    // mirror into the tracked orders so a later granular update for a
+    // formerly tracked order cannot resurrect the queue.
+    let (mut engine, _cache, handler) = get_l3_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 1, "5.000", 1);
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 2, "5.000", 2);
+
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    // Aggregate delete clears the level: queue 10 -> 0
+    let aggregate_delete = OrderBookDeltaTestBuilder::new(instrument_id)
+        .book_action(BookAction::Delete)
+        .book_order(BookOrder::new(
+            OrderSide::Sell,
+            Price::from("100.00"),
+            Quantity::from("0.000"),
+            0,
+        ))
+        .flags(RecordFlag::F_MBP as u8)
+        .sequence(3)
+        .ts_event(UnixNanos::from(3))
+        .ts_init(UnixNanos::from(3))
+        .build();
+    engine.process_order_book_delta(&aggregate_delete).unwrap();
+
+    // A granular size increase for a formerly tracked order must not
+    // re-grow the cleared queue
+    process_l3_ask_delta(
+        &mut engine,
+        instrument_id,
+        BookAction::Update,
+        1,
+        "8.000",
+        4,
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "2.000", "1", 5);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("2.000")]);
+}
+
+fn get_l2_queue_position_engine(
+    instrument: InstrumentAny,
+) -> (
+    OrderMatchingEngine,
+    Rc<RefCell<Cache>>,
+    TypedIntoMessageSavingHandler<OrderEventAny>,
+) {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+
+    let handler = order_event_handler_with_cache(Rc::clone(&cache));
+
+    let config = OrderMatchingEngineConfig {
+        trade_execution: true,
+        queue_position: true,
+        ..Default::default()
+    };
+
+    let engine = OrderMatchingEngine::new(
+        instrument,
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::default().into(),
+        BookType::L2_MBP,
+        OmsType::Netting,
+        AccountType::Margin,
+        clock,
+        Rc::clone(&cache),
+        config,
+    );
+
+    (engine, cache, handler)
+}
+
+fn process_l2_ask_level_delta(
+    engine: &mut OrderMatchingEngine,
+    instrument_id: InstrumentId,
+    action: BookAction,
+    size: &str,
+    sequence: u64,
+) {
+    let delta = OrderBookDeltaTestBuilder::new(instrument_id)
+        .book_action(action)
+        .book_order(BookOrder::new(
+            OrderSide::Sell,
+            Price::from("100.00"),
+            Quantity::from(size),
+            0,
+        ))
+        .sequence(sequence)
+        .ts_event(UnixNanos::from(sequence))
+        .ts_init(UnixNanos::from(sequence))
+        .build();
+    engine.process_order_book_delta(&delta).unwrap();
+}
+
+#[rstest]
+fn test_l2_queue_position_level_delete_clears_queue(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    // In L2 books a DELETE removes the whole price level, so the queue
+    // clears and the next trade through fills us.
+    let (mut engine, _cache, handler) = get_l2_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l2_ask_level_delta(&mut engine, instrument_id, BookAction::Add, "10.000", 1);
+
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    process_l2_ask_level_delta(&mut engine, instrument_id, BookAction::Delete, "10.000", 2);
+
+    process_buyer_trade(&mut engine, instrument_id, "5.000", "1", 3);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("5.000")]);
+}
+
+#[rstest]
+fn test_l2_queue_position_update_caps_queue(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    // In L2 books an UPDATE sets the level's displayed size, capping the
+    // quantity ahead.
+    let (mut engine, _cache, handler) = get_l2_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l2_ask_level_delta(&mut engine, instrument_id, BookAction::Add, "10.000", 1);
+
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    // Level shrinks to 4: queue capped 10 -> 4
+    process_l2_ask_level_delta(&mut engine, instrument_id, BookAction::Update, "4.000", 2);
+
+    process_buyer_trade(&mut engine, instrument_id, "4.000", "1", 3);
+    assert_eq!(
+        get_fill_quantities(&handler),
+        Vec::<Quantity>::new(),
+        "trade only consumed the capped queue, must not fill",
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "2.000", "2", 4);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("2.000")]);
+}
+
+#[rstest]
+fn test_l3_queue_position_stranger_size_decrease_advances_queue_by_difference(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    // A stranger ahead shrinking its order retains time priority: the
+    // queue advances by the size difference only.
+    let (mut engine, _cache, handler) = get_l3_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 1, "5.000", 1);
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 2, "5.000", 2);
+
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    // Stranger 2 shrinks 5 -> 2: queue 10 -> 7
+    process_l3_ask_delta(
+        &mut engine,
+        instrument_id,
+        BookAction::Update,
+        2,
+        "2.000",
+        3,
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "7.000", "1", 4);
+    assert_eq!(
+        get_fill_quantities(&handler),
+        Vec::<Quantity>::new(),
+        "trade only consumed the two strangers ahead, must not fill",
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "1.000", "2", 5);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("1.000")]);
+}
+
+#[rstest]
+fn test_l3_queue_position_stranger_size_increase_stays_ahead_with_new_size(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    // A stranger ahead growing its order keeps its book FIFO slot, so the
+    // queue grows by the size difference (pessimistic, consistent with the
+    // book that later snapshots read).
+    let (mut engine, _cache, handler) = get_l3_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 1, "5.000", 1);
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 2, "5.000", 2);
+
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    // Stranger 1 grows 5 -> 8: queue 10 -> 13
+    process_l3_ask_delta(
+        &mut engine,
+        instrument_id,
+        BookAction::Update,
+        1,
+        "8.000",
+        3,
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "13.000", "1", 4);
+    assert_eq!(
+        get_fill_quantities(&handler),
+        Vec::<Quantity>::new(),
+        "trade only consumed the grown strangers ahead, must not fill",
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "2.000", "2", 5);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("2.000")]);
+}
+
+#[rstest]
+fn test_l3_queue_position_exact_trade_consumes_strangers_no_fill(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    // A trade exactly consuming the strangers ahead must not fill us.
+    let (mut engine, _cache, handler) = get_l3_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 1, "5.000", 1);
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 2, "5.000", 2);
+
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    process_buyer_trade(&mut engine, instrument_id, "10.000", "1", 3);
+    assert_eq!(get_fill_quantities(&handler), Vec::<Quantity>::new());
+}
+
+#[rstest]
+fn test_l3_queue_position_overflow_trade_fills(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    // A trade overflowing the queue fills us with the excess.
+    let (mut engine, _cache, handler) = get_l3_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 1, "5.000", 1);
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 2, "5.000", 2);
+
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    process_buyer_trade(&mut engine, instrument_id, "15.000", "1", 3);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("5.000")]);
+}
+
+#[rstest]
+fn test_l3_queue_position_all_strangers_cancel_then_trade_fills(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    // When every stranger ahead cancels, the next trade fills us.
+    let (mut engine, _cache, handler) = get_l3_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 1, "5.000", 1);
+    process_l3_ask_delta(&mut engine, instrument_id, BookAction::Add, 2, "5.000", 2);
+
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+
+    process_l3_ask_delta(
+        &mut engine,
+        instrument_id,
+        BookAction::Delete,
+        1,
+        "5.000",
+        3,
+    );
+    process_l3_ask_delta(
+        &mut engine,
+        instrument_id,
+        BookAction::Delete,
+        2,
+        "5.000",
+        4,
+    );
+
+    process_buyer_trade(&mut engine, instrument_id, "5.000", "1", 5);
+    assert_eq!(get_fill_quantities(&handler), vec![Quantity::from("5.000")]);
 }
 
 #[rstest]

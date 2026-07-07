@@ -542,6 +542,7 @@ jobs:
           rust-cache-workspaces: . -> target/build-macos
           rust-cache-on-failure: "false"
           rust-cache-save-if: ${{ github.event_name == 'push' }}
+          uv-cache-enabled: "false"
 
       - name: Cached test data
         uses: ./.github/actions/common-test-data
@@ -556,6 +557,16 @@ jobs:
       - name: Run Rust tests (adapters)
         if: needs.plan.outputs.run-rust-tests == 'true'
         run: make cargo-test-adapters EXTRA_FEATURES="capnp,hypersync" NEXTEST_PROFILE=ci
+
+      - name: Clean Rust test artifacts
+        run: |
+          rm -rf "${CARGO_TARGET_DIR}/nextest"
+          rm -rf "${CARGO_TARGET_DIR}/${CARGO_CI_PROFILE:-nextest}"
+          if [ -d "$CARGO_TARGET_DIR" ]; then
+            df -h . "$CARGO_TARGET_DIR"
+          else
+            df -h .
+          fi
 
       # Temporary: fail fast on rare runner worktree corruption while we isolate the root cause
       - name: Verify immutable CI inputs (pre-wheel build)
@@ -586,7 +597,9 @@ jobs:
           cargo -Vv || true
           python --version || true
           which python || true
-          env | rg '^(ARCHFLAGS|CARGO|DYLD_LIBRARY_PATH|LD_LIBRARY_PATH|LIBRARY_PATH|PYO3|RUST)=' || true
+          macos_env_pattern='^(ARCHFLAGS|CARGO[A-Z_]*|DYLD_LIBRARY_PATH|LD_LIBRARY_PATH|'
+          macos_env_pattern="${macos_env_pattern}LIBRARY_PATH|PYO3[A-Z_]*|RUST[A-Z_]*)="
+          env | grep -E "$macos_env_pattern" || true
           echo "::endgroup::"
 
           if [ ! -d "$MACOS_WHEEL_TARGET_DIR" ]; then

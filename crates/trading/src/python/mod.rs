@@ -21,6 +21,7 @@
 )]
 
 pub mod algorithm;
+pub mod controller;
 #[cfg(feature = "examples")]
 mod examples;
 pub mod sessions;
@@ -42,8 +43,10 @@ pub fn trading(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sessions::py_fx_next_end, m)?)?;
     m.add_function(wrap_pyfunction!(sessions::py_fx_prev_end, m)?)?;
     m.add_class::<strategy::PyStrategy>()?;
+    m.add_class::<crate::controller::ImportableControllerConfig>()?;
     m.add_class::<crate::strategy::StrategyConfig>()?;
     m.add_class::<crate::strategy::ImportableStrategyConfig>()?;
+    m.add_class::<algorithm::PyExecutionAlgorithm>()?;
     m.add_class::<crate::algorithm::ExecutionAlgorithmConfig>()?;
     m.add_class::<crate::algorithm::ImportableExecAlgorithmConfig>()?;
     #[cfg(feature = "examples")]

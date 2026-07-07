@@ -694,9 +694,15 @@ Some endpoints have higher weight costs per request:
 | `/api/v3/allOrders`       | 20     | Spot historical orders (expensive).    |
 | `/api/v3/klines`          | 2+     | Scales with `limit` parameter.         |
 | `/fapi/v1/order`          | 1      | Futures order placement.               |
+| `/fapi/v1/algoOrder`      | 0      | Uses order‑count limits.               |
 | `/fapi/v1/allOrders`      | 20     | Futures historical orders (expensive). |
 | `/fapi/v1/commissionRate` | 20     | Futures commission rate query.         |
 | `/fapi/v1/klines`         | 5+     | Scales with `limit` parameter.         |
+
+USD-M Futures `POST /fapi/v1/algoOrder` consumes `1` from both
+`X-MBX-ORDER-COUNT-10S` and `X-MBX-ORDER-COUNT-1M`. Binance charges no IP
+request weight for this endpoint; the adapter still queues it through the
+global bucket as part of its local pacing model.
 
 ### WebSocket API limits
 

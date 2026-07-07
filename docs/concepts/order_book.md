@@ -146,7 +146,7 @@ Each `OwnBookOrder` carries:
 
 - `client_order_id`: Client order ID used to reconcile the own book with cache state.
 - `venue_order_id`: Venue order ID when one has been assigned.
-- `side`, `price`, and `size`: Order side and the remaining own-book price level.
+- `side`, `price`, and `size`: Order side, price, and remaining (leaves) quantity.
 - `order_type` and `time_in_force`: Order type metadata used by filters and diagnostics.
 - `status`: Current order status, such as `SUBMITTED`, `ACCEPTED`, or `PENDING_CANCEL`.
 - `ts_last`: Timestamp of the latest order event applied to this own-book order.

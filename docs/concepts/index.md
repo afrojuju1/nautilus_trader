@@ -118,7 +118,8 @@ High-performance logging for both backtesting and live trading, implemented in R
 
 ## Backtesting
 
-Running simulated trading on historical data using a specific system implementation.
+Backtest APIs, data and venue setup, execution sequencing, fill simulation,
+accounts, funding, and margin configuration.
 
 ## Visualization
 

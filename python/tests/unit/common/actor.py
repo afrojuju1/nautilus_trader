@@ -31,7 +31,10 @@ from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import Venue
+from nautilus_trader.trading import Controller
+from nautilus_trader.trading import ImportableStrategyConfig
 from nautilus_trader.trading import Strategy
+from nautilus_trader.trading import StrategyConfig
 
 
 class TestActorConfig(DataActorConfig):
@@ -44,6 +47,92 @@ class TestActor(DataActor):
 
 class TestStrategy(Strategy):
     pass
+
+
+class TestStrategyConfig(StrategyConfig):
+    def __new__(cls, *args, strategy_id: str | None = None, **kwargs):
+        instance = super().__new__(cls, *args, **kwargs)
+        instance._strategy_id_override = strategy_id
+        return instance
+
+    def __init__(self, strategy_id: str | None = None, **kwargs):
+        super().__init__()
+
+    @property
+    def strategy_id(self):
+        if self._strategy_id_override is not None:
+            return self._strategy_id_override
+        return super().strategy_id
+
+
+class TestControllerConfig(DataActorConfig):
+    pass
+
+
+class ControllerRegistrationProbeConfig(DataActorConfig):
+    def __init__(self, actor_id=None, log_events: bool = True, log_commands: bool = True):
+        self.actor_id = actor_id
+        self.log_events = log_events
+        self.log_commands = log_commands
+
+
+class ControllerRegistrationProbe(Controller):
+    constructed = 0
+    received_actor_id = None
+
+    @classmethod
+    def reset(cls):
+        cls.constructed = 0
+        cls.received_actor_id = None
+
+    def __init__(self, config):
+        super().__init__(config)
+        type(self).constructed += 1
+        type(self).received_actor_id = str(config.actor_id)
+
+
+class ControllerCreatedStrategy(Strategy):
+    started = 0
+
+    @classmethod
+    def reset(cls):
+        cls.started = 0
+
+    def on_start(self):
+        type(self).started += 1
+
+
+class StrategyCreatingController(Controller):
+    started = 0
+    created_strategy_id = None
+
+    @classmethod
+    def reset(cls):
+        cls.started = 0
+        cls.created_strategy_id = None
+
+    def on_start(self):
+        type(self).started += 1
+        type(self).created_strategy_id = self.create_strategy_from_config(
+            ImportableStrategyConfig(
+                strategy_path="tests.unit.common.actor:ControllerCreatedStrategy",
+                config_path="tests.unit.common.actor:TestStrategyConfig",
+                config={"strategy_id": "ControllerCreatedStrategy-001"},
+            ),
+        )
+
+
+class NonStartingStrategyCreatingController(StrategyCreatingController):
+    def on_start(self):
+        type(self).started += 1
+        type(self).created_strategy_id = self.create_strategy_from_config(
+            ImportableStrategyConfig(
+                strategy_path="tests.unit.common.actor:ControllerCreatedStrategy",
+                config_path="tests.unit.common.actor:TestStrategyConfig",
+                config={"strategy_id": "ControllerCreatedStrategy-001"},
+            ),
+            start=False,
+        )
 
 
 class PortfolioProbeStrategy(Strategy):

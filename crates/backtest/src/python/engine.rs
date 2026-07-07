@@ -32,16 +32,8 @@ use nautilus_core::{
     python::{to_pyruntime_err, to_pytype_err, to_pyvalue_err},
 };
 use nautilus_execution::{
-    models::{
-        fill::{
-            BestPriceFillModel, CompetitionAwareFillModel, DefaultFillModel, FillModelAny,
-            LimitOrderPartialFillModel, MarketHoursFillModel, OneTickSlippageFillModel,
-            ProbabilisticFillModel, SizeAwareFillModel, ThreeTierFillModel, TwoTierFillModel,
-            VolumeSensitiveFillModel,
-        },
-        latency::{LatencyModelAny, StaticLatencyModel},
-    },
-    python::fee::pyobject_to_fee_model_any,
+    models::latency::{LatencyModelAny, StaticLatencyModel},
+    python::{fee::pyobject_to_fee_model_handle, fill::pyobject_to_fill_model_handle},
 };
 #[cfg(feature = "defi")]
 use nautilus_model::defi::DefiData;
@@ -73,7 +65,10 @@ use nautilus_trading::examples::{
 use nautilus_trading::{
     ImportableExecAlgorithmConfig, ImportableStrategyConfig,
     algorithm::{TwapAlgorithm, TwapAlgorithmConfig},
-    python::strategy::{PyStrategy, PyStrategyInner},
+    python::{
+        algorithm::PyExecutionAlgorithm,
+        strategy::{PyStrategy, PyStrategyInner},
+    },
 };
 use pyo3::prelude::*;
 use rust_decimal::Decimal;
@@ -234,11 +229,11 @@ impl PyBacktestEngine {
             .map(|obj| Python::attach(|py| pyobject_to_margin_model_any(py, obj.bind(py))))
             .transpose()?;
         let fill_model = fill_model
-            .map(|obj| Python::attach(|py| pyobject_to_fill_model_any(py, obj.bind(py))))
+            .map(|obj| Python::attach(|py| pyobject_to_fill_model_handle(obj.bind(py))))
             .transpose()?
             .unwrap_or_default();
         let fee_model = fee_model
-            .map(|obj| Python::attach(|py| pyobject_to_fee_model_any(obj.bind(py))))
+            .map(|obj| Python::attach(|py| pyobject_to_fee_model_handle(obj.bind(py))))
             .transpose()?
             .unwrap_or_default();
         let latency_model = latency_model
@@ -317,7 +312,7 @@ impl PyBacktestEngine {
         venue: Venue,
         fill_model: Py<PyAny>,
     ) -> PyResult<()> {
-        let fill_model = pyobject_to_fill_model_any(py, fill_model.bind(py))?;
+        let fill_model = pyobject_to_fill_model_handle(fill_model.bind(py))?;
         self.0.change_fill_model(venue, fill_model);
         Ok(())
     }
@@ -1154,6 +1149,10 @@ impl PyBacktestEngine {
     fn add_python_exec_algorithm(&mut self, exec_algorithm: &Py<PyAny>) -> PyResult<()> {
         self.ensure_can_add_exec_algorithm()?;
 
+        if self.try_add_py_execution_algorithm(exec_algorithm)? {
+            return Ok(());
+        }
+
         let actor_id = Python::attach(|py| -> anyhow::Result<ActorId> {
             let bound = exec_algorithm.bind(py);
 
@@ -1268,6 +1267,75 @@ impl PyBacktestEngine {
 
         log::info!("Registered Python exec algorithm {exec_algorithm_id}");
         Ok(())
+    }
+
+    fn try_add_py_execution_algorithm(&mut self, exec_algorithm: &Py<PyAny>) -> PyResult<bool> {
+        let py_exec_algorithm =
+            Python::attach(|py| -> anyhow::Result<Option<PyExecutionAlgorithm>> {
+                let bound = exec_algorithm.bind(py);
+
+                let config_instance = bound
+                    .getattr("config")
+                    .ok()
+                    .filter(|config| !config.is_none());
+
+                let Ok(mut py_exec_algorithm_ref) =
+                    bound.extract::<PyRefMut<PyExecutionAlgorithm>>()
+                else {
+                    return Ok(None);
+                };
+
+                if let Some(config_obj) = config_instance.as_ref() {
+                    let id_attr = config_obj
+                        .getattr("exec_algorithm_id")
+                        .ok()
+                        .filter(|v| !v.is_none())
+                        .or_else(|| config_obj.getattr("actor_id").ok().filter(|v| !v.is_none()));
+
+                    if let Some(id_value) = id_attr {
+                        let exec_algorithm_id =
+                            if let Ok(eaid) = id_value.extract::<ExecAlgorithmId>() {
+                                eaid
+                            } else if let Ok(aid) = id_value.extract::<ActorId>() {
+                                ExecAlgorithmId::new_checked(aid.inner().as_str())?
+                            } else if let Ok(id_str) = id_value.extract::<String>() {
+                                ExecAlgorithmId::new_checked(&id_str)?
+                            } else {
+                                anyhow::bail!("Invalid `exec_algorithm_id`/`actor_id` type");
+                            };
+                        py_exec_algorithm_ref.set_exec_algorithm_id(exec_algorithm_id);
+                    }
+
+                    if let Ok(log_events) = config_obj.getattr("log_events")
+                        && let Ok(log_events_val) = log_events.extract::<bool>()
+                    {
+                        py_exec_algorithm_ref.set_log_events(log_events_val);
+                    }
+
+                    if let Ok(log_commands) = config_obj.getattr("log_commands")
+                        && let Ok(log_commands_val) = log_commands.extract::<bool>()
+                    {
+                        py_exec_algorithm_ref.set_log_commands(log_commands_val);
+                    }
+                }
+
+                py_exec_algorithm_ref.set_python_instance(exec_algorithm.clone_ref(py));
+
+                Ok(Some(py_exec_algorithm_ref.clone()))
+            })
+            .map_err(to_pyruntime_err)?;
+
+        let Some(py_exec_algorithm) = py_exec_algorithm else {
+            return Ok(false);
+        };
+
+        let exec_algorithm_id = py_exec_algorithm.exec_algorithm_id();
+        self.0
+            .add_exec_algorithm(py_exec_algorithm)
+            .map_err(to_pyruntime_err)?;
+
+        log::info!("Registered Python exec algorithm {exec_algorithm_id}");
+        Ok(true)
     }
 
     /// Rejects adding an execution algorithm when the trader is running or disposed.
@@ -1668,60 +1736,6 @@ mod tests {
     }
 }
 
-pub(crate) fn pyobject_to_fill_model_any(
-    _py: Python,
-    obj: &Bound<'_, PyAny>,
-) -> PyResult<FillModelAny> {
-    if let Ok(m) = obj.extract::<DefaultFillModel>() {
-        return Ok(FillModelAny::Default(m));
-    }
-
-    if let Ok(m) = obj.extract::<BestPriceFillModel>() {
-        return Ok(FillModelAny::BestPrice(m));
-    }
-
-    if let Ok(m) = obj.extract::<OneTickSlippageFillModel>() {
-        return Ok(FillModelAny::OneTickSlippage(m));
-    }
-
-    if let Ok(m) = obj.extract::<ProbabilisticFillModel>() {
-        return Ok(FillModelAny::Probabilistic(m));
-    }
-
-    if let Ok(m) = obj.extract::<TwoTierFillModel>() {
-        return Ok(FillModelAny::TwoTier(m));
-    }
-
-    if let Ok(m) = obj.extract::<ThreeTierFillModel>() {
-        return Ok(FillModelAny::ThreeTier(m));
-    }
-
-    if let Ok(m) = obj.extract::<LimitOrderPartialFillModel>() {
-        return Ok(FillModelAny::LimitOrderPartialFill(m));
-    }
-
-    if let Ok(m) = obj.extract::<SizeAwareFillModel>() {
-        return Ok(FillModelAny::SizeAware(m));
-    }
-
-    if let Ok(m) = obj.extract::<CompetitionAwareFillModel>() {
-        return Ok(FillModelAny::CompetitionAware(m));
-    }
-
-    if let Ok(m) = obj.extract::<VolumeSensitiveFillModel>() {
-        return Ok(FillModelAny::VolumeSensitive(m));
-    }
-
-    if let Ok(m) = obj.extract::<MarketHoursFillModel>() {
-        return Ok(FillModelAny::MarketHours(m));
-    }
-
-    let type_name = obj.get_type().name()?;
-    Err(to_pytype_err(format!(
-        "Cannot convert {type_name} to FillModel"
-    )))
-}
-
 pub(crate) fn pyobject_to_simulation_module_any(
     _py: Python,
     obj: &Bound<'_, PyAny>,
@@ -1866,4 +1880,109 @@ fn pyobject_to_data(_py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Data> {
 
     let type_name = obj.get_type().name()?;
     Err(to_pytype_err(format!("Cannot convert {type_name} to Data")))
+}
+
+#[cfg(test)]
+mod model_tests {
+    use nautilus_execution::python::{fee::PyFeeModel, fill::PyFillModel};
+    use nautilus_model::{
+        enums::{AccountType, BookType, OmsType, OtoTriggerMode},
+        identifiers::Venue,
+        types::{Currency, Money},
+    };
+    use pyo3::{
+        IntoPyObjectExt, Python,
+        ffi::c_str,
+        types::{PyAnyMethods, PyDict, PyDictMethods},
+    };
+    use rstest::rstest;
+
+    use crate::{config::BacktestEngineConfig, engine::BacktestEngine};
+
+    #[rstest]
+    fn test_add_venue_accepts_python_defined_fee_and_fill_models() {
+        Python::initialize();
+
+        let mut engine =
+            super::PyBacktestEngine(BacktestEngine::new(BacktestEngineConfig::default()).unwrap());
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            locals
+                .set_item("FeeModel", py.get_type::<PyFeeModel>())
+                .unwrap();
+            locals
+                .set_item("FillModel", py.get_type::<PyFillModel>())
+                .unwrap();
+
+            let fill_model = py
+                .eval(
+                    c_str!(
+                        "type('CustomFillModel', (FillModel,), {\
+                            'is_limit_filled': lambda self: True, \
+                            'is_slipped': lambda self: False\
+                        })()"
+                    ),
+                    None,
+                    Some(&locals),
+                )
+                .unwrap();
+            let fee_model = py
+                .eval(
+                    c_str!(
+                        "type('CustomFeeModel', (FeeModel,), {\
+                            'get_commission': \
+                                lambda self, order, fill_quantity, fill_px, instrument: self.commission\
+                        })()"
+                    ),
+                    None,
+                    Some(&locals),
+                )
+                .unwrap();
+            fee_model
+                .setattr("commission", Money::from("0 USD").into_py_any(py).unwrap())
+                .unwrap();
+
+            engine
+                .py_add_venue(
+                    Venue::from("SIM"),
+                    OmsType::Netting,
+                    AccountType::Margin,
+                    vec![Money::from("1_000_000 USD")],
+                    None::<Currency>,
+                    None,
+                    None,
+                    None,
+                    Some(fill_model.unbind()),
+                    Some(fee_model.unbind()),
+                    None,
+                    None,
+                    BookType::L1_MBP,
+                    false,
+                    true,
+                    true,
+                    true,
+                    true,
+                    false,
+                    true,
+                    true,
+                    false,
+                    true,
+                    false,
+                    true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    OtoTriggerMode::Partial,
+                    None,
+                    None,
+                    false,
+                    None,
+                    true,
+                )
+                .unwrap();
+
+            assert_eq!(engine.0.list_venues(), vec![Venue::from("SIM")]);
+        });
+    }
 }

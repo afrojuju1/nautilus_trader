@@ -33,6 +33,7 @@ from nautilus_trader.model import BookType
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import OmsType
 from nautilus_trader.risk import RiskEngineConfig
+from nautilus_trader.trading import ImportableControllerConfig
 
 
 def test_engine_config_defaults():
@@ -102,6 +103,19 @@ def test_engine_config_accepts_sub_configs():
     assert config.cache is not None
     assert config.msgbus is not None
     assert config.portfolio is not None
+
+
+def test_engine_config_accepts_controller_config():
+    controller = ImportableControllerConfig(
+        controller_path="tests.unit.common.actor:StrategyCreatingController",
+        config_path="tests.unit.common.actor:TestControllerConfig",
+        config={"actor_id": "Controller-001"},
+    )
+
+    config = BacktestEngineConfig(controller=controller)
+
+    assert config.controller is not None
+    assert config.controller.controller_path == "tests.unit.common.actor:StrategyCreatingController"
 
 
 def test_venue_config_required_params():

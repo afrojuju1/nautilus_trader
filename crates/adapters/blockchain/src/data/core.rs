@@ -60,6 +60,8 @@ use crate::{
 
 const BLOCKS_PROCESS_IN_SYNC_REPORT: u64 = 50_000;
 const POOL_EVENT_BLOCK_BATCH_SIZE: usize = 20_000;
+// Block-scoped RPC snapshots include the whole block, so same-block replay must skip every log.
+const BLOCK_SCOPED_SNAPSHOT_INDEX: u32 = i32::MAX as u32;
 
 /// Core blockchain data client responsible for fetching, processing, and caching blockchain data.
 ///
@@ -1210,6 +1212,11 @@ impl BlockchainDataClientCore {
             dex_extended.collect_created_event.as_ref(),
             dex_extended.flash_created_event.as_deref(),
         );
+        self.subscription_manager.register_dex_fee_protocol_events(
+            dex_id,
+            dex_extended.fee_protocol_update_event.as_deref(),
+            dex_extended.fee_protocol_collect_event.as_deref(),
+        );
         Ok(())
     }
 
@@ -1253,56 +1260,9 @@ impl BlockchainDataClientCore {
             Some(block) => block,
             None => self.hypersync_client.current_block().await,
         };
-        let mut profiler = PoolProfiler::new(pool.clone());
-
-        // Calculate latest valid block position after which we need to start profiling.
-        let from_position = match self
-            .cache
-            .database
-            .as_ref()
-            .unwrap()
-            .load_latest_pool_snapshot(
-                pool.chain.chain_id,
-                &pool.pool_identifier,
-                Some(to_block),
-                true,
-            )
-            .await
-        {
-            Ok(Some(snapshot)) => {
-                // Empty snapshots at the pool's creation block are stubs left behind by an
-                // earlier bootstrap that bailed before any liquidity events landed. Restoring
-                // marks the profiler as initialized, which then conflicts with the Initialize
-                // event that hypersync re-emits at the same block. Fall through to a fresh
-                // bootstrap rather than trust the stub.
-                if snapshot.positions.is_empty()
-                    && snapshot.ticks.is_empty()
-                    && snapshot.block_position.number == pool.creation_block
-                {
-                    log::warn!(
-                        "Ignoring empty stub snapshot at pool creation block {} for {}; rebuilding from events",
-                        snapshot.block_position.number.separate_with_commas(),
-                        pool.instrument_id,
-                    );
-                    None
-                } else {
-                    log::debug!(
-                        "Loaded valid snapshot from block {} which contains {} positions and {} ticks",
-                        snapshot.block_position.number.separate_with_commas(),
-                        snapshot.positions.len(),
-                        snapshot.ticks.len()
-                    );
-                    let block_position = snapshot.block_position.clone();
-                    profiler.restore_from_snapshot(snapshot)?;
-                    log::debug!("Restored profiler from snapshot");
-                    Some(block_position)
-                }
-            }
-            _ => {
-                log::debug!("No valid snapshot found, processing from beginning");
-                None
-            }
-        };
+        let (mut profiler, from_position) = self
+            .seed_pool_profiler_from_latest_snapshot(pool, to_block)
+            .await?;
 
         // If we don't have never synced pool events, proceed with faster
         // construction of pool profiler from hypersync and RPC, where we
@@ -1375,12 +1335,97 @@ impl BlockchainDataClientCore {
         Ok((profiler, false))
     }
 
+    /// Bootstraps a pool profiler by reading liquidity topology from HyperSync and state from RPC.
+    ///
+    /// This mode avoids storing the full swap history. It streams Initialize, Mint, Burn, and
+    /// fee-protocol updates only, then hydrates the exact target block from the pool contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if database is not initialized, event streaming fails, or RPC hydration fails.
+    pub async fn bootstrap_pool_profiler_from_rpc_snapshot(
+        &mut self,
+        pool: &SharedPool,
+        to_block: u64,
+    ) -> anyhow::Result<(PoolProfiler, bool)> {
+        if self.cache.database.is_none() {
+            anyhow::bail!(
+                "Database is not initialized, so we cannot bootstrap the pool profiler from an RPC snapshot"
+            );
+        }
+
+        let (profiler, from_position) = self
+            .seed_pool_profiler_from_latest_snapshot(pool, to_block)
+            .await?;
+        self.construct_pool_profiler_from_hypersync_rpc(profiler, from_position, to_block)
+            .await
+    }
+
+    async fn seed_pool_profiler_from_latest_snapshot(
+        &self,
+        pool: &SharedPool,
+        to_block: u64,
+    ) -> anyhow::Result<(PoolProfiler, Option<BlockPosition>)> {
+        let mut profiler = PoolProfiler::new(pool.clone());
+
+        let from_position = match self
+            .cache
+            .database
+            .as_ref()
+            .expect("database presence is checked by caller")
+            .load_latest_pool_snapshot(
+                pool.chain.chain_id,
+                &pool.pool_identifier,
+                Some(to_block),
+                true,
+            )
+            .await
+        {
+            Ok(Some(snapshot)) => {
+                // Empty snapshots at the pool's creation block are stubs left behind by an
+                // earlier bootstrap that bailed before any liquidity events landed. Restoring
+                // marks the profiler as initialized, which then conflicts with the Initialize
+                // event that hypersync re-emits at the same block. Fall through to a fresh
+                // bootstrap rather than trust the stub.
+                if snapshot.positions.is_empty()
+                    && snapshot.ticks.is_empty()
+                    && snapshot.block_position.number == pool.creation_block
+                {
+                    log::warn!(
+                        "Ignoring empty stub snapshot at pool creation block {} for {}; rebuilding from events",
+                        snapshot.block_position.number.separate_with_commas(),
+                        pool.instrument_id,
+                    );
+                    None
+                } else {
+                    log::debug!(
+                        "Loaded valid snapshot from block {} which contains {} positions and {} ticks",
+                        snapshot.block_position.number.separate_with_commas(),
+                        snapshot.positions.len(),
+                        snapshot.ticks.len()
+                    );
+                    let block_position = snapshot.block_position.clone();
+                    profiler.restore_from_snapshot(snapshot)?;
+                    log::debug!("Restored profiler from snapshot");
+                    Some(block_position)
+                }
+            }
+            _ => {
+                log::debug!("No valid snapshot found, processing from beginning");
+                None
+            }
+        };
+
+        Ok((profiler, from_position))
+    }
+
     /// Constructs a pool profiler by fetching events directly from HyperSync RPC.
     ///
     /// This method is used when the pool has never been synced to the database. It streams
     /// liquidity events (mints, burns) directly from HyperSync and processes them
     /// to build up the profiler's state in real-time. After processing all events, it
-    /// restores the profiler from the current on-chain state with the provided ticks and positions
+    /// restores the profiler from on-chain state at the target block with the provided ticks and
+    /// positions.
     ///
     /// # Returns
     ///
@@ -1400,9 +1445,7 @@ impl BlockchainDataClientCore {
         from_position: Option<BlockPosition>,
         to_block: u64,
     ) -> anyhow::Result<(PoolProfiler, bool)> {
-        log::debug!(
-            "Constructing pool profiler from hypersync stream and RPC final state querying"
-        );
+        log::debug!("Constructing pool profiler from hypersync stream and RPC target block state");
         let dex_extended = self.get_dex_extended(&profiler.pool.dex.name)?.clone();
         let mint_event_signature = dex_extended.mint_created_event.as_ref();
         let burn_event_signature = dex_extended.burn_created_event.as_ref();
@@ -1553,19 +1596,15 @@ impl BlockchainDataClientCore {
         self.flush_pool_event_blocks(&mut block_batch).await?;
         profiler.finalize_reporting();
 
+        let snapshot_block_position = self.block_scoped_snapshot_position(to_block).await?;
         let on_chain_snapshot = self
-            .get_on_chain_snapshot(&profiler)
+            .get_on_chain_snapshot_at_position(&profiler, snapshot_block_position)
             .await
             .with_context(|| {
-                let snapshot_block = profiler
-                    .last_processed_event
-                    .as_ref()
-                    .map_or(profiler.pool.creation_block, |event| event.number);
-
                 format!(
-                    "failed to restore pool {} from on-chain snapshot at block {} with {} ticks and {} positions",
+                    "failed to restore pool {} from RPC snapshot at target block {} with {} ticks and {} positions",
                     profiler.pool.address,
-                    snapshot_block.separate_with_commas(),
+                    to_block.separate_with_commas(),
                     profiler.get_active_tick_values().len().separate_with_commas(),
                     profiler.get_all_position_keys().len().separate_with_commas()
                 )
@@ -1698,16 +1737,25 @@ impl BlockchainDataClientCore {
     /// using the profiler's active positions and last processed block number.
     /// Used for profiler state restoration after bootstrapping and validation.
     async fn get_on_chain_snapshot(&self, profiler: &PoolProfiler) -> anyhow::Result<PoolSnapshot> {
+        let last_processed_event = Self::last_processed_event_for_on_chain_snapshot(profiler)?;
+        self.get_on_chain_snapshot_at_position(profiler, last_processed_event)
+            .await
+    }
+
+    async fn get_on_chain_snapshot_at_position(
+        &self,
+        profiler: &PoolProfiler,
+        block_position: BlockPosition,
+    ) -> anyhow::Result<PoolSnapshot> {
         // PancakeSwap V3 shares the Uniswap V3 pool read ABI, so it hydrates through the same contract
         if matches!(
             profiler.pool.dex.name,
             DexType::UniswapV3 | DexType::PancakeSwapV3
         ) {
-            let last_processed_event = Self::last_processed_event_for_on_chain_snapshot(profiler)?;
             let timestamp = Self::timestamp_for_on_chain_snapshot(
                 profiler,
                 self.cache
-                    .get_block_timestamp(last_processed_event.number)
+                    .get_block_timestamp(block_position.number)
                     .copied(),
             )?;
             let on_chain_snapshot = self
@@ -1717,7 +1765,7 @@ impl BlockchainDataClientCore {
                     profiler.pool.instrument_id,
                     profiler.get_active_tick_values().as_slice(),
                     &profiler.get_all_position_keys(),
-                    last_processed_event,
+                    block_position,
                     timestamp, // ts_event
                     timestamp, // ts_init (same block timestamp)
                 )
@@ -1755,6 +1803,50 @@ impl BlockchainDataClientCore {
             );
         };
         Ok(last_processed_event)
+    }
+
+    async fn block_scoped_snapshot_position(
+        &mut self,
+        block_number: u64,
+    ) -> anyhow::Result<BlockPosition> {
+        let blocks_stream = self
+            .hypersync_client
+            .request_blocks_stream(block_number, Some(block_number))
+            .await;
+        tokio::pin!(blocks_stream);
+        let block = blocks_stream
+            .next()
+            .await
+            .with_context(|| format!("failed to fetch block {block_number} for RPC snapshot"))?;
+
+        let block_position =
+            Self::block_scoped_snapshot_position_from_block(&mut self.cache, &block, block_number)?;
+        self.cache.add_pool_event_blocks_batch(vec![block]).await?;
+
+        Ok(block_position)
+    }
+
+    fn block_scoped_snapshot_position_from_block(
+        cache: &mut BlockchainCache,
+        block: &Block,
+        block_number: u64,
+    ) -> anyhow::Result<BlockPosition> {
+        if block.number != block_number {
+            anyhow::bail!(
+                "Fetched block {} while requesting RPC snapshot block {}",
+                block.number,
+                block_number
+            );
+        }
+
+        cache.cache_block_timestamp(block.number, block.timestamp);
+
+        Ok(BlockPosition::new(
+            block.number,
+            block.hash.clone(),
+            BLOCK_SCOPED_SNAPSHOT_INDEX,
+            BLOCK_SCOPED_SNAPSHOT_INDEX,
+        ))
     }
 
     /// Replays historical events for a pool to hydrate its profiler state.
@@ -1886,6 +1978,7 @@ mod tests {
     use nautilus_model::defi::{Chain, Token};
     use rstest::rstest;
     use tokio_util::sync::CancellationToken;
+    use ustr::Ustr;
 
     use super::*;
 
@@ -1977,6 +2070,51 @@ mod tests {
             error.to_string(),
             "missing block timestamp for on-chain snapshot"
         );
+    }
+
+    #[rstest]
+    fn block_scoped_snapshot_position_from_block_caches_timestamp_and_uses_sentinel_indexes() {
+        let chain = Arc::new(
+            Chain::from_chain_id(42161)
+                .expect("Arbitrum chain should exist")
+                .clone(),
+        );
+        let mut cache = BlockchainCache::new(chain);
+        let timestamp = UnixNanos::from(1_700_000_002_000_000_000);
+        let block = test_block(123, timestamp);
+
+        let position = BlockchainDataClientCore::block_scoped_snapshot_position_from_block(
+            &mut cache, &block, 123,
+        )
+        .unwrap();
+
+        assert_eq!(position.number, 123);
+        assert_eq!(position.transaction_hash, block.hash);
+        assert_eq!(position.transaction_index, BLOCK_SCOPED_SNAPSHOT_INDEX);
+        assert_eq!(position.log_index, BLOCK_SCOPED_SNAPSHOT_INDEX);
+        assert_eq!(cache.get_block_timestamp(123), Some(&timestamp));
+    }
+
+    #[rstest]
+    fn block_scoped_snapshot_position_from_block_rejects_mismatched_block() {
+        let chain = Arc::new(
+            Chain::from_chain_id(42161)
+                .expect("Arbitrum chain should exist")
+                .clone(),
+        );
+        let mut cache = BlockchainCache::new(chain);
+        let block = test_block(122, UnixNanos::from(1_700_000_002_000_000_000));
+
+        let error = BlockchainDataClientCore::block_scoped_snapshot_position_from_block(
+            &mut cache, &block, 123,
+        )
+        .expect_err("mismatched block should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "Fetched block 122 while requesting RPC snapshot block 123"
+        );
+        assert_eq!(cache.get_block_timestamp(122), None);
     }
 
     #[rstest]
@@ -2150,5 +2288,18 @@ mod tests {
             Some(60),
             UnixNanos::default(),
         ))
+    }
+
+    fn test_block(number: u64, timestamp: UnixNanos) -> Block {
+        Block::new(
+            format!("0x{number:064x}"),
+            String::from("0x0"),
+            number,
+            Ustr::from("0x0000000000000000000000000000000000000000"),
+            30_000_000,
+            21_000,
+            timestamp,
+            Some(Blockchain::Arbitrum),
+        )
     }
 }

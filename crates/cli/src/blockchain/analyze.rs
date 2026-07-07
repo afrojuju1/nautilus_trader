@@ -37,6 +37,7 @@ use crate::opt::DatabaseConfig;
 ///
 /// Returns an error if the chain or DEX parameters are invalid.
 #[expect(
+    clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
     reason = "CLI command options map directly to clap fields"
 )]
@@ -52,6 +53,7 @@ pub(crate) async fn run_analyze_pool(
     require_existing_snapshot: bool,
     checkpoint_blocks: Vec<u64>,
     skip_validation: bool,
+    snapshot_from_rpc: bool,
     multicall_calls_per_rpc_request: Option<u32>,
 ) -> anyhow::Result<()> {
     let (chain, dex_type) = parse_chain_dex(&chain, &dex)?;
@@ -78,6 +80,7 @@ pub(crate) async fn run_analyze_pool(
         require_existing_snapshot,
         &checkpoint_blocks,
         skip_validation,
+        snapshot_from_rpc,
     ))
     .await?;
 
@@ -101,6 +104,7 @@ const DEFAULT_ANALYZE_CONCURRENCY: usize = 4;
 /// Returns an error if chain, DEX, database, RPC, or address file setup fails. Individual pool
 /// failures are emitted as structured output and the command returns an error after all pools run.
 #[expect(
+    clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
     reason = "CLI command options map directly to clap fields"
 )]
@@ -117,6 +121,7 @@ pub(crate) async fn run_analyze_pools(
     require_existing_snapshot: bool,
     checkpoint_blocks: Vec<u64>,
     skip_validation: bool,
+    snapshot_from_rpc: bool,
     concurrency: Option<usize>,
     multicall_calls_per_rpc_request: Option<u32>,
 ) -> anyhow::Result<()> {
@@ -185,6 +190,7 @@ pub(crate) async fn run_analyze_pools(
                 require_existing_snapshot,
                 &checkpoint_blocks,
                 skip_validation,
+                snapshot_from_rpc,
             )
             .await
         });
@@ -231,6 +237,7 @@ pub(crate) async fn run_analyze_pools(
 }
 
 #[expect(
+    clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
     reason = "CLI command options map directly to clap fields"
 )]
@@ -244,7 +251,12 @@ async fn analyze_pool_with_client(
     require_existing_snapshot: bool,
     checkpoint_blocks: &[u64],
     skip_validation: bool,
+    snapshot_from_rpc: bool,
 ) -> anyhow::Result<Vec<PoolAnalysisOutcome>> {
+    if snapshot_from_rpc {
+        validate_snapshot_from_rpc_options(from_block, reset, require_existing_snapshot)?;
+    }
+
     let pool_address = validate_address(&pool_address)?;
     let pool_identifier = PoolIdentifier::Address(Ustr::from(&pool_address.to_string()));
 
@@ -279,19 +291,23 @@ async fn analyze_pool_with_client(
         )]);
     }
 
-    // Sync once up to the final checkpoint, honoring reset/from_block. Each checkpoint then bootstraps
-    // incrementally from the previous checkpoint's snapshot, so one pass produces every snapshot.
     let last_checkpoint = *checkpoints.last().expect("checkpoints is non-empty");
-    data_client
-        .sync_pool_events(
-            &dex_type,
-            pool_identifier,
-            from_block,
-            Some(last_checkpoint),
-            reset,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to sync pool events: {e}"))?;
+
+    if !snapshot_from_rpc {
+        // Sync once up to the final checkpoint, honoring reset/from_block. Each checkpoint then
+        // bootstraps incrementally from the previous checkpoint's snapshot, so one pass produces
+        // every snapshot.
+        data_client
+            .sync_pool_events(
+                &dex_type,
+                pool_identifier,
+                from_block,
+                Some(last_checkpoint),
+                reset,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to sync pool events: {e}"))?;
+    }
 
     let pool = data_client
         .cache
@@ -302,9 +318,15 @@ async fn analyze_pool_with_client(
     let mut outcomes = Vec::with_capacity(checkpoints.len());
     for checkpoint in checkpoints {
         log::info!("Profiling pool {pool_identifier} to checkpoint block {checkpoint}");
-        let (profiler, already_valid) = data_client
-            .bootstrap_latest_pool_profiler(&pool, Some(checkpoint))
-            .await?;
+        let (profiler, already_valid) = if snapshot_from_rpc {
+            data_client
+                .bootstrap_pool_profiler_from_rpc_snapshot(&pool, checkpoint)
+                .await?
+        } else {
+            data_client
+                .bootstrap_latest_pool_profiler(&pool, Some(checkpoint))
+                .await?
+        };
         let snapshot = profiler.extract_snapshot()?;
         let snapshot_block_position = snapshot.block_position.clone();
         let positions = snapshot.positions.len();
@@ -318,7 +340,7 @@ async fn analyze_pool_with_client(
             .add_pool_snapshot(&pool.dex.name, &pool.pool_identifier, &snapshot)
             .await?;
 
-        let validation = if skip_validation {
+        let validation = if skip_validation && !already_valid {
             SnapshotValidation::Replay
         } else {
             data_client
@@ -345,6 +367,26 @@ async fn analyze_pool_with_client(
     }
 
     Ok(outcomes)
+}
+
+fn validate_snapshot_from_rpc_options(
+    from_block: Option<u64>,
+    reset: bool,
+    require_existing_snapshot: bool,
+) -> anyhow::Result<()> {
+    if from_block.is_some() {
+        anyhow::bail!("--snapshot-from-rpc cannot be combined with --from-block");
+    }
+
+    if reset {
+        anyhow::bail!("--snapshot-from-rpc cannot be combined with --reset");
+    }
+
+    if require_existing_snapshot {
+        anyhow::bail!("--snapshot-from-rpc cannot be combined with --require-existing-snapshot");
+    }
+
+    Ok(())
 }
 
 /// Sorts, dedups, and clamps requested checkpoint blocks to `to_block`.
@@ -661,6 +703,49 @@ mod tests {
     }
 
     #[rstest]
+    fn analyze_pool_cli_parses_snapshot_from_rpc() {
+        let cli = NautilusCli::try_parse_from([
+            "nautilus",
+            "blockchain",
+            "analyze-pool",
+            "--chain",
+            "ethereum",
+            "--dex",
+            "UniswapV3",
+            "--address",
+            "0x1111111111111111111111111111111111111111",
+            "--to-block",
+            "200",
+            "--rpc-url",
+            "http://localhost:8545",
+            "--snapshot-from-rpc",
+            "--host",
+            "localhost",
+            "--port",
+            "5433",
+            "--username",
+            "postgres",
+            "--database",
+            "nautilus",
+            "--password",
+            "secret",
+        ])
+        .unwrap();
+
+        match cli.command {
+            crate::opt::Commands::Blockchain(crate::opt::BlockchainOpt {
+                command:
+                    crate::opt::BlockchainCommand::AnalyzePool {
+                        snapshot_from_rpc, ..
+                    },
+            }) => {
+                assert!(snapshot_from_rpc);
+            }
+            _ => panic!("Expected analyze-pool blockchain command"),
+        }
+    }
+
+    #[rstest]
     fn analyze_pools_cli_parses_checkpoint_blocks_and_concurrency() {
         let cli = NautilusCli::try_parse_from([
             "nautilus",
@@ -700,16 +785,38 @@ mod tests {
                     crate::opt::BlockchainCommand::AnalyzePools {
                         checkpoint_blocks,
                         skip_validation,
+                        snapshot_from_rpc,
                         concurrency,
                         ..
                     },
             }) => {
                 assert_eq!(checkpoint_blocks, vec![100, 200, 300]);
                 assert!(skip_validation);
+                assert!(!snapshot_from_rpc);
                 assert_eq!(concurrency, Some(8));
             }
             _ => panic!("Expected analyze-pools blockchain command"),
         }
+    }
+
+    #[rstest]
+    #[case(Some(100), false, false, "--from-block")]
+    #[case(None, true, false, "--reset")]
+    #[case(None, false, true, "--require-existing-snapshot")]
+    fn snapshot_from_rpc_rejects_storage_sync_options(
+        #[case] from_block: Option<u64>,
+        #[case] reset: bool,
+        #[case] require_existing_snapshot: bool,
+        #[case] rejected_option: &str,
+    ) {
+        let error =
+            validate_snapshot_from_rpc_options(from_block, reset, require_existing_snapshot)
+                .expect_err("conflicting options should fail");
+
+        assert!(
+            error.to_string().contains(rejected_option),
+            "unexpected error message: {error}"
+        );
     }
 
     #[rstest]

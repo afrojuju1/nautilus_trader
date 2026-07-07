@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::collections::VecDeque;
+
 use nautilus_common::{
     clients::DataClient,
     defi::RequestPoolSnapshot,
@@ -29,17 +31,23 @@ use nautilus_common::{
     },
 };
 use nautilus_model::{
-    defi::{DefiData, PoolIdentifier, SharedChain, validation::validate_address},
+    defi::{DefiData, DexType, PoolIdentifier, SharedChain, validation::validate_address},
     identifiers::{ClientId, Venue},
 };
 use ustr::Ustr;
 
 use crate::{
+    cache::BlockchainCache,
     config::BlockchainDataClientConfig,
     data::core::BlockchainDataClientCore,
     exchanges::get_dex_extended,
-    rpc::{BlockchainRpcClient, types::BlockchainMessage},
+    rpc::{
+        BlockchainRpcClient,
+        types::{BlockchainMessage, RpcEventType},
+    },
 };
+
+const MAX_PENDING_POOL_MESSAGES: usize = 10_000;
 
 /// A client for interacting with blockchain data from multiple sources.
 ///
@@ -140,6 +148,7 @@ impl BlockchainDataClient {
             }
 
             let mut command_rx = command_rx;
+            let mut pending_pool_messages = VecDeque::new();
 
             loop {
                 tokio::select! {
@@ -186,135 +195,45 @@ impl BlockchainDataClient {
                     }
                     data = hypersync_rx.recv() => {
                         if let Some(msg) = data {
-                            let data_event = match msg {
-                                BlockchainMessage::Block(block) => {
-                                    // Fetch and process all subscribed events per DEX
-                                    for dex in core_client.cache.get_registered_dexes(){
-                                        let addresses = core_client.subscription_manager.get_subscribed_dex_contract_addresses(&dex);
-                                        if !addresses.is_empty() {
-                                            core_client.hypersync_client.process_block_dex_contract_events(
-                                                &dex,
-                                                block.number,
-                                                &addresses,
-                                                core_client.subscription_manager.get_dex_pool_swap_event_signature(&dex).unwrap(),
-                                                core_client.subscription_manager.get_dex_pool_mint_event_signature(&dex).unwrap(),
-                                                core_client.subscription_manager.get_dex_pool_burn_event_signature(&dex).unwrap(),
-                                            );
-                                        }
-                                    }
-
-                                    // Cache the block before its events are processed,
-                                    // so conversion can resolve ts_event.
-                                    if let Err(e) = core_client.cache.add_block(block.clone()).await {
-                                        log::error!("Failed to cache block {}: {e}", block.number);
-                                    }
-
-                                    Some(DataEvent::DeFi(DefiData::Block(block)))
-                                }
-                                BlockchainMessage::SwapEvent(swap_event) => {
-                                    match core_client.get_pool(&swap_event.pool_identifier) {
-                                        Ok(pool) => {
-                                            match core_client.process_pool_swap_event(&swap_event, pool){
-                                                Ok(swap) => Some(DataEvent::DeFi(DefiData::PoolSwap(swap))),
-                                                Err(e) => {
-                                                    log::error!("Error processing pool swap event: {e}");
-                                                    None
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log::error!("Failed to get pool {} with error {:?}", swap_event.pool_identifier, e);
-                                            None
-                                        }
-                                    }
-                                }
-                                BlockchainMessage::BurnEvent(burn_event) => {
-                                    match core_client.get_pool(&burn_event.pool_identifier) {
-                                        Ok(pool) => {
-                                            let dex_extended = get_dex_extended(core_client.chain.name, &pool.dex.name).expect("Failed to get dex extended");
-                                            match core_client.process_pool_burn_event(
-                                                &burn_event,
-                                                pool,
-                                                dex_extended,
-                                            ){
-                                                Ok(update) => Some(DataEvent::DeFi(DefiData::PoolLiquidityUpdate(update))),
-                                                Err(e) => {
-                                                    log::error!("Error processing pool burn event: {e}");
-                                                    None
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log::error!("Failed to get pool {} with error {:?}", burn_event.pool_identifier, e);
-                                            None
-                                        }
-                                    }
-                                }
-                                BlockchainMessage::MintEvent(mint_event) => {
-                                    match core_client.get_pool(&mint_event.pool_identifier) {
-                                        Ok(pool) => {
-                                            let dex_extended = get_dex_extended(core_client.chain.name,&pool.dex.name).expect("Failed to get dex extended");
-                                            match core_client.process_pool_mint_event(
-                                                &mint_event,
-                                                pool,
-                                                dex_extended,
-                                            ){
-                                                Ok(update) => Some(DataEvent::DeFi(DefiData::PoolLiquidityUpdate(update))),
-                                                Err(e) => {
-                                                    log::error!("Error processing pool mint event: {e}");
-                                                    None
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log::error!("Failed to get pool {} with error {:?}", mint_event.pool_identifier, e);
-                                            None
-                                        }
-                                    }
-                                }
-                                BlockchainMessage::CollectEvent(collect_event) => {
-                                    match core_client.get_pool(&collect_event.pool_identifier) {
-                                        Ok(pool) => {
-                                            let dex_extended = get_dex_extended(core_client.chain.name, &pool.dex.name).expect("Failed to get dex extended");
-                                            match core_client.process_pool_collect_event(
-                                                &collect_event,
-                                                pool,
-                                                dex_extended,
-                                            ){
-                                                Ok(update) => Some(DataEvent::DeFi(DefiData::PoolFeeCollect(update))),
-                                                Err(e) => {
-                                                    log::error!("Error processing pool collect event: {e}");
-                                                    None
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log::error!("Failed to get pool {} with error {:?}", collect_event.pool_identifier, e);
-                                            None
-                                        }
-                                    }
-                                }
-                            BlockchainMessage::FlashEvent(flash_event) => {
-                                    match core_client.get_pool(&flash_event.pool_identifier) {
-                                        Ok(pool) => {
-                                            match core_client.process_pool_flash_event(&flash_event,pool){
-                                                Ok(flash) => Some(DataEvent::DeFi(DefiData::PoolFlash(flash))),
-                                                Err(e) => {
-                                                    log::error!("Error processing pool flash event: {e}");
-                                                    None
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log::error!("Failed to get pool {} with error {:?}", flash_event.pool_identifier, e);
-                                            None
-                                        }
-                                    }
-                                }
+                            let block_number = match &msg {
+                                BlockchainMessage::Block(block) => Some(block.number),
+                                _ => None,
                             };
+                            let data_event =
+                                Self::data_event_from_blockchain_message(msg, &mut core_client)
+                                    .await;
 
                             if let Some(event) = data_event {
                                 core_client.send_data(event);
+                            }
+
+                            if let Some(block_number) = block_number {
+                                for data in Self::drain_pending_pool_messages(
+                                    &mut core_client,
+                                    &mut pending_pool_messages,
+                                )
+                                .await
+                                {
+                                    core_client.send_data(data);
+                                }
+
+                                for dex in core_client.cache.get_registered_dexes() {
+                                    let addresses = core_client
+                                        .subscription_manager
+                                        .get_subscribed_dex_contract_addresses(&dex);
+                                    let event_signatures = core_client
+                                        .subscription_manager
+                                        .get_active_subscribed_dex_event_signatures(&dex);
+
+                                    if !addresses.is_empty() && !event_signatures.is_empty() {
+                                        core_client.hypersync_client.process_block_dex_contract_events(
+                                            &dex,
+                                            block_number,
+                                            &addresses,
+                                            event_signatures,
+                                        );
+                                    }
+                                }
                             }
                         } else {
                             log::debug!("HyperSync data channel closed");
@@ -329,24 +248,42 @@ impl BlockchainDataClient {
                     } => {
                         // This branch only fires when we actually receive a message
                         match msg {
-                            Ok(BlockchainMessage::Block(block)) => {
-                                let data = DataEvent::DeFi(DefiData::Block(block));
-                                core_client.send_data(data);
-                            },
-                            Ok(BlockchainMessage::SwapEvent(_)) => {
-                                log::warn!("RPC swap events are not yet supported");
-                            }
-                            Ok(BlockchainMessage::MintEvent(_)) => {
-                                log::warn!("RPC mint events are not yet supported");
-                            }
-                            Ok(BlockchainMessage::BurnEvent(_)) => {
-                                log::warn!("RPC burn events are not yet supported");
-                            }
-                            Ok(BlockchainMessage::CollectEvent(_)) => {
-                                log::warn!("RPC collect events are not yet supported");
-                            }
-                            Ok(BlockchainMessage::FlashEvent(_)) => {
-                                log::warn!("RPC flash events are not yet supported");
+                            Ok(msg) => {
+                                let is_block = matches!(&msg, BlockchainMessage::Block(_));
+
+                                if let Some(block_number) =
+                                    Self::pool_event_missing_block_timestamp(
+                                        &msg,
+                                        &core_client.cache,
+                                    )
+                                {
+                                    log::debug!(
+                                        "Deferring live pool event until block {block_number} timestamp is cached"
+                                    );
+                                    Self::queue_pending_pool_message(
+                                        &mut pending_pool_messages,
+                                        msg,
+                                    );
+                                    continue;
+                                }
+
+                                if let Some(data) =
+                                    Self::data_event_from_blockchain_message(msg, &mut core_client)
+                                        .await
+                                {
+                                    core_client.send_data(data);
+                                }
+
+                                if is_block {
+                                    for data in Self::drain_pending_pool_messages(
+                                        &mut core_client,
+                                        &mut pending_pool_messages,
+                                    )
+                                    .await
+                                    {
+                                        core_client.send_data(data);
+                                    }
+                                }
                             }
                             Err(e) => {
                                 log::error!("Error processing RPC message: {e}");
@@ -360,6 +297,267 @@ impl BlockchainDataClient {
         });
 
         self.process_task = Some(handle);
+    }
+
+    async fn drain_pending_pool_messages(
+        core_client: &mut BlockchainDataClientCore,
+        pending_pool_messages: &mut VecDeque<BlockchainMessage>,
+    ) -> Vec<DataEvent> {
+        let ready_messages = Self::drain_pending_pool_messages_with_cached_timestamps(
+            pending_pool_messages,
+            &core_client.cache,
+        );
+        let mut data_events = Vec::with_capacity(ready_messages.len());
+
+        for msg in ready_messages {
+            if let Some(data) = Self::data_event_from_blockchain_message(msg, core_client).await {
+                data_events.push(data);
+            }
+        }
+
+        data_events
+    }
+
+    fn drain_pending_pool_messages_with_cached_timestamps(
+        pending_pool_messages: &mut VecDeque<BlockchainMessage>,
+        cache: &BlockchainCache,
+    ) -> Vec<BlockchainMessage> {
+        let pending_count = pending_pool_messages.len();
+        let mut ready_messages = Vec::new();
+
+        for _ in 0..pending_count {
+            let Some(msg) = pending_pool_messages.pop_front() else {
+                break;
+            };
+
+            if Self::pool_event_missing_block_timestamp(&msg, cache).is_some() {
+                pending_pool_messages.push_back(msg);
+                continue;
+            }
+
+            ready_messages.push(msg);
+        }
+
+        ready_messages
+    }
+
+    fn queue_pending_pool_message(
+        pending_pool_messages: &mut VecDeque<BlockchainMessage>,
+        msg: BlockchainMessage,
+    ) {
+        if pending_pool_messages.len() >= MAX_PENDING_POOL_MESSAGES
+            && let Some(dropped_msg) = pending_pool_messages.pop_front()
+            && let Some(block_number) = Self::pool_event_block_number(&dropped_msg)
+        {
+            log::warn!(
+                "Dropping oldest live pool event waiting for uncached block {block_number}; pending buffer reached {MAX_PENDING_POOL_MESSAGES} messages"
+            );
+        }
+
+        pending_pool_messages.push_back(msg);
+    }
+
+    fn pool_event_missing_block_timestamp(
+        msg: &BlockchainMessage,
+        cache: &BlockchainCache,
+    ) -> Option<u64> {
+        let block_number = Self::pool_event_block_number(msg)?;
+        cache
+            .get_block_timestamp(block_number)
+            .is_none()
+            .then_some(block_number)
+    }
+
+    fn pool_event_block_number(msg: &BlockchainMessage) -> Option<u64> {
+        match msg {
+            BlockchainMessage::SwapEvent(event) => Some(event.block_number),
+            BlockchainMessage::MintEvent(event) => Some(event.block_number),
+            BlockchainMessage::BurnEvent(event) => Some(event.block_number),
+            BlockchainMessage::CollectEvent(event) => Some(event.block_number),
+            BlockchainMessage::FlashEvent(event) => Some(event.block_number),
+            BlockchainMessage::FeeProtocolUpdateEvent(event) => Some(event.block_number),
+            BlockchainMessage::FeeProtocolCollectEvent(event) => Some(event.block_number),
+            BlockchainMessage::Block(_) => None,
+        }
+    }
+
+    async fn data_event_from_blockchain_message(
+        msg: BlockchainMessage,
+        core_client: &mut BlockchainDataClientCore,
+    ) -> Option<DataEvent> {
+        match msg {
+            BlockchainMessage::Block(block) => {
+                if let Err(e) = core_client.cache.add_block(block.clone()).await {
+                    log::error!("Failed to cache block {}: {e}", block.number);
+                }
+
+                Some(DataEvent::DeFi(DefiData::Block(block)))
+            }
+            BlockchainMessage::SwapEvent(swap_event) => {
+                match core_client.get_pool(&swap_event.pool_identifier) {
+                    Ok(pool) => match core_client.process_pool_swap_event(&swap_event, pool) {
+                        Ok(swap) => Some(DataEvent::DeFi(DefiData::PoolSwap(swap))),
+                        Err(e) => {
+                            log::error!("Error processing pool swap event: {e}");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        log::error!(
+                            "Failed to get pool {} with error {:?}",
+                            swap_event.pool_identifier,
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            BlockchainMessage::BurnEvent(burn_event) => {
+                match core_client.get_pool(&burn_event.pool_identifier) {
+                    Ok(pool) => {
+                        let dex_extended = get_dex_extended(core_client.chain.name, &pool.dex.name)
+                            .expect("Failed to get dex extended");
+
+                        match core_client.process_pool_burn_event(&burn_event, pool, dex_extended) {
+                            Ok(update) => {
+                                Some(DataEvent::DeFi(DefiData::PoolLiquidityUpdate(update)))
+                            }
+                            Err(e) => {
+                                log::error!("Error processing pool burn event: {e}");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to get pool {} with error {:?}",
+                            burn_event.pool_identifier,
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            BlockchainMessage::MintEvent(mint_event) => {
+                match core_client.get_pool(&mint_event.pool_identifier) {
+                    Ok(pool) => {
+                        let dex_extended = get_dex_extended(core_client.chain.name, &pool.dex.name)
+                            .expect("Failed to get dex extended");
+
+                        match core_client.process_pool_mint_event(&mint_event, pool, dex_extended) {
+                            Ok(update) => {
+                                Some(DataEvent::DeFi(DefiData::PoolLiquidityUpdate(update)))
+                            }
+                            Err(e) => {
+                                log::error!("Error processing pool mint event: {e}");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to get pool {} with error {:?}",
+                            mint_event.pool_identifier,
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            BlockchainMessage::CollectEvent(collect_event) => {
+                match core_client.get_pool(&collect_event.pool_identifier) {
+                    Ok(pool) => {
+                        let dex_extended = get_dex_extended(core_client.chain.name, &pool.dex.name)
+                            .expect("Failed to get dex extended");
+
+                        match core_client.process_pool_collect_event(
+                            &collect_event,
+                            pool,
+                            dex_extended,
+                        ) {
+                            Ok(update) => Some(DataEvent::DeFi(DefiData::PoolFeeCollect(update))),
+                            Err(e) => {
+                                log::error!("Error processing pool collect event: {e}");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to get pool {} with error {:?}",
+                            collect_event.pool_identifier,
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            BlockchainMessage::FlashEvent(flash_event) => {
+                match core_client.get_pool(&flash_event.pool_identifier) {
+                    Ok(pool) => match core_client.process_pool_flash_event(&flash_event, pool) {
+                        Ok(flash) => Some(DataEvent::DeFi(DefiData::PoolFlash(flash))),
+                        Err(e) => {
+                            log::error!("Error processing pool flash event: {e}");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        log::error!(
+                            "Failed to get pool {} with error {:?}",
+                            flash_event.pool_identifier,
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            BlockchainMessage::FeeProtocolUpdateEvent(update_event) => {
+                match core_client.get_pool(&update_event.pool_identifier) {
+                    Ok(pool) => match core_client
+                        .process_pool_fee_protocol_update_event(&update_event, pool)
+                    {
+                        Ok(update) => {
+                            Some(DataEvent::DeFi(DefiData::PoolFeeProtocolUpdate(update)))
+                        }
+                        Err(e) => {
+                            log::error!("Error processing pool fee-protocol update event: {e}");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        log::error!(
+                            "Failed to get pool {} with error {:?}",
+                            update_event.pool_identifier,
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            BlockchainMessage::FeeProtocolCollectEvent(collect_event) => {
+                match core_client.get_pool(&collect_event.pool_identifier) {
+                    Ok(pool) => match core_client
+                        .process_pool_fee_protocol_collect_event(&collect_event, pool)
+                    {
+                        Ok(collect) => {
+                            Some(DataEvent::DeFi(DefiData::PoolFeeProtocolCollect(collect)))
+                        }
+                        Err(e) => {
+                            log::error!("Error processing pool fee-protocol collect event: {e}");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        log::error!(
+                            "Failed to get pool {} with error {:?}",
+                            collect_event.pool_identifier,
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+        }
     }
 
     /// Processes DeFi subscription commands to start receiving specific blockchain data.
@@ -396,10 +594,6 @@ impl BlockchainDataClient {
                     cmd.instrument_id
                 );
 
-                if let Some(ref mut _rpc) = core_client.rpc_client {
-                    log::warn!("RPC pool subscription not yet implemented, using HyperSync");
-                }
-
                 if let Ok((_, dex)) = cmd.instrument_id.venue.parse_dex() {
                     let pool_address = validate_address(cmd.instrument_id.symbol.as_str())
                         .map_err(|e| {
@@ -426,6 +620,13 @@ impl BlockchainDataClient {
                     core_client
                         .subscription_manager
                         .subscribe_flashes(dex, pool_address);
+                    core_client
+                        .subscription_manager
+                        .subscribe_fee_protocol_updates(dex, pool_address);
+                    core_client
+                        .subscription_manager
+                        .subscribe_fee_protocol_collects(dex, pool_address);
+                    Self::update_rpc_pool_event_subscriptions(core_client, dex).await?;
 
                     log::debug!(
                         "Subscribed to all pool events for {} at address {}",
@@ -447,10 +648,6 @@ impl BlockchainDataClient {
                     cmd.instrument_id
                 );
 
-                if let Some(ref mut _rpc) = core_client.rpc_client {
-                    log::warn!("RPC pool swaps subscription not yet implemented, using HyperSync");
-                }
-
                 if let Ok((_, dex)) = cmd.instrument_id.venue.parse_dex() {
                     let pool_address = validate_address(cmd.instrument_id.symbol.as_str())
                         .map_err(|e| {
@@ -463,6 +660,7 @@ impl BlockchainDataClient {
                     core_client
                         .subscription_manager
                         .subscribe_swaps(dex, pool_address);
+                    Self::update_rpc_pool_event_subscriptions(core_client, dex).await?;
                 } else {
                     anyhow::bail!(
                         "Invalid venue {}, expected Blockchain DEX format",
@@ -478,12 +676,6 @@ impl BlockchainDataClient {
                     cmd.instrument_id
                 );
 
-                if let Some(ref mut _rpc) = core_client.rpc_client {
-                    log::warn!(
-                        "RPC pool liquidity updates subscription not yet implemented, using HyperSync"
-                    );
-                }
-
                 if let Ok((_, dex)) = cmd.instrument_id.venue.parse_dex() {
                     let pool_address = validate_address(cmd.instrument_id.symbol.as_str())
                         .map_err(|_| {
@@ -495,6 +687,7 @@ impl BlockchainDataClient {
                     core_client
                         .subscription_manager
                         .subscribe_mints(dex, pool_address);
+                    Self::update_rpc_pool_event_subscriptions(core_client, dex).await?;
                 } else {
                     anyhow::bail!(
                         "Invalid venue {}, expected Blockchain DEX format",
@@ -510,12 +703,6 @@ impl BlockchainDataClient {
                     cmd.instrument_id
                 );
 
-                if let Some(ref mut _rpc) = core_client.rpc_client {
-                    log::warn!(
-                        "RPC pool fee collects subscription not yet implemented, using HyperSync"
-                    );
-                }
-
                 if let Ok((_, dex)) = cmd.instrument_id.venue.parse_dex() {
                     let pool_address = validate_address(cmd.instrument_id.symbol.as_str())
                         .map_err(|_| {
@@ -527,6 +714,7 @@ impl BlockchainDataClient {
                     core_client
                         .subscription_manager
                         .subscribe_collects(dex, pool_address);
+                    Self::update_rpc_pool_event_subscriptions(core_client, dex).await?;
                 } else {
                     anyhow::bail!(
                         "Invalid venue {}, expected Blockchain DEX format",
@@ -542,12 +730,6 @@ impl BlockchainDataClient {
                     cmd.instrument_id
                 );
 
-                if let Some(ref mut _rpc) = core_client.rpc_client {
-                    log::warn!(
-                        "RPC pool fee collects subscription not yet implemented, using HyperSync"
-                    );
-                }
-
                 if let Ok((_, dex)) = cmd.instrument_id.venue.parse_dex() {
                     let pool_address = validate_address(cmd.instrument_id.symbol.as_str())
                         .map_err(|_| {
@@ -559,6 +741,7 @@ impl BlockchainDataClient {
                     core_client
                         .subscription_manager
                         .subscribe_flashes(dex, pool_address);
+                    Self::update_rpc_pool_event_subscriptions(core_client, dex).await?;
                 } else {
                     anyhow::bail!(
                         "Invalid venue {}, expected Blockchain DEX format",
@@ -580,14 +763,20 @@ impl BlockchainDataClient {
             DefiUnsubscribeCommand::Blocks(_cmd) => {
                 log::debug!("Processing unsubscribe blocks command");
 
-                // TODO: Implement RPC unsubscription when available
-                if core_client.rpc_client.is_some() {
-                    log::warn!("RPC blocks unsubscription not yet implemented");
+                if Self::has_active_pool_event_subscriptions(core_client) {
+                    log::debug!(
+                        "Keeping block subscription active for live pool-event timestamp cache"
+                    );
+                    return Ok(());
                 }
 
-                // Use HyperSync client for unsubscription
-                core_client.hypersync_client.unsubscribe_blocks().await;
-                log::debug!("Unsubscribed from blocks via HyperSync");
+                if let Some(ref mut rpc) = core_client.rpc_client {
+                    rpc.unsubscribe_blocks().await?;
+                    log::debug!("Unsubscribed from blocks via RPC");
+                } else {
+                    core_client.hypersync_client.unsubscribe_blocks().await;
+                    log::debug!("Unsubscribed from blocks via HyperSync");
+                }
 
                 Ok(())
             }
@@ -619,6 +808,13 @@ impl BlockchainDataClient {
                     core_client
                         .subscription_manager
                         .unsubscribe_flashes(dex, pool_address);
+                    core_client
+                        .subscription_manager
+                        .unsubscribe_fee_protocol_updates(dex, pool_address);
+                    core_client
+                        .subscription_manager
+                        .unsubscribe_fee_protocol_collects(dex, pool_address);
+                    Self::update_rpc_pool_event_subscriptions(core_client, dex).await?;
 
                     log::debug!(
                         "Unsubscribed from all pool events for {} at address {}",
@@ -645,6 +841,7 @@ impl BlockchainDataClient {
                     core_client
                         .subscription_manager
                         .unsubscribe_swaps(dex, pool_address);
+                    Self::update_rpc_pool_event_subscriptions(core_client, dex).await?;
                 } else {
                     anyhow::bail!(
                         "Invalid venue {}, expected Blockchain DEX format",
@@ -671,6 +868,7 @@ impl BlockchainDataClient {
                     core_client
                         .subscription_manager
                         .unsubscribe_mints(dex, pool_address);
+                    Self::update_rpc_pool_event_subscriptions(core_client, dex).await?;
                 } else {
                     anyhow::bail!(
                         "Invalid venue {}, expected Blockchain DEX format",
@@ -697,6 +895,7 @@ impl BlockchainDataClient {
                     core_client
                         .subscription_manager
                         .unsubscribe_collects(dex, pool_address);
+                    Self::update_rpc_pool_event_subscriptions(core_client, dex).await?;
                 } else {
                     anyhow::bail!(
                         "Invalid venue {}, expected Blockchain DEX format",
@@ -720,6 +919,7 @@ impl BlockchainDataClient {
                     core_client
                         .subscription_manager
                         .unsubscribe_flashes(dex, pool_address);
+                    Self::update_rpc_pool_event_subscriptions(core_client, dex).await?;
                 } else {
                     anyhow::bail!(
                         "Invalid venue {}, expected Blockchain DEX format",
@@ -730,6 +930,105 @@ impl BlockchainDataClient {
                 Ok(())
             }
         }
+    }
+
+    async fn update_rpc_pool_event_subscriptions(
+        core_client: &mut BlockchainDataClientCore,
+        dex: DexType,
+    ) -> anyhow::Result<()> {
+        let updates = vec![
+            (
+                RpcEventType::PoolSwap(dex),
+                core_client
+                    .subscription_manager
+                    .get_subscribed_pool_swap_addresses(&dex),
+                core_client
+                    .subscription_manager
+                    .get_dex_pool_swap_event_signature(&dex),
+            ),
+            (
+                RpcEventType::PoolMint(dex),
+                core_client
+                    .subscription_manager
+                    .get_subscribed_pool_mint_addresses(&dex),
+                core_client
+                    .subscription_manager
+                    .get_dex_pool_mint_event_signature(&dex),
+            ),
+            (
+                RpcEventType::PoolBurn(dex),
+                core_client
+                    .subscription_manager
+                    .get_subscribed_pool_burn_addresses(&dex),
+                core_client
+                    .subscription_manager
+                    .get_dex_pool_burn_event_signature(&dex),
+            ),
+            (
+                RpcEventType::PoolCollect(dex),
+                core_client
+                    .subscription_manager
+                    .get_subscribed_pool_collect_addresses(&dex),
+                core_client
+                    .subscription_manager
+                    .get_dex_pool_collect_event_signature(&dex),
+            ),
+            (
+                RpcEventType::PoolFlash(dex),
+                core_client
+                    .subscription_manager
+                    .get_subscribed_pool_flash_addresses(&dex),
+                core_client
+                    .subscription_manager
+                    .get_dex_pool_flash_event_signature(&dex),
+            ),
+            (
+                RpcEventType::PoolFeeProtocolUpdate(dex),
+                core_client
+                    .subscription_manager
+                    .get_subscribed_pool_fee_protocol_update_addresses(&dex),
+                core_client
+                    .subscription_manager
+                    .get_dex_pool_fee_protocol_update_event_signature(&dex),
+            ),
+            (
+                RpcEventType::PoolFeeProtocolCollect(dex),
+                core_client
+                    .subscription_manager
+                    .get_subscribed_pool_fee_protocol_collect_addresses(&dex),
+                core_client
+                    .subscription_manager
+                    .get_dex_pool_fee_protocol_collect_event_signature(&dex),
+            ),
+        ];
+
+        let has_pool_event_addresses = updates
+            .iter()
+            .any(|(_, addresses, _)| !addresses.is_empty());
+
+        if let Some(ref mut rpc) = core_client.rpc_client {
+            if has_pool_event_addresses {
+                rpc.subscribe_blocks().await?;
+            }
+
+            for (event_type, addresses, event_signature) in updates {
+                if let Some(event_signature) = event_signature {
+                    rpc.subscribe_pool_events(event_type, &addresses, event_signature)
+                        .await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn has_active_pool_event_subscriptions(core_client: &BlockchainDataClientCore) -> bool {
+        core_client.cache.get_registered_dexes().iter().any(|dex| {
+            !core_client
+                .subscription_manager
+                .get_subscribed_dex_contract_addresses(dex)
+                .is_empty()
+        })
     }
 
     /// Processes DeFi request commands to fetch specific blockchain data.
@@ -1021,16 +1320,18 @@ impl DataClient for BlockchainDataClient {
 mod tests {
     use std::sync::Arc;
 
-    use alloy::primitives::address;
+    use alloy::primitives::{I256, U160, U256, address};
     use nautilus_common::defi::RequestPoolSnapshot;
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
         defi::{Chain, DexType, Pool, PoolIdentifier, Token},
         identifiers::ClientId,
     };
+    use rstest::rstest;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::events::{flash::FlashEvent, swap::SwapEvent};
 
     const WETH_USDT_CREATION_BLOCK: u64 = 12_375_326;
 
@@ -1093,6 +1394,145 @@ mod tests {
                 .iter()
                 .all(|event| !matches!(event, DataEvent::DeFi(DefiData::PoolSnapshot(_))))
         );
+    }
+
+    #[rstest]
+    fn pool_event_missing_block_timestamp_clears_after_timestamp_cache_update() {
+        let chain = Arc::new(
+            Chain::from_chain_id(1)
+                .expect("Ethereum chain should exist")
+                .clone(),
+        );
+        let mut cache = BlockchainCache::new(chain);
+        let msg = flash_message(42);
+
+        assert_eq!(
+            BlockchainDataClient::pool_event_block_number(&msg),
+            Some(42)
+        );
+        assert_eq!(
+            BlockchainDataClient::pool_event_missing_block_timestamp(&msg, &cache),
+            Some(42)
+        );
+
+        cache.cache_block_timestamp(42, UnixNanos::from(1_700_000_000_000_000_000));
+
+        assert_eq!(
+            BlockchainDataClient::pool_event_missing_block_timestamp(&msg, &cache),
+            None
+        );
+    }
+
+    #[rstest]
+    fn queue_pending_pool_message_drops_oldest_entry_at_cap() {
+        let mut pending = VecDeque::new();
+
+        for block_number in 0..MAX_PENDING_POOL_MESSAGES {
+            BlockchainDataClient::queue_pending_pool_message(
+                &mut pending,
+                swap_message(block_number as u64),
+            );
+        }
+
+        BlockchainDataClient::queue_pending_pool_message(
+            &mut pending,
+            swap_message(MAX_PENDING_POOL_MESSAGES as u64),
+        );
+
+        assert_eq!(pending.len(), MAX_PENDING_POOL_MESSAGES);
+        assert_eq!(
+            BlockchainDataClient::pool_event_block_number(pending.front().unwrap()),
+            Some(1)
+        );
+        assert_eq!(
+            BlockchainDataClient::pool_event_block_number(pending.back().unwrap()),
+            Some(MAX_PENDING_POOL_MESSAGES as u64)
+        );
+    }
+
+    #[rstest]
+    fn drain_pending_pool_messages_releases_events_after_timestamps_are_cached() {
+        let chain = Arc::new(
+            Chain::from_chain_id(1)
+                .expect("Ethereum chain should exist")
+                .clone(),
+        );
+        let mut cache = BlockchainCache::new(chain);
+        cache.cache_block_timestamp(42, UnixNanos::from(1_700_000_000_000_000_000));
+        let mut pending = VecDeque::from([flash_message(41), flash_message(42)]);
+
+        let ready_messages =
+            BlockchainDataClient::drain_pending_pool_messages_with_cached_timestamps(
+                &mut pending,
+                &cache,
+            );
+
+        assert_eq!(ready_messages.len(), 1);
+        assert_eq!(
+            BlockchainDataClient::pool_event_block_number(&ready_messages[0]),
+            Some(42)
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            BlockchainDataClient::pool_event_block_number(pending.front().unwrap()),
+            Some(41)
+        );
+
+        cache.cache_block_timestamp(41, UnixNanos::from(1_700_000_000_000_000_001));
+
+        let ready_messages =
+            BlockchainDataClient::drain_pending_pool_messages_with_cached_timestamps(
+                &mut pending,
+                &cache,
+            );
+
+        assert_eq!(ready_messages.len(), 1);
+        assert_eq!(
+            BlockchainDataClient::pool_event_block_number(&ready_messages[0]),
+            Some(41)
+        );
+        assert!(pending.is_empty());
+    }
+
+    fn swap_message(block_number: u64) -> BlockchainMessage {
+        let pool = weth_usdt_pool();
+        let address = address!("1111111111111111111111111111111111111111");
+
+        BlockchainMessage::SwapEvent(SwapEvent::new(
+            pool.dex.clone(),
+            pool.pool_identifier,
+            block_number,
+            "0x1".to_string(),
+            0,
+            0,
+            address,
+            address,
+            I256::ZERO,
+            I256::ZERO,
+            U160::ZERO,
+            0,
+            0,
+        ))
+    }
+
+    fn flash_message(block_number: u64) -> BlockchainMessage {
+        let pool = weth_usdt_pool();
+        let address = address!("1111111111111111111111111111111111111111");
+
+        BlockchainMessage::FlashEvent(FlashEvent::new(
+            pool.dex.clone(),
+            pool.pool_identifier,
+            block_number,
+            "0x1".to_string(),
+            0,
+            0,
+            address,
+            address,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+        ))
     }
 
     fn weth_usdt_pool() -> Arc<Pool> {

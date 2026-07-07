@@ -708,6 +708,23 @@ For production deployments, add multiple strategies to a **single TradingNode** 
 For parallel execution or workload isolation, run each node in its own separate process.
 :::
 
+### Memory allocation
+
+The event-driven core allocates and frees small objects at high frequency: message bus dispatch,
+order event handling, and order book maintenance all exercise the heap on every event. Default
+system allocators handle this pattern poorly; profiling shows allocator overhead approaching half
+of hot-loop time on both the Windows CRT heap and glibc malloc under order-flow workloads.
+
+The Python wheels and the `nautilus` CLI binary therefore use
+[mimalloc](https://github.com/microsoft/mimalloc) for Rust allocations.
+Backtest engine benchmarks run roughly 3% to 44% faster depending on workload,
+with order-flow heavy paths gaining the most. The trade-off is a modest increase in resident
+memory from mimalloc's segment caching.
+
+A Rust binary links exactly one global allocator, and libraries do not impose one, so the
+NautilusTrader crates remain allocator-neutral. When building directly against the crates,
+opt in from your own binary (see the [Rust guide](rust.md#memory-allocator)).
+
 ## Related guides
 
 - [Overview](overview.md) - High-level introduction to NautilusTrader.

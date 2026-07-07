@@ -221,6 +221,8 @@ class LiveNodeConfig:
     def timeout_shutdown_secs(self) -> float: ...
     @property
     def plugins(self) -> list[PluginConfig]: ...
+    @property
+    def controller(self) -> trading.ImportableControllerConfig | None: ...
     def __new__(
         cls,
         environment: common.Environment | None = None,
@@ -243,6 +245,7 @@ class LiveNodeConfig:
         data_engine: LiveDataEngineConfig | None = None,
         risk_engine: LiveRiskEngineConfig | None = None,
         exec_engine: LiveExecEngineConfig | None = None,
+        controller: trading.ImportableControllerConfig | None = None,
         plugins: typing.Sequence[PluginConfig] | None = None,
     ) -> LiveNodeConfig: ...
 

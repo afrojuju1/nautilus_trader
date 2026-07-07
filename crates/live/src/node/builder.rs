@@ -35,6 +35,8 @@ use nautilus_data::client::DataClientAdapter;
 use nautilus_execution::engine::ExecutionEngine;
 use nautilus_model::identifiers::TraderId;
 use nautilus_portfolio::config::PortfolioConfig;
+#[cfg(feature = "python")]
+use nautilus_system::trader::Trader;
 use nautilus_system::{
     clock_factory::ClockFactory,
     config::StreamingConfig,
@@ -518,6 +520,17 @@ impl LiveNodeBuilder {
                 .with_clock_factory(self.clock_factory.take())
                 .with_event_store_factory(self.event_store_factory.take()),
         )?;
+        #[cfg(feature = "python")]
+        if let Some(controller) = self.config.controller.as_ref() {
+            Trader::add_controller_from_importable_config(&kernel.trader, controller)?;
+        }
+        #[cfg(not(feature = "python"))]
+        if let Some(controller) = self.config.controller.as_ref() {
+            anyhow::bail!(
+                "LiveNodeConfig.controller for importable controller '{}' requires the python feature",
+                controller.controller_path
+            );
+        }
 
         self.install_external_msgbus_factory(&kernel)?;
 

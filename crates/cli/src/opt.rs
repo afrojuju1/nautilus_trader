@@ -444,6 +444,9 @@ pub enum BlockchainCommand {
         /// Skip on-chain validation and persist replay-derived snapshots without the multicall compare
         #[arg(long)]
         skip_validation: bool,
+        /// Build the snapshot from mint/burn history plus an RPC read, without full swap storage
+        #[arg(long)]
+        snapshot_from_rpc: bool,
         /// Maximum number of Multicall calls per RPC request (optional, defaults to 200)
         #[arg(long)]
         multicall_calls_per_rpc_request: Option<u32>,
@@ -494,6 +497,9 @@ pub enum BlockchainCommand {
         /// Skip on-chain validation and persist replay-derived snapshots without the multicall compare
         #[arg(long)]
         skip_validation: bool,
+        /// Build snapshots from mint/burn history plus RPC reads, without full swap storage
+        #[arg(long)]
+        snapshot_from_rpc: bool,
         /// Maximum number of pools to analyze concurrently (optional, defaults to 4)
         #[arg(long)]
         concurrency: Option<usize>,
@@ -567,6 +573,7 @@ mod tests {
                         require_existing_snapshot,
                         checkpoint_blocks,
                         skip_validation,
+                        snapshot_from_rpc,
                         concurrency,
                         multicall_calls_per_rpc_request,
                         database,
@@ -589,6 +596,7 @@ mod tests {
                 assert!(require_existing_snapshot);
                 assert!(checkpoint_blocks.is_empty());
                 assert!(!skip_validation);
+                assert!(!snapshot_from_rpc);
                 assert_eq!(concurrency, None);
                 assert_eq!(multicall_calls_per_rpc_request, Some(25));
                 assert_eq!(database.host.as_deref(), Some("localhost"));

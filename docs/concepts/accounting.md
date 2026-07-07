@@ -7,7 +7,7 @@ consistent across venues.
 
 It applies equally to backtest and live trading. For backtest-specific
 configuration (starting balances, margin-model selection per venue), see
-[Backtesting](backtesting.md).
+[Backtesting](backtesting/).
 
 ## Account types
 
@@ -359,7 +359,7 @@ class RiskAdjustedMarginModel(MarginModel):
 
 For backtest-wide configuration of the margin model via `BacktestVenueConfig`
 and `MarginModelConfig`, see the margin-models section of
-[Backtesting](backtesting.md#margin-models).
+[Backtesting](backtesting/accounts-and-margin.md#margin-models).
 
 ## Adapter convention
 
@@ -391,7 +391,7 @@ are keyed by `currency`.
 
 ## Related guides
 
-- [Backtesting](backtesting.md): starting balances, `MarginModelConfig`, and
+- [Backtesting](backtesting/): starting balances, `MarginModelConfig`, and
   backtest-specific account setup.
 - [Portfolio](portfolio.md): portfolio-level PnL, exposures, and currency
   conversion.

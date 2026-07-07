@@ -439,5 +439,5 @@ PnL in `NETTING` OMS, include position snapshots when generating reports.
 
 - [Visualization](visualization.md) - Interactive tearsheets and charts from backtest results.
 - [Portfolio](portfolio.md) - Portfolio statistics and performance metrics.
-- [Backtesting](backtesting.md) - Running backtests that generate reports.
+- [Backtesting](backtesting/) - Running backtests that generate reports.
 - [Cache](cache.md) - Cache system that stores data for reports.

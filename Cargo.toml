@@ -52,7 +52,7 @@ members = [
 [workspace.package]
 version = "0.61.0"
 edition = "2024"
-rust-version = "1.96.0"
+rust-version = "1.96.1"
 authors = ["Nautech Systems <info@nautechsystems.io>"]
 license = "LGPL-3.0-or-later"
 readme = "README.md"
@@ -141,14 +141,14 @@ arrow = { version = "58.3.0", default-features = false, features = [
 arrow-row = "58.3.0"
 async-stream = "0.3.6"
 async-trait = "0.1.89"
-aws-lc-rs = { version = "1.17.0", default-features = false, features = [
+aws-lc-rs = { version = "1.17.1", default-features = false, features = [
   "non-fips", # FIPS 140-3 mode blocked: aws-lc-fips-sys requires Go toolchain
 ] }
 base64 = "0.22.1"
 blake3 = { version = "1.8.5", default-features = false, features = ["std"] }
 bon = "3.9.3"
 bytes = { version = "1.12.0", features = ["serde"] }
-capnp = "0.26.0"
+capnp = "0.26.1"
 chrono = { version = "0.4.45", default-features = false, features = [
   "serde",
   "std",
@@ -192,6 +192,7 @@ log = { version = "0.4.33", features = [
   "release_max_level_debug",
 ] }
 madsim = "0.2.34"
+mimalloc = "0.1.52"
 object_store = { version = "0.13.2", default-features = false, features = [
   "fs",
 ] }
@@ -220,7 +221,7 @@ pyo3-async-runtimes = { version = "0.29.0", default-features = false, features =
 pyo3-stub-gen = { version = "=0.20.0", default-features = false, features = [
   "rust_decimal",
 ] }
-rand = { version = "0.10.1", default-features = false, features = [
+rand = { version = "0.10.2", default-features = false, features = [
   "std",
   "thread_rng",
 ] }
@@ -350,7 +351,7 @@ ibapi = "=3.0.1"
 itoa = "1.0.18"
 ryu = "1.0.23"
 serde_repr = "0.1.20"
-time = { version = "0.3.51", default-features = false, features = [
+time = { version = "0.3.53", default-features = false, features = [
   "macros",
   "parsing",
   "serde",

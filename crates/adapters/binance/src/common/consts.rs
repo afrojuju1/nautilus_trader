@@ -210,8 +210,8 @@ pub const BINANCE_FAPI_RATE_LIMITS: &[BinanceRateLimitQuota] = &[
     BinanceRateLimitQuota {
         rate_limit_type: BinanceRateLimitType::Orders,
         interval: BinanceRateLimitInterval::Second,
-        interval_num: 1,
-        limit: 50,
+        interval_num: 10,
+        limit: 300,
     },
     BinanceRateLimitQuota {
         rate_limit_type: BinanceRateLimitType::Orders,

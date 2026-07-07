@@ -24,30 +24,68 @@ installation. Follow-up `2.0.0rcN` wheels are likely to ship at a higher cadence
 releases as feedback arrives, before the final `2.0.0` release.
 
 ### Enhancements
+- Added opt-in `mimalloc` allocator feature, enabled by default for Python wheels (#4358), thanks @ivannp
 - Added `LiveNode` metrics for Rust live runner metrics
 - Added returns skewness and kurtosis portfolio statistics (#4334), thanks @Martingale42
 - Added WebSocket transport backend selection for Python and PyO3 configs (#4342), thanks @graceyangfan
+- Added Up/Down Capture ratio portfolio statistics (#4354), thanks @mahimn01
+- Added Ulcer Index, Omega Ratio, VaR, and Expected Shortfall portfolio statistics (#4352), thanks @Martingale42
+- Added Tail Ratio portfolio statistic (#4341), thanks @Martingale42
+- Added Python v2 controller subclassing and importable controller configs for backtest/live
+- Added Python v2 subclassable execution algorithms for routed orders
+- Added Python v2 `FeeModel` and `FillModel` subclass support for custom backtest models
+- Added Blockchain pool analysis to build exact checkpoint snapshots without storing full swap history
 - Added Hyperliquid market data stream health warnings for stalled Deltas, Depth10, and Quote subscriptions (#4298)
+- Added Hyperliquid opt-in stale stream recovery with targeted resubscribe and reconnect escalation (#4298)
+- Added Interactive Brokers PyO3 type stub annotations (#4350), thanks @dfjmax
 
 ### Breaking Changes
 - Removed `DataActor` order fill/cancel callbacks and subscription methods; use the message bus
 - Renamed Python v2 `RedisMessageBusDatabase` to `RedisMessageBusBacking` (documenting a previous break)
+- Renamed Interactive Brokers PyO3 enum variants to uppercase names (e.g. `MarketDataType.DELAYED`) (#4350)
 
 ### Fixes
+- Fixed mixed-instrument backtest `SubmitOrderList` fills to use each leg's own book (#4392), thanks for reporting @gtalknitin
 - Fixed `LiveNode` external order claims bypassing the execution engine (#4347), thanks for reporting @linimin
+- Fixed Python v2 migration gaps for `core.datetime`, `Clock.set_time`, and Strategy data APIs
+- Fixed Python v2 subclassable PyO3 stubs marked as final (#4384), thanks @bebop23
 - Fixed `PerContractFeeModel` generic spread fees to charge per leg ratio (#4360), thanks for reporting @pjlegato
 - Fixed `HEDGING` reduce-only orders without cached position IDs (#4312), thanks for reporting @luckykefu
+- Fixed indicator rolling-window bounds and averages past capacity (#4351), thanks @Martingale42
+- Fixed v2 matching engine queue position for per-order deltas in L3 books (#4370), thanks for reporting @warmi024
+- Fixed v2 own order book sizes to track remaining quantity after partial fills
+- Fixed v2 interval book snapshots blocking order submission from `on_book` handlers
+- Fixed v2 position reconciliation grace to measure on the monotonic clock (#4366), thanks @folknor
+- Fixed live execution engine position activity to stamp receipt time instead of venue `ts_event`
 - Fixed Redis message bus startup with Python v2 configs (#4356), thanks for reporting @davidgreyme
 - Fixed Binance Futures order reports omitting external limit order prices (#4346), thanks for reporting @linimin
 - Fixed Binance Futures external algo order materialization (#4348), thanks for reporting @linimin
+- Fixed Binance Futures algo orders to consume USD-M order-count limits (#4395), thanks for reporting @cjdsellers
+- Fixed Databento OPRA option contract multipliers (#4388), thanks for reporting @pjlegato
+- Fixed Derive perpetual quote and settlement currency to USDC (venue reports quote as `USD`)
+- Fixed Derive option `scheduled_activation` parsing as UNIX seconds (was parsed as milliseconds)
+- Fixed Derive response decoding to tolerate unknown venue enum values and salvage undecodable trade rows with a log
 - Fixed Polymarket RTDS retained-subscription recovery after reconnects (#4353), thanks @graceyangfan
+- Fixed Tardis replay trades directory to `trades/` for catalog compatibility (#4373), thanks @AdvancedUno
+- Fixed Tardis replay bars directory to `bars/` for catalog compatibility (#4378), thanks @AdvancedUno
+- Fixed Hyperliquid `l2Book` resubscribe options and shared stream teardown (#4298)
+- Fixed Interactive Brokers `contract_details_to_dict` crash when `contractDetails.ineligibilityReasonList` contains non-serializable `IneligibilityReason` objects
+- Fixed Interactive Brokers futures/options parsing for legacy `US/*` time zones
 
 ### Internal Improvements
+- Improved core decimal deserialization to round fractional scales above 28 digits instead of erroring
+- Improved portfolio statistics test coverage with canonical worked examples
+- Made portfolio reference-count clones explicit (#4364), thanks @ChrisAB
+- Upgraded Rust (MSRV) to 1.96.1
+- Upgraded Cython to v3.2.8
 - Upgraded `redis` crate to v1.3.0
 
 ### Documentation Updates
+- Added Binance Futures `/fapi/v1/algoOrder` order-count rate limit docs
 - Added SinoPac Securities community adapter listing (#4324), thanks @Martingale42
+- Added canonical references and doc comments for portfolio statistics
 - Fixed Lighter get-started Python v2 development wheel link
+- Fixed PyO3 docstring generation for attributes with trailing comments
 
 ---
 

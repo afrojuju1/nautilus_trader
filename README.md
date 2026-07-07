@@ -16,10 +16,10 @@
 
 | Platform           | Rust   | Python    |
 | :----------------- | :----- | :-------- |
-| `Linux (x86_64)`   | 1.96.0 | 3.12-3.14 |
-| `Linux (ARM64)`    | 1.96.0 | 3.12-3.14 |
-| `macOS (ARM64)`    | 1.96.0 | 3.12-3.14 |
-| `Windows (x86_64)` | 1.96.0 | 3.12-3.14 |
+| `Linux (x86_64)`   | 1.96.1 | 3.12-3.14 |
+| `Linux (ARM64)`    | 1.96.1 | 3.12-3.14 |
+| `macOS (ARM64)`    | 1.96.1 | 3.12-3.14 |
+| `Windows (x86_64)` | 1.96.1 | 3.12-3.14 |
 
 - **Docs**: <https://nautilustrader.io/docs/>
 - **Website**: <https://nautilustrader.io>
@@ -51,7 +51,7 @@ DEX), traditional markets (FX, equities, futures, options), and betting exchange
 
 ## Features
 
-- **Fast**: Rust core with asynchronous networking using [tokio](https://crates.io/crates/tokio).
+- **Fast**: Rust core with the [mimalloc](https://github.com/microsoft/mimalloc) allocator and asynchronous networking using [tokio](https://crates.io/crates/tokio).
 - **Reliable**: Type- and thread-safety backed by Rust, with optional Redis-backed state persistence.
 - **Portable**: Runs on Linux, macOS, and Windows. Deploy using Docker.
 - **Flexible**: Modular adapters integrate any REST API or WebSocket feed.
@@ -581,6 +581,10 @@ See the [Developer Guide](https://nautilustrader.io/docs/latest/developer_guide/
 > [!TIP]
 >
 > Run `make build-debug` to compile after changes to Rust or Cython code for the most efficient development workflow.
+
+After changes to v2 PyO3 bindings or wrapped Rust docs, run `make py-stubs-v2` and commit the
+generated `.pyi` files and wrapper docstrings. See
+[Generated Python artifacts](docs/developer_guide/rust.md#generated-python-artifacts).
 
 ### Testing with Rust
 

@@ -47,7 +47,7 @@ use nautilus_core::{
     UUID4, UnixNanos, datetime::unix_nanos_to_iso8601, string::formatting::Separable,
 };
 use nautilus_data::client::DataClientAdapter;
-use nautilus_execution::models::fill::FillModelAny;
+use nautilus_execution::models::fill::FillModelHandle;
 use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{Data, HasTsInit},
@@ -57,6 +57,8 @@ use nautilus_model::{
     position::Position,
     types::Price,
 };
+#[cfg(feature = "python")]
+use nautilus_system::trader::Trader;
 use nautilus_system::{config::NautilusKernelConfig, kernel::NautilusKernel};
 use nautilus_trading::{
     ExecutionAlgorithm, ExecutionAlgorithmNative,
@@ -138,6 +140,17 @@ impl BacktestEngine {
         config.cache = Some(cache_config);
         let kernel = NautilusKernel::new("BacktestEngine".to_string(), config.clone())?;
         let instance_id = kernel.instance_id;
+        #[cfg(feature = "python")]
+        if let Some(controller) = config.controller.as_ref() {
+            Trader::add_controller_from_importable_config(&kernel.trader, controller)?;
+        }
+        #[cfg(not(feature = "python"))]
+        if let Some(controller) = config.controller.as_ref() {
+            anyhow::bail!(
+                "BacktestEngineConfig.controller for importable controller '{}' requires the python feature",
+                controller.controller_path
+            );
+        }
 
         Ok(Self {
             kernel,
@@ -312,7 +325,7 @@ impl BacktestEngine {
     }
 
     /// Changes the fill model for the specified venue.
-    pub fn change_fill_model(&mut self, venue: Venue, fill_model: FillModelAny) {
+    pub fn change_fill_model(&mut self, venue: Venue, fill_model: FillModelHandle) {
         if let Some(exchange) = self.venues.get_mut(&venue) {
             exchange.borrow_mut().set_fill_model(fill_model);
         } else {

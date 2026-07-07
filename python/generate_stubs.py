@@ -119,6 +119,7 @@ class ClassMethodFixup:
     """
 
     python_name: str | None = None
+    subclass: bool = False
     getters: set[str] = field(default_factory=set)
     staticmethods: set[str] = field(default_factory=set)
     classmethods: set[str] = field(default_factory=set)
@@ -193,6 +194,17 @@ EXTRA_REEXPORTS: dict[str, tuple[str, ...]] = {
         "from nautilus_trader.analysis.themes import list_themes as list_themes",
         "from nautilus_trader.analysis.themes import register_theme as register_theme",
     ),
+    "nautilus_trader/core/__init__.pyi": (
+        "from nautilus_trader.core.datetime import dt_to_unix_nanos as dt_to_unix_nanos",
+        "from nautilus_trader.core.datetime import unix_nanos_to_dt as unix_nanos_to_dt",
+    ),
+    "nautilus_trader/trading/__init__.pyi": (
+        "from nautilus_trader.trading.controller import Controller as Controller",
+    ),
+}
+
+EXTRA_ALL_EXPORTS: dict[str, tuple[str, ...]] = {
+    "nautilus_trader/trading/__init__.pyi": ("Controller",),
 }
 
 MODEL_EXPORTS = frozenset(MODULE_FIXUPS["model"].all_exports)
@@ -297,6 +309,10 @@ def generate_stubs() -> bool:
     maturin_features = pyproject.get("tool", {}).get("maturin", {}).get("features", [])
     cargo_features = [f for f in maturin_features if f != "extension-module"]
 
+    # extension-module (stripped above) is what enables gateway in the wheel build
+    if "nautilus-interactive-brokers/gateway" not in cargo_features:
+        cargo_features.append("nautilus-interactive-brokers/gateway")
+
     cmd = ["cargo", "run", "--bin", "python-stub-gen"]
 
     if cargo_features:
@@ -356,24 +372,29 @@ def inject_reexports(content: str, stub_path: Path) -> str:
     """
     posix = stub_path.as_posix()
     reexports = next((v for k, v in EXTRA_REEXPORTS.items() if posix.endswith(k)), None)
+    exports = next((v for k, v in EXTRA_ALL_EXPORTS.items() if posix.endswith(k)), None)
 
-    if not reexports:
+    if not reexports and not exports:
         return content
 
-    lines = content.split("\n")
-    missing = [imp for imp in reexports if imp not in lines]
+    if reexports:
+        lines = content.split("\n")
+        missing = [imp for imp in reexports if imp not in lines]
 
-    if not missing:
-        return content
+        if missing:
+            insert_at = 0
 
-    insert_at = 0
+            for i, line in enumerate(lines):
+                if line.startswith(("import ", "from ")):
+                    insert_at = i + 1
 
-    for i, line in enumerate(lines):
-        if line.startswith(("import ", "from ")):
-            insert_at = i + 1
+            lines[insert_at:insert_at] = missing
+            content = "\n".join(lines)
 
-    lines[insert_at:insert_at] = missing
-    return "\n".join(lines)
+    if exports:
+        content = _add_names_to_all(content, list(exports))
+
+    return content
 
 
 def post_process_stubs(root: Path) -> None:
@@ -401,6 +422,9 @@ def post_process_stubs(root: Path) -> None:
 
         # Rename wrapper classes to their public Python names
         content = rename_stub_classes(content, rust_fixups)
+
+        # Remove stale final markers from classes PyO3 exposes as subclassable
+        content = remove_final_from_subclassable_classes(content, rust_fixups)
 
         # Escape keywords introduced by fixup renames (e.g. py_from -> from)
         content = _escape_keyword_methods(content)
@@ -472,7 +496,7 @@ INJECTABLE_STATICMETHODS = frozenset({"from_json", "from_msgpack"})
 # Methods to suppress from public stubs (implementation details, not user-facing API)
 SUPPRESSED_METHODS = frozenset({"__richcmp__", "_safe_constructor"})
 PYMETHODS_ATTRS = frozenset({"#[pymethods]", "#[pyo3::pymethods]"})
-PYCLASS_ATTR_PREFIXES = ("#[pyclass", "#[pyo3::pyclass")
+PYCLASS_ATTR_RE = re.compile(r"\b(?:pyo3::)?pyclass\s*\(")
 PYO3_NAME_RE = re.compile(r'#\[pyo3\(\s*name\s*=\s*"([^"]+)"')
 ATTR_NAME_RE = re.compile(r'\bname\s*=\s*"([^"]+)"')
 RUST_IMPL_RE = re.compile(r"^\s*impl(?:\s*<[^>]+>)?\s+([A-Za-z_][A-Za-z0-9_:<>]*)\s*\{")
@@ -653,9 +677,12 @@ def collect_rust_class_fixups(workspace_root: Path) -> dict[str, ClassMethodFixu
     """
     fixups: dict[str, ClassMethodFixup] = {}
 
-    for rust_file in sorted(workspace_root.glob("crates/**/src/python/**/*.rs")):
+    for rust_file in sorted(workspace_root.glob("crates/**/src/**/*.rs")):
         source = rust_file.read_text()
         _collect_pyclass_name_fixups(source, fixups)
+
+    for rust_file in sorted(workspace_root.glob("crates/**/src/python/**/*.rs")):
+        source = rust_file.read_text()
         _collect_identifier_macro_fixups(source, fixups)
         _collect_pymethod_fixups(source, fixups)
         _collect_pyfunction_signature_defaults(source, fixups)
@@ -984,18 +1011,18 @@ def _collect_pyclass_name_fixups(source: str, fixups: dict[str, ClassMethodFixup
             i += 1
             continue
 
-        pyclass_attr = next(
-            (attr for attr in pending_attrs if attr.startswith(PYCLASS_ATTR_PREFIXES)),
-            None,
-        )
+        pyclass_attr = next((attr for attr in pending_attrs if PYCLASS_ATTR_RE.search(attr)), None)
 
         if pyclass_attr is not None:
+            rust_name = struct_match.group(1)
+            fixup = fixups.setdefault(rust_name, ClassMethodFixup())
             name_match = ATTR_NAME_RE.search(pyclass_attr)
             if name_match is not None:
-                rust_name = struct_match.group(1)
                 python_name = name_match.group(1)
                 if python_name != rust_name:
-                    fixups.setdefault(rust_name, ClassMethodFixup()).python_name = python_name
+                    fixup.python_name = python_name
+            if pyclass_has_option(pyclass_attr, "subclass"):
+                fixup.subclass = True
 
         pending_attrs.clear()
         i += 1
@@ -1006,6 +1033,52 @@ def _collect_identifier_macro_fixups(source: str, fixups: dict[str, ClassMethodF
         fixup = fixups.setdefault(class_name, ClassMethodFixup())
         fixup.getters.update(IDENTIFIER_MACRO_METHOD_FIXUPS.getters)
         fixup.staticmethods.update(IDENTIFIER_MACRO_METHOD_FIXUPS.staticmethods)
+
+
+def pyclass_has_option(attribute: str, option: str) -> bool:
+    """
+    Return whether a ``#[pyclass(...)]`` attribute includes a bare option token.
+    """
+    match = PYCLASS_ATTR_RE.search(attribute)
+    if match is None:
+        return False
+
+    args = _extract_signature_params_str(attribute, match.end() - 1)
+    args = strip_double_quoted_strings(args)
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(option)}(?![A-Za-z0-9_])", args) is not None
+
+
+def strip_double_quoted_strings(text: str) -> str:
+    """
+    Replace double-quoted string literal contents with spaces.
+    """
+    chars: list[str] = []
+    in_string = False
+    escaped = False
+
+    for ch in text:
+        if escaped:
+            chars.append(" ")
+            escaped = False
+            continue
+
+        if in_string:
+            chars.append(" ")
+
+            if ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            chars.append(" ")
+            in_string = True
+            continue
+
+        chars.append(ch)
+
+    return "".join(chars)
 
 
 def _collect_custom_data_macro_fixups(source: str, fixups: dict[str, ClassMethodFixup]) -> None:
@@ -1431,6 +1504,40 @@ def rename_stub_classes(content: str, class_fixups: dict[str, ClassMethodFixup])
         content = re.sub(rf"\b{re.escape(rust_name)}\b", class_renames[rust_name], content)
 
     return content
+
+
+def remove_final_from_subclassable_classes(
+    content: str,
+    class_fixups: dict[str, ClassMethodFixup],
+) -> str:
+    """
+    Remove ``@typing.final`` from classes declared ``#[pyclass(subclass)]``.
+    """
+    subclassable = {
+        name
+        for rust_name, fixup in class_fixups.items()
+        if fixup.subclass
+        for name in {rust_name, fixup.python_name or rust_name}
+    }
+
+    if not subclassable:
+        return content
+
+    lines = content.split("\n")
+    result: list[str] = []
+    i = 0
+
+    while i < len(lines):
+        if lines[i].strip() == "@typing.final" and i + 1 < len(lines):
+            class_match = STUB_CLASS_RE.match(lines[i + 1].strip())
+            if class_match is not None and class_match.group(1) in subclassable:
+                i += 1
+                continue
+
+        result.append(lines[i])
+        i += 1
+
+    return "\n".join(result)
 
 
 def apply_class_block_fixups(

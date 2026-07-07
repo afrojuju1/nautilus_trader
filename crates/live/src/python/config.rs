@@ -25,6 +25,7 @@ use nautilus_model::{
     identifiers::{ClientId, TraderId},
 };
 use nautilus_portfolio::config::PortfolioConfig;
+use nautilus_trading::ImportableControllerConfig;
 use pyo3::{
     IntoPyObject, Py, PyAny, PyResult, Python, pymethods,
     types::{PyAnyMethods, PyDict, PyDictMethods},
@@ -646,7 +647,7 @@ impl LiveNodeConfig {
     /// Configuration for live Nautilus system nodes.
     #[new]
     #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (environment=None, trader_id=None, load_state=None, save_state=None, shutdown_on_error=None, logging=None, instance_id=None, timeout_connection_secs=None, timeout_reconciliation_secs=None, timeout_portfolio_secs=None, timeout_disconnection_secs=None, delay_post_stop_secs=None, timeout_shutdown_secs=None, cache=None, msgbus=None, portfolio=None, loop_debug=None, data_engine=None, risk_engine=None, exec_engine=None, plugins=None))]
+    #[pyo3(signature = (environment=None, trader_id=None, load_state=None, save_state=None, shutdown_on_error=None, logging=None, instance_id=None, timeout_connection_secs=None, timeout_reconciliation_secs=None, timeout_portfolio_secs=None, timeout_disconnection_secs=None, delay_post_stop_secs=None, timeout_shutdown_secs=None, cache=None, msgbus=None, portfolio=None, loop_debug=None, data_engine=None, risk_engine=None, exec_engine=None, controller=None, plugins=None))]
     fn py_new(
         environment: Option<Environment>,
         trader_id: Option<TraderId>,
@@ -668,6 +669,7 @@ impl LiveNodeConfig {
         data_engine: Option<LiveDataEngineConfig>,
         risk_engine: Option<LiveRiskEngineConfig>,
         exec_engine: Option<LiveExecEngineConfig>,
+        controller: Option<ImportableControllerConfig>,
         plugins: Option<Vec<PluginConfig>>,
     ) -> PyResult<Self> {
         let default = Self::default();
@@ -720,6 +722,7 @@ impl LiveNodeConfig {
             exec_engine: exec_engine.unwrap_or_default(),
             data_clients: HashMap::new(),
             exec_clients: HashMap::new(),
+            controller,
             plugins: plugins.unwrap_or_default(),
         })
     }
@@ -790,5 +793,10 @@ impl LiveNodeConfig {
     #[getter]
     fn plugins(&self) -> Vec<PluginConfig> {
         self.plugins.clone()
+    }
+
+    #[getter]
+    fn controller(&self) -> Option<ImportableControllerConfig> {
+        self.controller.clone()
     }
 }

@@ -28,7 +28,7 @@ use nautilus_backtest::{
 use nautilus_common::{
     cache::Cache,
     clock::TestClock,
-    messages::execution::{ModifyOrder, SubmitOrder, TradingCommand},
+    messages::execution::{ModifyOrder, SubmitOrder, SubmitOrderList, TradingCommand},
     msgbus::{
         self, MessagingSwitchboard,
         stubs::{
@@ -58,13 +58,14 @@ use nautilus_model::{
         order::spec::OrderPendingUpdateSpec,
     },
     identifiers::{
-        AccountId, ClientOrderId, InstrumentId, StrategyId, Symbol, TradeId, TraderId, Venue,
+        AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol, TradeId, TraderId,
+        Venue,
     },
     instruments::{
         CryptoOption, CryptoPerpetual, Instrument, InstrumentAny, OptionContract,
         stubs::crypto_perpetual_ethusdt,
     },
-    orders::{Order, OrderAny, OrderTestBuilder, stubs::TestOrderEventStubs},
+    orders::{Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
     stubs::TestDefault,
     types::{AccountBalance, Currency, Money, Price, Quantity},
@@ -88,7 +89,7 @@ fn get_exchange(
         .book_type(book_type)
         .starting_balances(vec![Money::new(1000.0, Currency::USD())])
         .default_leverage(Decimal::ONE)
-        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel))
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel).into())
         .build()
         .unwrap();
     let exchange = Rc::new(RefCell::new(
@@ -346,6 +347,134 @@ fn test_option_limit_order_crossing_bbo_fills_as_taker(
             .borrow()
             .get_open_orders(Some(instrument.id()))
             .is_empty()
+    );
+}
+
+#[rstest]
+fn test_submit_order_list_routes_mixed_instrument_legs_to_own_matching_engine(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+) {
+    let saving_handler = register_order_event_saving_handler();
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let exchange = get_exchange(
+        Venue::new("BINANCE"),
+        AccountType::Margin,
+        BookType::L1_MBP,
+        Some(cache.clone()),
+    );
+    let eth_instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt.clone());
+    let mut btcusdt = crypto_perpetual_ethusdt;
+    btcusdt.id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    btcusdt.raw_symbol = Symbol::from("BTCUSDT");
+    btcusdt.base_currency = Currency::from("BTC");
+    let btc_instrument = InstrumentAny::CryptoPerpetual(btcusdt);
+
+    exchange
+        .borrow_mut()
+        .add_instrument(eth_instrument.clone())
+        .unwrap();
+    exchange
+        .borrow_mut()
+        .add_instrument(btc_instrument.clone())
+        .unwrap();
+
+    let eth_quote = QuoteTick::new(
+        eth_instrument.id(),
+        Price::from("100.00"),
+        Price::from("101.00"),
+        Quantity::from("10.000"),
+        Quantity::from("10.000"),
+        UnixNanos::from(1),
+        UnixNanos::from(1),
+    );
+    let btc_quote = QuoteTick::new(
+        btc_instrument.id(),
+        Price::from("200.00"),
+        Price::from("201.00"),
+        Quantity::from("10.000"),
+        Quantity::from("10.000"),
+        UnixNanos::from(1),
+        UnixNanos::from(1),
+    );
+    exchange.borrow_mut().process_quote_tick(&eth_quote);
+    exchange.borrow_mut().process_quote_tick(&btc_quote);
+
+    let eth_order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(eth_instrument.id())
+        .client_order_id(ClientOrderId::from("O-MIXED-ETH"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .build();
+    let btc_order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(btc_instrument.id())
+        .client_order_id(ClientOrderId::from("O-MIXED-BTC"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .build();
+    let orders = vec![eth_order.clone(), btc_order.clone()];
+    let account_id = AccountId::test_default();
+
+    for order in &orders {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .update_order(&TestOrderEventStubs::submitted(order, account_id))
+            .unwrap();
+    }
+
+    let ts_init = UnixNanos::from(2);
+    let order_list = OrderList::new(
+        OrderListId::from("OL-MIXED-001"),
+        eth_order.instrument_id(),
+        StrategyId::test_default(),
+        orders.iter().map(OrderAny::client_order_id).collect(),
+        ts_init,
+    );
+    let command = SubmitOrderList::new(
+        TraderId::test_default(),
+        None,
+        StrategyId::test_default(),
+        order_list,
+        orders
+            .iter()
+            .map(|order| order.init_event().clone())
+            .collect(),
+        None,
+        None,
+        None,
+        UUID4::default(),
+        ts_init,
+        None,
+    );
+
+    exchange
+        .borrow_mut()
+        .send(TradingCommand::SubmitOrderList(command));
+    exchange.borrow_mut().process(ts_init);
+
+    let messages = saving_handler.get_messages();
+    let fill_price = |client_order_id: ClientOrderId| -> Price {
+        messages
+            .iter()
+            .find_map(|event| match event {
+                OrderEventAny::Filled(fill) if fill.client_order_id == client_order_id => {
+                    Some(fill.last_px)
+                }
+                _ => None,
+            })
+            .expect("expected mixed instrument order-list leg fill")
+    };
+
+    assert_eq!(
+        fill_price(eth_order.client_order_id()),
+        Price::from("101.00")
+    );
+    assert_eq!(
+        fill_price(btc_order.client_order_id()),
+        Price::from("201.00")
     );
 }
 
@@ -1404,7 +1533,7 @@ fn build_exchange_with_options(
         .book_type(BookType::L2_MBP)
         .starting_balances(vec![Money::new(1000.0, Currency::USD())])
         .default_leverage(Decimal::ONE)
-        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel))
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel).into())
         .frozen_account(frozen_account)
         .allow_cash_borrowing(allow_cash_borrowing)
         .build()
@@ -2469,7 +2598,7 @@ fn get_exchange_with_module(
         .starting_balances(vec![Money::new(1000.0, Currency::USD())])
         .default_leverage(Decimal::ONE)
         .modules(modules)
-        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel))
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel).into())
         .build()
         .unwrap();
     let exchange = Rc::new(RefCell::new(

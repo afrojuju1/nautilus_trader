@@ -671,7 +671,7 @@ the local position without any strategy-side handling.
 
 ## Related guides
 
-- [Events](events.md) - Order and position event types and dispatch.
+- [Events](events/) - Order and position event types and dispatch.
 - [Orders](orders/) - Order types and management.
 - [Positions](positions.md) - Position tracking from executions.
 - [Strategies](strategies.md) - Order submission from strategies.

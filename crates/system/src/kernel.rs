@@ -659,7 +659,8 @@ impl NautilusKernel {
     pub fn start_trader(&mut self) {
         log::info!("Starting trader...");
         self.order_emulator.start();
-        if let Err(e) = self.trader.borrow_mut().start() {
+
+        if let Err(e) = Trader::start_with_component_callbacks(&self.trader) {
             log::error!("Error starting trader: {e:?}");
         }
         log::info!("Trader started");

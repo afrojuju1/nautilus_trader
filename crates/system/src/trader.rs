@@ -22,13 +22,15 @@
 use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use ahash::AHashMap;
+#[cfg(feature = "python")]
+use nautilus_common::{actor::data_actor::ImportableActorConfig, python::actor::PyDataActor};
 use nautilus_common::{
     actor::{DataActor, DataActorNative, registry::try_get_actor_unchecked},
     cache::Cache,
     clock::Clock,
     component::{
-        Component, dispose_component, register_component_actor, reset_component, start_component,
-        stop_component,
+        Component, component_state, dispose_component, register_component_actor, reset_component,
+        start_component, stop_component,
     },
     enums::{ComponentState, ComponentTrigger, Environment},
     messages::execution::TradingCommand,
@@ -50,6 +52,16 @@ use nautilus_portfolio::portfolio::Portfolio;
 use nautilus_trading::{
     ExecutionAlgorithm, ExecutionAlgorithmNative,
     strategy::{Strategy, StrategyNative},
+};
+#[cfg(feature = "python")]
+use nautilus_trading::{
+    ImportableControllerConfig, ImportableStrategyConfig,
+    python::strategy::{PyStrategy, PyStrategyInner},
+};
+#[cfg(feature = "python")]
+use pyo3::{
+    prelude::*,
+    types::{PyDict, PyModule},
 };
 use ustr::Ustr;
 
@@ -305,6 +317,106 @@ impl Trader {
         let actor = factory()?;
 
         self.add_actor(actor)
+    }
+
+    /// Adds an importable Python actor to the trader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor cannot be imported, configured, registered, or tracked.
+    #[cfg(feature = "python")]
+    pub fn add_actor_from_importable_config(
+        &mut self,
+        config: &ImportableActorConfig,
+    ) -> anyhow::Result<ActorId> {
+        self.validate_actor_or_strategy_registration()?;
+
+        let (python_actor, actor_id) = create_python_actor(config)?;
+        if self.actor_ids.contains(&actor_id) {
+            anyhow::bail!("Actor {actor_id} is already registered");
+        }
+
+        self.register_python_actor_instance(&python_actor, actor_id)?;
+
+        log::info!(
+            "Registered Python actor {actor_id} with trader {}",
+            self.trader_id
+        );
+        Ok(actor_id)
+    }
+
+    #[cfg(feature = "python")]
+    fn register_python_actor_instance(
+        &mut self,
+        python_actor: &Py<PyAny>,
+        actor_id: ActorId,
+    ) -> anyhow::Result<()> {
+        let component_id = ComponentId::new(actor_id.inner().as_str());
+        let clock = self.create_component_clock(component_id);
+        let trader_id = self.trader_id;
+        let cache = self.cache.clone();
+
+        Python::attach(|py| -> anyhow::Result<()> {
+            let py_actor = python_actor.bind(py);
+            let mut py_data_actor_ref = py_actor
+                .extract::<PyRefMut<PyDataActor>>()
+                .map_err(Into::<PyErr>::into)
+                .map_err(|e| anyhow::anyhow!("Failed to extract PyDataActor: {e}"))?;
+
+            py_data_actor_ref
+                .register(trader_id, clock, cache)
+                .map_err(|e| anyhow::anyhow!("Failed to register PyDataActor: {e}"))?;
+
+            Ok(())
+        })?;
+
+        Python::attach(|py| -> anyhow::Result<()> {
+            let py_actor = python_actor.bind(py);
+            let py_data_actor_ref = py_actor
+                .cast::<PyDataActor>()
+                .map_err(|e| anyhow::anyhow!("Failed to downcast to PyDataActor: {e}"))?;
+            py_data_actor_ref.borrow().register_in_global_registries();
+            Ok(())
+        })?;
+
+        self.add_actor_id_for_lifecycle(actor_id)?;
+
+        Ok(())
+    }
+
+    /// Adds an importable Python controller to the trader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the controller cannot be imported, configured, registered, or tracked.
+    #[cfg(feature = "python")]
+    pub fn add_controller_from_importable_config(
+        trader: &Rc<RefCell<Self>>,
+        config: &ImportableControllerConfig,
+    ) -> anyhow::Result<ActorId> {
+        trader.borrow().validate_actor_or_strategy_registration()?;
+
+        let actor_config = ImportableActorConfig {
+            actor_path: config.controller_path.clone(),
+            config_path: config.config_path.clone(),
+            config: config.config.clone(),
+        };
+        let (python_controller, actor_id) = create_python_actor(&actor_config)?;
+        if trader.borrow().actor_ids.contains(&actor_id) {
+            anyhow::bail!("Actor {actor_id} is already registered");
+        }
+
+        crate::python::controller::attach_controller_handle(&python_controller, trader, actor_id)?;
+
+        trader
+            .borrow_mut()
+            .register_python_actor_instance(&python_controller, actor_id)?;
+
+        log::info!(
+            "Registered Python controller {actor_id} with trader {}",
+            trader.borrow().trader_id
+        );
+        Ok(actor_id)
     }
 
     /// Adds an already registered actor to the trader's component registry.
@@ -637,6 +749,64 @@ impl Trader {
         Ok(())
     }
 
+    /// Adds an importable Python strategy to the trader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy cannot be imported, configured, registered, or tracked.
+    #[cfg(feature = "python")]
+    pub fn add_strategy_from_importable_config(
+        &mut self,
+        config: &ImportableStrategyConfig,
+    ) -> anyhow::Result<StrategyId> {
+        self.validate_actor_or_strategy_registration()?;
+
+        let (python_strategy, strategy_id) = create_python_strategy(config)?;
+        if self.strategy_ids.contains(&strategy_id) {
+            anyhow::bail!("Strategy {strategy_id} is already registered");
+        }
+        let existing_order_id_tags: Vec<&str> =
+            self.strategy_ids.iter().map(StrategyId::get_tag).collect();
+        ensure_unique_order_id_tag(&existing_order_id_tags, strategy_id.get_tag())?;
+
+        let component_id = ComponentId::new(strategy_id.inner().as_str());
+        let clock = self.create_component_clock(component_id);
+        let trader_id = self.trader_id;
+        let cache = self.cache.clone();
+        let portfolio = self.portfolio.clone();
+
+        Python::attach(|py| -> anyhow::Result<()> {
+            let py_strategy = python_strategy.bind(py);
+            let mut py_strategy_ref = py_strategy
+                .extract::<PyRefMut<PyStrategy>>()
+                .map_err(Into::<PyErr>::into)
+                .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
+
+            py_strategy_ref
+                .register(trader_id, clock, cache, portfolio)
+                .map_err(|e| anyhow::anyhow!("Failed to register PyStrategy: {e}"))?;
+
+            Ok(())
+        })?;
+
+        Python::attach(|py| -> anyhow::Result<()> {
+            let py_strategy = python_strategy.bind(py);
+            let py_strategy_ref = py_strategy
+                .cast::<PyStrategy>()
+                .map_err(|e| anyhow::anyhow!("Failed to downcast to PyStrategy: {e}"))?;
+            py_strategy_ref.borrow().register_in_global_registries();
+            Ok(())
+        })?;
+
+        self.add_strategy_id_with_subscriptions::<PyStrategyInner>(strategy_id)?;
+
+        log::info!(
+            "Registered Python strategy {strategy_id} with trader {}",
+            self.trader_id
+        );
+        Ok(strategy_id)
+    }
+
     /// Adds an execution algorithm to the trader.
     ///
     /// Execution algorithms are registered in both the component registry (for lifecycle
@@ -701,6 +871,7 @@ impl Trader {
         match self.state {
             ComponentState::PreInitialized
             | ComponentState::Ready
+            | ComponentState::Starting
             | ComponentState::Stopped
             | ComponentState::Running => Ok(()),
             ComponentState::Disposed => {
@@ -735,22 +906,76 @@ impl Trader {
     ///
     /// Returns an error if any component fails to start.
     pub fn start_components(&mut self) -> anyhow::Result<()> {
-        for actor_id in &self.actor_ids {
+        let actor_ids = self.actor_ids.clone();
+        let strategy_ids = self.strategy_ids.clone();
+        let exec_algorithm_ids = self.exec_algorithm_ids.clone();
+
+        for actor_id in actor_ids {
             log::debug!("Starting actor {actor_id}");
-            start_component(&actor_id.inner())?;
+            Self::start_component_if_not_running(actor_id.inner())?;
         }
 
-        for strategy_id in &self.strategy_ids {
+        for strategy_id in strategy_ids {
             log::debug!("Starting strategy {strategy_id}");
-            start_component(&strategy_id.inner())?;
+            Self::start_component_if_not_running(strategy_id.inner())?;
         }
 
-        for exec_algorithm_id in &self.exec_algorithm_ids {
+        for exec_algorithm_id in exec_algorithm_ids {
             log::debug!("Starting execution algorithm {exec_algorithm_id}");
-            start_component(&exec_algorithm_id.inner())?;
+            Self::start_component_if_not_running(exec_algorithm_id.inner())?;
         }
 
         Ok(())
+    }
+
+    /// Starts the trader while releasing the trader borrow before component callbacks run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the trader state transition or any component startup fails.
+    pub fn start_with_component_callbacks(trader: &Rc<RefCell<Self>>) -> anyhow::Result<()> {
+        trader
+            .borrow_mut()
+            .transition_state(ComponentTrigger::Start)?;
+
+        let (actor_ids, strategy_ids, exec_algorithm_ids) = {
+            let trader_ref = trader.borrow();
+            (
+                trader_ref.actor_ids.clone(),
+                trader_ref.strategy_ids.clone(),
+                trader_ref.exec_algorithm_ids.clone(),
+            )
+        };
+
+        for actor_id in actor_ids {
+            log::debug!("Starting actor {actor_id}");
+            Self::start_component_if_not_running(actor_id.inner())?;
+        }
+
+        for strategy_id in strategy_ids {
+            log::debug!("Starting strategy {strategy_id}");
+            Self::start_component_if_not_running(strategy_id.inner())?;
+        }
+
+        for exec_algorithm_id in exec_algorithm_ids {
+            log::debug!("Starting execution algorithm {exec_algorithm_id}");
+            Self::start_component_if_not_running(exec_algorithm_id.inner())?;
+        }
+
+        let mut trader_ref = trader.borrow_mut();
+        let clock = trader_ref.clock_factory.clock();
+        trader_ref.ts_started = Some(clock.borrow().timestamp_ns());
+        trader_ref.transition_state(ComponentTrigger::StartCompleted)?;
+
+        Ok(())
+    }
+
+    fn start_component_if_not_running(component_id: Ustr) -> anyhow::Result<()> {
+        if component_state(&component_id)? == ComponentState::Running {
+            return Ok(());
+        }
+
+        start_component(&component_id)
     }
 
     /// Stops all registered components.
@@ -761,12 +986,12 @@ impl Trader {
     pub fn stop_components(&mut self) -> anyhow::Result<()> {
         for actor_id in &self.actor_ids {
             log::debug!("Stopping actor {actor_id}");
-            stop_component(&actor_id.inner())?;
+            Self::stop_component_if_running(actor_id.inner())?;
         }
 
         for exec_algorithm_id in &self.exec_algorithm_ids {
             log::debug!("Stopping execution algorithm {exec_algorithm_id}");
-            stop_component(&exec_algorithm_id.inner())?;
+            Self::stop_component_if_running(exec_algorithm_id.inner())?;
         }
 
         for strategy_id in self.strategy_ids.clone() {
@@ -777,11 +1002,19 @@ impl Trader {
                 .is_none_or(|stop_fn| stop_fn());
 
             if should_proceed {
-                stop_component(&strategy_id.inner())?;
+                Self::stop_component_if_running(strategy_id.inner())?;
             }
         }
 
         Ok(())
+    }
+
+    fn stop_component_if_running(component_id: Ustr) -> anyhow::Result<()> {
+        if component_state(&component_id)? != ComponentState::Running {
+            return Ok(());
+        }
+
+        stop_component(&component_id)
     }
 
     /// Resets all registered components.
@@ -1211,6 +1444,271 @@ impl Component for Trader {
     fn on_dispose(&mut self) -> anyhow::Result<()> {
         Self::on_dispose(self)
     }
+}
+
+#[cfg(feature = "python")]
+fn create_python_actor(config: &ImportableActorConfig) -> anyhow::Result<(Py<PyAny>, ActorId)> {
+    let (module_name, class_name) = split_import_path(&config.actor_path, "actor_path")?;
+
+    log::info!("Importing actor from module: {module_name} class: {class_name}");
+
+    Python::attach(|py| -> anyhow::Result<(Py<PyAny>, ActorId)> {
+        let actor_class = import_python_class(py, module_name, class_name)?;
+        let config_instance = create_config_instance(py, &config.config_path, &config.config)?;
+
+        let python_actor = if let Some(config_obj) = config_instance.as_ref() {
+            actor_class.call1((config_obj,))?
+        } else {
+            actor_class.call0()?
+        };
+
+        let mut py_data_actor_ref = python_actor
+            .extract::<PyRefMut<PyDataActor>>()
+            .map_err(Into::<PyErr>::into)
+            .map_err(|e| anyhow::anyhow!("Failed to extract PyDataActor: {e}"))?;
+
+        if let Some(config_obj) = config_instance.as_ref() {
+            configure_py_data_actor(&mut py_data_actor_ref, config_obj)?;
+        }
+
+        py_data_actor_ref.set_python_instance(python_actor.clone().unbind());
+        let actor_id = py_data_actor_ref.actor_id();
+
+        Ok((python_actor.unbind(), actor_id))
+    })
+}
+
+#[cfg(feature = "python")]
+fn create_python_strategy(
+    config: &ImportableStrategyConfig,
+) -> anyhow::Result<(Py<PyAny>, StrategyId)> {
+    let (module_name, class_name) = split_import_path(&config.strategy_path, "strategy_path")?;
+
+    log::info!("Importing strategy from module: {module_name} class: {class_name}");
+
+    Python::attach(|py| -> anyhow::Result<(Py<PyAny>, StrategyId)> {
+        let strategy_class = import_python_class(py, module_name, class_name)?;
+        let config_instance = create_config_instance(py, &config.config_path, &config.config)?;
+
+        let python_strategy = if let Some(config_obj) = config_instance.as_ref() {
+            strategy_class.call1((config_obj,))?
+        } else {
+            strategy_class.call0()?
+        };
+
+        let mut py_strategy_ref = python_strategy
+            .extract::<PyRefMut<PyStrategy>>()
+            .map_err(Into::<PyErr>::into)
+            .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
+
+        if let Some(config_obj) = config_instance.as_ref() {
+            configure_py_strategy(&mut py_strategy_ref, config_obj)?;
+        }
+
+        py_strategy_ref.set_python_instance(python_strategy.clone().unbind());
+        let strategy_id = py_strategy_ref.strategy_id();
+
+        Ok((python_strategy.unbind(), strategy_id))
+    })
+}
+
+#[cfg(feature = "python")]
+fn split_import_path<'a>(path: &'a str, field: &str) -> anyhow::Result<(&'a str, &'a str)> {
+    let Some((module_name, class_name)) = path.split_once(':') else {
+        anyhow::bail!("{field} must be in format 'module.path:ClassName'");
+    };
+
+    if module_name.is_empty() || class_name.is_empty() || class_name.contains(':') {
+        anyhow::bail!("{field} must be in format 'module.path:ClassName'");
+    }
+
+    Ok((module_name, class_name))
+}
+
+#[cfg(feature = "python")]
+fn import_python_class<'py>(
+    py: Python<'py>,
+    module_name: &str,
+    class_name: &str,
+) -> anyhow::Result<Bound<'py, PyAny>> {
+    let module = py
+        .import(module_name)
+        .map_err(|e| anyhow::anyhow!("Failed to import module {module_name}: {e}"))?;
+
+    module
+        .getattr(class_name)
+        .map_err(|e| anyhow::anyhow!("Failed to get class {class_name}: {e}"))
+}
+
+#[cfg(feature = "python")]
+fn create_config_instance<'py>(
+    py: Python<'py>,
+    config_path: &str,
+    config: &std::collections::HashMap<String, serde_json::Value>,
+) -> anyhow::Result<Option<Bound<'py, PyAny>>> {
+    if config_path.is_empty() && config.is_empty() {
+        log::debug!("No config_path or empty config, using None");
+        return Ok(None);
+    }
+
+    let Some((config_module_name, config_class_name)) = config_path.split_once(':') else {
+        anyhow::bail!("config_path must be in format 'module.path:ClassName', was {config_path}");
+    };
+
+    if config_module_name.is_empty()
+        || config_class_name.is_empty()
+        || config_class_name.contains(':')
+    {
+        anyhow::bail!("config_path must be in format 'module.path:ClassName', was {config_path}");
+    }
+
+    log::debug!(
+        "Importing config class from module: {config_module_name} class: {config_class_name}"
+    );
+
+    let config_module = py
+        .import(config_module_name)
+        .map_err(|e| anyhow::anyhow!("Failed to import config module {config_module_name}: {e}"))?;
+    let config_class = config_module
+        .getattr(config_class_name)
+        .map_err(|e| anyhow::anyhow!("Failed to get config class {config_class_name}: {e}"))?;
+    let py_dict = PyDict::new(py);
+
+    for (key, value) in config {
+        let py_value = config_value_to_py(py, key, value)?;
+        py_dict.set_item(key, py_value)?;
+    }
+
+    let config_instance = match config_class.call((), Some(&py_dict)) {
+        Ok(instance) => instance,
+        Err(kwargs_err) => match config_class.call0() {
+            Ok(instance) => {
+                for (key, value) in config {
+                    let py_value = config_value_to_py(py, key, value)?;
+
+                    if let Err(setattr_err) = instance.setattr(key, py_value) {
+                        log::warn!("Failed to set attribute {key}: {setattr_err}");
+                    }
+                }
+
+                if instance.hasattr("__post_init__")? {
+                    instance.call_method0("__post_init__")?;
+                }
+
+                instance
+            }
+            Err(default_err) => {
+                anyhow::bail!(
+                    "Failed to create config instance. Tried kwargs: {kwargs_err}, default: {default_err}"
+                );
+            }
+        },
+    };
+
+    Ok(Some(config_instance))
+}
+
+#[cfg(feature = "python")]
+fn config_value_to_py<'py>(
+    py: Python<'py>,
+    key: &str,
+    value: &serde_json::Value,
+) -> anyhow::Result<Bound<'py, PyAny>> {
+    if key == "actor_id"
+        && let Some(actor_id) = value.as_str()
+    {
+        return Ok(ActorId::new_checked(actor_id)?
+            .into_pyobject(py)?
+            .into_any());
+    }
+
+    let json_str = serde_json::to_string(value)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize config value: {e}"))?;
+
+    Ok(PyModule::import(py, "json")?
+        .call_method("loads", (json_str,), None)?
+        .into_any())
+}
+
+#[cfg(feature = "python")]
+fn configure_py_data_actor(
+    actor: &mut PyRefMut<'_, PyDataActor>,
+    config_obj: &Bound<'_, PyAny>,
+) -> anyhow::Result<()> {
+    if let Some(actor_id) = config_obj
+        .getattr("actor_id")
+        .ok()
+        .filter(|value| !value.is_none())
+    {
+        let actor_id = if let Ok(actor_id) = actor_id.extract::<ActorId>() {
+            actor_id
+        } else if let Ok(actor_id_str) = actor_id.extract::<String>() {
+            ActorId::new_checked(&actor_id_str)?
+        } else {
+            anyhow::bail!("Invalid `actor_id` type");
+        };
+        actor.set_actor_id(actor_id);
+    }
+
+    if let Some(log_events) = extract_bool_config_attr(config_obj, "log_events") {
+        actor.set_log_events(log_events);
+    }
+
+    if let Some(log_commands) = extract_bool_config_attr(config_obj, "log_commands") {
+        actor.set_log_commands(log_commands);
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "python")]
+fn configure_py_strategy(
+    strategy: &mut PyRefMut<'_, PyStrategy>,
+    config_obj: &Bound<'_, PyAny>,
+) -> anyhow::Result<()> {
+    if let Some(strategy_id) = config_obj
+        .getattr("strategy_id")
+        .ok()
+        .filter(|value| !value.is_none())
+    {
+        let strategy_id = if let Ok(strategy_id) = strategy_id.extract::<StrategyId>() {
+            strategy_id
+        } else if let Ok(strategy_id_str) = strategy_id.extract::<String>() {
+            StrategyId::new_checked(&strategy_id_str)?
+        } else {
+            anyhow::bail!("Invalid `strategy_id` type");
+        };
+        strategy.set_strategy_id(strategy_id)?;
+    }
+
+    if let Some(order_id_tag) = config_obj
+        .getattr("order_id_tag")
+        .ok()
+        .filter(|value| !value.is_none())
+    {
+        let order_id_tag = order_id_tag
+            .extract::<String>()
+            .map_err(|e| anyhow::anyhow!("Invalid `order_id_tag` type: {e}"))?;
+        strategy.set_order_id_tag(&order_id_tag)?;
+    }
+
+    if let Some(log_events) = extract_bool_config_attr(config_obj, "log_events") {
+        strategy.set_log_events(log_events);
+    }
+
+    if let Some(log_commands) = extract_bool_config_attr(config_obj, "log_commands") {
+        strategy.set_log_commands(log_commands);
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "python")]
+fn extract_bool_config_attr(config_obj: &Bound<'_, PyAny>, attr: &str) -> Option<bool> {
+    config_obj
+        .getattr(attr)
+        .ok()
+        .and_then(|value| value.extract::<bool>().ok())
 }
 
 #[cfg(test)]

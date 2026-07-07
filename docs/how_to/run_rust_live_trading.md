@@ -1,6 +1,6 @@
 # Run Live Trading (Rust)
 
-The `LiveNode` connects to real venues through adapter clients. This guide
+The `LiveNode` connects to real venues and data sources through adapter clients. This guide
 walks through a complete live trading setup using OKX as an example.
 
 For background on live trading architecture and reconciliation, see the
@@ -154,19 +154,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Most adapters include runnable examples with data testers and execution
 testers:
 
-| Adapter      | Example directory                          |
-|--------------|--------------------------------------------|
-| Architect AX | `crates/adapters/architect_ax/examples/`   |
-| Betfair      | `crates/adapters/betfair/examples/`        |
-| Binance      | `crates/adapters/binance/examples/`        |
-| BitMEX       | `crates/adapters/bitmex/examples/`         |
-| Bybit        | `crates/adapters/bybit/examples/`          |
-| Databento    | `crates/adapters/databento/examples/`      |
-| Deribit      | `crates/adapters/deribit/examples/`        |
-| dYdX         | `crates/adapters/dydx/examples/`           |
-| Hyperliquid  | `crates/adapters/hyperliquid/examples/`    |
-| Kraken       | `crates/adapters/kraken/examples/`         |
-| OKX          | `crates/adapters/okx/examples/`            |
-| Polymarket   | `crates/adapters/polymarket/examples/`     |
-| Sandbox      | `crates/adapters/sandbox/examples/`        |
-| Tardis       | `crates/adapters/tardis/examples/`         |
+| Adapter             | Example directory                                  |
+|---------------------|----------------------------------------------------|
+| Architect AX        | `crates/adapters/architect_ax/examples/`           |
+| Betfair             | `crates/adapters/betfair/examples/`                |
+| Binance             | `crates/adapters/binance/examples/`                |
+| BitMEX              | `crates/adapters/bitmex/examples/`                 |
+| Blockchain          | `crates/adapters/blockchain/examples/`             |
+| Bybit               | `crates/adapters/bybit/examples/`                  |
+| Coinbase            | `crates/adapters/coinbase/examples/`               |
+| Databento           | `crates/adapters/databento/examples/`              |
+| Deribit             | `crates/adapters/deribit/examples/`                |
+| Derive              | `crates/adapters/derive/examples/`                 |
+| dYdX                | `crates/adapters/dydx/examples/`                   |
+| Hyperliquid         | `crates/adapters/hyperliquid/examples/`            |
+| Interactive Brokers | `crates/adapters/interactive_brokers/examples/`    |
+| Kraken              | `crates/adapters/kraken/examples/`                 |
+| Lighter             | `crates/adapters/lighter/examples/`                |
+| OKX                 | `crates/adapters/okx/examples/`                    |
+| Polymarket          | `crates/adapters/polymarket/examples/`             |
+| Sandbox             | `crates/adapters/sandbox/examples/`                |
+| Tardis              | `crates/adapters/tardis/examples/`                 |

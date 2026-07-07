@@ -13,6 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import inspect
+
 import pytest
 
 from nautilus_trader.backtest import BacktestEngine
@@ -20,6 +22,7 @@ from nautilus_trader.backtest import BacktestEngineConfig
 from nautilus_trader.common import DataActor
 from nautilus_trader.common import DataActorConfig
 from nautilus_trader.model import ExecAlgorithmId
+from nautilus_trader.trading import ExecutionAlgorithm
 from nautilus_trader.trading import ExecutionAlgorithmConfig
 from nautilus_trader.trading import ImportableExecAlgorithmConfig
 
@@ -44,6 +47,89 @@ class RequiredConfigBacktestExecAlgorithm(DataActor):
     def __init__(self, config: RequiredConfigBacktestExecAlgorithmConfig):
         super().__init__()
         type(self).received_exec_algorithm_id = config.exec_algorithm_id
+
+
+@pytest.mark.parametrize(
+    ("method_name", "parameter_names"),
+    [
+        ("execute", ["self", "command"]),
+        ("on_order", ["self", "order"]),
+        ("on_order_list", ["self", "order_list", "orders"]),
+        ("on_order_event", ["self", "event"]),
+        ("on_order_initialized", ["self", "event"]),
+        ("on_order_denied", ["self", "event"]),
+        ("on_order_emulated", ["self", "event"]),
+        ("on_order_released", ["self", "event"]),
+        ("on_order_submitted", ["self", "event"]),
+        ("on_order_rejected", ["self", "event"]),
+        ("on_order_accepted", ["self", "event"]),
+        ("on_order_canceled", ["self", "event"]),
+        ("on_order_expired", ["self", "event"]),
+        ("on_order_triggered", ["self", "event"]),
+        ("on_order_pending_update", ["self", "event"]),
+        ("on_order_pending_cancel", ["self", "event"]),
+        ("on_order_modify_rejected", ["self", "event"]),
+        ("on_order_cancel_rejected", ["self", "event"]),
+        ("on_order_updated", ["self", "event"]),
+        ("on_order_filled", ["self", "event"]),
+        ("on_position_event", ["self", "event"]),
+        ("on_position_opened", ["self", "event"]),
+        ("on_position_changed", ["self", "event"]),
+        ("on_position_closed", ["self", "event"]),
+        (
+            "spawn_market",
+            [
+                "self",
+                "primary",
+                "quantity",
+                "time_in_force",
+                "reduce_only",
+                "tags",
+                "reduce_primary",
+            ],
+        ),
+        (
+            "spawn_limit",
+            [
+                "self",
+                "primary",
+                "quantity",
+                "price",
+                "time_in_force",
+                "expire_time",
+                "post_only",
+                "reduce_only",
+                "display_qty",
+                "emulation_trigger",
+                "tags",
+                "reduce_primary",
+            ],
+        ),
+        (
+            "spawn_market_to_limit",
+            [
+                "self",
+                "primary",
+                "quantity",
+                "time_in_force",
+                "expire_time",
+                "reduce_only",
+                "display_qty",
+                "emulation_trigger",
+                "tags",
+                "reduce_primary",
+            ],
+        ),
+        ("submit_order", ["self", "order", "position_id", "client_id"]),
+        ("modify_order", ["self", "order", "quantity", "price", "trigger_price", "client_id"]),
+        ("modify_order_in_place", ["self", "order", "quantity", "price", "trigger_price"]),
+        ("cancel_order", ["self", "order", "client_id"]),
+    ],
+)
+def test_execution_algorithm_authoring_surface_parameters(method_name, parameter_names):
+    method = getattr(ExecutionAlgorithm, method_name)
+
+    assert list(inspect.signature(method).parameters) == parameter_names
 
 
 def test_add_native_exec_algorithm_rejects_unknown_type():

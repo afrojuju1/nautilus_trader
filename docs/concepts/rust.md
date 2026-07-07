@@ -55,13 +55,17 @@ you choose the right one for your use case.
 | Betfair             | ✓                  | ✓       | ✓       |
 | Binance             | ✓                  | ✓       | ✓       |
 | BitMEX              | ✓                  | ✓       | ✓       |
+| Blockchain          | -                  | ✓       | ✓       |
 | Bybit               | ✓                  | ✓       | ✓       |
+| Coinbase            | -                  | ✓       | ✓       |
 | Databento           | ✓                  | ✓       | ✓       |
 | Deribit             | ✓                  | ✓       | ✓       |
+| Derive              | -                  | ✓       | ✓       |
 | dYdX                | ✓                  | ✓       | ✓       |
 | Hyperliquid         | ✓                  | ✓       | ✓       |
-| Interactive Brokers | ✓                  | -       | -       |
+| Interactive Brokers | ✓                  | ✓       | ✓       |
 | Kraken              | ✓                  | ✓       | ✓       |
+| Lighter             | -                  | ✓       | ✓       |
 | OKX                 | ✓                  | ✓       | ✓       |
 | Polymarket          | ✓                  | ✓       | ✓       |
 | Sandbox             | ✓                  | ✓       | ✓       |
@@ -70,7 +74,7 @@ you choose the right one for your use case.
 ### Choosing a path
 
 - **v1 legacy** is the most complete today. Use it if you need the
-  Controller, Interactive Brokers, or config serialization.
+  Controller or config serialization.
 - **v2 Rust** gives native performance without a Python runtime. All core
   trading functionality is available. Use it for latency-sensitive
   deployments or teams that prefer a compiled language.
@@ -116,7 +120,7 @@ nautilus-model = { git = "https://github.com/nautechsystems/nautilus_trader.git"
 nautilus-trading = { git = "https://github.com/nautechsystems/nautilus_trader.git", branch = "develop", features = ["examples"] }
 ```
 
-The minimum supported Rust version (MSRV) is **1.96.0**.
+The minimum supported Rust version (MSRV) is **1.96.1**.
 
 ### Feature flags
 
@@ -133,6 +137,28 @@ Standard 9-digit precision handles most traditional finance instruments.
 Enable `high-precision` for crypto venues where prices can have many decimal
 places (e.g. `0.00000001`).
 :::
+
+### Memory allocator
+
+The Python wheels and the `nautilus` CLI use [mimalloc](https://crates.io/crates/mimalloc)
+for Rust allocations. A Rust binary chooses its own allocator, so add mimalloc to yours
+to match:
+
+```toml
+[dependencies]
+mimalloc = "0.1"
+```
+
+```rust
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+```
+
+The default system allocator also works, but backtest throughput drops materially,
+especially on Windows, where allocator overhead can reach half of hot-loop run time.
+See the [architecture guide](architecture.md#memory-allocation) for background.
 
 ## Actors
 
@@ -417,27 +443,31 @@ Source:
 For an annotated walkthrough, see the
 [Run Live Trading (Rust)](../how_to/run_rust_live_trading.md) how-to guide.
 
-The `LiveNode` connects to real venues through adapter clients. The builder
+The `LiveNode` connects to real venues and data sources through adapter clients. The builder
 pattern configures data and execution clients, then `run()` starts the async
 event loop. Each adapter provides its own factory and config types.
 
-| Adapter        | Example                                                  |
-|----------------|----------------------------------------------------------|
-| Architect AX   | `crates/adapters/architect_ax/examples/`                 |
-| Betfair        | `crates/adapters/betfair/examples/`                      |
-| Binance        | `crates/adapters/binance/examples/`                      |
-| BitMEX         | `crates/adapters/bitmex/examples/`                       |
-| Blockchain     | `crates/adapters/blockchain/examples/`                   |
-| Bybit          | `crates/adapters/bybit/examples/`                        |
-| Databento      | `crates/adapters/databento/examples/`                    |
-| Deribit        | `crates/adapters/deribit/examples/`                      |
-| dYdX           | `crates/adapters/dydx/examples/`                         |
-| Hyperliquid    | `crates/adapters/hyperliquid/examples/`                  |
-| Kraken         | `crates/adapters/kraken/examples/`                       |
-| OKX            | `crates/adapters/okx/examples/`                          |
-| Polymarket     | `crates/adapters/polymarket/examples/`                   |
-| Sandbox        | `crates/adapters/sandbox/examples/`                      |
-| Tardis         | `crates/adapters/tardis/examples/`                       |
+| Adapter             | Example                                                |
+|---------------------|--------------------------------------------------------|
+| Architect AX        | `crates/adapters/architect_ax/examples/`               |
+| Betfair             | `crates/adapters/betfair/examples/`                    |
+| Binance             | `crates/adapters/binance/examples/`                    |
+| BitMEX              | `crates/adapters/bitmex/examples/`                     |
+| Blockchain          | `crates/adapters/blockchain/examples/`                 |
+| Bybit               | `crates/adapters/bybit/examples/`                      |
+| Coinbase            | `crates/adapters/coinbase/examples/`                   |
+| Databento           | `crates/adapters/databento/examples/`                  |
+| Deribit             | `crates/adapters/deribit/examples/`                    |
+| Derive              | `crates/adapters/derive/examples/`                     |
+| dYdX                | `crates/adapters/dydx/examples/`                       |
+| Hyperliquid         | `crates/adapters/hyperliquid/examples/`                |
+| Interactive Brokers | `crates/adapters/interactive_brokers/examples/`        |
+| Kraken              | `crates/adapters/kraken/examples/`                     |
+| Lighter             | `crates/adapters/lighter/examples/`                    |
+| OKX                 | `crates/adapters/okx/examples/`                        |
+| Polymarket          | `crates/adapters/polymarket/examples/`                 |
+| Sandbox             | `crates/adapters/sandbox/examples/`                    |
+| Tardis              | `crates/adapters/tardis/examples/`                     |
 
 Most adapters include `node_data_tester.rs` and `node_exec_tester.rs`
 examples. These test data requests, streaming, and order execution
@@ -452,5 +482,5 @@ against live venues.
 - [Architecture](architecture.md) - System design and data/execution flow.
 - [Actors](actors.md) - Actor concepts (applies to both Python and Rust).
 - [Strategies](strategies.md) - Strategy concepts and handler reference.
-- [Events](events.md) - Event types and handler dispatch.
-- [Backtesting](backtesting.md) - Backtest concepts and matching engine behavior.
+- [Events](events/) - Event types and handler dispatch.
+- [Backtesting](backtesting/) - Backtest concepts and matching engine behavior.

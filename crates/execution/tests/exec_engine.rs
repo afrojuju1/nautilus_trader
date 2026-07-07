@@ -8816,6 +8816,193 @@ fn test_filled_order_removes_from_own_book() {
 }
 
 #[rstest]
+fn test_partially_filled_order_shrinks_own_book_quantity() {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = ExecutionEngineConfig {
+        debug: true,
+        snapshot_orders: true,
+        snapshot_positions: true,
+        manage_own_order_books: true,
+        ..Default::default()
+    };
+
+    let mut execution_engine = ExecutionEngine::new(clock, cache, Some(config));
+
+    let trader_id = TraderId::test_default();
+    let strategy_id = StrategyId::test_default();
+    let account_id = AccountId::test_default();
+    let instrument = audusd_sim();
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone().into())
+        .unwrap();
+
+    let stub_client = StubExecutionClient::new(
+        ClientId::from("STUB"),
+        account_id,
+        Venue::test_default(),
+        OmsType::Netting,
+        None,
+    );
+    execution_engine
+        .register_client(Box::new(stub_client))
+        .unwrap();
+
+    let order_bid = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument.id)
+        .client_order_id(ClientOrderId::from("O-20240101-000000-001-001-1"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .price(Price::from_str("10.0").unwrap())
+        .build();
+
+    let order_ask = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(trader_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument.id)
+        .client_order_id(ClientOrderId::from("O-20240101-000000-001-001-2"))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from(100_000))
+        .price(Price::from_str("11.0").unwrap())
+        .build();
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order_bid.clone(), None, Some(ClientId::from("STUB")), true)
+        .unwrap();
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order_ask.clone(), None, Some(ClientId::from("STUB")), true)
+        .unwrap();
+
+    let submit_order_bid = SubmitOrder {
+        trader_id,
+        strategy_id,
+        instrument_id: instrument.id,
+        client_order_id: order_bid.client_order_id(),
+        order_init: order_bid.init_event().clone(),
+        position_id: None,
+        params: None,
+        client_id: Some(ClientId::from("STUB")),
+        exec_algorithm_id: None,
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    let submit_order_ask = SubmitOrder {
+        trader_id,
+        strategy_id,
+        instrument_id: instrument.id,
+        client_order_id: order_ask.client_order_id(),
+        order_init: order_ask.init_event().clone(),
+        position_id: None,
+        params: None,
+        client_id: Some(ClientId::from("STUB")),
+        exec_algorithm_id: None,
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    execution_engine.execute(TradingCommand::SubmitOrder(submit_order_bid));
+    execution_engine.execute(TradingCommand::SubmitOrder(submit_order_ask));
+    let order_submitted_bid = TestOrderEventStubs::submitted(&order_bid, account_id);
+    let order_submitted_ask = TestOrderEventStubs::submitted(&order_ask, account_id);
+    execution_engine.process(&order_submitted_bid);
+    execution_engine.process(&order_submitted_ask);
+
+    let order_accepted_bid =
+        TestOrderEventStubs::accepted(&order_bid, account_id, VenueOrderId::from("V-001"));
+    let order_accepted_ask =
+        TestOrderEventStubs::accepted(&order_ask, account_id, VenueOrderId::from("V-002"));
+    execution_engine.process(&order_accepted_bid);
+    execution_engine.process(&order_accepted_ask);
+
+    {
+        let cache = execution_engine.cache().borrow();
+        let own_book = cache
+            .try_own_order_book(&instrument.id)
+            .expect("Own order book should exist");
+        let bid_quantities = own_book.bid_quantity(None, None, None, None, None);
+        let ask_quantities = own_book.ask_quantity(None, None, None, None, None);
+
+        assert_eq!(bid_quantities.get(&dec!(10.0)), Some(&dec!(100_000)));
+        assert_eq!(ask_quantities.get(&dec!(11.0)), Some(&dec!(100_000)));
+    }
+
+    let order_filled_bid = OrderEventAny::Filled(build_order_filled(
+        order_bid.trader_id(),
+        order_bid.strategy_id(),
+        instrument.id(),
+        order_bid.client_order_id(),
+        VenueOrderId::from("V-001"),
+        account_id,
+        TradeId::new("E-19700101-000000-001-001"),
+        order_bid.order_side(),
+        order_bid.order_type(),
+        Quantity::from(40_000), // last_qty: partial fill
+        Price::from_str("10.0").unwrap(),
+        instrument.quote_currency(),
+        LiquiditySide::Maker,
+        None, // position_id
+        None, // commission
+    ));
+    let order_filled_ask = OrderEventAny::Filled(build_order_filled(
+        order_ask.trader_id(),
+        order_ask.strategy_id(),
+        instrument.id(),
+        order_ask.client_order_id(),
+        VenueOrderId::from("V-002"),
+        account_id,
+        TradeId::new("E-19700101-000000-001-002"),
+        order_ask.order_side(),
+        order_ask.order_type(),
+        Quantity::from(40_000), // last_qty: partial fill
+        Price::from_str("11.0").unwrap(),
+        instrument.quote_currency(),
+        LiquiditySide::Maker,
+        None, // position_id
+        None, // commission
+    ));
+    execution_engine.process(&order_filled_bid);
+    execution_engine.process(&order_filled_ask);
+
+    let cache = execution_engine.cache().borrow();
+
+    let bid_order = cache
+        .order(&order_bid.client_order_id())
+        .expect("Bid order should exist in cache");
+    let ask_order = cache
+        .order(&order_ask.client_order_id())
+        .expect("Ask order should exist in cache");
+
+    let own_book = cache
+        .try_own_order_book(&instrument.id)
+        .expect("Own order book should exist");
+
+    let bid_quantities = own_book.bid_quantity(None, None, None, None, None);
+    let ask_quantities = own_book.ask_quantity(None, None, None, None, None);
+
+    assert_eq!(bid_order.status(), OrderStatus::PartiallyFilled);
+    assert_eq!(ask_order.status(), OrderStatus::PartiallyFilled);
+    assert_eq!(bid_order.leaves_qty(), Quantity::from(60_000));
+    assert_eq!(ask_order.leaves_qty(), Quantity::from(60_000));
+    assert_eq!(bid_quantities.get(&dec!(10.0)), Some(&dec!(60_000)));
+    assert_eq!(ask_quantities.get(&dec!(11.0)), Some(&dec!(60_000)));
+}
+
+#[rstest]
 fn test_order_updates_in_own_book() {
     let clock = Rc::new(RefCell::new(TestClock::new()));
     let cache = Rc::new(RefCell::new(Cache::default()));

@@ -17,10 +17,13 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from strategies.backtest_surface import DoubleSpawnExecutionAlgorithm
 from strategies.backtest_surface import MarketDataAuditActor
 from strategies.backtest_surface import MarketDataAuditActorConfig
+from strategies.backtest_surface import OversizedSpawnExecutionAlgorithm
 from strategies.backtest_surface import RoutedOrderExecAlgorithm
 from strategies.backtest_surface import RoutedOrderExecAlgorithmConfig
+from strategies.backtest_surface import RoutedOrderExecutionAlgorithm
 from strategies.backtest_surface import RoutedOrderProbe
 from strategies.backtest_surface import RoutedOrderProbeConfig
 from strategies.backtest_surface import StreamingWhipsaw
@@ -71,9 +74,13 @@ from nautilus_trader.trading import CompositeMarketMakerConfig
 from nautilus_trader.trading import EmaCrossConfig
 from nautilus_trader.trading import ExecutionAlgorithmConfig
 from nautilus_trader.trading import GridMarketMakerConfig
+from nautilus_trader.trading import ImportableControllerConfig
 from nautilus_trader.trading import ImportableExecAlgorithmConfig
 from nautilus_trader.trading import ImportableStrategyConfig
 from tests.providers import TestInstrumentProvider
+from tests.unit.common.actor import ControllerCreatedStrategy
+from tests.unit.common.actor import NonStartingStrategyCreatingController
+from tests.unit.common.actor import StrategyCreatingController
 
 
 USD = Currency.from_str("USD")
@@ -261,6 +268,55 @@ def test_importable_actor_receives_quotes_and_depth_snapshot_books():
     engine.dispose()
 
 
+def test_importable_controller_creates_strategy_on_start():
+    StrategyCreatingController.reset()
+    ControllerCreatedStrategy.reset()
+    engine = BacktestEngine(
+        BacktestEngineConfig(
+            bypass_logging=True,
+            run_analysis=False,
+            controller=ImportableControllerConfig(
+                controller_path="tests.unit.common.actor:StrategyCreatingController",
+                config_path="tests.unit.common.actor:TestControllerConfig",
+                config={"actor_id": "Controller-001"},
+            ),
+        ),
+    )
+
+    engine.run()
+
+    assert StrategyCreatingController.started == 1
+    assert str(StrategyCreatingController.created_strategy_id) == "ControllerCreatedStrategy-001"
+    assert ControllerCreatedStrategy.started == 1
+    engine.dispose()
+
+
+def test_importable_controller_preserves_strategy_start_flag_on_start():
+    NonStartingStrategyCreatingController.reset()
+    ControllerCreatedStrategy.reset()
+    engine = BacktestEngine(
+        BacktestEngineConfig(
+            bypass_logging=True,
+            run_analysis=False,
+            controller=ImportableControllerConfig(
+                controller_path="tests.unit.common.actor:NonStartingStrategyCreatingController",
+                config_path="tests.unit.common.actor:TestControllerConfig",
+                config={"actor_id": "Controller-001"},
+            ),
+        ),
+    )
+
+    engine.run()
+
+    assert NonStartingStrategyCreatingController.started == 1
+    assert (
+        str(NonStartingStrategyCreatingController.created_strategy_id)
+        == "ControllerCreatedStrategy-001"
+    )
+    assert ControllerCreatedStrategy.started == 0
+    engine.dispose()
+
+
 def test_importable_strategy_routes_synthetic_bars_through_native_twap():
     engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
     instrument = TestInstrumentProvider.btcusdt_binance()
@@ -379,6 +435,148 @@ def test_importable_strategy_routes_orders_through_importable_exec_algorithm():
     assert RoutedOrderExecAlgorithm.received_client_order_ids == [str(orders[0].client_order_id)]
     assert RoutedOrderExecAlgorithm.received_exec_algorithm_ids == [algo_id]
     assert RoutedOrderExecAlgorithm.signal_values == [str(orders[0].client_order_id)]
+    engine.dispose()
+
+
+def test_importable_strategy_routes_orders_through_importable_execution_algorithm():
+    RoutedOrderExecutionAlgorithm.reset_observations()
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
+    instrument = TestInstrumentProvider.ethusdt_binance()
+    algo_id = ExecAlgorithmId("PY-EXEC-ROUTE")
+    engine.add_venue(
+        venue=Venue("BINANCE"),
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        starting_balances=[Money(1_000_000.0, USDT)],
+        base_currency=USDT,
+    )
+    engine.add_instrument(instrument)
+    engine.add_exec_algorithm_from_config(
+        ImportableExecAlgorithmConfig(
+            exec_algorithm_path="strategies.backtest_surface:RoutedOrderExecutionAlgorithm",
+            config_path="strategies.backtest_surface:RoutedOrderExecAlgorithmConfig",
+            config={
+                "exec_algorithm_id": str(algo_id),
+                "log_events": False,
+                "log_commands": False,
+            },
+        ),
+    )
+    engine.add_strategy_from_config(
+        ImportableStrategyConfig(
+            strategy_path="strategies.backtest_surface:RoutedOrderProbe",
+            config_path="strategies.backtest_surface:RoutedOrderProbeConfig",
+            config={
+                "instrument_id": str(instrument.id),
+                "trade_size": "0.10000",
+                "exec_algorithm_id": str(algo_id),
+            },
+        ),
+    )
+
+    engine.add_data(_crypto_quotes(instrument, count=3, mid_start=Decimal("2000.00")))
+    engine.run()
+    result = engine.get_result()
+    orders = engine.cache.orders()
+
+    assert result.iterations == 3
+    assert result.total_orders == 1
+    assert orders[0].exec_algorithm_id == algo_id
+    assert orders[0].status == OrderStatus.INITIALIZED
+    assert RoutedOrderExecutionAlgorithm.received_client_order_ids == [
+        str(orders[0].client_order_id),
+    ]
+    assert RoutedOrderExecutionAlgorithm.received_exec_algorithm_ids == [algo_id]
+    assert RoutedOrderExecutionAlgorithm.signal_values == [str(orders[0].client_order_id)]
+    engine.dispose()
+
+
+def test_execution_algorithm_spawn_reuses_cached_primary_order_state():
+    DoubleSpawnExecutionAlgorithm.reset_observations()
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
+    instrument = TestInstrumentProvider.ethusdt_binance()
+    algo_id = ExecAlgorithmId("PY-EXEC-SPAWN")
+    engine.add_venue(
+        venue=Venue("BINANCE"),
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        starting_balances=[Money(1_000_000.0, USDT)],
+        base_currency=USDT,
+    )
+    engine.add_instrument(instrument)
+    engine.add_exec_algorithm_from_config(
+        ImportableExecAlgorithmConfig(
+            exec_algorithm_path="strategies.backtest_surface:DoubleSpawnExecutionAlgorithm",
+            config_path="strategies.backtest_surface:RoutedOrderExecAlgorithmConfig",
+            config={
+                "exec_algorithm_id": str(algo_id),
+                "log_events": False,
+                "log_commands": False,
+            },
+        ),
+    )
+    engine.add_strategy_from_config(
+        ImportableStrategyConfig(
+            strategy_path="strategies.backtest_surface:RoutedOrderProbe",
+            config_path="strategies.backtest_surface:RoutedOrderProbeConfig",
+            config={
+                "instrument_id": str(instrument.id),
+                "trade_size": "0.10000",
+                "exec_algorithm_id": str(algo_id),
+            },
+        ),
+    )
+
+    engine.add_data(_crypto_quotes(instrument, count=3, mid_start=Decimal("2000.00")))
+    engine.run()
+
+    assert DoubleSpawnExecutionAlgorithm.cached_primary_quantities == [Decimal("0.05000")]
+    assert DoubleSpawnExecutionAlgorithm.spawned_exec_algorithm_ids == [algo_id, algo_id]
+    engine.dispose()
+
+
+def test_execution_algorithm_spawn_rejects_quantity_above_primary_leaves_qty():
+    OversizedSpawnExecutionAlgorithm.reset_observations()
+    engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
+    instrument = TestInstrumentProvider.ethusdt_binance()
+    algo_id = ExecAlgorithmId("PY-EXEC-SPAWN-REJECT")
+    engine.add_venue(
+        venue=Venue("BINANCE"),
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        starting_balances=[Money(1_000_000.0, USDT)],
+        base_currency=USDT,
+    )
+    engine.add_instrument(instrument)
+    engine.add_exec_algorithm_from_config(
+        ImportableExecAlgorithmConfig(
+            exec_algorithm_path="strategies.backtest_surface:OversizedSpawnExecutionAlgorithm",
+            config_path="strategies.backtest_surface:RoutedOrderExecAlgorithmConfig",
+            config={
+                "exec_algorithm_id": str(algo_id),
+                "log_events": False,
+                "log_commands": False,
+            },
+        ),
+    )
+    engine.add_strategy_from_config(
+        ImportableStrategyConfig(
+            strategy_path="strategies.backtest_surface:RoutedOrderProbe",
+            config_path="strategies.backtest_surface:RoutedOrderProbeConfig",
+            config={
+                "instrument_id": str(instrument.id),
+                "trade_size": "0.10000",
+                "exec_algorithm_id": str(algo_id),
+            },
+        ),
+    )
+
+    engine.add_data(_crypto_quotes(instrument, count=3, mid_start=Decimal("2000.00")))
+    engine.run()
+
+    assert OversizedSpawnExecutionAlgorithm.error_messages == [
+        "Spawn quantity 0.11000 exceeds primary leaves_qty 0.10000",
+    ]
     engine.dispose()
 
 

@@ -150,11 +150,9 @@ impl HyperSyncClient {
 
     /// Processes DEX contract events for a specific block.
     ///
-    /// Spawns a short-lived task that streams the block's swap, mint, and burn events to the data
-    /// client. The query is bounded just past the requested block, so once its events are delivered
-    /// the stream reaches the end of its range (over-reaching the chain tip) and ends. An
-    /// end-of-stream error that arrives after a response is a clean drain (logged at debug); one
-    /// that arrives before any response means the events could not be fetched (logged at error).
+    /// Spawns a short-lived task that streams the block's pool events to the data client. The query
+    /// uses the inclusive block supplied by the caller and converts it to HyperSync's exclusive
+    /// upper bound once, so a single-block live query for block N covers `[N, N + 1)`.
     ///
     /// # Panics
     ///
@@ -164,22 +162,15 @@ impl HyperSyncClient {
         dex: &DexType,
         block: u64,
         contract_addresses: &[Address],
-        swap_event_encoded_signature: String,
-        mint_event_encoded_signature: String,
-        burn_event_encoded_signature: String,
+        event_signatures: Vec<String>,
     ) {
-        let topics = vec![
-            swap_event_encoded_signature.as_str(),
-            &mint_event_encoded_signature.as_str(),
-            &burn_event_encoded_signature.as_str(),
-        ];
+        let topics = event_signatures
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
 
-        let query = Self::construct_contract_events_query(
-            block,
-            Some(block + 1),
-            contract_addresses,
-            &topics,
-        );
+        let query =
+            Self::construct_contract_events_query(block, Some(block), contract_addresses, &topics);
 
         let tx = if let Some(tx) = &self.tx {
             tx.clone()
@@ -191,6 +182,22 @@ impl HyperSyncClient {
         let client = self.client.clone();
         let dex_extended =
             get_dex_extended(self.chain.name, dex).expect("Failed to get dex extended");
+        let swap_event_signature = dex_extended.swap_created_event.to_string();
+        let mint_event_signature = dex_extended.mint_created_event.to_string();
+        let burn_event_signature = dex_extended.burn_created_event.to_string();
+        let collect_event_signature = dex_extended.collect_created_event.to_string();
+        let flash_event_signature = dex_extended
+            .flash_created_event
+            .as_ref()
+            .map(ToString::to_string);
+        let fee_protocol_update_event_signature = dex_extended
+            .fee_protocol_update_event
+            .as_ref()
+            .map(ToString::to_string);
+        let fee_protocol_collect_event_signature = dex_extended
+            .fee_protocol_collect_event
+            .as_ref()
+            .map(ToString::to_string);
         let cancellation_token = self.cancellation_token.clone();
 
         let _task = get_runtime().spawn(async move {
@@ -218,7 +225,9 @@ impl HyperSyncClient {
                         let response = match response {
                             Ok(resp) => resp,
                             Err(e) => {
-                                if received_response {
+                                if Self::dex_event_stream_error_level(received_response)
+                                    == log::Level::Debug
+                                {
                                     log::debug!("DEX event stream drained for block {block}: {e}");
                                 } else {
                                     log::error!("Failed to receive DEX event stream response: {e}");
@@ -238,7 +247,7 @@ impl HyperSyncClient {
                                     None => continue,
                                 };
 
-                                if event_signature == swap_event_encoded_signature {
+                                if event_signature == swap_event_signature {
                                     match dex_extended.parse_swap_event_hypersync(&log) {
                                         Ok(swap_event) => {
                                             if let Err(e) =
@@ -253,11 +262,11 @@ impl HyperSyncClient {
                                             );
                                         }
                                     }
-                                } else if event_signature == mint_event_encoded_signature {
+                                } else if event_signature == mint_event_signature {
                                     match dex_extended.parse_mint_event_hypersync(&log) {
-                                        Ok(swap_event) => {
+                                        Ok(mint_event) => {
                                             if let Err(e) =
-                                                tx.send(BlockchainMessage::MintEvent(swap_event))
+                                                tx.send(BlockchainMessage::MintEvent(mint_event))
                                             {
                                                 log::error!("Failed to send mint event: {e}");
                                             }
@@ -268,11 +277,11 @@ impl HyperSyncClient {
                                             );
                                         }
                                     }
-                                } else if event_signature == burn_event_encoded_signature {
+                                } else if event_signature == burn_event_signature {
                                     match dex_extended.parse_burn_event_hypersync(&log) {
-                                        Ok(swap_event) => {
+                                        Ok(burn_event) => {
                                             if let Err(e) =
-                                                tx.send(BlockchainMessage::BurnEvent(swap_event))
+                                                tx.send(BlockchainMessage::BurnEvent(burn_event))
                                             {
                                                 log::error!("Failed to send burn event: {e}");
                                             }
@@ -280,6 +289,79 @@ impl HyperSyncClient {
                                         Err(e) => {
                                             log::error!(
                                                 "Failed to parse burn with error '{e:?}' for event: {log:?}",
+                                            );
+                                        }
+                                    }
+                                } else if event_signature == collect_event_signature {
+                                    match dex_extended.parse_collect_event_hypersync(&log) {
+                                        Ok(collect_event) => {
+                                            if let Err(e) =
+                                                tx.send(BlockchainMessage::CollectEvent(collect_event))
+                                            {
+                                                log::error!("Failed to send collect event: {e}");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::error!(
+                                                "Failed to parse collect with error '{e:?}' for event: {log:?}",
+                                            );
+                                        }
+                                    }
+                                } else if flash_event_signature
+                                    .as_ref()
+                                    .is_some_and(|signature| event_signature == *signature)
+                                {
+                                    match dex_extended.parse_flash_event_hypersync(&log) {
+                                        Ok(flash_event) => {
+                                            if let Err(e) =
+                                                tx.send(BlockchainMessage::FlashEvent(flash_event))
+                                            {
+                                                log::error!("Failed to send flash event: {e}");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::error!(
+                                                "Failed to parse flash with error '{e:?}' for event: {log:?}",
+                                            );
+                                        }
+                                    }
+                                } else if fee_protocol_update_event_signature
+                                    .as_ref()
+                                    .is_some_and(|signature| event_signature == *signature)
+                                {
+                                    match dex_extended.parse_fee_protocol_update_event_hypersync(&log) {
+                                        Ok(update_event) => {
+                                            if let Err(e) = tx.send(
+                                                BlockchainMessage::FeeProtocolUpdateEvent(update_event),
+                                            ) {
+                                                log::error!(
+                                                    "Failed to send fee-protocol update event: {e}"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::error!(
+                                                "Failed to parse fee-protocol update with error '{e:?}' for event: {log:?}",
+                                            );
+                                        }
+                                    }
+                                } else if fee_protocol_collect_event_signature
+                                    .as_ref()
+                                    .is_some_and(|signature| event_signature == *signature)
+                                {
+                                    match dex_extended.parse_fee_protocol_collect_event_hypersync(&log) {
+                                        Ok(collect_event) => {
+                                            if let Err(e) = tx.send(
+                                                BlockchainMessage::FeeProtocolCollectEvent(collect_event),
+                                            ) {
+                                                log::error!(
+                                                    "Failed to send fee-protocol collect event: {e}"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::error!(
+                                                "Failed to parse fee-protocol collect with error '{e:?}' for event: {log:?}",
                                             );
                                         }
                                     }
@@ -560,6 +642,14 @@ impl HyperSyncClient {
         to_block.map(|block| block.saturating_add(1))
     }
 
+    fn dex_event_stream_error_level(received_response: bool) -> log::Level {
+        if received_response {
+            log::Level::Debug
+        } else {
+            log::Level::Error
+        }
+    }
+
     /// Unsubscribes from new blocks by stopping the background watch task.
     pub async fn unsubscribe_blocks(&mut self) {
         if let Some(task) = self.blocks_task.take() {
@@ -672,5 +762,46 @@ mod tests {
 
         assert_eq!(query.from_block, 10);
         assert_eq!(query.to_block, Some(13));
+    }
+
+    #[rstest]
+    fn construct_contract_events_query_single_block_uses_next_block_as_exclusive_bound() {
+        let address = Address::from_str("0x0000000000000000000000000000000000000001").unwrap();
+        let query = HyperSyncClient::construct_contract_events_query(
+            10,
+            Some(10),
+            &[address],
+            &["0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"],
+        );
+
+        assert_eq!(query.from_block, 10);
+        assert_eq!(query.to_block, Some(11));
+    }
+
+    #[rstest]
+    fn construct_contract_events_query_open_upper_bound_stays_open() {
+        let address = Address::from_str("0x0000000000000000000000000000000000000001").unwrap();
+        let query = HyperSyncClient::construct_contract_events_query(
+            10,
+            None,
+            &[address],
+            &["0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"],
+        );
+
+        assert_eq!(query.from_block, 10);
+        assert_eq!(query.to_block, None);
+    }
+
+    #[rstest]
+    #[case(false, log::Level::Error)]
+    #[case(true, log::Level::Debug)]
+    fn dex_event_stream_error_level_preserves_pre_response_errors(
+        #[case] received_response: bool,
+        #[case] expected: log::Level,
+    ) {
+        assert_eq!(
+            HyperSyncClient::dex_event_stream_error_level(received_response),
+            expected
+        );
     }
 }

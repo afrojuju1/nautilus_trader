@@ -89,6 +89,8 @@ class BacktestEngineConfig:
     def exec_engine(self) -> execution.ExecutionEngineConfig | None: ...
     @property
     def portfolio(self) -> portfolio.PortfolioConfig | None: ...
+    @property
+    def controller(self) -> trading.ImportableControllerConfig | None: ...
     def __new__(
         cls,
         trader_id: model.TraderId | None = None,
@@ -111,6 +113,7 @@ class BacktestEngineConfig:
         risk_engine: risk.RiskEngineConfig | None = None,
         exec_engine: execution.ExecutionEngineConfig | None = None,
         portfolio: portfolio.PortfolioConfig | None = None,
+        controller: trading.ImportableControllerConfig | None = None,
     ) -> BacktestEngineConfig: ...
 
 @typing.final

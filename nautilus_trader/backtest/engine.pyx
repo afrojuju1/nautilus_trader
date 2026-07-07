@@ -3775,6 +3775,9 @@ cdef class SimulatedExchange:
             matching_engine.process_order(command.order, self.exec_client.account_id)
         elif isinstance(command, SubmitOrderList):
             for order in command.order_list.orders:
+                matching_engine = self._matching_engines.get(order.instrument_id)
+                if matching_engine is None:
+                    raise RuntimeError(f"Cannot process command: no matching engine for {order.instrument_id}")
                 matching_engine.process_order(order, self.exec_client.account_id)
         elif isinstance(command, ModifyOrder):
             # Check if order is in SUBMITTED status or PENDING_UPDATE with previous SUBMITTED status

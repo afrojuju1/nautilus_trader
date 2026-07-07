@@ -41,6 +41,7 @@
 //! - `hypersync`: Enables hypersync support (fast parallel hash maps) where available.
 //! - `tracing-bridge`: Enables the `tracing` subscriber bridge for log integration.
 //! - `defi`: Enables DeFi (Decentralized Finance) support including blockchain adapters.
+//! - `mimalloc`: Sets [mimalloc](https://github.com/microsoft/mimalloc) as Rust's global allocator (enabled for binary wheels).
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]
@@ -53,8 +54,14 @@
 
 use std::{path::Path, time::Duration};
 
+#[cfg(feature = "mimalloc")]
+use mimalloc::MiMalloc;
 use nautilus_common::live::runtime::shutdown_runtime;
 use pyo3::{prelude::*, pyfunction};
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 const RUNTIME_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 

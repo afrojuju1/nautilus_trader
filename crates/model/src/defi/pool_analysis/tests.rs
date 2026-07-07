@@ -829,6 +829,107 @@ fn test_process_swap_snaps_sqrt_price_to_event() {
 }
 
 #[rstest]
+fn test_process_swap_mismatch_does_not_mutate_simulated_crossed_tick() {
+    let mut actual_profiler = uni_pool_profiler();
+    actual_profiler
+        .process(&DexPoolData::FeeProtocolUpdate(create_fee_protocol_update(
+            6, 0,
+        )))
+        .unwrap();
+
+    let mut drifted_profiler = actual_profiler.clone();
+    let pool_identifier = actual_profiler.pool.pool_identifier;
+    let stale_upper_tick = -23040;
+    let stale_lower_tick = PoolTick::get_min_tick(TICK_SPACING);
+
+    drifted_profiler
+        .process(&DexPoolData::LiquidityUpdate(create_mint_event(
+            lp_address(),
+            stale_lower_tick,
+            stale_upper_tick,
+            50_000,
+        )))
+        .unwrap();
+
+    let stale_tick_before = *drifted_profiler
+        .get_tick(stale_upper_tick)
+        .expect("stale upper tick should exist");
+
+    let swap_quote = actual_profiler
+        .swap_exact_in(U256::from(expand_to_18_decimals(1)), true, None)
+        .unwrap();
+    assert!(swap_quote.crossed_ticks.is_empty());
+    assert!(swap_quote.tick_after < stale_upper_tick);
+
+    let swap_event = swap_quote.to_swap_event(
+        arbitrum(),
+        uniswap_v3(),
+        pool_identifier,
+        create_block_position(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        user_address(),
+        user_address(),
+    );
+    let amount_specified = swap_event.amount0;
+    let drifted_quote = drifted_profiler
+        .simulate_swap_through_ticks(amount_specified, true, swap_event.sqrt_price_x96, true)
+        .unwrap();
+    assert!(
+        drifted_quote
+            .crossed_ticks
+            .iter()
+            .any(|crossed| crossed.tick == stale_upper_tick)
+    );
+    assert_ne!(drifted_quote.liquidity_after, swap_event.liquidity);
+
+    let fee_growth_global_1_before = drifted_profiler.state.fee_growth_global_1;
+    let protocol_fees_token0_before = drifted_profiler.state.protocol_fees_token0;
+    let protocol_fees_token1_before = drifted_profiler.state.protocol_fees_token1;
+
+    drifted_profiler
+        .process(&DexPoolData::Swap(swap_event))
+        .unwrap();
+
+    let stale_tick_after = drifted_profiler
+        .get_tick(stale_upper_tick)
+        .expect("stale upper tick should remain");
+    assert_eq!(
+        stale_tick_after.fee_growth_outside_0,
+        stale_tick_before.fee_growth_outside_0
+    );
+    assert_eq!(
+        stale_tick_after.fee_growth_outside_1,
+        stale_tick_before.fee_growth_outside_1
+    );
+    assert_eq!(drifted_profiler.state.current_tick, swap_quote.tick_after);
+    assert_eq!(
+        drifted_profiler.state.price_sqrt_ratio_x96,
+        swap_quote.sqrt_price_after_x96
+    );
+    assert_eq!(
+        drifted_profiler.state.fee_growth_global_0,
+        drifted_quote.fee_growth_global_after
+    );
+    assert_eq!(
+        drifted_profiler.state.fee_growth_global_1,
+        fee_growth_global_1_before
+    );
+    assert_eq!(
+        drifted_profiler.state.protocol_fees_token0,
+        protocol_fees_token0_before + drifted_quote.protocol_fee
+    );
+    assert_eq!(
+        drifted_profiler.state.protocol_fees_token1,
+        protocol_fees_token1_before
+    );
+    assert_eq!(
+        drifted_profiler.tick_map.liquidity,
+        swap_quote.liquidity_after
+    );
+}
+
+#[rstest]
 fn test_set_fee_protocol_applies_to_state_and_snapshot(mut profiler: PoolProfiler) {
     let min_tick = PoolTick::get_min_tick(TICK_SPACING);
     let max_tick = PoolTick::get_max_tick(TICK_SPACING);
