@@ -17,8 +17,9 @@ use nautilus_trading::{
     },
     scheduled_events::{
         ApprovedScheduledEventLoadReport, ApprovedScheduledEventLoadRequest,
-        SCHEDULED_EVENT_CATALOG_ENV, ScheduledEventLoadFreshness,
-        default_scheduled_event_catalog_path, load_approved_scheduled_events,
+        DEFAULT_SCHEDULED_EVENT_STALE_AFTER_DAYS, SCHEDULED_EVENT_CATALOG_ENV,
+        ScheduledEventLoadFreshness, default_scheduled_event_catalog_path,
+        load_approved_scheduled_events,
     },
 };
 use serde::Deserialize;
@@ -1602,7 +1603,7 @@ fn load_event_shock_earnings_events(
     request.underlyings = underlyings.to_vec();
     request.stale_after_days = env_parse("ALPACA_EVENT_SHOCK_STALE_AFTER_DAYS")
         .or(config.stale_after_days)
-        .unwrap_or(1)
+        .unwrap_or(DEFAULT_SCHEDULED_EVENT_STALE_AFTER_DAYS)
         .max(0);
 
     let report = load_approved_scheduled_events(&catalog_path, &request).map_err(|error| {

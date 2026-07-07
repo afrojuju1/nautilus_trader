@@ -32,6 +32,8 @@ const RAW_DIR: &str = "raw";
 pub const SCHEDULED_EVENT_RESOLVER_VERSION: &str = "scheduled-event-resolver:v1";
 /// Initial approval policy version for runtime-safe scheduled events.
 pub const SCHEDULED_EVENT_APPROVAL_POLICY_VERSION: &str = "scheduled-event-approval:v1";
+/// Default maximum approval age before runtime treats scheduled-event data as stale.
+pub const DEFAULT_SCHEDULED_EVENT_STALE_AFTER_DAYS: i64 = 7;
 
 const STATUS_CONFIRMED: &str = "confirmed";
 const STATUS_CONFLICTED: &str = "conflicted";
@@ -321,7 +323,7 @@ impl ApprovedScheduledEventLoadRequest {
             lookback_days: 0,
             horizon_days: 0,
             underlyings: Vec::new(),
-            stale_after_days: 1,
+            stale_after_days: DEFAULT_SCHEDULED_EVENT_STALE_AFTER_DAYS,
         }
     }
 
@@ -405,7 +407,10 @@ pub fn load_approved_scheduled_events(
     let events =
         query_approved_scheduled_events(catalog_path.to_path_buf(), request.event_type.clone())?;
 
-    Ok(build_approved_event_report(events, request))
+    Ok(build_approved_event_report(
+        dedupe_approved_events(events),
+        request,
+    ))
 }
 
 impl ApprovedScheduledEventLoadReport {
@@ -440,7 +445,7 @@ fn query_approved_scheduled_events(
             None,
             None,
             None,
-            true,
+            false,
         )?;
         approved_events_from_data(data)
     })
@@ -752,6 +757,43 @@ fn build_approved_event_report(
         unavailable_reason,
         rejected_count,
     }
+}
+
+fn dedupe_approved_events(events: Vec<ApprovedScheduledEvent>) -> Vec<ApprovedScheduledEvent> {
+    let mut by_event = BTreeMap::new();
+
+    for event in events {
+        let key = approved_event_key(&event);
+        match by_event.get(&key) {
+            Some(existing) if !approved_event_is_newer(&event, existing) => {}
+            _ => {
+                by_event.insert(key, event);
+            }
+        }
+    }
+
+    by_event.into_values().collect()
+}
+
+fn approved_event_key(event: &ApprovedScheduledEvent) -> (String, String, String) {
+    (
+        event.event_type.trim().to_string(),
+        normalize_underlying(&event.underlying),
+        event.event_date.trim().to_string(),
+    )
+}
+
+fn approved_event_is_newer(
+    candidate: &ApprovedScheduledEvent,
+    existing: &ApprovedScheduledEvent,
+) -> bool {
+    parse_utc(&candidate.approved_at_utc)
+        .cmp(&parse_utc(&existing.approved_at_utc))
+        .then_with(|| {
+            parse_utc(&candidate.valid_until_utc).cmp(&parse_utc(&existing.valid_until_utc))
+        })
+        .then_with(|| candidate.ts_init.cmp(&existing.ts_init))
+        .is_gt()
 }
 
 fn matching_underlying_events(
@@ -1240,6 +1282,15 @@ mod tests {
                     "2026-05-05",
                     "approved",
                     "alpha_vantage",
+                    Utc.with_ymd_and_hms(2026, 4, 30, 12, 0, 0).unwrap(),
+                    "2026-05-03T12:00:00Z",
+                    0,
+                ),
+                approved_event(
+                    "AAPL",
+                    "2026-05-05",
+                    "approved",
+                    "alpha_vantage",
                     fixed_utc(),
                     "2026-05-08T12:00:00Z",
                     1,
@@ -1279,6 +1330,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["AAPL", "IWM"]
         );
+        assert_eq!(report.events[0].approved_at_utc, format_utc(fixed_utc()));
         assert_eq!(report.source_set, vec!["alpha_vantage", "manual_override"]);
         assert_eq!(report.policy_versions, vec!["scheduled-event-approval:v1"]);
         assert_eq!(
